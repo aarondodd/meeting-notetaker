@@ -25,6 +25,7 @@ from .models.session import (
 )
 from .models.transcript import TranscriptStore
 from .transcription import model_manager
+from .ui.devices_dialog import DevicesDialog
 from .ui.main_window import MainWindow
 from .ui.new_session_dialog import NewSessionDialog
 from .ui.progress import run_with_progress
@@ -66,6 +67,7 @@ class MainApp(QObject):
         self._wire_signals()
         self._refresh_session_list()
         self._handle_crash_recovery()
+        self._warn_if_store_python()
 
         self.window.show()
         self.tray.set_state("idle")
@@ -75,6 +77,7 @@ class MainApp(QObject):
     def _wire_signals(self) -> None:
         self.window.new_session_requested.connect(self._on_new_session)
         self.window.open_settings_requested.connect(self._on_settings)
+        self.window.open_devices_dialog_requested.connect(self._on_devices)
         self.window.quit_requested.connect(self.qt_app.quit)
         self.window.session_selected.connect(self._on_session_selected)
         self.window.delete_sessions_requested.connect(self._on_delete_sessions)
@@ -251,6 +254,10 @@ class MainApp(QObject):
 
     # ---- settings ---------------------------------------------------------
 
+    def _on_devices(self) -> None:
+        dialog = DevicesDialog(parent=self.window)
+        dialog.exec()
+
     def _on_settings(self) -> None:
         dialog = SettingsDialog(self.config, parent=self.window)
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -261,6 +268,35 @@ class MainApp(QObject):
             return
         self.config.save()
         self.window.status("Settings saved.", timeout_ms=4000)
+
+    # ---- environment warnings ---------------------------------------------
+
+    def _warn_if_store_python(self) -> None:
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            from .audio.mic_recorder import _is_store_python
+        except Exception:
+            return
+        if not _is_store_python():
+            return
+        QMessageBox.warning(
+            self.window,
+            "Microsoft Store Python detected",
+            "You appear to be running Python from the Microsoft Store, which "
+            "runs in an AppContainer sandbox that blocks microphone access at "
+            "the OS level. Recording will fail with 'No input audio devices "
+            "found' when you click Start.\n\n"
+            "Fix: install Python from python.org (the standard installer), "
+            "then rebuild the venv:\n\n"
+            "    deactivate\n"
+            "    Remove-Item -Recurse -Force .venv\n"
+            "    py -3.12 -m venv .venv\n"
+            "    .\\.venv\\Scripts\\Activate.ps1\n"
+            "    pip install -r requirements-dev.txt\n\n"
+            "Use Help -> Audio Devices... to confirm what PyAudio sees on this "
+            "interpreter.",
+        )
 
     # ---- crash recovery ---------------------------------------------------
 

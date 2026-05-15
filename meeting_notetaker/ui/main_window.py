@@ -31,6 +31,7 @@ from .session_view import SessionView
 class MainWindow(QMainWindow):
     new_session_requested = pyqtSignal()
     open_settings_requested = pyqtSignal()
+    open_devices_dialog_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     delete_sessions_requested = pyqtSignal(list)   # list of session_ids
     session_selected = pyqtSignal(str)             # session_id
@@ -57,6 +58,11 @@ class MainWindow(QMainWindow):
         action_quit.setShortcut("Ctrl+Q")
         action_quit.triggered.connect(self.quit_requested.emit)
         file_menu.addAction(action_quit)
+
+        help_menu = menubar.addMenu("&Help")
+        action_devices = QAction("&Audio Devices...", self)
+        action_devices.triggered.connect(self.open_devices_dialog_requested.emit)
+        help_menu.addAction(action_devices)
 
         # Body: splitter
         central = QWidget(self)

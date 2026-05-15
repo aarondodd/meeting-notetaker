@@ -67,6 +67,28 @@ pip install -r requirements-dev.txt
 python main.py
 ```
 
+**Important on Windows:** make sure the `python` you use is from
+[python.org](https://www.python.org/downloads/) **not** the Microsoft Store.
+Microsoft Store Python runs in a UWP AppContainer sandbox that blocks
+microphone access at the OS level -- you'll get "No input audio devices
+found" no matter what you do in Windows Privacy settings. The app detects
+this at startup and shows a warning dialog. To check which Python you have:
+
+```powershell
+where.exe python
+# Look at the FIRST hit. If it contains "WindowsApps", it is the Store Python.
+# The python.org Python is typically under
+#   C:\Users\<you>\AppData\Local\Programs\Python\Python312\python.exe
+# or C:\Program Files\Python312\python.exe (system-wide install).
+```
+
+If you have both installed, prefix commands with `py -3.12` to pick the
+python.org version explicitly:
+
+```powershell
+py -3.12 -m venv .venv
+```
+
 ```bash
 # Linux / macOS dev environment (UI runs; loopback capture stays disabled)
 python3 -m venv .venv

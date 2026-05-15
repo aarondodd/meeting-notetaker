@@ -149,6 +149,33 @@ class MicRecorder(QObject):
         self.stopped.emit()
 
 
+def _is_store_python() -> bool:
+    """Detect Microsoft Store Python (sandboxed AppContainer, no mic capability).
+
+    The Store Python package runs inside a UWP AppContainer that strips
+    capabilities the package manifest doesn't declare. Microphone is one
+    of them, so PortAudio sees zero input devices regardless of Windows
+    Privacy settings. The fix is non-Store Python (python.org installer).
+    """
+    import sys
+
+    exe = (sys.executable or "").lower()
+    return ("windowsapps" in exe) or ("pythonsoftwarefoundation" in exe)
+
+
+def list_all_devices(pa) -> list[dict]:
+    """Return PyAudio's device list as a list of plain dicts (for diagnostics)."""
+    out: list[dict] = []
+    for i in range(pa.get_device_count()):
+        try:
+            d = dict(pa.get_device_info_by_index(i))
+            d["_index"] = i
+            out.append(d)
+        except Exception as exc:
+            out.append({"_index": i, "_error": str(exc)})
+    return out
+
+
 def _pick_input_device(pa) -> tuple[Optional[int], dict]:
     """Choose an input device. Returns (device_index_or_None, device_info).
 
@@ -159,6 +186,7 @@ def _pick_input_device(pa) -> tuple[Optional[int], dict]:
     prefer the first WASAPI input, then any input, then a helpful error.
     """
     import pyaudio
+    import sys
 
     try:
         info = pa.get_default_input_device_info()
@@ -178,11 +206,49 @@ def _pick_input_device(pa) -> tuple[Optional[int], dict]:
             continue
         candidates.append((i, d))
 
+    # Log every device we did see, so the meeting_notetaker.log shows enough
+    # context for future "why no mic" triage. Includes 0-input rows.
+    try:
+        all_devices = list_all_devices(pa)
+        log.info("PyAudio device enumeration (%d total):", len(all_devices))
+        for d in all_devices:
+            log.info(
+                "  #%s  name=%r hostApi=%s maxIn=%s maxOut=%s rate=%s",
+                d.get("_index", "?"),
+                d.get("name", "?"),
+                d.get("hostApi", "?"),
+                d.get("maxInputChannels", "?"),
+                d.get("maxOutputChannels", "?"),
+                d.get("defaultSampleRate", "?"),
+            )
+    except Exception:
+        log.exception("device-enumeration logging failed")
+
     if not candidates:
+        # Most common Windows root cause first.
+        if sys.platform.startswith("win") and _is_store_python():
+            raise RuntimeError(
+                "Microsoft Store Python detected (interpreter path contains "
+                "'WindowsApps'). The Store Python runs inside a UWP AppContainer "
+                "that blocks microphone access at the OS level -- PyAudio sees "
+                "zero input devices regardless of Windows Privacy settings.\n\n"
+                "Fix: install Python from https://www.python.org/downloads/ "
+                "(not the Microsoft Store), then rebuild the venv:\n\n"
+                "    deactivate\n"
+                "    Remove-Item -Recurse -Force .venv\n"
+                "    py -3.12 -m venv .venv\n"
+                "    .\\.venv\\Scripts\\Activate.ps1\n"
+                "    pip install -r requirements-dev.txt\n\n"
+                "Then run 'python main.py' again. The mic will be visible."
+            )
         raise RuntimeError(
-            "No input audio devices found. On Windows: open Settings -> Privacy & "
-            "Security -> Microphone and make sure 'Microphone access' is on for "
-            "Desktop apps. If the mic is brand new, unplug + replug it and try again."
+            "No input audio devices found. Check:\n"
+            "  1) Settings -> Privacy & Security -> Microphone:\n"
+            "     - 'Microphone access' = On\n"
+            "     - 'Let desktop apps access your microphone' = On\n"
+            "  2) The mic is plugged in and works in another app.\n"
+            "  3) Use Help -> Audio Devices... in the app to see exactly what "
+            "PyAudio enumerates."
         )
 
     # Prefer WASAPI inputs (most reliable on Windows 11).
