@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meeting-notetaker"
+version = "0.1.0"
+description = "Local meeting capture, transcription, and prompt-mediated synthesis (Windows PyQt6)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Aaron Dodd" }]
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[tool.setuptools.packages.find]
+include = ["meeting_notetaker*"]
+
+[tool.setuptools.package-data]
+meeting_notetaker = ["resources/prompts/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "audio: integration tests that need real audio hardware (skipped by default)",
+]
+addopts = "-ra --strict-markers"
