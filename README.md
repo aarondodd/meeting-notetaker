@@ -218,11 +218,40 @@ Get-ChildItem wheels\ | ForEach-Object {
 
 The app makes exactly one kind of outbound network call: downloading the
 selected faster-whisper model from `huggingface.co` on first run. After
-that, no network. If Hugging Face is blocked, pre-stage the model under
-`%APPDATA%\MeetingNotetaker\models\faster-whisper-<size>\` and the
-download is skipped.
+that, no network. All other paths (clipboard handoff, file I/O,
+transcription) are on-device.
 
-All other paths (clipboard handoff, file I/O, transcription) are on-device.
+### Corporate proxies (Netskope, Zscaler, etc.)
+
+If your workstation routes through a MITM proxy that re-signs TLS, the
+first-run model download will fail with `CERTIFICATE_VERIFY_FAILED` even
+though Edge / Outlook / npm all work. Python's `httpx` (used by
+`huggingface_hub`) doesn't see the corporate CA -- it has its own bundled
+trust list.
+
+The app ships `truststore` (Windows only, in `requirements.txt`) and
+injects it at startup in `main.py`. `truststore` makes Python's `ssl`
+module use the OS certificate store, which already trusts the corporate
+CA. **`pip install -r requirements.txt`** is enough; no manual CA wrangling
+needed.
+
+If `truststore` isn't enough (e.g. the proxy uses pinning, or you're on a
+Python ssl build with weird defaults), pre-stage the model offline:
+
+1. On a machine that can reach `huggingface.co`, download the model files.
+   Easiest: `pip install faster-whisper` in a clean venv and run
+   `python -c "from faster_whisper import WhisperModel; WhisperModel('small.en')"`
+   then copy the snapshot directory to a thumb drive.
+2. On the work machine, drop the model files into
+   `%APPDATA%\MeetingNotetaker\models\small.en\` (or whichever size).
+   That directory should contain `model.bin`, `config.json`, and either
+   `tokenizer.json` or `vocabulary.txt`.
+3. Start the app. The model manager detects the local snapshot and never
+   calls Hugging Face.
+
+You can also set `HF_HUB_OFFLINE=1` in the environment to force offline
+mode against the standard HF cache layout (`models--Systran--faster-whisper-
+<size>/`). Either approach works.
 
 ## Architecture
 
