@@ -28,16 +28,18 @@ chatbot via clipboard. No audio leaves the machine; no API key required.
 
 ## Why this exists
 
-The work environment forbids:
+A typical corporate workstation forbids:
 
 - Sending audio or transcript content out to any external API.
-- Synthesising notes via any LLM other than a company-approved chatbot.
+- Synthesising via any LLM other than a company-approved one.
 
 Granola, Otter, Fireflies, Meetily-with-API-LLM, and similar SaaS tools all
 violate one or both. This app moves transcription on-device and keeps the
 synthesis step manual: you paste the prompt + transcript into Claude.ai or
-Copilot, and paste the response back. Aaron stays in the loop as the explicit
+Copilot, and paste the response back. The user stays in the loop as the explicit
 transport.
+
+Future enhancements may include integration with LLMs directly, but the initial intent of this release is limited to just local processing and human movement of the data in question.
 
 ## Status
 
