@@ -1,6 +1,6 @@
 # Meeting Notetaker
 
-Granola-style local meeting capture for Windows. Records your microphone and
+Local meeting capture for Windows. Records your microphone and
 the system audio (whatever's playing through your speakers, including Teams /
 Zoom / Meet calls), transcribes both streams locally with faster-whisper, and
 hands the resulting transcript to you for synthesis by a company-approved
@@ -28,7 +28,7 @@ chatbot via clipboard. No audio leaves the machine; no API key required.
 
 ## Why this exists
 
-A typical corporate workstation forbids:
+A typical corporate workstation may forbid:
 
 - Sending audio or transcript content out to any external API.
 - Synthesising via any LLM other than a company-approved one.
@@ -43,8 +43,9 @@ Future enhancements may include integration with LLMs directly, but the initial 
 
 ## Status
 
-v0.1 alpha. Built on Linux, runs on Windows. Not yet tested against a real
-meeting end-to-end; the WASAPI loopback path is cribbed from
+v0.1 alpha. Performance is being tweaked (it might be slower than desired to finish the final transcription cleanup due to local-only processing).
+
+The WASAPI loopback path is cribbed from
 [Danaor/WhisperType](https://github.com/Danaor/WhisperType) and works there.
 
 ## Requirements
@@ -84,26 +85,10 @@ where.exe python
 # or C:\Program Files\Python312\python.exe (system-wide install).
 ```
 
-If you have both installed, prefix commands with `py -3.12` to pick the
-python.org version explicitly:
-
-```powershell
-py -3.12 -m venv .venv
-```
-
-```bash
-# Linux / macOS dev environment (UI runs; loopback capture stays disabled)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
-python main.py
-```
-
-The non-Windows path is for development only -- it works for everything
-except real system-audio capture, since `pyaudiowpatch` only ships Windows
-wheels. The mic recorder works cross-platform.
 
 ## Run (packaged)
+
+This is the target use. It creates a .exe that is clickable to run. Not yet actually tested/used but should work.
 
 ```powershell
 .\build.ps1                 # produces dist\meeting-notetaker.exe
@@ -114,7 +99,7 @@ The executable bundles the Python runtime, PyQt6, and faster-whisper. The
 Whisper model itself is downloaded on first run into
 `%APPDATA%\MeetingNotetaker\models\`.
 
-## Usage (golden path)
+## Usage
 
 1. Launch the app. A blue dot appears in the system tray; the main window
    shows an empty session list.
@@ -210,10 +195,6 @@ session.
       audio\                     # mic.wav + sys.wav (deleted after transcription
                                  # unless 'Keep audio' was set for the session)
 ```
-
-On Linux/macOS dev installs the equivalent root is
-`$XDG_CONFIG_HOME/MeetingNotetaker/` (defaults to `~/.config/MeetingNotetaker/`).
-Set `MEETING_NOTETAKER_DATA_DIR` to override anywhere.
 
 ## Settings
 
