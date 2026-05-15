@@ -108,6 +108,7 @@ class MainApp(QObject):
         self.controller.state_changed.connect(self._on_session_state_changed)
         self.controller.segment_arrived.connect(self._on_segment_arrived)
         self.controller.transcript_replaced.connect(self._on_transcript_replaced)
+        self.controller.batch_progress.connect(self._on_batch_progress)
         self.controller.error.connect(self._on_controller_error)
         self.controller.status.connect(lambda msg: self.window.status(msg, timeout_ms=5000))
 
@@ -193,6 +194,11 @@ class MainApp(QObject):
         sv = self.window.session_view
         if sv._session and sv._session.id == session_id:
             sv.set_transcript_text("\n".join(format_segment(s) for s in segments))
+
+    def _on_batch_progress(self, session_id: str, pct: int) -> None:
+        sv = self.window.session_view
+        if sv._session and sv._session.id == session_id:
+            sv.update_batch_progress(pct)
 
     def _on_controller_error(self, msg: str) -> None:
         log.error("controller error: %s", msg)

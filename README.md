@@ -143,7 +143,18 @@ Whisper model itself is downloaded on first run into
 ### Taking notes in parallel (the My Notes tab)
 
 The **My Notes** tab is an editable Markdown buffer that lives next to the
-transcript. Open a new session and the tab is pre-seeded with:
+transcript. A small toolbar above the editor handles common formatting:
+
+- **B** / **I** -- bold (`Ctrl+B`) and italic (`Ctrl+I`); wraps selection in `**...**` or `*...*`
+- **H1 / H2 / H3** -- replaces the current line's heading marker
+- **List** / **1. List** / **Task** -- prefixes selected lines with `- `, `1. 2. ...`, or `- [ ] `
+- **Quote** -- prefixes selected lines with `> `
+- **Code** -- inline code (`Ctrl+\``); **Code Block** -- fenced ` ``` ` block
+- **Link** -- inserts `[text](url)` (`Ctrl+K`)
+- **HR** -- inserts a `---` divider
+- **Preview** -- toggle between Markdown source (edit) and rendered view; the button label flips to **Edit** while previewing
+
+Open a new session and the editor is pre-seeded with:
 
 ```
 # Attendees
@@ -212,10 +223,59 @@ are also editable directly in `config.toml`.
 | Your name | (empty -> "Me") | Replaces "Me:" in the transcript display and in the synthesis prompt. When set, the LLM sees your real name and assigns action items by name instead of "TBD". The on-disk transcript is always stored with the neutral "Me:" label and rewritten on display, so changing your name later does not break old sessions. |
 | Model size | `small.en` | Which faster-whisper model to use. See "Choosing a model" below. |
 | Capture-only mode | off | Skip live transcription; run a single Whisper pass when you click Stop. Lower CPU during the meeting, no live view. |
+| Skip post-Stop refinement | off | Make the live transcript final. No second Whisper pass after you click Stop. See "Why transcription can take a while" below for the trade-off. |
+| Fast batch mode | off | When the refinement pass runs, use beam_size=1 (greedy decoding) instead of beam_size=5 (beam search). About 3x faster, modest quality drop on English-only models. Ignored when "Skip refinement" is on. |
 | Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. Per-session override stays available. |
 | Enable VAD | on | Trim silent stretches before Whisper decodes them. Saves CPU. Disable if it ever clips speech. |
 | VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. 250-2000 ms range. |
 | Theme | auto | UI theme. (Stub for v0.1; `auto` follows the OS.) |
+
+### Why transcription can take a while (and what to do about it)
+
+Two Whisper passes run for every recording:
+
+- **Live transcription**, while recording. Each source (mic + system audio)
+  runs as its own background worker, popping 10-second windows with 5-second
+  overlap from a ring buffer. Each window is decoded as it arrives. By the
+  time you click Stop, the transcript pane is almost always within a few
+  seconds of the actual end of audio. This is the "good enough" version --
+  it works well in practice but does not see cross-sentence context across
+  window boundaries.
+- **Batch refinement**, after Stop. The full mic + sys WAV files are
+  re-transcribed end-to-end so Whisper has the entire context to lean on.
+  Quality is slightly higher (better punctuation, fewer split sentences,
+  fewer mis-heard words at chunk boundaries). On CPU this is roughly
+  **real-time** -- a 30-minute meeting on `small.en` takes ~30 minutes of
+  CPU to refine.
+
+As of v0.3 you no longer have to wait for the refinement pass before
+synthesizing. The status label switches from "Recording" to
+**"Refining transcript -- you can synthesize now"** the moment Stop
+completes, the Generate / Paste / Copy buttons are immediately available,
+and the percentage updates live as the refinement runs in the background.
+Anything you do during refinement uses the live transcript; if you
+re-generate after refinement finishes, the better version is used
+automatically.
+
+If the refinement wait still bothers you:
+
+- **Skip post-Stop refinement.** Best if you find live quality acceptable.
+  Setting -> Skip post-Stop refinement = on. No CPU cost after Stop;
+  transcription is "done" immediately.
+- **Fast batch mode.** Cuts the refinement wall-clock by roughly two
+  thirds. Quality drop is modest for English-only models. Setting -> Fast
+  batch mode = on.
+- **Smaller model.** `base.en` is roughly 3x faster than `small.en` for
+  both live and batch passes. Quality is a real step down, but workable
+  for many meetings.
+- **Retain the audio.** Per-session "Keep audio" toggle keeps the WAV
+  files. If you ever want to re-run Whisper with a different model or
+  settings, you have the source material to do it.
+
+Two-source recordings (mic + system audio, e.g. a Teams call with system
+audio captured) get a free 2x speedup on the refinement pass: both sources
+run in parallel on different CPU cores. Single-source recordings (mic
+only) get no benefit from this.
 
 ### Choosing a model
 

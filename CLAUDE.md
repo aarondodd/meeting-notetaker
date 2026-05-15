@@ -32,9 +32,10 @@ meeting_notetaker/
   ui/
     main_window.py               # left pane: session list + bulk delete + new
     session_view.py              # right pane: transcript / my-notes / synthesis / previous + controls
+    live_notes_widget.py         # Markdown editor + formatting toolbar + Preview/Edit toggle
     new_session_dialog.py        # title + per-session "Keep recording" toggle
     prompt_dialog.py             # Generate Synthesis Prompt + Paste Response Back
-    settings_dialog.py           # model, VAD, retain default, capture-only, theme, prompts-folder
+    settings_dialog.py           # model, VAD, batch toggles, retain default, name, prompts-folder
     tray.py                      # QSystemTrayIcon wrapper with state coloring
   utils/
     paths.py                     # %APPDATA% / XDG resolution; MEETING_NOTETAKER_DATA_DIR override
@@ -136,6 +137,22 @@ ChunkBuffer (per source) --10s windows, 5s overlap-->  LiveTranscriptionWorker (
   Whenever a bundled prompt body changes, add the *previous* bundled body's
   SHA-256 to `_PRIOR_BUNDLED_HASHES[<filename>]` so existing installs pick
   up the new body on next launch.
+- **Synthesis is not gated on batch refinement.** As of v0.3 the Generate /
+  Paste / Copy buttons unlock as soon as the live transcript is committed
+  to disk (i.e. at Stop). The batch pass runs in the background and emits
+  `batch_progress` from `SessionController`; the SessionView state label
+  updates with the percentage. If the user generates during refinement,
+  they get the live-transcript version; when refinement finishes, the
+  on-disk transcript is replaced, and the next generate pass uses it.
+- **Batch pass runs sources concurrently.** `_BatchTranscribeThread` uses
+  a ThreadPoolExecutor to run mic + sys through `batch_transcribe` in
+  parallel. faster-whisper's `transcribe()` is thread-safe when sharing
+  one model instance. Two-source recordings get a free ~2x wall-clock
+  speedup; single-source recordings are unaffected.
+- **`worker.batch_transcribe` is importable without Qt.** The Qt-dependent
+  `LiveTranscriptionWorker` class is only defined when `PyQt6` imports.
+  This is why pure-Python tests can import `batch_transcribe` for unit
+  testing without `pip install PyQt6` in the test env.
 
 ### Why PyAudio + PyAudioWPatch (not sounddevice)
 
@@ -197,17 +214,34 @@ basic correctness assertions.
 - Microsoft Store Python detection + Audio Devices diagnostic dialog.
 - Corporate MITM proxy handled via truststore.
 
-### v0.2 (in progress)
+### v0.2
 
 - Live notes tab (Attendees / Agenda / Notes / Action Items) with debounced
   auto-save.
 - Synthesis prompt merges live notes with transcript; attendees parsed from
   bulleted list and passed as `{{attendees}}`.
+- `{{user_name}}` placeholder; "Your name" setting replaces "Me:" labels
+  everywhere it matters (display + prompt + action-item attribution).
 - Copy Notes to Clipboard button on the session view.
 - Open Prompts Folder shortcut in Settings.
-- Hash-gated bundled-prompt upgrade so unmodified user prompts pick up new
-  bundled bodies automatically.
-- 61 unit tests passing on Linux.
+- Hash-gated bundled-prompt upgrade with line-ending normalization so a
+  CRLF Windows checkout upgrades cleanly.
+
+### v0.3 (current)
+
+- Markdown editor toolbar on the My Notes tab (bold/italic/headings/
+  lists/quote/code/link/HR) plus a Preview/Edit toggle that renders the
+  source as Markdown via QTextBrowser.setMarkdown.
+- Batch refinement decoupled from synthesis: Generate / Paste / Copy
+  enabled immediately after Stop; progress percentage shown in the state
+  label.
+- Concurrent mic + sys batch passes via ThreadPoolExecutor inside the
+  batch QThread.
+- Per-segment progress callback in `batch_transcribe` (uses
+  `info.duration` + `seg.end`).
+- Two new settings: "Skip post-Stop refinement" (live transcript is final)
+  and "Fast batch mode" (beam_size=1 in the batch pass).
+- 79 unit tests passing on Linux.
 
 ### Open follow-ups
 

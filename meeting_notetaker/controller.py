@@ -15,8 +15,10 @@ from __future__ import annotations
 import logging
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Callable, Optional
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
@@ -43,10 +45,20 @@ log = logging.getLogger(__name__)
 
 
 class _BatchTranscribeThread(QThread):
-    """Wraps batch_transcribe for the final-pass after stop()."""
+    """Wraps batch_transcribe for the final-pass after stop().
+
+    Sources (mic + sys) run concurrently in a ThreadPoolExecutor since
+    faster-whisper's `transcribe()` is thread-safe and we share one model
+    instance. On modern multi-core CPUs this roughly halves wall-clock for
+    two-source meetings; for single-source recordings it is a no-op.
+
+    Progress is reported as a single 0-100% number, derived from each
+    source's per-segment progress combined (mean across active sources).
+    """
 
     done = pyqtSignal(list)            # list[TranscriptSegment]
-    progress = pyqtSignal(str)
+    progress = pyqtSignal(str)         # human-readable status text
+    progress_pct = pyqtSignal(int)     # 0..100 (combined across active sources)
     failed = pyqtSignal(str)
 
     def __init__(
@@ -57,6 +69,7 @@ class _BatchTranscribeThread(QThread):
         *,
         vad_filter: bool,
         vad_min_silence_ms: int,
+        beam_size: int = 5,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -65,27 +78,50 @@ class _BatchTranscribeThread(QThread):
         self.model_size = model_size
         self.vad_filter = vad_filter
         self.vad_min_silence_ms = vad_min_silence_ms
+        self.beam_size = beam_size
 
     def run(self) -> None:
         try:
             model = model_manager.get_model(self.model_size, progress=self.progress.emit)
-            results: list[TranscriptSegment] = []
+            tasks: list[tuple[str, Path]] = []
             if self.mic_wav and self.mic_wav.exists() and self.mic_wav.stat().st_size > 44:
-                results += batch_transcribe(
-                    self.mic_wav, model,
-                    source=MIC,
-                    vad_filter=self.vad_filter,
-                    vad_min_silence_ms=self.vad_min_silence_ms,
-                    progress=self.progress.emit,
-                )
+                tasks.append((MIC, self.mic_wav))
             if self.sys_wav and self.sys_wav.exists() and self.sys_wav.stat().st_size > 44:
-                results += batch_transcribe(
-                    self.sys_wav, model,
-                    source=SYS,
-                    vad_filter=self.vad_filter,
-                    vad_min_silence_ms=self.vad_min_silence_ms,
-                    progress=self.progress.emit,
-                )
+                tasks.append((SYS, self.sys_wav))
+
+            per_source_pct: dict[str, float] = {src: 0.0 for src, _ in tasks}
+            pct_lock = Lock()
+
+            def on_pct(source: str, pct: float) -> None:
+                with pct_lock:
+                    per_source_pct[source] = pct
+                    if per_source_pct:
+                        combined = int(100 * sum(per_source_pct.values()) / len(per_source_pct))
+                    else:
+                        combined = 0
+                self.progress_pct.emit(combined)
+
+            results: list[TranscriptSegment] = []
+            if not tasks:
+                self.done.emit([])
+                return
+            with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
+                futures = {
+                    pool.submit(
+                        batch_transcribe,
+                        wav, model,
+                        source=src,
+                        beam_size=self.beam_size,
+                        vad_filter=self.vad_filter,
+                        vad_min_silence_ms=self.vad_min_silence_ms,
+                        progress=self.progress.emit,
+                        on_progress_pct=on_pct,
+                    ): src
+                    for src, wav in tasks
+                }
+                for fut in futures:
+                    results += fut.result()
+            self.progress_pct.emit(100)
             self.done.emit(interleave(results, []))
         except Exception as exc:  # pragma: no cover - thread safety net
             log.exception("batch transcribe failed")
@@ -96,6 +132,7 @@ class SessionController(QObject):
     state_changed = pyqtSignal(str, str)               # session_id, state
     segment_arrived = pyqtSignal(str, object)          # session_id, TranscriptSegment
     transcript_replaced = pyqtSignal(str, list)        # session_id, list[TranscriptSegment]
+    batch_progress = pyqtSignal(str, int)              # session_id, pct (0..100)
     error = pyqtSignal(str)
     status = pyqtSignal(str)
 
@@ -262,7 +299,9 @@ class SessionController(QObject):
             worker.wait(5000)
         self._workers = []
 
-        # Persist live transcript (if any) before kicking off batch pass.
+        # Persist live transcript (if any). This is the "good enough" version
+        # the user can synthesize from immediately while the batch pass refines
+        # it in the background.
         store = TranscriptStore(session.id)
         if self._live_segments:
             store.write_segments(self._live_segments)
@@ -271,32 +310,56 @@ class SessionController(QObject):
 
         self.store.update_session(
             session.id,
-            state=STATE_PROCESSING,
             ended_at=utc_now_iso(),
             duration_seconds=duration,
         )
+
+        # Skip batch pass entirely if configured. The live transcript becomes
+        # final and the user moves straight to STATE_COMPLETE (and audio
+        # cleanup) -- no 30-min wait for a 30-min recording.
+        if self.config.transcription.skip_batch_refinement:
+            self._finalize_session(session, batch_segments=None)
+            return
+
+        self.store.update_session(session.id, state=STATE_PROCESSING)
         session.state = STATE_PROCESSING
         self.state_changed.emit(session.id, STATE_PROCESSING)
+        self.batch_progress.emit(session.id, 0)
 
-        # Kick off the batch / final pass in a background thread.
+        beam_size = 1 if self.config.transcription.fast_batch else 5
         self._batch_thread = _BatchTranscribeThread(
             self._mic_wav,
             self._sys_wav,
             self.config.transcription.model_size,
             vad_filter=self.config.audio.vad_enabled,
             vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
+            beam_size=beam_size,
         )
         self._batch_thread.progress.connect(self.status.emit)
+        self._batch_thread.progress_pct.connect(
+            lambda pct, sid=session.id: self.batch_progress.emit(sid, pct)
+        )
         self._batch_thread.done.connect(lambda segs: self._on_batch_done(session, store, segs))
         self._batch_thread.failed.connect(lambda msg: self._on_batch_failed(session, msg))
         self._batch_thread.start()
 
-    def _on_batch_done(self, session: Session, store: TranscriptStore, segments: list[TranscriptSegment]) -> None:
-        if segments:
-            store.write_segments(segments)
+    def _finalize_session(
+        self,
+        session: Session,
+        *,
+        batch_segments: Optional[list[TranscriptSegment]],
+    ) -> None:
+        """Commit final state for a stopped session.
+
+        If `batch_segments` is provided, the live transcript is replaced by
+        the batch result on disk. Otherwise the on-disk live transcript is
+        treated as final (the skip-batch-refinement path).
+        """
+        store = TranscriptStore(session.id)
+        if batch_segments is not None and batch_segments:
+            store.write_segments(batch_segments)
             self.store.update_session(session.id, has_transcript=True)
-            self.transcript_replaced.emit(session.id, segments)
-        # Audio retention: delete WAVs if not retained.
+            self.transcript_replaced.emit(session.id, batch_segments)
         if not session.retain_audio:
             audio_dir = session_audio_dir(session.id)
             try:
@@ -309,6 +372,14 @@ class SessionController(QObject):
         self.state_changed.emit(session.id, STATE_COMPLETE)
         self._teardown_recording()
         self.status.emit("Transcription complete.")
+
+    def _on_batch_done(
+        self,
+        session: Session,
+        store: TranscriptStore,
+        segments: list[TranscriptSegment],
+    ) -> None:
+        self._finalize_session(session, batch_segments=segments)
 
     def _on_batch_failed(self, session: Session, msg: str) -> None:
         self.store.update_session(session.id, state=STATE_ERROR)

@@ -65,6 +65,34 @@ class SettingsDialog(QDialog):
             "meeting; full transcript appears after you click Stop."
         )
         tx_form.addRow(self._capture_only)
+
+        self._skip_batch = QCheckBox(
+            "Skip post-Stop refinement (use live transcript as final)", self
+        )
+        self._skip_batch.setChecked(config.transcription.skip_batch_refinement)
+        self._skip_batch.setToolTip(
+            "After Stop, do NOT re-run Whisper over the full recording. The live "
+            "transcript (already on disk) becomes the final transcript. Skips the "
+            "long post-meeting wait (a 30-min meeting on small.en is ~30 min of CPU "
+            "to re-transcribe). Quality is slightly lower than the batch pass -- "
+            "small.en's live windows are 10s with 5s overlap, so cross-sentence "
+            "context is shorter than what the batch pass gets. Recommended if you "
+            "find the live view's quality acceptable."
+        )
+        tx_form.addRow(self._skip_batch)
+
+        self._fast_batch = QCheckBox(
+            "Fast batch mode (beam_size=1, ~3x faster, slight quality drop)", self
+        )
+        self._fast_batch.setChecked(config.transcription.fast_batch)
+        self._fast_batch.setToolTip(
+            "Only applies when the post-Stop refinement is running. Uses greedy "
+            "decoding instead of beam search 5. For English-only models the "
+            "quality drop is modest -- a handful of incorrect word choices in "
+            "noisy audio. Wall-clock is roughly 1/3 of the default. Ignored if "
+            "Skip refinement is on."
+        )
+        tx_form.addRow(self._fast_batch)
         layout.addWidget(tx_group)
 
         # Audio group ------------------------------------------------------
@@ -154,6 +182,8 @@ class SettingsDialog(QDialog):
     def _on_accept(self) -> None:
         self._config.transcription.model_size = self._model_picker.currentText()
         self._config.transcription.capture_only_mode = self._capture_only.isChecked()
+        self._config.transcription.skip_batch_refinement = self._skip_batch.isChecked()
+        self._config.transcription.fast_batch = self._fast_batch.isChecked()
         self._config.audio.retain_audio_default = self._retain_default.isChecked()
         self._config.audio.vad_enabled = self._vad_enabled.isChecked()
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()

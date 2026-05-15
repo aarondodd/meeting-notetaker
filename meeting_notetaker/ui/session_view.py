@@ -33,6 +33,7 @@ from ..models.transcript import (
     label_for,
     rewrite_user_label,
 )
+from .live_notes_widget import LiveNotesWidget
 
 
 class SessionView(QWidget):
@@ -120,12 +121,12 @@ class SessionView(QWidget):
         self._transcript_view.setFont(mono)
         self._tabs.addTab(self._transcript_view, "Transcript")
 
-        self._live_notes_editor = QPlainTextEdit(self)
-        self._live_notes_editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self._live_notes_editor = LiveNotesWidget(self)
         self._live_notes_editor.setPlaceholderText(
-            "Take notes here during the meeting. Sections (Attendees / Agenda / Notes / "
-            "Action Items) auto-seed on first open. Saved continuously. Included in the "
-            "synthesis prompt; attendee names are extracted from the bulleted list."
+            "Take notes here during the meeting using Markdown. Sections (Attendees / "
+            "Agenda / Notes / Action Items) auto-seed on first open. Saved continuously. "
+            "Included in the synthesis prompt; attendee names are extracted from the "
+            "bulleted list. Click Preview to render Markdown, Edit to resume writing."
         )
         self._live_notes_editor.textChanged.connect(self._on_live_notes_changed)
         self._tabs.addTab(self._live_notes_editor, "My Notes")
@@ -199,6 +200,13 @@ class SessionView(QWidget):
             has_transcript=self._session.has_transcript or bool(self._transcript_view.toPlainText().strip()),
             has_notes=self._session.has_notes or bool(self._notes_view.toPlainText().strip()),
         )
+
+    def update_batch_progress(self, pct: int) -> None:
+        """Reflect background batch-refinement progress in the state label."""
+        if self._session is None:
+            return
+        if self._session.state == STATE_PROCESSING:
+            self._state_label.setText(f"Refining transcript -- {pct}%")
 
     def append_segment(self, segment: TranscriptSegment) -> None:
         """Append a finalized segment; provisional segments use append_provisional."""
@@ -323,8 +331,12 @@ class SessionView(QWidget):
         self._pause_btn.setEnabled(has_session and is_recording)
         self._resume_btn.setEnabled(has_session and is_paused)
         self._stop_btn.setEnabled(has_session and (is_recording or is_paused))
-        # Generate/paste are available once a transcript exists.
-        can_synthesize = has_session and has_transcript and not is_recording and not is_processing
+        # Generate/paste are available as soon as a transcript exists. The
+        # batch-refinement pass after Stop runs in the background and is
+        # explicitly NOT a gate on synthesis -- the live transcript is good
+        # enough to act on, and any later regenerate will pick up the
+        # refined version automatically.
+        can_synthesize = has_session and has_transcript and not is_recording
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
         self._copy_notes_btn.setEnabled(has_session and has_notes)
@@ -335,7 +347,7 @@ def _pretty_state(state: str) -> str:
         STATE_NEW: "New",
         STATE_RECORDING: "Recording",
         STATE_PAUSED: "Paused",
-        STATE_PROCESSING: "Transcribing",
+        STATE_PROCESSING: "Refining transcript -- you can synthesize now",
         STATE_COMPLETE: "Complete",
         STATE_ERROR: "Error",
     }

@@ -10,6 +10,8 @@ Schema (config.toml):
     [transcription]
     model_size = "small.en"
     capture_only_mode = false
+    skip_batch_refinement = false   # if true, no post-Stop full-recording pass -- live transcript is final
+    fast_batch = false              # if true, batch pass uses beam_size=1 (~3x faster, slight quality drop)
 
     [ui]
     theme = "auto"               # "auto" | "light" | "dark"
@@ -49,6 +51,8 @@ class AudioConfig:
 class TranscriptionConfig:
     model_size: str = "small.en"
     capture_only_mode: bool = False
+    skip_batch_refinement: bool = False
+    fast_batch: bool = False
 
 
 @dataclass
