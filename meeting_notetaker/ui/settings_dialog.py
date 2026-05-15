@@ -135,7 +135,7 @@ class SettingsDialog(QDialog):
         ui_group = QGroupBox("Interface", self)
         ui_form = QFormLayout(ui_group)
         self._user_name_edit = QLineEdit(self)
-        self._user_name_edit.setPlaceholderText("e.g. Aaron Dodd (leave blank for \"Me\")")
+        self._user_name_edit.setPlaceholderText("e.g. John Smith (leave blank for \"Me\")")
         self._user_name_edit.setText(config.ui.user_name)
         self._user_name_edit.setToolTip(
             "How the user's microphone is labeled in the transcript and synthesis "
