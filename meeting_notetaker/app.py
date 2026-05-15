@@ -65,12 +65,16 @@ class MainApp(QObject):
         self.tray = TrayIcon(self.window)
 
         self._wire_signals()
+        self._apply_user_name()
         self._refresh_session_list()
         self._handle_crash_recovery()
         self._warn_if_store_python()
 
         self.window.show()
         self.tray.set_state("idle")
+
+    def _apply_user_name(self) -> None:
+        self.window.session_view.set_user_name(self.config.ui.user_name)
 
     # ---- wiring ------------------------------------------------------------
 
@@ -218,6 +222,7 @@ class MainApp(QObject):
             session_date=when,
             transcript=transcript,
             live_notes=live_notes,
+            user_name=self.config.ui.user_name,
             templates=prompts_mod.list_templates(),
             parent=self.window,
         )
@@ -295,6 +300,7 @@ class MainApp(QObject):
             QMessageBox.warning(self.window, "Settings", "\n".join(errors))
             return
         self.config.save()
+        self._apply_user_name()
         self.window.status("Settings saved.", timeout_ms=4000)
 
     # ---- environment warnings ---------------------------------------------

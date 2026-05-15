@@ -27,7 +27,12 @@ from ..models.session import (
     STATE_RECORDING,
     Session,
 )
-from ..models.transcript import TranscriptSegment, format_segment, label_for
+from ..models.transcript import (
+    TranscriptSegment,
+    format_segment,
+    label_for,
+    rewrite_user_label,
+)
 
 
 class SessionView(QWidget):
@@ -48,6 +53,8 @@ class SessionView(QWidget):
         self._session: Optional[Session] = None
         self._provisional_segments: dict[tuple[str, float], int] = {}
         # Maps (source, t_start) -> line index in the transcript view.
+        self._user_name = ""
+        self._raw_transcript_text = ""
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -156,6 +163,7 @@ class SessionView(QWidget):
         if session is None:
             self._title_label.setText("(no session)")
             self._state_label.setText("")
+            self._raw_transcript_text = ""
             self._transcript_view.setPlainText("")
             self._notes_view.setMarkdown("")
             self._previous_view.setPlainText("")
@@ -166,7 +174,8 @@ class SessionView(QWidget):
             return
         self._title_label.setText(session.title)
         self._state_label.setText(_pretty_state(session.state))
-        self._transcript_view.setPlainText(transcript)
+        self._raw_transcript_text = transcript
+        self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
         self._notes_view.setMarkdown(notes)
         self._set_live_notes_text(live_notes)
         self._retain_checkbox.setEnabled(True)
@@ -193,7 +202,7 @@ class SessionView(QWidget):
 
     def append_segment(self, segment: TranscriptSegment) -> None:
         """Append a finalized segment; provisional segments use append_provisional."""
-        line = format_segment(segment)
+        line = format_segment(segment, self._user_name)
         cursor = self._transcript_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if self._transcript_view.toPlainText():
@@ -201,6 +210,11 @@ class SessionView(QWidget):
         cursor.insertText(line)
         self._transcript_view.setTextCursor(cursor)
         self._transcript_view.ensureCursorVisible()
+        # Track the raw (un-rewritten) form so we can re-render on name change.
+        raw_line = format_segment(segment, "")
+        if self._raw_transcript_text:
+            self._raw_transcript_text += "\n"
+        self._raw_transcript_text += raw_line
 
     def append_provisional(self, segment: TranscriptSegment) -> None:
         """Append a provisional segment that may be rewritten when the next overlap arrives."""
@@ -209,7 +223,19 @@ class SessionView(QWidget):
         self.append_segment(segment)
 
     def set_transcript_text(self, text: str) -> None:
-        self._transcript_view.setPlainText(text)
+        """Replace the transcript view's contents. `text` should be the raw on-disk form."""
+        self._raw_transcript_text = text
+        self._transcript_view.setPlainText(rewrite_user_label(text, self._user_name))
+
+    def set_user_name(self, name: str) -> None:
+        """Update the display label for the user's mic and refresh the transcript view."""
+        new_name = (name or "").strip()
+        if new_name == self._user_name:
+            return
+        self._user_name = new_name
+        self._transcript_view.setPlainText(
+            rewrite_user_label(self._raw_transcript_text, self._user_name)
+        )
 
     def set_notes_text(self, text: str) -> None:
         self._notes_view.setMarkdown(text)

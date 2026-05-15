@@ -8,10 +8,17 @@ Per-session layout under <session_dir>/:
     notes-YYYYMMDD-HHMM.md     archived prior notes (older first)
     metadata.json              denormalized session metadata cache
     audio/{mic,sys}.wav        raw capture (deleted after transcription unless retained)
+
+Saved transcripts always use the stable token "Me:" for the user's mic and
+"Them:" for system audio -- those labels are the source-of-truth provenance
+markers. Display and synthesis-prompt code substitute the user's preferred
+name in via `rewrite_user_label`; the on-disk file is never rewritten when
+the user changes their preferred name.
 """
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +31,9 @@ from ..utils.paths import session_dir
 MIC = "mic"
 SYS = "sys"
 ALL_SOURCES = (MIC, SYS)
+DEFAULT_USER_LABEL = "Me"
+
+_USER_LABEL_LINE_RE = re.compile(r"^(\[\d{2}:\d{2}:\d{2}\]) Me: ", re.MULTILINE)
 
 
 @dataclass
@@ -48,14 +58,36 @@ class TranscriptSegment:
         )
 
 
-def label_for(source: str) -> str:
-    return {"mic": "Me", "sys": "Them"}.get(source, source.upper())
+def label_for(source: str, user_name: str = "") -> str:
+    """Render the speaker label for a segment.
+
+    `user_name` is the user's preferred display name (e.g. "Aaron"). Empty
+    string keeps the default "Me" label so the on-disk transcript stays
+    consistent across name changes.
+    """
+    if source == "mic":
+        return user_name.strip() or DEFAULT_USER_LABEL
+    return {"sys": "Them"}.get(source, source.upper())
 
 
-def format_segment(seg: TranscriptSegment) -> str:
+def format_segment(seg: TranscriptSegment, user_name: str = "") -> str:
     h, rem = divmod(int(seg.t_start), 3600)
     m, s = divmod(rem, 60)
-    return f"[{h:02d}:{m:02d}:{s:02d}] {label_for(seg.source)}: {seg.text.strip()}"
+    return f"[{h:02d}:{m:02d}:{s:02d}] {label_for(seg.source, user_name)}: {seg.text.strip()}"
+
+
+def rewrite_user_label(text: str, user_name: str) -> str:
+    """Replace `[HH:MM:SS] Me: ` line prefixes with `[HH:MM:SS] <user_name>: `.
+
+    Used when displaying an on-disk transcript (where mic lines are always
+    saved as "Me:") with the user's preferred display name. The anchor on
+    the timestamp prefix avoids matching the word "Me" anywhere else in the
+    transcribed text. No-op when `user_name` is empty.
+    """
+    name = user_name.strip()
+    if not name or name == DEFAULT_USER_LABEL:
+        return text
+    return _USER_LABEL_LINE_RE.sub(rf"\1 {name}: ", text)
 
 
 class TranscriptStore:

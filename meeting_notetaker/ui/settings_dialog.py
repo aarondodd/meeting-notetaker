@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSlider,
     QVBoxLayout,
@@ -105,6 +106,17 @@ class SettingsDialog(QDialog):
         # UI group ---------------------------------------------------------
         ui_group = QGroupBox("Interface", self)
         ui_form = QFormLayout(ui_group)
+        self._user_name_edit = QLineEdit(self)
+        self._user_name_edit.setPlaceholderText("e.g. Aaron Dodd (leave blank for \"Me\")")
+        self._user_name_edit.setText(config.ui.user_name)
+        self._user_name_edit.setToolTip(
+            "How the user's microphone is labeled in the transcript and synthesis "
+            "prompt. When set, the LLM sees your real name and can attribute action "
+            "items to you instead of \"Me\" or \"TBD\". On-disk transcripts always "
+            "store the neutral \"Me:\" label and get rewritten on display + at "
+            "prompt-generation time."
+        )
+        ui_form.addRow("Your name:", self._user_name_edit)
         self._theme_picker = QComboBox(self)
         for theme in VALID_THEMES:
             self._theme_picker.addItem(theme)
@@ -146,6 +158,7 @@ class SettingsDialog(QDialog):
         self._config.audio.vad_enabled = self._vad_enabled.isChecked()
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()
         self._config.ui.theme = self._theme_picker.currentText()
+        self._config.ui.user_name = self._user_name_edit.text().strip()
         self.accept()
 
     def _open_prompts_folder(self) -> None:

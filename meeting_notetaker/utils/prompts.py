@@ -16,24 +16,40 @@ from . import live_notes as live_notes_mod
 from .paths import prompts_dir, resource_path
 
 
-# SHA-256 of bundled prompt bodies shipped in prior versions. When the user
-# has a file whose body matches one of these hashes, it is considered
-# unmodified and gets refreshed from the current bundle. Hashes are
-# per-filename to avoid cross-template accidents. Append new hashes here
+# SHA-256 of bundled prompt bodies shipped in prior versions, computed against
+# line-ending-normalized content (CRLF and CR collapsed to LF). When the user
+# has a file whose normalized body hashes to one of these values it is
+# considered unmodified and gets refreshed to the current bundled body.
+# Per-filename to avoid cross-template accidents. Append new hashes here
 # whenever a bundled prompt body changes.
 _PRIOR_BUNDLED_HASHES: dict[str, set[str]] = {
-    # v0.1 -- pre-merge templates that did not include {{live_notes}} or
-    # {{attendees}} placeholders.
+    # v0.1 -- pre-merge templates without {{live_notes}} / {{attendees}}.
+    # v0.2 -- merged-synthesis templates without {{user_name}} support.
     "default.md": {
         "ec67b04a5c86bb91e9dcd61e31455b1130bd123681c6f89ca9d66ecacd14bdf4",
+        "dd281f15122bfdc4f0466c13576a7d45ecd8acc27e14d23092181ff470132309",
     },
     "one-on-one.md": {
         "2a140d9fd7d1ae7687bfd5f7fba0d517b6f41135e467a98cdd13abd8e1ca87f5",
+        "b756a457b03b3903f2eb2350fba6c93a8e6f20097355402388fb0e62a12829c9",
     },
     "standup.md": {
         "d46aff489d5c60cdcc3fa95318a027b06da0125dcfda79aa650be4c3b18991e5",
+        "f03f06ef0fb6ffd79ac6f8d5fee034159e3406cc5b7764312e56ec874ef8356d",
     },
 }
+
+
+def _normalized_digest(body: bytes) -> str:
+    """SHA-256 of `body` with CRLF and CR newlines collapsed to LF.
+
+    Git's autocrlf setting checks files out with CRLF on Windows, so a file
+    that is byte-identical to the bundled source upstream hashes differently
+    after checkout. Normalizing makes the upgrade-detection robust across
+    platforms.
+    """
+    normalized = body.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(normalized).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -80,8 +96,7 @@ def seed_user_prompts(user_dir: Path | None = None) -> int:
             current = dst.read_bytes()
         except OSError:
             continue
-        digest = hashlib.sha256(current).hexdigest()
-        if digest in prior_hashes:
+        if _normalized_digest(current) in prior_hashes:
             shutil.copy(src, dst)
             written += 1
     return written
@@ -115,17 +130,26 @@ def render(
     transcript: str,
     live_notes: str = "",
     attendees: list[str] | None = None,
+    user_name: str = "",
 ) -> str:
     """Substitute the prompt placeholders.
 
     Replaces {{session_title}}, {{date}}, {{transcript}}, {{live_notes}},
-    and {{attendees}}. Unknown placeholders are left intact so users can
-    include literal `{{whatever}}` text.
+    {{attendees}}, and {{user_name}}. Unknown placeholders are left intact
+    so users can include literal `{{whatever}}` text.
 
     If `attendees` is None, the attendee list is parsed from `live_notes`.
     The {{live_notes}} substitution is replaced with a clear "(none)"
     placeholder if the user has not added content beyond the seeded template.
+
+    If `user_name` is provided, `[HH:MM:SS] Me: ` line prefixes in the
+    transcript are rewritten to `[HH:MM:SS] <user_name>: ` before
+    substitution, so the LLM sees the user's actual name and can attribute
+    action items by name. The {{user_name}} placeholder expands to the
+    same name (or "Me" when unset).
     """
+    from ..models.transcript import DEFAULT_USER_LABEL, rewrite_user_label
+
     if isinstance(template, PromptTemplate):
         body = template.body
     else:
@@ -141,11 +165,15 @@ def render(
         live_notes_str = live_notes.strip()
     else:
         live_notes_str = "(none -- user did not take live notes)"
+    name = (user_name or "").strip()
+    user_name_str = name or DEFAULT_USER_LABEL
+    transcript_for_prompt = rewrite_user_label(transcript, name)
     return (
         body
         .replace("{{session_title}}", session_title)
         .replace("{{date}}", date_str)
-        .replace("{{transcript}}", transcript)
+        .replace("{{transcript}}", transcript_for_prompt)
         .replace("{{live_notes}}", live_notes_str)
         .replace("{{attendees}}", attendees_str)
+        .replace("{{user_name}}", user_name_str)
     )

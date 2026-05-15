@@ -104,3 +104,75 @@ def test_seed_preserves_user_modified_template(isolated_data_dir):
     (user_dir / "default.md").write_text(custom, encoding="utf-8")
     prompts_mod.seed_user_prompts()
     assert (user_dir / "default.md").read_text(encoding="utf-8") == custom
+
+
+def test_seed_refreshes_unmodified_template_with_crlf_line_endings(isolated_data_dir):
+    """A Git-on-Windows checkout converts LF to CRLF. The upgrade check must
+    still recognize that body as 'unmodified from prior bundle' and refresh it."""
+    user_dir = prompts_dir()
+    prompts_mod.seed_user_prompts()
+    v01_default_lf = (
+        "You are summarizing a meeting transcript. The transcript is labeled by\n"
+        "source: lines starting with \"Me:\" are the user's microphone; \"Them:\"\n"
+        "are the system audio (other meeting participants). Produce:\n\n"
+        "1. A 3-bullet TL;DR.\n"
+        "2. Decisions made (or \"none\").\n"
+        "3. Action items as `[ ] Owner -- task` lines. If owner is unclear, use \"TBD\".\n"
+        "4. Open questions.\n"
+        "5. Verbatim quotes for any commitment or numbered fact.\n\n"
+        "Use plain ASCII. Do not invent content the transcript does not support.\n\n"
+        "Session: {{session_title}}\n"
+        "Date: {{date}}\n\n"
+        "Transcript:\n"
+        "{{transcript}}\n"
+    )
+    crlf = v01_default_lf.replace("\n", "\r\n")
+    (user_dir / "default.md").write_bytes(crlf.encode("utf-8"))
+    written = prompts_mod.seed_user_prompts()
+    assert written >= 1
+    body = (user_dir / "default.md").read_text(encoding="utf-8")
+    assert "{{live_notes}}" in body
+
+
+def test_seed_refreshes_v02_template_to_v03(isolated_data_dir):
+    """v0.2 templates (merged-synthesis, no {{user_name}}) should be refreshed
+    to the current bundled body when the user hasn't customized them."""
+    user_dir = prompts_dir()
+    prompts_mod.seed_user_prompts()
+    v02_default_lf = (
+        "You are synthesizing a meeting from two sources written in parallel:\n\n"
+        "1. A live transcript labeled by source -- \"Me:\" is the user's microphone, \"Them:\" is the system audio (other participants).\n"
+        "2. The user's own running notes (\"live notes\") taken during the meeting. These reflect the user's framing, emphasis, and any pre-meeting context (agenda, prior decisions) that does not appear in the transcript.\n\n"
+        "Merge the two. Treat the user's live notes as the source of truth for intent and any pre-meeting context (the agenda especially). Refine and expand them with what the transcript supports; add transcript-only content the user did not capture. Do not contradict the user's notes unless the transcript clearly does -- if so, flag the conflict under \"Open Questions\".\n\n"
+        "Known attendees: {{attendees}}\n"
+        "When assigning Action Items, prefer one of these names as the owner. Use \"TBD\" only if no attendee is plausibly the owner from context.\n\n"
+        "Produce, in this order, in plain ASCII markdown:\n\n"
+        "# Attendees\n"
+        "- Carry over the user's list. Add anyone the transcript reveals who was not listed.\n\n"
+        "# Agenda\n"
+        "- Carry over the user's agenda exactly. If the transcript shows the meeting deviated, note that under \"Open Questions\", not here.\n\n"
+        "# TL;DR\n"
+        "- 3 bullets, what a manager would want to know in 20 seconds.\n\n"
+        "# Decisions\n"
+        "- One line per decision. If no decisions were made, write \"none\".\n\n"
+        "# Notes\n"
+        "- The merged narrative. Start from the user's \"# Notes\" content, refine and expand with transcript-supported detail. Use subheadings where helpful.\n\n"
+        "# Action Items\n"
+        "- Each item as `[ ] Owner -- task`. Owner is an attendee name or \"TBD\".\n\n"
+        "# Open Questions\n"
+        "- Anything the meeting did not resolve, plus any conflicts between the user's notes and the transcript.\n\n"
+        "# Verbatim Quotes\n"
+        "- Any commitment, numbered fact, or notably-phrased statement. Format as `Speaker: \"quote\"`.\n\n"
+        "Do not invent content beyond what the transcript and live notes support.\n\n"
+        "Session: {{session_title}}\n"
+        "Date: {{date}}\n\n"
+        "User's Live Notes:\n"
+        "{{live_notes}}\n\n"
+        "Transcript:\n"
+        "{{transcript}}\n"
+    )
+    (user_dir / "default.md").write_text(v02_default_lf, encoding="utf-8")
+    written = prompts_mod.seed_user_prompts()
+    assert written >= 1
+    body = (user_dir / "default.md").read_text(encoding="utf-8")
+    assert "{{user_name}}" in body

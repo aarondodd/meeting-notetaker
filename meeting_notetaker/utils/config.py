@@ -13,6 +13,7 @@ Schema (config.toml):
 
     [ui]
     theme = "auto"               # "auto" | "light" | "dark"
+    user_name = ""               # how the user's mic is labeled (defaults to "Me" when empty)
     first_run_complete = false
 
 Reads use tomllib (3.11+) or the tomli fallback. Writes are emitted by hand
@@ -53,6 +54,7 @@ class TranscriptionConfig:
 @dataclass
 class UiConfig:
     theme: str = "auto"
+    user_name: str = ""
     first_run_complete: bool = False
 
 

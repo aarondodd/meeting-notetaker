@@ -209,6 +209,7 @@ are also editable directly in `config.toml`.
 
 | Setting | Default | What it does |
 |---|---|---|
+| Your name | (empty -> "Me") | Replaces "Me:" in the transcript display and in the synthesis prompt. When set, the LLM sees your real name and assigns action items by name instead of "TBD". The on-disk transcript is always stored with the neutral "Me:" label and rewritten on display, so changing your name later does not break old sessions. |
 | Model size | `small.en` | Which faster-whisper model to use. See "Choosing a model" below. |
 | Capture-only mode | off | Skip live transcription; run a single Whisper pass when you click Stop. Lower CPU during the meeting, no live view. |
 | Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. Per-session override stays available. |
@@ -256,9 +257,10 @@ unchanged):
 |---|---|
 | `{{session_title}}` | The session's title |
 | `{{date}}` | The session's creation date (`YYYY-MM-DD HH:MM`) |
-| `{{transcript}}` | The full transcript body |
+| `{{transcript}}` | The full transcript body. If "Your name" is set, every `[HH:MM:SS] Me: ` line prefix is rewritten to `[HH:MM:SS] <Your name>: ` before substitution, so the LLM sees you by name. |
 | `{{live_notes}}` | The body of the My Notes tab. If the user did not take live notes, expands to `(none -- user did not take live notes)`. |
 | `{{attendees}}` | Comma-joined list of names from the `# Attendees` bullets in My Notes. Empty -> `(none specified)`. |
+| `{{user_name}}` | The value of the "Your name" setting. Empty setting -> `Me`. |
 
 **Upgrading.** Bundled prompts get new revisions across releases. If you
 have not edited a template (its on-disk body matches the version that
