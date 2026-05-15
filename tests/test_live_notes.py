@@ -16,41 +16,41 @@ def test_seed_body_contains_required_sections():
 
 def test_parse_attendees_from_basic_bullets():
     body = """# Attendees
-- Aaron
+- Alex
 - Bob
 - Charlie
 
 # Agenda
 - intro
 """
-    assert ln.parse_attendees(body) == ["Aaron", "Bob", "Charlie"]
+    assert ln.parse_attendees(body) == ["Alex", "Bob", "Charlie"]
 
 
 def test_parse_attendees_handles_asterisk_and_plus_bullets():
     body = """# Attendees
-* Aaron
+* Alex
 + Bob
 - Charlie
 """
-    assert ln.parse_attendees(body) == ["Aaron", "Bob", "Charlie"]
+    assert ln.parse_attendees(body) == ["Alex", "Bob", "Charlie"]
 
 
 def test_parse_attendees_strips_trailing_comments():
     body = """# Attendees
-- Aaron -- host
+- Alex -- host
 - Bob # facilitator
 - Charlie
 """
-    assert ln.parse_attendees(body) == ["Aaron", "Bob", "Charlie"]
+    assert ln.parse_attendees(body) == ["Alex", "Bob", "Charlie"]
 
 
 def test_parse_attendees_dedupes_case_insensitively():
     body = """# Attendees
-- Aaron
-- aaron
+- Alex
+- alex
 - Bob
 """
-    assert ln.parse_attendees(body) == ["Aaron", "Bob"]
+    assert ln.parse_attendees(body) == ["Alex", "Bob"]
 
 
 def test_parse_attendees_empty_seed_template_returns_empty_list():
@@ -59,13 +59,13 @@ def test_parse_attendees_empty_seed_template_returns_empty_list():
 
 def test_parse_attendees_stops_at_next_heading():
     body = """# Attendees
-- Aaron
+- Alex
 
 # Agenda
 - Topic A
 - Topic B
 """
-    assert ln.parse_attendees(body) == ["Aaron"]
+    assert ln.parse_attendees(body) == ["Alex"]
 
 
 def test_parse_attendees_handles_missing_section():
@@ -83,7 +83,7 @@ def test_has_user_content_true_when_user_typed_anything():
 
 
 def test_format_attendee_list_with_names():
-    assert ln.format_attendee_list(["Aaron", "Bob"]) == "Aaron, Bob"
+    assert ln.format_attendee_list(["Alex", "Bob"]) == "Alex, Bob"
 
 
 def test_format_attendee_list_empty():
@@ -92,7 +92,7 @@ def test_format_attendee_list_empty():
 
 def test_render_substitutes_live_notes_and_attendees():
     body = "Attendees: {{attendees}}\nNotes:\n{{live_notes}}\nT: {{transcript}}"
-    live_notes = "# Attendees\n- Aaron\n- Bob\n\n# Notes\n- decided X\n"
+    live_notes = "# Attendees\n- Alex\n- Bob\n\n# Notes\n- decided X\n"
     out = prompts_mod.render(
         body,
         session_title="x",
@@ -100,7 +100,7 @@ def test_render_substitutes_live_notes_and_attendees():
         transcript="T body",
         live_notes=live_notes,
     )
-    assert "Attendees: Aaron, Bob" in out
+    assert "Attendees: Alex, Bob" in out
     assert "# Notes" in out
     assert "decided X" in out
     assert "T: T body" in out
@@ -141,5 +141,5 @@ def test_transcript_store_seeds_live_notes_on_first_read(isolated_data_dir):
 
 def test_transcript_store_save_then_read_live_notes_roundtrip(isolated_data_dir):
     store = TranscriptStore("test-session")
-    store.save_live_notes("# Attendees\n- Aaron\n")
-    assert store.read_live_notes() == "# Attendees\n- Aaron\n"
+    store.save_live_notes("# Attendees\n- Alex\n")
+    assert store.read_live_notes() == "# Attendees\n- Alex\n"

@@ -2,12 +2,7 @@
 
 Granola-style local meeting capture + clipboard-mediated LLM synthesis for
 Windows. PyQt6 desktop app. No audio or transcript leaves the machine; final
-note synthesis routes through a company-approved chatbot via clipboard, not
-API.
-
-The full Technical Design Document lives on your wiki at your-workspace > Projects >
-Meeting Notetaker > "design doc: Meeting Notetaker". Read that before any
-substantive design change.
+note synthesis routes through an approved chatbot via clipboard, not API.
 
 ## Project Structure
 
@@ -123,8 +118,8 @@ ChunkBuffer (per source) --10s windows, 5s overlap-->  LiveTranscriptionWorker (
   WAVs survive; you can manually re-trigger transcription later.
 - WASAPI stale-handle bug (per WhisperType, whispertype.py:1390-1500): may
   surface on second-or-later `LoopbackRecorder.start()` in one process. v0.1
-  raises a clear error; v0.2+ will add the subprocess-isolated fallback per
-  design doc Open Question 10.
+  raises a clear error; later releases will add a subprocess-isolated
+  fallback if the bug shows up in practice.
 - **live_notes.md vs notes.md.** Two distinct files per session: `live_notes.md`
   is the user's own running buffer (Attendees / Agenda / Notes / Action Items),
   edited in the My Notes tab with debounced auto-save on every keystroke.
@@ -245,7 +240,8 @@ basic correctness assertions.
 
 ### Open follow-ups
 
-- Subprocess-isolated loopback fallback (design doc Open Question 10) is stubbed
-  but not implemented; lands later if WASAPI stale-handle bug surfaces.
-- M365 Copilot automation for synthesis hand-off (no-admin user path) --
-  research notes in README/docs.
+- Subprocess-isolated loopback fallback is stubbed but not implemented;
+  lands later if the WASAPI stale-handle bug surfaces in practice.
+- Tighter integration with the chosen synthesis chatbot (M365 Copilot,
+  Claude.ai, etc.) for users without admin rights to automate the
+  clipboard hand-off.

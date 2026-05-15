@@ -22,16 +22,16 @@ def test_label_for_falls_back_to_me_when_user_name_empty():
 
 
 def test_label_for_uses_user_name_when_set():
-    assert label_for("mic", "Aaron") == "Aaron"
+    assert label_for("mic", "Alex") == "Alex"
 
 
 def test_label_for_sys_unchanged_by_user_name():
-    assert label_for("sys", "Aaron") == "Them"
+    assert label_for("sys", "Alex") == "Them"
 
 
 def test_format_segment_with_user_name():
-    line = format_segment(_seg("mic", 65.0), "Aaron")
-    assert line == "[00:01:05] Aaron: hello"
+    line = format_segment(_seg("mic", 65.0), "Alex")
+    assert line == "[00:01:05] Alex: hello"
 
 
 def test_format_segment_without_user_name_uses_me():
@@ -40,15 +40,15 @@ def test_format_segment_without_user_name_uses_me():
 
 
 def test_rewrite_user_label_replaces_line_prefixes():
-    raw = "[00:00:05] Me: Hello\n[00:00:08] Them: Hi Aaron\n"
-    out = rewrite_user_label(raw, "Aaron")
-    assert "[00:00:05] Aaron: Hello" in out
-    assert "[00:00:08] Them: Hi Aaron" in out  # untouched
+    raw = "[00:00:05] Me: Hello\n[00:00:08] Them: Hi Alex\n"
+    out = rewrite_user_label(raw, "Alex")
+    assert "[00:00:05] Alex: Hello" in out
+    assert "[00:00:08] Them: Hi Alex" in out  # untouched
 
 
 def test_rewrite_user_label_does_not_touch_content_containing_me():
     raw = "[00:00:05] Them: Tell me about the project\n"
-    assert rewrite_user_label(raw, "Aaron") == raw
+    assert rewrite_user_label(raw, "Alex") == raw
 
 
 def test_rewrite_user_label_noop_when_user_name_blank_or_default():
@@ -64,10 +64,10 @@ def test_render_substitutes_user_name_placeholder():
         session_title="x",
         session_date="2026-05-15",
         transcript="[00:00:05] Me: Hi",
-        user_name="Aaron",
+        user_name="Alex",
     )
-    assert "User: Aaron" in out
-    assert "[00:00:05] Aaron: Hi" in out
+    assert "User: Alex" in out
+    assert "[00:00:05] Alex: Hi" in out
 
 
 def test_render_user_name_placeholder_falls_back_to_me():
@@ -85,9 +85,9 @@ def test_render_rewrites_transcript_me_to_user_name():
         session_title="x",
         session_date="2026-05-15",
         transcript="[00:00:05] Me: line one\n[00:00:08] Them: line two",
-        user_name="Aaron Dodd",
+        user_name="John Smith",
     )
-    assert "[00:00:05] Aaron Dodd: line one" in out
+    assert "[00:00:05] John Smith: line one" in out
     assert "[00:00:08] Them: line two" in out
 
 

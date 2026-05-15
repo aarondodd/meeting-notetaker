@@ -61,9 +61,9 @@ class TranscriptSegment:
 def label_for(source: str, user_name: str = "") -> str:
     """Render the speaker label for a segment.
 
-    `user_name` is the user's preferred display name (e.g. "Aaron"). Empty
-    string keeps the default "Me" label so the on-disk transcript stays
-    consistent across name changes.
+    `user_name` is the user's preferred display name (e.g. "John Smith").
+    Empty string keeps the default "Me" label so the on-disk transcript
+    stays consistent across name changes.
     """
     if source == "mic":
         return user_name.strip() or DEFAULT_USER_LABEL

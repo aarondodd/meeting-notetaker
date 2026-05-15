@@ -90,7 +90,7 @@ def parse_attendees(body: str) -> list[str]:
 
 
 def _strip_trailing_comment(value: str) -> str:
-    # Allow "- Aaron -- notes" style annotations; keep only the name.
+    # Allow "- Name -- notes" style annotations; keep only the name.
     for sep in (" -- ", " #"):
         idx = value.find(sep)
         if idx >= 0:

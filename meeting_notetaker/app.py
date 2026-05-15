@@ -373,7 +373,7 @@ def main() -> int:
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName("Meeting Notetaker")
-    qt_app.setOrganizationName("Aaron Dodd")
+    qt_app.setOrganizationName("MeetingNotetaker")
     qt_app.setQuitOnLastWindowClosed(False)
     qt_app.setWindowIcon(app_icon())
 
