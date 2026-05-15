@@ -24,7 +24,8 @@ build/
 Thumbs.db
 
 # faster-whisper model cache (downloaded on first run)
-models/
+# Root-anchored so it does NOT match meeting_notetaker/models/ (the Python package).
+/models/
 
 # pyinstaller artifacts
 *.toc
