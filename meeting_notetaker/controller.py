@@ -132,7 +132,10 @@ class SessionController(QObject):
             self._sys_wav = audio_dir / "sys.wav"
             self._chunk_buffer = ChunkBuffer(sources=[MIC, SYS])
 
-            # Live transcription off if capture-only mode is on.
+            # Live transcription off if capture-only mode is on. The model is
+            # expected to be already cached -- the app layer preloads it via a
+            # progress dialog before calling us, so this get_model() is a
+            # near-instant cache hit on the second-and-subsequent runs.
             if not self.config.transcription.capture_only_mode:
                 model = model_manager.get_model(
                     self.config.transcription.model_size,
@@ -185,6 +188,31 @@ class SessionController(QObject):
             self.state_changed.emit(session.id, STATE_RECORDING)
         except Exception as exc:
             log.exception("start_session failed")
+            # Stop anything that managed to start before we bailed.
+            try:
+                if self._mic_recorder is not None and self._mic_recorder.is_recording:
+                    self._mic_recorder.stop()
+            except Exception:
+                log.exception("mic cleanup after partial-start failed")
+            try:
+                if self._loopback_recorder is not None and self._loopback_recorder.is_recording:
+                    self._loopback_recorder.stop()
+            except Exception:
+                log.exception("loopback cleanup after partial-start failed")
+            for worker in self._workers:
+                try:
+                    worker.stop(drain=False)
+                except Exception:
+                    log.exception("worker stop after partial-start failed")
+            for worker in self._workers:
+                try:
+                    worker.wait(2000)
+                except Exception:
+                    pass
+            self._workers = []
+            self.store.update_session(session.id, state=STATE_ERROR)
+            session.state = STATE_ERROR
+            self.state_changed.emit(session.id, STATE_ERROR)
             self.error.emit(f"Failed to start recording: {exc}")
             self._teardown_recording(error=True)
 

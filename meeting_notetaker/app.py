@@ -24,8 +24,10 @@ from .models.session import (
     SessionStore,
 )
 from .models.transcript import TranscriptStore
+from .transcription import model_manager
 from .ui.main_window import MainWindow
 from .ui.new_session_dialog import NewSessionDialog
+from .ui.progress import run_with_progress
 from .ui.prompt_dialog import GeneratePromptDialog, PasteNotesDialog
 from .ui.settings_dialog import SettingsDialog
 from .ui.tray import TrayIcon
@@ -142,7 +144,27 @@ class MainApp(QObject):
         session = self.store.get_session(session_id)
         if session is None:
             return
-        self.controller.start_session(session)
+        # Preload the Whisper model under a progress dialog so the UI doesn't
+        # freeze during first-run download or model swap. If capture-only mode
+        # is on, live workers don't load the model -- but the batch pass at
+        # stop time still needs it, so we preload either way.
+        size = self.config.transcription.model_size
+        if model_manager.current_size() == size:
+            self.controller.start_session(session)
+            return
+
+        run_with_progress(
+            self.window,
+            title="Loading Whisper model",
+            message=(
+                f"Loading the '{size}' model (this can take a minute on first run "
+                "while the weights download). The app will respond again once it's ready."
+            ),
+            fn=model_manager.get_model,
+            kwargs={"size": size},
+            on_success=lambda _model: self.controller.start_session(session),
+            on_failure=lambda msg: self._on_controller_error(msg),
+        )
 
     def _on_session_state_changed(self, session_id: str, state: str) -> None:
         # Update list label + selected view.
