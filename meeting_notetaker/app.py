@@ -97,6 +97,8 @@ class MainApp(QObject):
         sv.stop_clicked.connect(lambda _sid: self.controller.stop_session())
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
+        sv.copy_notes_clicked.connect(self._on_copy_notes)
+        sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
 
         self.controller.state_changed.connect(self._on_session_state_changed)
@@ -125,6 +127,7 @@ class MainApp(QObject):
             transcript=store.read_transcript(),
             notes=store.read_notes(),
             previous_notes_paths=store.list_previous_notes(),
+            live_notes=store.read_live_notes(),
         )
 
     # ---- session lifecycle handlers ---------------------------------------
@@ -203,6 +206,9 @@ class MainApp(QObject):
         if not transcript.strip():
             QMessageBox.information(self.window, "Generate Prompt", "This session has no transcript yet.")
             return
+        # Ensure the editor's pending text is on disk and reflected in the prompt.
+        self.window.session_view.flush_pending_live_notes()
+        live_notes = store.read_live_notes()
         try:
             when = datetime.fromisoformat(session.created_at.replace("Z", "+00:00"))
         except ValueError:
@@ -211,10 +217,32 @@ class MainApp(QObject):
             session_title=session.title,
             session_date=when,
             transcript=transcript,
+            live_notes=live_notes,
             templates=prompts_mod.list_templates(),
             parent=self.window,
         )
         dialog.exec()
+
+    def _on_live_notes_changed(self, session_id: str, body: str) -> None:
+        try:
+            TranscriptStore(session_id).save_live_notes(body)
+        except OSError:
+            log.exception("failed to save live notes for %s", session_id)
+
+    def _on_copy_notes(self, session_id: str) -> None:
+        import pyperclip
+        store = TranscriptStore(session_id)
+        notes = store.read_notes()
+        if not notes.strip():
+            QMessageBox.information(self.window, "Copy Notes", "This session has no synthesized notes yet.")
+            return
+        try:
+            pyperclip.copy(notes)
+        except Exception as exc:
+            log.exception("clipboard copy failed")
+            QMessageBox.warning(self.window, "Copy Notes", f"Clipboard copy failed: {exc}")
+            return
+        self.window.status("Notes copied to clipboard.", timeout_ms=4000)
 
     def _on_paste_notes(self, session_id: str) -> None:
         session = self.store.get_session(session_id)

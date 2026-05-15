@@ -64,3 +64,43 @@ def test_render_accepts_pre_formatted_date_string(isolated_data_dir):
         "{{date}}", session_title="x", session_date="custom", transcript=""
     )
     assert out == "custom"
+
+
+def test_seed_refreshes_unmodified_prior_bundled_template(isolated_data_dir):
+    """If a user file matches a prior-shipped hash, re-seed refreshes it."""
+    user_dir = prompts_dir()
+    # First seed populates the current bundled bodies.
+    prompts_mod.seed_user_prompts()
+    # Simulate "user has the v0.1 default.md unchanged from prior release"
+    # by writing the v0.1 body whose hash is in _PRIOR_BUNDLED_HASHES.
+    v01_default = (
+        "You are summarizing a meeting transcript. The transcript is labeled by\n"
+        "source: lines starting with \"Me:\" are the user's microphone; \"Them:\"\n"
+        "are the system audio (other meeting participants). Produce:\n\n"
+        "1. A 3-bullet TL;DR.\n"
+        "2. Decisions made (or \"none\").\n"
+        "3. Action items as `[ ] Owner -- task` lines. If owner is unclear, use \"TBD\".\n"
+        "4. Open questions.\n"
+        "5. Verbatim quotes for any commitment or numbered fact.\n\n"
+        "Use plain ASCII. Do not invent content the transcript does not support.\n\n"
+        "Session: {{session_title}}\n"
+        "Date: {{date}}\n\n"
+        "Transcript:\n"
+        "{{transcript}}\n"
+    )
+    (user_dir / "default.md").write_text(v01_default, encoding="utf-8")
+    written = prompts_mod.seed_user_prompts()
+    assert written >= 1
+    # File now contains the current bundled body, which includes the new merge
+    # instructions referencing live_notes.
+    body = (user_dir / "default.md").read_text(encoding="utf-8")
+    assert "{{live_notes}}" in body
+
+
+def test_seed_preserves_user_modified_template(isolated_data_dir):
+    user_dir = prompts_dir()
+    prompts_mod.seed_user_prompts()
+    custom = "MY CUSTOM PROMPT\n{{transcript}}\n"
+    (user_dir / "default.md").write_text(custom, encoding="utf-8")
+    prompts_mod.seed_user_prompts()
+    assert (user_dir / "default.md").read_text(encoding="utf-8") == custom

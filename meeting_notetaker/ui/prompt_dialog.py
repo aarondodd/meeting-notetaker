@@ -39,6 +39,7 @@ class GeneratePromptDialog(QDialog):
         session_date: datetime,
         transcript: str,
         templates: Iterable[PromptTemplate],
+        live_notes: str = "",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -49,6 +50,7 @@ class GeneratePromptDialog(QDialog):
         self._session_title = session_title
         self._session_date = session_date
         self._transcript = transcript
+        self._live_notes = live_notes
         self._templates = list(templates)
 
         layout = QVBoxLayout(self)
@@ -101,6 +103,7 @@ class GeneratePromptDialog(QDialog):
             session_title=self._session_title,
             session_date=self._session_date,
             transcript=self._transcript,
+            live_notes=self._live_notes,
         )
         self._preview.setPlainText(rendered)
 

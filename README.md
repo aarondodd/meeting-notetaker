@@ -129,17 +129,53 @@ Whisper model itself is downloaded on first run into
    returns to blue and the transcript view shows the cleaned-up final
    transcript.
 7. Click **Generate Synthesis Prompt**. Pick a template (default, one-on-one,
-   standup, or any you added). The rendered prompt + transcript is copied to
-   your clipboard.
+   standup, or any you added). The rendered prompt + your live notes +
+   transcript is copied to your clipboard.
 8. Switch to Claude.ai or Copilot, paste, send.
 9. Copy the response, come back to Meeting Notetaker, click **Paste
-   Response Back...**, paste, save. The Notes tab now shows the rendered
+   Response Back...**, paste, save. The Synthesis tab now shows the rendered
    response. If a prior notes file existed it is auto-archived as
    `notes-YYYYMMDD-HHMM.md` and shown under the Previous Notes tab.
+10. Click **Copy Notes to Clipboard** any time after step 9 to grab the raw
+    Markdown -- ready to paste into your wiki, OneNote, or wherever you keep
+    long-term meeting notes.
+
+### Taking notes in parallel (the My Notes tab)
+
+The **My Notes** tab is an editable Markdown buffer that lives next to the
+transcript. Open a new session and the tab is pre-seeded with:
+
+```
+# Attendees
+-
+
+# Agenda
+
+# Notes
+
+# Action Items
+```
+
+Use it the way you would use Granola: paste in the meeting agenda, jot down
+who is in the room, type your own observations and to-dos as the meeting
+runs. Everything you type auto-saves continuously (no Save button).
+
+When you click **Generate Synthesis Prompt**, your live notes are included
+in the prompt alongside the transcript. The default template asks the LLM
+to *merge* the two -- using your notes as the source of truth for intent,
+framing, and any pre-meeting context that does not appear in the
+transcript. Names from the `# Attendees` bulleted list are parsed out
+separately and passed in as `{{attendees}}`, so action-item owners come
+from the people who were actually in the meeting instead of "TBD".
+
+If you do not touch the My Notes tab at all, the prompt just substitutes
+"(none -- user did not take live notes)" for the live-notes block and
+falls back to a transcript-only synthesis -- exactly the v0.1 behavior.
 
 If the app crashes mid-meeting, on next launch the recovery dialog lists any
-sessions left in a transient state. The WAV files survive; you can re-run
-the transcription against them, or delete the session.
+sessions left in a transient state. The WAV files (and your live notes)
+survive; you can re-run the transcription against them, or delete the
+session.
 
 ## Where things live
 
@@ -154,7 +190,8 @@ the transcription against them, or delete the session.
   sessions\
     <session-uuid>\
       raw.transcript.md          # interleaved transcript, source-labeled
-      notes.md                   # latest LLM-generated notes
+      live_notes.md              # your own running notes (auto-seeded, auto-saved)
+      notes.md                   # latest LLM-generated (merged) notes
       notes-YYYYMMDD-HHMM.md     # archived prior notes (if any)
       metadata.json
       audio\                     # mic.wav + sys.wav (deleted after transcription
@@ -195,20 +232,45 @@ sessions are not re-transcribed automatically.
 
 Bundled prompts seed `%APPDATA%\MeetingNotetaker\prompts\` on first run:
 
-- `default.md` -- generic meeting (TL;DR, decisions, action items, quotes)
+- `default.md` -- generic meeting (Attendees / Agenda / TL;DR / Decisions /
+  Notes / Action Items / Open Questions / Verbatim Quotes; merges live
+  notes with transcript)
 - `one-on-one.md` -- 1:1 retrospective shape (topics, commitments by side)
 - `standup.md` -- yesterday / today / blockers per speaker
 
-Add your own: drop any `*.md` file into the prompts directory. It will
-appear in the Generate Synthesis Prompt template picker on next open.
+**Editing existing prompts.** Open Settings (`Ctrl+,`) and click **Open
+Prompts Folder** -- or browse to `%APPDATA%\MeetingNotetaker\prompts\`
+yourself. Edit any `.md` file in your favorite text editor and save.
+Changes are picked up the next time you open the Generate Synthesis Prompt
+dialog (no restart needed).
 
-Three placeholders are substituted:
+**Adding your own prompts.** Drop any `*.md` file into the prompts
+directory. It appears in the template picker on next open. Filename (sans
+extension) becomes the display name; `my-team-retro.md` shows as "My Team
+Retro".
 
-- `{{session_title}}` -- the session's title
-- `{{date}}` -- the session's creation date (`YYYY-MM-DD HH:MM`)
-- `{{transcript}}` -- the full transcript body
+**Available placeholders** (any other `{{...}}` text passes through
+unchanged):
 
-Any other `{{...}}` text passes through unchanged.
+| Placeholder | What it expands to |
+|---|---|
+| `{{session_title}}` | The session's title |
+| `{{date}}` | The session's creation date (`YYYY-MM-DD HH:MM`) |
+| `{{transcript}}` | The full transcript body |
+| `{{live_notes}}` | The body of the My Notes tab. If the user did not take live notes, expands to `(none -- user did not take live notes)`. |
+| `{{attendees}}` | Comma-joined list of names from the `# Attendees` bullets in My Notes. Empty -> `(none specified)`. |
+
+**Upgrading.** Bundled prompts get new revisions across releases. If you
+have not edited a template (its on-disk body matches the version that
+shipped with a prior release), the app refreshes it automatically on
+startup. Any prompt you have actually edited is never touched -- it stays
+exactly as you left it. To force a refresh of a customized prompt, delete
+the file and restart; the latest bundled body re-seeds on next launch.
+
+**Tip:** start from `default.md` as your base when writing a new prompt --
+the section headings (`# Attendees`, `# Agenda`, `# Action Items`, etc.)
+match the live-notes template, so the LLM's output drops into your final
+notes shape cleanly.
 
 ## IT review notes (your org or equivalent)
 

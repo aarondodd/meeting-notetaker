@@ -3,7 +3,8 @@
 Per-session layout under <session_dir>/:
 
     raw.transcript.md          interleaved transcript, source-labeled, time-stamped
-    notes.md                   latest LLM-generated notes
+    live_notes.md              user's own running notes (Attendees/Agenda/Notes/Action Items)
+    notes.md                   latest LLM-generated (merged) notes
     notes-YYYYMMDD-HHMM.md     archived prior notes (older first)
     metadata.json              denormalized session metadata cache
     audio/{mic,sys}.wav        raw capture (deleted after transcription unless retained)
@@ -16,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
+from ..utils.live_notes import seed_body as live_notes_seed_body
 from ..utils.paths import session_dir
 
 
@@ -63,6 +65,7 @@ class TranscriptStore:
         self.session_id = session_id
         self.session_dir = session_dir(session_id)
         self.transcript_path = self.session_dir / "raw.transcript.md"
+        self.live_notes_path = self.session_dir / "live_notes.md"
         self.notes_path = self.session_dir / "notes.md"
         self.metadata_path = self.session_dir / "metadata.json"
 
@@ -92,7 +95,20 @@ class TranscriptStore:
             return ""
         return self.transcript_path.read_text(encoding="utf-8")
 
-    # ---- notes ----
+    # ---- live notes (user-authored, in parallel with the recording) ----
+    def read_live_notes(self) -> str:
+        """Return live_notes.md, seeding the template if the file is missing."""
+        if not self.live_notes_path.exists():
+            body = live_notes_seed_body()
+            self.live_notes_path.write_text(body, encoding="utf-8")
+            return body
+        return self.live_notes_path.read_text(encoding="utf-8")
+
+    def save_live_notes(self, body: str) -> None:
+        """Overwrite live_notes.md. No archive -- this is the user's running buffer."""
+        self.live_notes_path.write_text(body, encoding="utf-8")
+
+    # ---- notes (LLM-synthesized, paste-back) ----
     def save_notes(self, body: str, *, archive_existing: bool = True) -> Optional[Path]:
         """Write notes.md. If a prior file exists, optionally archive it.
 

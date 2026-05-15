@@ -19,7 +19,7 @@ meeting_notetaker/
   version.py
   models/
     session.py                   # Session, Folder dataclasses + SessionStore (SQLite WAL)
-    transcript.py                # TranscriptSegment + TranscriptStore (per-session md files)
+    transcript.py                # TranscriptSegment + TranscriptStore (transcript + live_notes + notes)
   audio/
     mic_recorder.py              # PyAudio input
     loopback_recorder.py         # PyAudioWPatch WASAPI loopback (Win-only, cribbed from WhisperType)
@@ -31,15 +31,16 @@ meeting_notetaker/
     worker.py                    # LiveTranscriptionWorker QThread + batch_transcribe()
   ui/
     main_window.py               # left pane: session list + bulk delete + new
-    session_view.py              # right pane: transcript / notes / previous notes + controls
+    session_view.py              # right pane: transcript / my-notes / synthesis / previous + controls
     new_session_dialog.py        # title + per-session "Keep recording" toggle
     prompt_dialog.py             # Generate Synthesis Prompt + Paste Response Back
-    settings_dialog.py           # model size, VAD, retain default, capture-only, theme
+    settings_dialog.py           # model, VAD, retain default, capture-only, theme, prompts-folder
     tray.py                      # QSystemTrayIcon wrapper with state coloring
   utils/
     paths.py                     # %APPDATA% / XDG resolution; MEETING_NOTETAKER_DATA_DIR override
     config.py                    # TOML round-trip + validation
-    prompts.py                   # bundled + user-editable templates + render()
+    prompts.py                   # bundled + user-editable templates + render(); upgrades stale files
+    live_notes.py                # live-notes seed body + attendee parser
     icons.py                     # QPainter-drawn tray + app icons (no PNGs)
     single_instance.py           # lockfile-based single-instance enforcement
   resources/
@@ -123,6 +124,18 @@ ChunkBuffer (per source) --10s windows, 5s overlap-->  LiveTranscriptionWorker (
   surface on second-or-later `LoopbackRecorder.start()` in one process. v0.1
   raises a clear error; v0.2+ will add the subprocess-isolated fallback per
   design doc Open Question 10.
+- **live_notes.md vs notes.md.** Two distinct files per session: `live_notes.md`
+  is the user's own running buffer (Attendees / Agenda / Notes / Action Items),
+  edited in the My Notes tab with debounced auto-save on every keystroke.
+  `notes.md` is the LLM-synthesized output, written when the user clicks
+  Paste Response Back. The synthesis prompt receives both (transcript +
+  live_notes) and is instructed to merge them.
+- **Prompt upgrades are hash-gated.** `seed_user_prompts` refreshes a user
+  prompt file only if its hash matches a known prior-bundled version listed
+  in `_PRIOR_BUNDLED_HASHES`. Any user-modified file is preserved.
+  Whenever a bundled prompt body changes, add the *previous* bundled body's
+  SHA-256 to `_PRIOR_BUNDLED_HASHES[<filename>]` so existing installs pick
+  up the new body on next launch.
 
 ### Why PyAudio + PyAudioWPatch (not sounddevice)
 
@@ -172,13 +185,33 @@ basic correctness assertions.
   imports `pyaudio` or `pyaudiowpatch` lives behind a local import so
   pure-Python modules can be tested without PortAudio installed.
 
-## Status (v0.1)
+## Status
+
+### v0.1 (tag `v0.1.0`)
 
 - 42 unit tests passing on Linux.
 - App imports cleanly with PyQt6 absent (pure-Python modules) and is
   expected to launch on Windows with the full requirements.
 - Live transcription, batch transcription, prompt copy, paste-back, crash
   recovery, bulk delete, settings, single-instance lock all wired.
-- Not yet tested end-to-end against a real meeting on Windows.
+- Microsoft Store Python detection + Audio Devices diagnostic dialog.
+- Corporate MITM proxy handled via truststore.
+
+### v0.2 (in progress)
+
+- Live notes tab (Attendees / Agenda / Notes / Action Items) with debounced
+  auto-save.
+- Synthesis prompt merges live notes with transcript; attendees parsed from
+  bulleted list and passed as `{{attendees}}`.
+- Copy Notes to Clipboard button on the session view.
+- Open Prompts Folder shortcut in Settings.
+- Hash-gated bundled-prompt upgrade so unmodified user prompts pick up new
+  bundled bodies automatically.
+- 61 unit tests passing on Linux.
+
+### Open follow-ups
+
 - Subprocess-isolated loopback fallback (design doc Open Question 10) is stubbed
-  but not implemented; lands in v0.2 if WASAPI stale-handle bug surfaces.
+  but not implemented; lands later if WASAPI stale-handle bug surfaces.
+- M365 Copilot automation for synthesis hand-off (no-admin user path) --
+  research notes in README/docs.

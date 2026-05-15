@@ -15,14 +15,18 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
+    QPushButton,
     QSlider,
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QDesktopServices
 
 from ..utils.config import Config, VALID_MODEL_SIZES, VALID_THEMES
+from ..utils.paths import prompts_dir
 
 
 class SettingsDialog(QDialog):
@@ -108,6 +112,24 @@ class SettingsDialog(QDialog):
         ui_form.addRow("Theme:", self._theme_picker)
         layout.addWidget(ui_group)
 
+        # Prompts group ----------------------------------------------------
+        prompts_group = QGroupBox("Synthesis Prompts", self)
+        prompts_layout = QVBoxLayout(prompts_group)
+        prompts_layout.addWidget(QLabel(
+            "Prompt templates are Markdown files in the folder below. Edit any file "
+            "to change wording, or drop in a new .md file to add a template -- it "
+            "appears in the Generate Synthesis Prompt picker on next open. Placeholders: "
+            "{{session_title}}, {{date}}, {{transcript}}, {{live_notes}}, {{attendees}}.",
+            self,
+        ))
+        prompts_row = QHBoxLayout()
+        self._open_prompts_btn = QPushButton("Open Prompts Folder", self)
+        self._open_prompts_btn.clicked.connect(self._open_prompts_folder)
+        prompts_row.addWidget(self._open_prompts_btn)
+        prompts_row.addStretch(1)
+        prompts_layout.addLayout(prompts_row)
+        layout.addWidget(prompts_group)
+
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(
@@ -125,3 +147,7 @@ class SettingsDialog(QDialog):
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()
         self._config.ui.theme = self._theme_picker.currentText()
         self.accept()
+
+    def _open_prompts_folder(self) -> None:
+        path = prompts_dir()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))

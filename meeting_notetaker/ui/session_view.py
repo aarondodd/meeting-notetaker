@@ -1,9 +1,9 @@
-"""Per-session three-pane view: transcript + notes + controls."""
+"""Per-session four-pane view: transcript + my-notes + synthesis + previous-notes."""
 from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -39,13 +39,20 @@ class SessionView(QWidget):
     stop_clicked = pyqtSignal(str)
     generate_prompt_clicked = pyqtSignal(str)
     paste_notes_clicked = pyqtSignal(str)
+    copy_notes_clicked = pyqtSignal(str)
     retain_audio_toggled = pyqtSignal(str, bool)  # session_id, value
+    live_notes_changed = pyqtSignal(str, str)     # session_id, body
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._session: Optional[Session] = None
         self._provisional_segments: dict[tuple[str, float], int] = {}
         # Maps (source, t_start) -> line index in the transcript view.
+        self._live_notes_save_timer = QTimer(self)
+        self._live_notes_save_timer.setSingleShot(True)
+        self._live_notes_save_timer.setInterval(800)
+        self._live_notes_save_timer.timeout.connect(self._flush_live_notes)
+        self._suppress_live_notes_signal = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -90,10 +97,13 @@ class SessionView(QWidget):
         self._paste_btn = QPushButton("Paste Response Back...", self)
         self._paste_btn.clicked.connect(self._on_paste_notes)
         synthesis.addWidget(self._paste_btn)
+        self._copy_notes_btn = QPushButton("Copy Notes to Clipboard", self)
+        self._copy_notes_btn.clicked.connect(self._on_copy_notes)
+        synthesis.addWidget(self._copy_notes_btn)
         synthesis.addStretch(1)
         layout.addLayout(synthesis)
 
-        # Transcript / Notes / Previous tabs in a splitter
+        # Transcript / My Notes / Synthesis / Previous tabs
         self._tabs = QTabWidget(self)
         self._transcript_view = QPlainTextEdit(self)
         self._transcript_view.setReadOnly(True)
@@ -103,9 +113,19 @@ class SessionView(QWidget):
         self._transcript_view.setFont(mono)
         self._tabs.addTab(self._transcript_view, "Transcript")
 
+        self._live_notes_editor = QPlainTextEdit(self)
+        self._live_notes_editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self._live_notes_editor.setPlaceholderText(
+            "Take notes here during the meeting. Sections (Attendees / Agenda / Notes / "
+            "Action Items) auto-seed on first open. Saved continuously. Included in the "
+            "synthesis prompt; attendee names are extracted from the bulleted list."
+        )
+        self._live_notes_editor.textChanged.connect(self._on_live_notes_changed)
+        self._tabs.addTab(self._live_notes_editor, "My Notes")
+
         self._notes_view = QTextBrowser(self)
         self._notes_view.setOpenExternalLinks(True)
-        self._tabs.addTab(self._notes_view, "Notes")
+        self._tabs.addTab(self._notes_view, "Synthesis")
 
         self._previous_view = QPlainTextEdit(self)
         self._previous_view.setReadOnly(True)
@@ -125,7 +145,12 @@ class SessionView(QWidget):
         transcript: str,
         notes: str,
         previous_notes_paths: list,
+        live_notes: str = "",
     ) -> None:
+        # Flush any pending live-notes save before swapping out the editor.
+        if self._live_notes_save_timer.isActive():
+            self._live_notes_save_timer.stop()
+            self._flush_live_notes()
         self._session = session
         self._provisional_segments.clear()
         if session is None:
@@ -134,6 +159,7 @@ class SessionView(QWidget):
             self._transcript_view.setPlainText("")
             self._notes_view.setMarkdown("")
             self._previous_view.setPlainText("")
+            self._set_live_notes_text("")
             self._retain_checkbox.setChecked(False)
             self._retain_checkbox.setEnabled(False)
             self._set_buttons_for_state(STATE_NEW, has_transcript=False, has_notes=False)
@@ -142,6 +168,7 @@ class SessionView(QWidget):
         self._state_label.setText(_pretty_state(session.state))
         self._transcript_view.setPlainText(transcript)
         self._notes_view.setMarkdown(notes)
+        self._set_live_notes_text(live_notes)
         self._retain_checkbox.setEnabled(True)
         self._retain_checkbox.blockSignals(True)
         self._retain_checkbox.setChecked(session.retain_audio)
@@ -190,6 +217,39 @@ class SessionView(QWidget):
     def set_previous_notes(self, paths: list) -> None:
         self._previous_view.setPlainText(_summarize_previous(paths))
 
+    def current_live_notes(self) -> str:
+        """Return the current live-notes editor body. Flushes pending saves."""
+        if self._live_notes_save_timer.isActive():
+            self._live_notes_save_timer.stop()
+            self._flush_live_notes()
+        return self._live_notes_editor.toPlainText()
+
+    def flush_pending_live_notes(self) -> None:
+        """Force any debounced live-notes save to commit immediately."""
+        if self._live_notes_save_timer.isActive():
+            self._live_notes_save_timer.stop()
+            self._flush_live_notes()
+
+    def _set_live_notes_text(self, text: str) -> None:
+        self._suppress_live_notes_signal = True
+        try:
+            self._live_notes_editor.setPlainText(text)
+        finally:
+            self._suppress_live_notes_signal = False
+
+    def _on_live_notes_changed(self) -> None:
+        if self._suppress_live_notes_signal:
+            return
+        if self._session is None:
+            return
+        self._live_notes_save_timer.start()
+
+    def _flush_live_notes(self) -> None:
+        if self._session is None:
+            return
+        body = self._live_notes_editor.toPlainText()
+        self.live_notes_changed.emit(self._session.id, body)
+
     # ---- internal handlers -------------------------------------------------
 
     def _on_start(self) -> None:
@@ -216,6 +276,10 @@ class SessionView(QWidget):
         if self._session:
             self.paste_notes_clicked.emit(self._session.id)
 
+    def _on_copy_notes(self) -> None:
+        if self._session:
+            self.copy_notes_clicked.emit(self._session.id)
+
     def _on_retain_toggled(self, checked: bool) -> None:
         if self._session:
             self._session.retain_audio = checked
@@ -237,6 +301,7 @@ class SessionView(QWidget):
         can_synthesize = has_session and has_transcript and not is_recording and not is_processing
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
+        self._copy_notes_btn.setEnabled(has_session and has_notes)
 
 
 def _pretty_state(state: str) -> str:
