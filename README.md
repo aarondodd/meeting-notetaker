@@ -317,32 +317,6 @@ the section headings (`# Attendees`, `# Agenda`, `# Action Items`, etc.)
 match the live-notes template, so the LLM's output drops into your final
 notes shape cleanly.
 
-## IT review notes (your org or equivalent)
-
-All third-party dependencies are pip-installable Python wheels. None are
-standalone EXEs or system binaries outside the Python ecosystem. The wheels
-that ship compiled native code are:
-
-| Package | Compiled artifact | License |
-|---|---|---|
-| PyQt6 | Qt 6 binaries | LGPL-3.0 |
-| PyAudio | PortAudio | MIT |
-| PyAudioWPatch | PortAudio fork with WASAPI loopback patch | MIT |
-| faster-whisper -> ctranslate2 | CTranslate2 inference engine | MIT |
-| faster-whisper -> tokenizers | Hugging Face tokenizers (Rust) | Apache-2.0 |
-| numpy | OpenBLAS | BSD-3-Clause |
-| webrtcvad-wheels | WebRTC VAD | BSD-3-Clause |
-
-The design doc appendix on your wiki captures exact wheel filenames + SHA256s for the
-IT review packet. Regenerate the manifest after any version bump:
-
-```powershell
-pip download -r requirements.txt -d wheels\
-Get-ChildItem wheels\ | ForEach-Object {
-    "$($_.Name)  $((Get-FileHash $_.FullName -Algorithm SHA256).Hash)"
-}
-```
-
 ### Network egress
 
 The app makes exactly one kind of outbound network call: downloading the
@@ -381,47 +355,6 @@ Python ssl build with weird defaults), pre-stage the model offline:
 You can also set `HF_HUB_OFFLINE=1` in the environment to force offline
 mode against the standard HF cache layout (`models--Systran--faster-whisper-
 <size>/`). Either approach works.
-
-## Architecture
-
-The full Technical Design Document lives on your wiki (look under your-workspace >
-Projects > Meeting Notetaker > design doc: Meeting Notetaker). Short version:
-
-- `meeting_notetaker.app` -- entry point, sets up Qt, lock, controller, UI.
-- `meeting_notetaker.controller.SessionController` -- bridges the UI to the
-  audio + transcription pipeline. Owns session lifecycle.
-- `meeting_notetaker.models.session.SessionStore` -- SQLite (WAL) wrapper
-  for session + folder metadata.
-- `meeting_notetaker.models.transcript.TranscriptStore` -- per-session
-  Markdown files (`raw.transcript.md`, `notes.md`, archived notes,
-  `metadata.json`).
-- `meeting_notetaker.audio.mic_recorder.MicRecorder` -- PyAudio capture.
-- `meeting_notetaker.audio.loopback_recorder.LoopbackRecorder` -- WASAPI
-  loopback via PyAudioWPatch (Windows only). Cribbed from WhisperType.
-- `meeting_notetaker.audio.chunk_buffer.ChunkBuffer` -- per-source 10s
-  rolling buffers with 5s overlap. `dedupe_overlap()` collapses the seam
-  between consecutive Whisper outputs.
-- `meeting_notetaker.transcription.model_manager` -- lazy-loaded
-  faster-whisper model with per-size cache.
-- `meeting_notetaker.transcription.worker.LiveTranscriptionWorker` --
-  QThread per source, polling the ChunkBuffer and emitting segments.
-- `meeting_notetaker.transcription.worker.batch_transcribe` -- final-pass
-  transcription on stop; also the only path in capture-only mode.
-
-## Development
-
-Run tests (pure-Python; no PyQt6, no audio hardware required):
-
-```bash
-pytest tests/ -v
-```
-
-The integration-marker tests need real audio hardware and are skipped by
-default:
-
-```bash
-pytest tests/ -v -m audio       # opt in
-```
 
 ## License
 
