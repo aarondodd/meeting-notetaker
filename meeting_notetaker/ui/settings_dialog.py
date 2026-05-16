@@ -155,13 +155,15 @@ class SettingsDialog(QDialog):
         # Prompts group ----------------------------------------------------
         prompts_group = QGroupBox("Synthesis Prompts", self)
         prompts_layout = QVBoxLayout(prompts_group)
-        prompts_layout.addWidget(QLabel(
+        prompts_blurb = QLabel(
             "Prompt templates are Markdown files in the folder below. Edit any file "
             "to change wording, or drop in a new .md file to add a template -- it "
             "appears in the Generate Synthesis Prompt picker on next open. Placeholders: "
             "{{session_title}}, {{date}}, {{transcript}}, {{live_notes}}, {{attendees}}.",
             self,
-        ))
+        )
+        prompts_blurb.setWordWrap(True)
+        prompts_layout.addWidget(prompts_blurb)
         prompts_row = QHBoxLayout()
         self._open_prompts_btn = QPushButton("Open Prompts Folder", self)
         self._open_prompts_btn.clicked.connect(self._open_prompts_folder)

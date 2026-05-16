@@ -28,12 +28,69 @@ via clipboard. No audio leaves the machine; no API key required.
                                                           notes.md
 ```
 
+## Screenshots
+
+The main window splits a session list (left) and a per-session view (right).
+Recording controls sit above four tabs: the live transcript, your own notes,
+the synthesized result, and any earlier synthesis runs archived for the
+same session.
+
+**Transcript -- interleaved mic + system audio, timestamped per line.**
+Your microphone is labeled with the name you set in Settings (`John` in
+the example below); the other side of the call is labeled `Them`.
+
+![Main window -- Transcript tab](docs/screenshots/01-main-transcript.png)
+
+**My Notes -- your running buffer alongside the transcript.** Markdown
+source with a small formatting toolbar. Sections (`# Attendees / # Agenda
+/ # Notes / # Action Items`) auto-seed on first open. Everything you
+type auto-saves continuously and is fed back into the synthesis prompt.
+
+![Main window -- My Notes (edit mode)](docs/screenshots/02-main-my-notes-edit.png)
+
+Click **Preview** in the toolbar to render the Markdown source in place:
+
+![Main window -- My Notes (preview mode)](docs/screenshots/03-main-my-notes-preview.png)
+
+**Synthesis -- the response from your chatbot, rendered as Markdown.**
+Populated after you click *Paste Response Back* with the LLM's reply.
+
+![Main window -- Synthesis tab](docs/screenshots/04-main-synthesis.png)
+
+**Previous Notes -- earlier synthesis runs, kept as an audit trail.** Any
+time you paste a new response, the prior `notes.md` is archived to
+`notes-YYYYMMDD-HHMM.md` and listed here.
+
+![Main window -- Previous Notes tab](docs/screenshots/05-main-previous-notes.png)
+
+### Dialogs
+
+**New Session** -- title plus a per-session "Keep recording" override:
+
+![New Session dialog](docs/screenshots/06-dialog-new-session.png)
+
+**Settings** -- model size, capture / refinement toggles, VAD, your
+name, theme, and a shortcut to the prompt-templates folder:
+
+![Settings dialog](docs/screenshots/07-dialog-settings.png)
+
+**Generate Synthesis Prompt** -- pick a template, preview the rendered
+prompt, copy to clipboard. The preview shows the live transcript merged
+with your notes and the attendee list parsed from `# Attendees`:
+
+![Generate Synthesis Prompt dialog](docs/screenshots/08-dialog-generate-prompt.png)
+
+**Paste Response Back** -- paste the LLM's reply; on Save the prior
+notes file is auto-archived (toggle controls whether):
+
+![Paste Response Back dialog](docs/screenshots/09-dialog-paste-response.png)
+
 ## Why this exists
 
 Many workstations forbid:
 
 - Sending audio or transcript content out to an external API.
-- Synthesising via any LLM other than an approved one.
+- Synthesizing via any LLM other than an approved one.
 
 SaaS meeting-note tools (Granola, Otter, Fireflies, and similar)
 generally violate one or both. This app moves transcription on-device and
