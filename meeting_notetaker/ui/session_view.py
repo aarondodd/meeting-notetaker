@@ -1,6 +1,7 @@
 """Per-session four-pane view: transcript + my-notes + synthesis + previous-notes."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -33,6 +34,7 @@ from ..models.transcript import (
     label_for,
     rewrite_user_label,
 )
+from ..utils.export import default_export_filename
 from ..utils.paths import session_dir
 from .live_notes_widget import LiveNotesWidget
 
@@ -46,9 +48,9 @@ class SessionView(QWidget):
     stop_clicked = pyqtSignal(str)
     generate_prompt_clicked = pyqtSignal(str)
     paste_notes_clicked = pyqtSignal(str)
-    copy_notes_clicked = pyqtSignal(str)
-    retain_audio_toggled = pyqtSignal(str, bool)  # session_id, value
-    live_notes_changed = pyqtSignal(str, str)     # session_id, body
+    copy_tab_clicked = pyqtSignal(str, str)        # session_id, tab_id
+    retain_audio_toggled = pyqtSignal(str, bool)   # session_id, value
+    live_notes_changed = pyqtSignal(str, str)      # session_id, body
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -106,17 +108,31 @@ class SessionView(QWidget):
         self._paste_btn = QPushButton("Paste Response Back...", self)
         self._paste_btn.clicked.connect(self._on_paste_notes)
         synthesis.addWidget(self._paste_btn)
-        self._copy_notes_btn = QPushButton("Copy Notes to Clipboard", self)
-        self._copy_notes_btn.clicked.connect(self._on_copy_notes)
-        synthesis.addWidget(self._copy_notes_btn)
+        self._copy_btn = QPushButton("Copy", self)
+        self._copy_btn.setToolTip(
+            "Copy the active tab's contents to the clipboard. The button "
+            "label updates to reflect which tab is active."
+        )
+        self._copy_btn.clicked.connect(self._on_copy_active_tab)
+        synthesis.addWidget(self._copy_btn)
         self._print_btn = QPushButton("Print...", self)
         self._print_btn.setToolTip(
-            "Print the active tab (My Notes or Synthesis). Use the printer "
-            "dialog's destination dropdown to pick \"Microsoft Print to PDF\" "
-            "for a PDF copy."
+            "Send the active tab (My Notes or Synthesis) to a physical "
+            "printer via the system print dialog. For a PDF copy, use the "
+            "Export PDF button instead -- it preserves images and "
+            "clickable links, which the Windows Print to PDF driver "
+            "rasterizes away."
         )
         self._print_btn.clicked.connect(self._on_print)
         synthesis.addWidget(self._print_btn)
+        self._export_pdf_btn = QPushButton("Export PDF...", self)
+        self._export_pdf_btn.setToolTip(
+            "Save the active tab (My Notes or Synthesis) directly to a "
+            "PDF. Images and links are preserved (the Print path through "
+            "Windows Print to PDF is lossy)."
+        )
+        self._export_pdf_btn.clicked.connect(self._on_export_pdf)
+        synthesis.addWidget(self._export_pdf_btn)
         synthesis.addStretch(1)
         layout.addLayout(synthesis)
 
@@ -325,9 +341,48 @@ class SessionView(QWidget):
         if self._session:
             self.paste_notes_clicked.emit(self._session.id)
 
-    def _on_copy_notes(self) -> None:
-        if self._session:
-            self.copy_notes_clicked.emit(self._session.id)
+    def _on_copy_active_tab(self) -> None:
+        if not self._session:
+            return
+        tab_id = self._active_tab_id()
+        if tab_id is None:
+            return
+        self.copy_tab_clicked.emit(self._session.id, tab_id)
+
+    def _active_tab_id(self) -> Optional[str]:
+        current = self._tabs.currentWidget()
+        if current is self._transcript_view:
+            return "transcript"
+        if current is self._live_notes_editor:
+            return "live_notes"
+        if current is self._notes_view:
+            return "notes"
+        if current is self._previous_view:
+            return "previous"
+        return None
+
+    def active_tab_text(self) -> str:
+        """Return the active tab's text in a clipboard-friendly form."""
+        tab_id = self._active_tab_id()
+        if tab_id == "transcript":
+            return self._transcript_view.toPlainText()
+        if tab_id == "live_notes":
+            return self._live_notes_editor.toPlainText()
+        if tab_id == "notes":
+            return self._notes_view.toMarkdown()
+        if tab_id == "previous":
+            return self._previous_view.toPlainText()
+        return ""
+
+    def active_tab_label(self) -> str:
+        """Display label for the active tab, used in toasts + Copy button."""
+        tab_id = self._active_tab_id()
+        return {
+            "transcript": "Transcript",
+            "live_notes": "My Notes",
+            "notes": "Synthesis",
+            "previous": "Previous Notes",
+        }.get(tab_id or "", "")
 
     def _on_retain_toggled(self, checked: bool) -> None:
         if self._session:
@@ -354,7 +409,7 @@ class SessionView(QWidget):
         can_synthesize = has_session and has_transcript and not is_recording
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
-        self._copy_notes_btn.setEnabled(has_session and has_notes)
+        self._update_copy_button(has_session=has_session)
         self._update_print_button(has_session=has_session, has_notes=has_notes)
 
     def _on_tab_changed(self, _index: int) -> None:
@@ -362,62 +417,123 @@ class SessionView(QWidget):
         has_notes = bool(
             self._session and (self._session.has_notes or self._notes_view.toPlainText().strip())
         )
+        self._update_copy_button(has_session=has_session)
         self._update_print_button(has_session=has_session, has_notes=has_notes)
 
+    def _update_copy_button(self, *, has_session: bool) -> None:
+        """Label + enabled state track the active tab."""
+        label = self.active_tab_label()
+        if not has_session or not label:
+            self._copy_btn.setText("Copy")
+            self._copy_btn.setEnabled(False)
+            return
+        self._copy_btn.setText(f"Copy {label}")
+        # Copy is meaningful any time the tab has any text content.
+        self._copy_btn.setEnabled(bool(self.active_tab_text().strip()))
+
     def _update_print_button(self, *, has_session: bool, has_notes: bool) -> None:
-        """Print is only meaningful on My Notes / Synthesis tabs."""
+        """Print + Export PDF only matter on My Notes / Synthesis tabs."""
         if not has_session:
             self._print_btn.setEnabled(False)
+            self._export_pdf_btn.setEnabled(False)
             return
         current = self._tabs.currentWidget()
         if current is self._live_notes_editor:
-            # Always allow printing the user's own notes (even if empty -- the
-            # printer dialog and a blank page is harmless).
             self._print_btn.setEnabled(True)
+            self._export_pdf_btn.setEnabled(True)
         elif current is self._notes_view:
             self._print_btn.setEnabled(has_notes)
+            self._export_pdf_btn.setEnabled(has_notes)
         else:
             self._print_btn.setEnabled(False)
+            self._export_pdf_btn.setEnabled(False)
 
-    def _on_print(self) -> None:
-        """Print the active tab via QPrinter.
+    def _build_print_document(self):
+        """Render the active tab into a QTextDocument bound to the session dir.
 
-        QPrintDialog exposes every installed Windows printer, including
-        "Microsoft Print to PDF" -- selecting it from the destination
-        dropdown is the standard path for saving to PDF. Markdown is
-        rendered into a temporary QTextDocument so the printer output
-        reflects the rendered view rather than the raw source.
+        Returns (doc, tab_label) or (None, "") if the active tab can't be
+        printed. The session dir as baseUrl makes relative image refs
+        (`images/foo.png`) resolve, which the QPrinter and PDF writer both
+        rely on.
         """
         if self._session is None:
-            return
+            return None, ""
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QTextDocument
+
         current = self._tabs.currentWidget()
         if current is self._live_notes_editor:
             markdown_source = self._live_notes_editor.toPlainText()
-            doc_title = f"{self._session.title} -- My Notes"
+            tab_label = "My Notes"
         elif current is self._notes_view:
             markdown_source = self._notes_view.toMarkdown()
-            doc_title = f"{self._session.title} -- Synthesis"
+            tab_label = "Synthesis"
         else:
-            return
-
-        # Lazy-imported so headless test envs without QtPrintSupport still
-        # import this module cleanly.
-        from PyQt6.QtCore import QUrl
-        from PyQt6.QtGui import QTextDocument
-        from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
+            return None, ""
 
         doc = QTextDocument(self)
         sdir = session_dir(self._session.id)
         doc.setBaseUrl(QUrl.fromLocalFile(str(sdir) + "/"))
         doc.setMarkdown(markdown_source)
+        return doc, tab_label
+
+    def _on_print(self) -> None:
+        """Print the active tab via QPrinter."""
+        doc, tab_label = self._build_print_document()
+        if doc is None or self._session is None:
+            return
+        from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
 
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        printer.setDocName(doc_title)
+        printer.setDocName(f"{self._session.title} -- {tab_label}")
         dialog = QPrintDialog(printer, self)
-        dialog.setWindowTitle(f"Print -- {doc_title}")
+        dialog.setWindowTitle(f"Print -- {self._session.title} -- {tab_label}")
         if dialog.exec() != QPrintDialog.DialogCode.Accepted:
             return
         doc.print(printer)
+
+    def _on_export_pdf(self) -> None:
+        """Save the active tab as a PDF via Qt's native PDF backend.
+
+        Qt's PDF writer preserves images (via direct embedding) and link
+        annotations (Markdown `[text](url)` becomes a clickable PDF
+        annotation), where the Windows Print-to-PDF driver typically
+        rasterizes both away.
+        """
+        doc, tab_label = self._build_print_document()
+        if doc is None or self._session is None:
+            return
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from PyQt6.QtPrintSupport import QPrinter
+
+        suggested_name = default_export_filename(
+            self._session.title, tab_label, ".pdf"
+        )
+        suggested_path = str(session_dir(self._session.id) / suggested_name)
+        path_str, _filter = QFileDialog.getSaveFileName(
+            self,
+            f"Export {tab_label} as PDF",
+            suggested_path,
+            "PDF documents (*.pdf)",
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        if target.suffix.lower() != ".pdf":
+            target = target.with_suffix(".pdf")
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setOutputFileName(str(target))
+        printer.setDocName(f"{self._session.title} -- {tab_label}")
+        try:
+            doc.print(printer)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export PDF", f"Could not write PDF: {exc}")
+            return
+        self.window().statusBar().showMessage(
+            f"Exported PDF to {target.name}", 5000
+        )
 
 
 def _pretty_state(state: str) -> str:

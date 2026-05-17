@@ -4,7 +4,6 @@ from __future__ import annotations
 from meeting_notetaker.utils.config import (
     Config,
     VALID_MODEL_SIZES,
-    VALID_THEMES,
 )
 from meeting_notetaker.utils.paths import config_path
 
@@ -13,7 +12,6 @@ def test_defaults_are_valid(isolated_data_dir):
     cfg = Config()
     assert cfg.validate() == []
     assert cfg.transcription.model_size in VALID_MODEL_SIZES
-    assert cfg.ui.theme in VALID_THEMES
     assert 50 <= cfg.audio.vad_min_silence_ms <= 5000
 
 
@@ -23,7 +21,6 @@ def test_save_load_round_trip(isolated_data_dir):
     cfg.audio.vad_min_silence_ms = 750
     cfg.transcription.model_size = "medium.en"
     cfg.transcription.capture_only_mode = True
-    cfg.ui.theme = "dark"
     cfg.ui.first_run_complete = True
     cfg.save()
 
@@ -32,7 +29,6 @@ def test_save_load_round_trip(isolated_data_dir):
     assert loaded.audio.vad_min_silence_ms == 750
     assert loaded.transcription.model_size == "medium.en"
     assert loaded.transcription.capture_only_mode is True
-    assert loaded.ui.theme == "dark"
     assert loaded.ui.first_run_complete is True
 
 
@@ -45,13 +41,26 @@ def test_load_with_missing_file_returns_defaults(isolated_data_dir):
 def test_validate_rejects_bad_values(isolated_data_dir):
     cfg = Config()
     cfg.transcription.model_size = "huge.fr"
-    cfg.ui.theme = "neon"
     cfg.audio.vad_min_silence_ms = 99999
     errors = cfg.validate()
-    assert len(errors) == 3
+    assert len(errors) == 2
     assert any("model_size" in e for e in errors)
-    assert any("theme" in e for e in errors)
     assert any("vad_min_silence_ms" in e for e in errors)
+
+
+def test_load_ignores_legacy_theme_key(isolated_data_dir, tmp_path):
+    """An older config.toml with `ui.theme = "dark"` should still load."""
+    p = tmp_path / "legacy.toml"
+    p.write_text(
+        "[audio]\n"
+        "[transcription]\n"
+        '[ui]\ntheme = "dark"\nuser_name = "Aaron"\n'
+        "[calendar]\n",
+        encoding="utf-8",
+    )
+    loaded = Config.load(p)
+    assert loaded.ui.user_name == "Aaron"
+    assert not hasattr(loaded.ui, "theme")
 
 
 def test_device_name_round_trip(isolated_data_dir):

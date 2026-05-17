@@ -1,8 +1,10 @@
 """App-level settings dialog.
 
 Exposes: model size, retain-audio default, VAD enable + min-silence threshold,
-capture-only mode, theme. Mutates the supplied Config in-place on accept;
-caller is responsible for persisting + applying the new values.
+capture-only mode, audio device pickers, calendar watch, user name. Mutates
+the supplied Config in-place on accept; caller is responsible for persisting
+and applying the new values. The interface follows the OS dark/light setting
+automatically, so there is no theme picker.
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
 from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
-from ..utils.config import Config, VALID_MODEL_SIZES, VALID_THEMES
+from ..utils.config import Config, VALID_MODEL_SIZES
 from ..utils.paths import prompts_dir, vocabulary_path
 from ..utils.vocabulary import seed_vocabulary_file
 
@@ -127,6 +129,17 @@ class SettingsDialog(QDialog):
         # Audio group ------------------------------------------------------
         audio_group = QGroupBox("Audio", self)
         audio_form = QFormLayout(audio_group)
+        audio_blurb = QLabel(
+            "(System default) follows whatever Windows is configured to use. "
+            "Pick a specific device only when you want to override that. "
+            "Duplicate entries (e.g. the same mic at index 1 and index 10) "
+            "are normal -- Windows exposes each device through multiple host "
+            "APIs (MME, WASAPI, WDM-KS); persisting by name picks the right "
+            "one across reboots.",
+            self,
+        )
+        audio_blurb.setWordWrap(True)
+        audio_form.addRow(audio_blurb)
 
         self._mic_devices = list_input_devices()
         self._mic_picker = QComboBox(self)
@@ -243,11 +256,6 @@ class SettingsDialog(QDialog):
             "prompt-generation time."
         )
         ui_form.addRow("Your name:", self._user_name_edit)
-        self._theme_picker = QComboBox(self)
-        for theme in VALID_THEMES:
-            self._theme_picker.addItem(theme)
-        self._theme_picker.setCurrentText(config.ui.theme)
-        ui_form.addRow("Theme:", self._theme_picker)
         layout.addWidget(ui_group)
 
         # Prompts group ----------------------------------------------------
@@ -293,7 +301,6 @@ class SettingsDialog(QDialog):
         self._config.audio.loopback_device_name = self._loopback_picker.currentData() or ""
         self._config.calendar.watch_calendar = self._watch_calendar.isChecked()
         self._config.calendar.window_minutes = int(self._window_slider.value())
-        self._config.ui.theme = self._theme_picker.currentText()
         self._config.ui.user_name = self._user_name_edit.text().strip()
         self.accept()
 

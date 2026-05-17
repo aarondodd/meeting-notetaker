@@ -58,6 +58,8 @@ class MainWindow(QMainWindow):
     new_session_requested = pyqtSignal()
     open_settings_requested = pyqtSignal()
     open_devices_dialog_requested = pyqtSignal()
+    open_outlook_diagnostic_requested = pyqtSignal()
+    open_log_viewer_requested = pyqtSignal()
     check_for_updates_requested = pyqtSignal()
     upgrade_requested = pyqtSignal()
     quit_requested = pyqtSignal()
@@ -91,6 +93,12 @@ class MainWindow(QMainWindow):
         action_devices = QAction("&Audio Devices...", self)
         action_devices.triggered.connect(self.open_devices_dialog_requested.emit)
         help_menu.addAction(action_devices)
+        action_outlook = QAction("Diagnose &Outlook...", self)
+        action_outlook.triggered.connect(self.open_outlook_diagnostic_requested.emit)
+        help_menu.addAction(action_outlook)
+        action_log = QAction("View &Log...", self)
+        action_log.triggered.connect(self.open_log_viewer_requested.emit)
+        help_menu.addAction(action_log)
         help_menu.addSeparator()
         action_check_updates = QAction("Check for &Updates...", self)
         action_check_updates.triggered.connect(self.check_for_updates_requested.emit)
@@ -152,6 +160,39 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
+
+        # Right-aligned permanent indicators on the status bar.
+        # Each is added with stretch=0 so the transient showMessage() text on
+        # the left side gets the whole leftover row. Labels are populated by
+        # app.py via set_status_indicators().
+        self._mic_indicator = QLabel("", self)
+        self._loopback_indicator = QLabel("", self)
+        self._calendar_indicator = QLabel("", self)
+        for ind in (
+            self._mic_indicator,
+            self._loopback_indicator,
+            self._calendar_indicator,
+        ):
+            ind.setContentsMargins(8, 0, 8, 0)
+            self.statusBar().addPermanentWidget(ind)
+
+    def set_status_indicators(
+        self,
+        *,
+        mic_label: str,
+        mic_tooltip: str = "",
+        loopback_label: str,
+        loopback_tooltip: str = "",
+        calendar_label: str,
+        calendar_tooltip: str = "",
+    ) -> None:
+        """Update the bottom status bar's right-side indicators."""
+        self._mic_indicator.setText(mic_label)
+        self._mic_indicator.setToolTip(mic_tooltip or mic_label)
+        self._loopback_indicator.setText(loopback_label)
+        self._loopback_indicator.setToolTip(loopback_tooltip or loopback_label)
+        self._calendar_indicator.setText(calendar_label)
+        self._calendar_indicator.setToolTip(calendar_tooltip or calendar_label)
 
     def set_sessions(self, sessions: Iterable[Session]) -> None:
         self._list.blockSignals(True)

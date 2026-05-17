@@ -78,6 +78,7 @@ class MainApp(QObject):
         self._handle_crash_recovery()
         self._warn_if_store_python()
         self._apply_calendar_config()
+        self._refresh_status_indicators()
 
         self.window.show()
         self.tray.set_state("idle")
@@ -95,6 +96,8 @@ class MainApp(QObject):
         self.window.new_session_requested.connect(self._on_new_session)
         self.window.open_settings_requested.connect(self._on_settings)
         self.window.open_devices_dialog_requested.connect(self._on_devices)
+        self.window.open_outlook_diagnostic_requested.connect(self._on_outlook_diagnostic)
+        self.window.open_log_viewer_requested.connect(self._on_log_viewer)
         self.window.check_for_updates_requested.connect(self._on_check_for_updates)
         self.window.upgrade_requested.connect(self._on_upgrade)
         self.window.quit_requested.connect(self.qt_app.quit)
@@ -117,7 +120,7 @@ class MainApp(QObject):
         sv.stop_clicked.connect(lambda _sid: self.controller.stop_session())
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
-        sv.copy_notes_clicked.connect(self._on_copy_notes)
+        sv.copy_tab_clicked.connect(self._on_copy_tab)
         sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
 
@@ -271,20 +274,29 @@ class MainApp(QObject):
         except OSError:
             log.exception("failed to save live notes for %s", session_id)
 
-    def _on_copy_notes(self, session_id: str) -> None:
+    def _on_copy_tab(self, session_id: str, tab_id: str) -> None:
         import pyperclip
-        store = TranscriptStore(session_id)
-        notes = store.read_notes()
-        if not notes.strip():
-            QMessageBox.information(self.window, "Copy Notes", "This session has no synthesized notes yet.")
+        sv = self.window.session_view
+        # Flush pending live-notes edits so the clipboard matches what's
+        # visible on screen.
+        if tab_id == "live_notes":
+            sv.flush_pending_live_notes()
+        text = sv.active_tab_text()
+        label = sv.active_tab_label() or "Tab"
+        if not text.strip():
+            QMessageBox.information(
+                self.window, f"Copy {label}", f"{label} is empty -- nothing to copy."
+            )
             return
         try:
-            pyperclip.copy(notes)
+            pyperclip.copy(text)
         except Exception as exc:
             log.exception("clipboard copy failed")
-            QMessageBox.warning(self.window, "Copy Notes", f"Clipboard copy failed: {exc}")
+            QMessageBox.warning(
+                self.window, f"Copy {label}", f"Clipboard copy failed: {exc}"
+            )
             return
-        self.window.status("Notes copied to clipboard.", timeout_ms=4000)
+        self.window.status(f"{label} copied to clipboard.", timeout_ms=4000)
 
     def _on_paste_notes(self, session_id: str) -> None:
         session = self.store.get_session(session_id)
@@ -328,6 +340,21 @@ class MainApp(QObject):
         dialog = DevicesDialog(parent=self.window)
         dialog.exec()
 
+    def _on_outlook_diagnostic(self) -> None:
+        from .ui.outlook_diagnostic_dialog import OutlookDiagnosticDialog
+        OutlookDiagnosticDialog(parent=self.window).exec()
+
+    def _on_log_viewer(self) -> None:
+        from .ui.log_viewer_dialog import LogViewerDialog
+        # Non-modal: lets the user keep using the app while watching the log.
+        # Stored as an attribute so the dialog isn't garbage-collected when
+        # the handler returns.
+        if getattr(self, "_log_viewer", None) is None:
+            self._log_viewer = LogViewerDialog(log_path(), parent=self.window)
+        self._log_viewer.show()
+        self._log_viewer.raise_()
+        self._log_viewer.activateWindow()
+
     def _on_settings(self) -> None:
         dialog = SettingsDialog(self.config, parent=self.window)
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -339,7 +366,60 @@ class MainApp(QObject):
         self.config.save()
         self._apply_user_name()
         self._apply_calendar_config()
+        self._refresh_status_indicators()
         self.window.status("Settings saved.", timeout_ms=4000)
+
+    # ---- status bar indicators -------------------------------------------
+
+    def _refresh_status_indicators(self) -> None:
+        """Repopulate the right-side status bar widgets from current state.
+
+        Pulled out so settings-saved, calendar-config-applied, and startup
+        all share one source of truth.
+        """
+        mic = self.config.audio.mic_device_name or "(System default)"
+        loopback = self.config.audio.loopback_device_name or "(System default)"
+
+        # Calendar indicator: combines the user's intent (Watch on/off) with
+        # actual Outlook reachability so the user sees whether the feature
+        # is silently disabled.
+        if not self.config.calendar.watch_calendar:
+            cal_label = "Calendar: off"
+            cal_tooltip = (
+                "Outlook calendar watching is disabled. Enable it in Settings "
+                "to be notified when a meeting is about to start."
+            )
+        elif outlook_calendar.is_available():
+            running = self._calendar_monitor is not None and self._calendar_monitor.is_running()
+            if running:
+                cal_label = "Calendar: watching"
+                cal_tooltip = (
+                    f"Watching Outlook calendar; notifying within "
+                    f"+- {self.config.calendar.window_minutes} min of each "
+                    "meeting start."
+                )
+            else:
+                cal_label = "Calendar: idle"
+                cal_tooltip = (
+                    "Calendar watching is enabled but the monitor is not "
+                    "running. Try toggling it off and on in Settings."
+                )
+        else:
+            cal_label = "Calendar: Outlook unavailable"
+            cal_tooltip = (
+                "Calendar watching is enabled, but Outlook (or pywin32) is "
+                "not reachable. Help > Diagnose Outlook... reports which "
+                "step in the chain is failing."
+            )
+
+        self.window.set_status_indicators(
+            mic_label=f"Mic: {_short_device_label(mic)}",
+            mic_tooltip=f"Microphone device: {mic}",
+            loopback_label=f"System audio: {_short_device_label(loopback)}",
+            loopback_tooltip=f"System audio capture (loopback): {loopback}",
+            calendar_label=cal_label,
+            calendar_tooltip=cal_tooltip,
+        )
 
     # ---- calendar integration ---------------------------------------------
 
@@ -581,6 +661,16 @@ class MainApp(QObject):
         self.window.showNormal()
         self.window.raise_()
         self.window.activateWindow()
+
+
+_STATUS_DEVICE_TRUNCATE_AT = 36
+
+
+def _short_device_label(name: str) -> str:
+    """Trim long device names so the status bar doesn't overflow."""
+    if len(name) <= _STATUS_DEVICE_TRUNCATE_AT:
+        return name
+    return name[: _STATUS_DEVICE_TRUNCATE_AT - 1].rstrip() + "..."
 
 
 def _set_windows_app_user_model_id() -> None:

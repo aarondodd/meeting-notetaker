@@ -63,9 +63,13 @@ Click **Preview** in the toolbar to render the Markdown source in place:
 
 **Synthesis -- the response from your chatbot, rendered as Markdown.**
 Populated after you click *Paste Response Back* with the LLM's reply.
-The **Print...** button above the tabs prints whichever of My Notes or
-Synthesis is active; pick "Microsoft Print to PDF" in the printer
-dialog to save to PDF.
+The **Print...** button above the tabs sends the active tab to a
+physical printer. For a PDF copy use **Export PDF...** -- it writes a
+PDF directly via Qt's PDF backend, which preserves images and
+clickable links (the Windows "Print to PDF" driver rasterizes both
+away). The **Copy** button copies whichever tab is currently active
+(its label updates to match: "Copy Transcript", "Copy My Notes",
+"Copy Synthesis").
 
 ![Main window -- Synthesis tab](docs/screenshots/04-main-synthesis.png)
 
@@ -98,8 +102,10 @@ when you accept:
 
 **Settings** -- model size, capture / refinement toggles, custom
 vocabulary, audio device picker, Outlook calendar watch, VAD, your
-name, theme, and a shortcut to the prompt-templates folder. The dialog
-scrolls if your screen is short:
+name, and a shortcut to the prompt-templates folder. The dialog
+scrolls if your screen is short. The interface follows the OS
+dark/light setting automatically -- there is no separate theme
+picker.
 
 ![Settings dialog](docs/screenshots/07-dialog-settings.png)
 
@@ -137,11 +143,17 @@ v0.4 alpha. End-to-end capture + transcription + synthesis works;
 v0.4 adds calendar-aware capture (Outlook COM polling -> tray
 notification -> pre-filled New Session) plus custom vocabulary (global
 plus per-session hotwords from attendees + agenda) plus an explicit
-audio-device picker, image paste / insert into My Notes, a Print
-button (for "Microsoft Print to PDF" or any other printer), and a
-weekly GitHub-releases update check (Help > Check for Updates...).
-Performance tuning is ongoing; the final refinement pass can take a
-while on CPU (see "Why transcription can take a while" below).
+audio-device picker, image paste / insert into My Notes, native PDF
+export (Print for paper; Export PDF for files; both preserve images
+and links), a "Copy" button that always copies the active tab, a
+non-modal log viewer (Help > View Log), an Outlook reachability
+diagnostic (Help > Diagnose Outlook), a permanent status bar at the
+bottom showing input device + system-audio device + calendar state,
+and a weekly GitHub-releases update check (Help > Check for
+Updates...). The interface follows the OS dark/light setting
+automatically. Performance tuning is ongoing; the final refinement
+pass can take a while on CPU (see "Why transcription can take a
+while" below).
 
 The WASAPI loopback path is cribbed from
 [Danaor/WhisperType](https://github.com/Danaor/WhisperType).
@@ -223,9 +235,12 @@ The Whisper model itself is downloaded on first run into
    Response Back...**, paste, save. The Synthesis tab now shows the
    rendered response. If a prior notes file existed it is auto-archived
    as `notes-YYYYMMDD-HHMM.md` and shown under the Previous Notes tab.
-10. Click **Copy Notes to Clipboard** any time after step 9 to grab the
-    raw Markdown -- ready to paste into whichever note-taking app you
-    use long-term.
+10. Click **Copy** any time to grab the active tab's contents in raw
+    text form (Transcript / My Notes / Synthesis / Previous Notes).
+    The button label updates to match the active tab.
+11. Click **Print...** to print whichever of My Notes / Synthesis is
+    active, or **Export PDF...** to save a PDF that keeps images
+    embedded and Markdown links clickable.
 
 ### Taking notes in parallel (the My Notes tab)
 
@@ -334,7 +349,6 @@ these are also editable directly in `config.toml`.
 | Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. Per-session override stays available. |
 | Enable VAD | on | Trim silent stretches before Whisper decodes them. Saves CPU. Disable if it ever clips speech. |
 | VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. 250-2000 ms range. |
-| Theme | auto | UI theme. (Stub for v0.1; `auto` follows the OS.) |
 | Mic device | (System default) | Which input device to capture from. Persists by name so the same device is picked after replug or reboot. |
 | Loopback device | (System default) | Which WASAPI loopback device to capture system audio from. Windows-only. |
 | Custom vocabulary | (empty) | One phrase per line in `vocabulary.txt`. Biases the transcriber toward proper nouns and corporate terms it would otherwise mis-hear ("Plantronics", "EDAPA-737", "Snowflake Cortex"). Per-session hotwords are also auto-derived from your `# Attendees` block and the agenda body when present. |
