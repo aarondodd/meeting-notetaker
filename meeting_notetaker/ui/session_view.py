@@ -382,10 +382,11 @@ class SessionView(QWidget):
     def _on_print(self) -> None:
         """Print the active tab via QPrinter.
 
-        QPrintDialog exposes whatever printers Windows reports, including
-        "Microsoft Print to PDF" -- the user's stated path for saving to
-        PDF. We render Markdown into a temporary QTextDocument so the
-        printer output reflects the rendered view, not the raw source.
+        QPrintDialog exposes every installed Windows printer, including
+        "Microsoft Print to PDF" -- selecting it from the destination
+        dropdown is the standard path for saving to PDF. Markdown is
+        rendered into a temporary QTextDocument so the printer output
+        reflects the rendered view rather than the raw source.
         """
         if self._session is None:
             return

@@ -1,19 +1,18 @@
-"""GitHub-releases-based update checker + in-place upgrade for Meeting Notetaker.
+"""GitHub-releases-based update checker + in-place upgrade.
 
-Mirrors the pattern Aaron's other Python desktop apps use (progman-py,
-bookmarker). On a successful check we hit:
+On a successful check the latest release is fetched from:
 
     https://api.github.com/repos/<owner>/<repo>/releases/latest
 
 If the response tag_name parses to a higher version tuple than the
-bundled __version__, we surface the offer and -- on accept -- download
-the source zipball, extract it, and invoke build.ps1 (Windows) or
-build.sh (POSIX) which in turn drives pyinstaller.
+bundled __version__, the offer is surfaced and -- on accept -- the
+source zipball is downloaded, extracted, and build.ps1 (Windows) or
+build.sh (POSIX) is invoked to drive pyinstaller.
 
 Failures are deliberately swallowed and reported back as "no update
 available" rather than raising:
 - Repo is private and the request is unauthenticated -> 404
-- Corporate proxy/Netskope rejects the call -> URLError
+- A corporate proxy / MITM appliance rejects the call -> URLError
 - DNS is sandboxed
 None of those should crash the host app.
 """
