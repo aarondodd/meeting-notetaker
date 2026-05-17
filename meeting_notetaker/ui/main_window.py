@@ -58,6 +58,8 @@ class MainWindow(QMainWindow):
     new_session_requested = pyqtSignal()
     open_settings_requested = pyqtSignal()
     open_devices_dialog_requested = pyqtSignal()
+    check_for_updates_requested = pyqtSignal()
+    upgrade_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     delete_sessions_requested = pyqtSignal(list)   # list of session_ids
     session_selected = pyqtSignal(str)             # session_id
@@ -89,6 +91,13 @@ class MainWindow(QMainWindow):
         action_devices = QAction("&Audio Devices...", self)
         action_devices.triggered.connect(self.open_devices_dialog_requested.emit)
         help_menu.addAction(action_devices)
+        help_menu.addSeparator()
+        action_check_updates = QAction("Check for &Updates...", self)
+        action_check_updates.triggered.connect(self.check_for_updates_requested.emit)
+        help_menu.addAction(action_check_updates)
+        action_upgrade = QAction("&Upgrade...", self)
+        action_upgrade.triggered.connect(self.upgrade_requested.emit)
+        help_menu.addAction(action_upgrade)
 
         # Body: splitter
         central = QWidget(self)

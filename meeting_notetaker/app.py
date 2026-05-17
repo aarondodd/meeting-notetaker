@@ -9,7 +9,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional
 
-from PyQt6.QtCore import QObject, Qt
+from PyQt6.QtCore import QObject, Qt, QTimer
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from .controller import SessionController
@@ -35,12 +35,14 @@ from .ui.prompt_dialog import GeneratePromptDialog, PasteNotesDialog
 from .ui.settings_dialog import SettingsDialog
 from .ui.tray import TrayIcon
 from .utils import prompts as prompts_mod
+from .utils import updater as updater_mod
 from .utils.config import Config
 from .utils.icons import app_icon
 from .utils.live_notes import seed_body_with_calendar
 from .utils.paths import app_data_dir, calendar_state_path, log_path
 from .utils.single_instance import acquire as acquire_lock, release as release_lock
 from .utils.vocabulary import seed_vocabulary_file
+from .version import __version__
 
 
 log = logging.getLogger("meeting_notetaker")
@@ -80,6 +82,10 @@ class MainApp(QObject):
         self.window.show()
         self.tray.set_state("idle")
 
+        # Weekly background check for a newer release on GitHub. Defer 2s
+        # after show() so the network call never blocks the first paint.
+        QTimer.singleShot(2000, self._auto_check_for_updates)
+
     def _apply_user_name(self) -> None:
         self.window.session_view.set_user_name(self.config.ui.user_name)
 
@@ -89,6 +95,8 @@ class MainApp(QObject):
         self.window.new_session_requested.connect(self._on_new_session)
         self.window.open_settings_requested.connect(self._on_settings)
         self.window.open_devices_dialog_requested.connect(self._on_devices)
+        self.window.check_for_updates_requested.connect(self._on_check_for_updates)
+        self.window.upgrade_requested.connect(self._on_upgrade)
         self.window.quit_requested.connect(self.qt_app.quit)
         self.window.session_selected.connect(self._on_session_selected)
         self.window.delete_sessions_requested.connect(self._on_delete_sessions)
@@ -415,6 +423,113 @@ class MainApp(QObject):
         self.window.status(
             f"Created session from calendar: {info.subject}", timeout_ms=5000
         )
+
+    # ---- update checks ----------------------------------------------------
+
+    def _auto_check_for_updates(self) -> None:
+        """Silent weekly check on startup.
+
+        Only nags the user via QMessageBox when there's a newer release.
+        Network errors / private-repo 404s degrade to silent no-op.
+        """
+        try:
+            result = updater_mod.check_for_updates()
+        except Exception:
+            log.exception("auto update check failed")
+            return
+        if result is None:
+            return
+        local, remote = result
+        self.window.status(
+            f"Update available: v{remote} (current v{local}). See Help > Upgrade.",
+            timeout_ms=10000,
+        )
+        QMessageBox.information(
+            self.window,
+            "Update Available",
+            f"A new version of Meeting Notetaker is available.\n\n"
+            f"Current version: {local}\n"
+            f"Latest version: {remote}\n\n"
+            "Use Help > Upgrade... to install it.",
+        )
+
+    def _on_check_for_updates(self) -> None:
+        """Manual Help > Check for Updates... path -- ignores the 7-day cooldown."""
+        self.window.status("Checking for updates...", timeout_ms=4000)
+        QApplication.processEvents()
+        release = updater_mod.get_latest_release()
+        if release is None:
+            QMessageBox.information(
+                self.window,
+                "Check for Updates",
+                "Could not check for updates.\n\n"
+                "Possible reasons:\n"
+                "  - No network connectivity\n"
+                "  - The release feed is restricted (private repo)\n"
+                "  - GitHub is unreachable from this network",
+            )
+            self.window.status("Ready", timeout_ms=2000)
+            return
+        remote = release["tag_name"]
+        if updater_mod.is_newer_version(remote, __version__):
+            choice = QMessageBox.question(
+                self.window,
+                "Update Available",
+                f"A new version is available.\n\n"
+                f"Current version: {__version__}\n"
+                f"Latest version: {remote}\n\n"
+                "Upgrade now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if choice == QMessageBox.StandardButton.Yes:
+                self._on_upgrade()
+        else:
+            QMessageBox.information(
+                self.window,
+                "Check for Updates",
+                f"You are running the latest version ({__version__}).",
+            )
+        self.window.status("Ready", timeout_ms=2000)
+
+    def _on_upgrade(self) -> None:
+        """Help > Upgrade... -- confirm + run UpgradeProgressDialog."""
+        # Imported here so the static graph stays light when the dialog is
+        # never opened.
+        from .ui.upgrade_dialog import UpgradeProgressDialog
+
+        release = updater_mod.get_latest_release()
+        if release is None:
+            QMessageBox.warning(
+                self.window,
+                "Upgrade",
+                "Could not reach GitHub to fetch the latest release.",
+            )
+            return
+        remote = release["tag_name"]
+        if not updater_mod.is_newer_version(remote, __version__):
+            QMessageBox.information(
+                self.window,
+                "Upgrade",
+                f"You are already running the latest version ({__version__}).",
+            )
+            return
+        confirm = QMessageBox.question(
+            self.window,
+            "Confirm Upgrade",
+            f"Upgrade from {__version__} to {remote}?\n\n"
+            "This downloads the new release and runs the build script "
+            "(pyinstaller). The app needs to be restarted afterwards to "
+            "pick up the new build.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        dialog = UpgradeProgressDialog(
+            owner=updater_mod.DEFAULT_GITHUB_OWNER,
+            repo=updater_mod.DEFAULT_GITHUB_REPO,
+            parent=self.window,
+        )
+        dialog.exec()
 
     # ---- environment warnings ---------------------------------------------
 
