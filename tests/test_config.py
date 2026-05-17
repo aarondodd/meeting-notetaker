@@ -100,3 +100,29 @@ def test_calendar_window_validation(isolated_data_dir):
     cfg.calendar.window_minutes = 0
     errors = cfg.validate()
     assert any("calendar.window_minutes" in e for e in errors)
+
+
+def test_speakers_defaults_and_round_trip(isolated_data_dir):
+    cfg = Config()
+    assert cfg.speakers.enabled is True
+    assert cfg.speakers.match_threshold == 0.75
+    assert cfg.speakers.merge_threshold == 0.75
+    cfg.speakers.enabled = False
+    cfg.speakers.match_threshold = 0.80
+    cfg.speakers.merge_threshold = 0.65
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.speakers.enabled is False
+    assert loaded.speakers.match_threshold == 0.80
+    assert loaded.speakers.merge_threshold == 0.65
+
+
+def test_speakers_threshold_validation(isolated_data_dir):
+    cfg = Config()
+    cfg.speakers.match_threshold = 1.5
+    errors = cfg.validate()
+    assert any("speakers.match_threshold" in e for e in errors)
+    cfg.speakers.match_threshold = 0.75
+    cfg.speakers.merge_threshold = 0.0
+    errors = cfg.validate()
+    assert any("speakers.merge_threshold" in e for e in errors)

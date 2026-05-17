@@ -24,6 +24,14 @@ from typing import Callable, Optional
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
 from .audio.chunk_buffer import ChunkBuffer
+from .diarization.embeddings import EmbedderUnavailable, default_encoder
+from .diarization.persistence import save_diarization
+from .diarization.refiner import (
+    RefinementResult,
+    apply_labels_to_segments,
+    refine_loopback,
+)
+from .diarization.store import open_speaker_store
 from .models.session import (
     STATE_COMPLETE,
     STATE_ERROR,
@@ -39,7 +47,7 @@ from .transcription import model_manager
 from .transcription.worker import LiveTranscriptionWorker, batch_transcribe, interleave
 from .utils.config import Config
 from .utils.live_notes import extract_section, parse_attendees
-from .utils.paths import session_audio_dir
+from .utils.paths import app_data_dir, session_audio_dir
 from .utils.vocabulary import derive_session_hotwords, join_hotwords, load_vocabulary
 
 
@@ -133,11 +141,89 @@ class _BatchTranscribeThread(QThread):
             self.failed.emit(str(exc))
 
 
+class _SpeakerRefinementThread(QThread):
+    """Runs the post-meeting speaker-identification pass off the UI thread.
+
+    Loads the loopback WAV, segments it into turns, embeds each turn, and
+    clusters them; matches each cluster against the speaker store. Emits
+    the RefinementResult on success so the controller can rewrite the
+    transcript with names and surface unknown clusters to the UI.
+
+    Failure modes: Resemblyzer not importable (`EmbedderUnavailable`) or
+    the loopback WAV doesn't exist / is empty. Both are reported via
+    `skipped` rather than `failed` so the controller treats them as a
+    soft no-op and proceeds straight to STATE_COMPLETE.
+    """
+
+    done = pyqtSignal(object)                # RefinementResult
+    skipped = pyqtSignal(str)                # reason text
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(
+        self,
+        sys_wav: Path,
+        transcript_segments: list,
+        *,
+        match_threshold: float,
+        merge_threshold: float,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.sys_wav = sys_wav
+        self.transcript_segments = transcript_segments
+        self.match_threshold = match_threshold
+        self.merge_threshold = merge_threshold
+
+    def run(self) -> None:
+        try:
+            if not self.sys_wav or not self.sys_wav.exists() or self.sys_wav.stat().st_size <= 44:
+                self.skipped.emit("no loopback audio to analyze")
+                return
+            sys_segments = [s for s in self.transcript_segments if s.source == SYS]
+            if not sys_segments:
+                self.skipped.emit("no system-audio transcript segments to label")
+                return
+            if not default_encoder.is_available:
+                self.skipped.emit(
+                    "speaker-embedding model unavailable "
+                    "(Resemblyzer not installed)"
+                )
+                return
+            self.progress.emit("Identifying speakers...")
+            speaker_store = open_speaker_store()
+            try:
+                result = refine_loopback(
+                    self.sys_wav,
+                    self.transcript_segments,
+                    speaker_store=speaker_store,
+                    encoder=default_encoder,
+                    sys_source=SYS,
+                    match_threshold=self.match_threshold,
+                    merge_threshold=self.merge_threshold,
+                )
+            finally:
+                speaker_store.close()
+            self.done.emit(result)
+        except EmbedderUnavailable as exc:
+            self.skipped.emit(str(exc))
+        except Exception as exc:  # pragma: no cover - thread safety net
+            log.exception("speaker refinement failed")
+            self.failed.emit(str(exc))
+
+
 class SessionController(QObject):
     state_changed = pyqtSignal(str, str)               # session_id, state
     segment_arrived = pyqtSignal(str, object)          # session_id, TranscriptSegment
     transcript_replaced = pyqtSignal(str, list)        # session_id, list[TranscriptSegment]
     batch_progress = pyqtSignal(str, int)              # session_id, pct (0..100)
+    # Speaker-refinement signals (v0.5). Fired after the batch transcription
+    # pass commits but before STATE_COMPLETE. The UI uses them to (a) update
+    # the status label while refinement runs, (b) pop the Label Unknown
+    # Speakers dialog when the result has unknown clusters.
+    speaker_refinement_starting = pyqtSignal(str)              # session_id
+    speaker_refinement_done = pyqtSignal(str, object)          # session_id, RefinementResult
+    speaker_refinement_skipped = pyqtSignal(str, str)          # session_id, reason
     error = pyqtSignal(str)
     status = pyqtSignal(str)
 
@@ -155,6 +241,7 @@ class SessionController(QObject):
         self._mic_wav: Optional[Path] = None
         self._sys_wav: Optional[Path] = None
         self._batch_thread: Optional[_BatchTranscribeThread] = None
+        self._refinement_thread: Optional[_SpeakerRefinementThread] = None
         self._session_hotwords: str = ""
 
     def _collect_hotwords(self, session: Session) -> str:
@@ -419,7 +506,92 @@ class SessionController(QObject):
         store: TranscriptStore,
         segments: list[TranscriptSegment],
     ) -> None:
-        self._finalize_session(session, batch_segments=segments)
+        """Commit the batch transcript, then run speaker refinement.
+
+        Refinement is skipped when (a) speakers.enabled is False, (b) the
+        loopback WAV is missing or empty (mic-only session), or (c) the
+        Resemblyzer embedder isn't importable. In any of those cases the
+        session moves straight to STATE_COMPLETE via _finalize_session.
+
+        Otherwise a worker thread runs the diarization pass on the
+        loopback WAV. The audio dir is NOT cleaned up until after
+        refinement finishes -- the WAV is needed for embedding extraction.
+        """
+        if segments:
+            store.write_segments(segments)
+            self.store.update_session(session.id, has_transcript=True)
+            self.transcript_replaced.emit(session.id, segments)
+        # Capture the latest on-disk transcript for the refinement input.
+        # Use the batch segments when present, else fall back to whatever
+        # the live workers wrote at Stop.
+        refinement_input = segments or list(self._live_segments)
+
+        if not self.config.speakers.enabled:
+            self._finalize_session(session, batch_segments=None)
+            return
+        if not self._sys_wav or not self._sys_wav.exists():
+            self._finalize_session(session, batch_segments=None)
+            return
+
+        self.speaker_refinement_starting.emit(session.id)
+        self.status.emit("Identifying speakers...")
+        self._refinement_thread = _SpeakerRefinementThread(
+            self._sys_wav,
+            refinement_input,
+            match_threshold=self.config.speakers.match_threshold,
+            merge_threshold=self.config.speakers.merge_threshold,
+        )
+        self._refinement_thread.progress.connect(self.status.emit)
+        self._refinement_thread.done.connect(
+            lambda res, s=session, segs=refinement_input:
+            self._on_refinement_done(s, segs, res)
+        )
+        self._refinement_thread.skipped.connect(
+            lambda reason, s=session: self._on_refinement_skipped(s, reason)
+        )
+        self._refinement_thread.failed.connect(
+            lambda msg, s=session: self._on_refinement_failed(s, msg)
+        )
+        self._refinement_thread.start()
+
+    def _on_refinement_done(
+        self,
+        session: Session,
+        input_segments: list[TranscriptSegment],
+        result: RefinementResult,
+    ) -> None:
+        """Apply labels, persist diarization metadata, and finalize."""
+        try:
+            labeled = apply_labels_to_segments(input_segments, result.segment_labels)
+            store = TranscriptStore(session.id)
+            store.write_segments(labeled)
+            self.transcript_replaced.emit(session.id, labeled)
+            save_diarization(
+                store.session_dir,
+                loopback_wav="audio/sys.wav",
+                match_threshold=self.config.speakers.match_threshold,
+                refinement_result=result,
+                transcript_segments=labeled,
+            )
+        except Exception:
+            log.exception("post-refinement write failed; transcript unchanged")
+        # Surface the result so the UI can pop the Label Unknown Speakers
+        # dialog. Emit before finalize so the dialog can grab a fresh
+        # sample clip from the loopback WAV (still on disk).
+        self.speaker_refinement_done.emit(session.id, result)
+        self._finalize_session(session, batch_segments=None)
+
+    def _on_refinement_skipped(self, session: Session, reason: str) -> None:
+        log.info("speaker refinement skipped for %s: %s", session.id, reason)
+        self.speaker_refinement_skipped.emit(session.id, reason)
+        self._finalize_session(session, batch_segments=None)
+
+    def _on_refinement_failed(self, session: Session, msg: str) -> None:
+        log.warning("speaker refinement failed for %s: %s", session.id, msg)
+        # Don't fail the whole session over a refinement bug; just skip
+        # the labeling step and finalize normally.
+        self.speaker_refinement_skipped.emit(session.id, f"failed: {msg}")
+        self._finalize_session(session, batch_segments=None)
 
     def _on_batch_failed(self, session: Session, msg: str) -> None:
         self.store.update_session(session.id, state=STATE_ERROR)

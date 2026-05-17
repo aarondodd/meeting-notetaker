@@ -23,6 +23,11 @@ Schema (config.toml):
     watch_calendar = false       # poll Outlook for imminent meetings (Windows + Outlook only)
     window_minutes = 5           # notify if a meeting starts within +- N min
 
+    [speakers]
+    enabled = true               # run post-meeting speaker identification on the loopback channel
+    match_threshold = 0.75       # cosine-similarity floor to auto-label a cluster from the store
+    merge_threshold = 0.75       # cosine-similarity floor for two turns to land in one cluster
+
 Reads use tomllib (3.11+) or the tomli fallback. Writes are emitted by hand
 since our schema is flat and tomli-w is not a stdlib component.
 """
@@ -74,11 +79,19 @@ class CalendarConfig:
 
 
 @dataclass
+class SpeakersConfig:
+    enabled: bool = True
+    match_threshold: float = 0.75
+    merge_threshold: float = 0.75
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     ui: UiConfig = field(default_factory=UiConfig)
     calendar: CalendarConfig = field(default_factory=CalendarConfig)
+    speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -97,6 +110,9 @@ class Config:
             ui=UiConfig(**_filter_fields(UiConfig, data.get("ui", {}))),
             calendar=CalendarConfig(
                 **_filter_fields(CalendarConfig, data.get("calendar", {}))
+            ),
+            speakers=SpeakersConfig(
+                **_filter_fields(SpeakersConfig, data.get("speakers", {}))
             ),
         )
 
@@ -121,6 +137,16 @@ class Config:
                 f"calendar.window_minutes must be between 1 and 60, "
                 f"got {self.calendar.window_minutes}"
             )
+        if not (0.0 < self.speakers.match_threshold <= 1.0):
+            errors.append(
+                f"speakers.match_threshold must be in (0, 1], "
+                f"got {self.speakers.match_threshold}"
+            )
+        if not (0.0 < self.speakers.merge_threshold <= 1.0):
+            errors.append(
+                f"speakers.merge_threshold must be in (0, 1], "
+                f"got {self.speakers.merge_threshold}"
+            )
         return errors
 
     def _dump_toml(self) -> str:
@@ -130,6 +156,7 @@ class Config:
             ("transcription", self.transcription),
             ("ui", self.ui),
             ("calendar", self.calendar),
+            ("speakers", self.speakers),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():
