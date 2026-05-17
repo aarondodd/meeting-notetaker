@@ -157,7 +157,22 @@ class MainApp(QObject):
             title=result.title,
             retain_audio=result.retain_audio,
         )
+        if result.calendar_meeting is not None:
+            self._seed_live_notes_from_meeting(session.id, result.calendar_meeting)
         self._refresh_session_list(select=session.id)
+
+    def _seed_live_notes_from_meeting(
+        self, session_id: str, info: MeetingInfo
+    ) -> None:
+        attendee_names = [a.display for a in info.attendees if a.display]
+        try:
+            TranscriptStore(session_id).save_live_notes(
+                seed_body_with_calendar(
+                    attendees=attendee_names, agenda=info.body
+                )
+            )
+        except OSError:
+            log.exception("failed to seed live notes from calendar")
 
     def _on_start_clicked(self, session_id: str) -> None:
         session = self.store.get_session(session_id)
@@ -384,6 +399,8 @@ class MainApp(QObject):
                 f"appear in My Notes. Starts at "
                 f"{info.start_time.strftime('%H:%M')}."
             ),
+            calendar_meeting=info,
+            allow_calendar_pick=False,
             parent=self.window,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -392,15 +409,8 @@ class MainApp(QObject):
         session = self.store.create_session(
             title=result.title, retain_audio=result.retain_audio
         )
-        attendee_names = [a.display for a in info.attendees if a.display]
-        try:
-            TranscriptStore(session.id).save_live_notes(
-                seed_body_with_calendar(
-                    attendees=attendee_names, agenda=info.body
-                )
-            )
-        except OSError:
-            log.exception("failed to seed live notes from calendar")
+        meeting = result.calendar_meeting or info
+        self._seed_live_notes_from_meeting(session.id, meeting)
         self._refresh_session_list(select=session.id)
         self.window.status(
             f"Created session from calendar: {info.subject}", timeout_ms=5000

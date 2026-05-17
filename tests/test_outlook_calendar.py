@@ -2,15 +2,19 @@
 
 COM dispatch + Qt monitor are exercised on real Windows; these cover the
 sanitize_body parser + the dedup store + the calendar-flavored live-notes
-seed.
+seed + the no-COM fallback paths of the range/remaining-today fetchers.
 """
 from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
 
+from meeting_notetaker.integrations import outlook_calendar
 from meeting_notetaker.integrations.outlook_calendar import (
     _DedupStore,
+    fetch_calendar_range,
+    fetch_remaining_today,
+    is_available,
     sanitize_body,
 )
 from meeting_notetaker.utils.live_notes import seed_body_with_calendar
@@ -141,3 +145,45 @@ def test_seed_with_calendar_dedupes_blank_names():
 def test_seed_with_calendar_strips_agenda_whitespace():
     body = seed_body_with_calendar(attendees=[], agenda="\n\n  text  \n\n")
     assert "# Agenda\ntext\n" in body
+
+
+# ---- fetch_* fallback paths ------------------------------------------------
+
+
+def test_is_available_false_on_linux():
+    # Linux dev runtime: pywin32 isn't installable, so the integration must
+    # advertise itself as unavailable and the fetchers return [] cleanly.
+    assert is_available() is False
+
+
+def test_fetch_calendar_range_returns_empty_when_unavailable():
+    # When is_available() is False, no exception should be raised; we just
+    # get an empty list. (Forced by the early-return in fetch_calendar_range.)
+    start = datetime(2026, 5, 17, 9, 0)
+    end = datetime(2026, 5, 17, 18, 0)
+    assert fetch_calendar_range(start, end) == []
+
+
+def test_fetch_remaining_today_returns_empty_when_unavailable():
+    assert fetch_remaining_today() == []
+    # And with an injected `now` -- still no Outlook, still empty.
+    assert fetch_remaining_today(now=datetime(2026, 5, 17, 14, 30)) == []
+
+
+def test_fetch_remaining_today_clamps_when_now_is_end_of_day(monkeypatch):
+    # If the integration is "available" but the COM dispatch fails (typical
+    # state during testing), fetch_calendar_range still returns []. We use
+    # this to assert that fetch_remaining_today doesn't raise around the
+    # 23:59:59 edge case.
+    captured: dict = {}
+
+    def fake_range(start, end):
+        captured["start"] = start
+        captured["end"] = end
+        return []
+
+    monkeypatch.setattr(outlook_calendar, "fetch_calendar_range", fake_range)
+    fetch_remaining_today(now=datetime(2026, 5, 17, 23, 59, 30))
+    assert captured["start"].hour == 23
+    assert captured["end"].hour == 23
+    assert captured["end"] >= captured["start"]

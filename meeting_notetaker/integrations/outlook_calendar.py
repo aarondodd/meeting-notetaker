@@ -101,11 +101,12 @@ def is_available() -> bool:
 # ---- Outlook fetch (live; not testable in CI) ------------------------------
 
 
-def fetch_imminent_meetings(window_minutes: int = 5) -> list[MeetingInfo]:
-    """Return calendar items whose start is within +- window_minutes of now.
+def fetch_calendar_range(start: datetime, end: datetime) -> list[MeetingInfo]:
+    """Return calendar items whose Start falls in [start, end].
 
     Returns [] silently on any failure path (Outlook not running, COM error,
-    pywin32 missing). The caller polls again on the next tick.
+    pywin32 missing). Used by both fetch_imminent_meetings (narrow +-window)
+    and fetch_remaining_today (now -> end-of-day).
     """
     if not is_available():
         return []
@@ -127,13 +128,9 @@ def fetch_imminent_meetings(window_minutes: int = 5) -> list[MeetingInfo]:
         items.IncludeRecurrences = True
         items.Sort("[Start]")
 
-        now = datetime.now()
-        lo = now - timedelta(minutes=window_minutes)
-        hi = now + timedelta(minutes=window_minutes)
-        # Outlook DASL restriction needs a US-locale-ish timestamp string.
         restriction = (
-            f"[Start] >= '{lo.strftime('%m/%d/%Y %I:%M %p')}' AND "
-            f"[Start] <= '{hi.strftime('%m/%d/%Y %I:%M %p')}'"
+            f"[Start] >= '{start.strftime('%m/%d/%Y %I:%M %p')}' AND "
+            f"[Start] <= '{end.strftime('%m/%d/%Y %I:%M %p')}'"
         )
         restricted = items.Restrict(restriction)
 
@@ -147,6 +144,36 @@ def fetch_imminent_meetings(window_minutes: int = 5) -> list[MeetingInfo]:
     except Exception:
         log.exception("Outlook calendar fetch failed")
         return []
+
+
+def fetch_imminent_meetings(window_minutes: int = 5) -> list[MeetingInfo]:
+    """Return calendar items whose start is within +- window_minutes of now.
+
+    Returns [] silently on any failure path. The monitor polls again on the
+    next tick.
+    """
+    now = datetime.now()
+    return fetch_calendar_range(
+        now - timedelta(minutes=window_minutes),
+        now + timedelta(minutes=window_minutes),
+    )
+
+
+def fetch_remaining_today(now: Optional[datetime] = None) -> list[MeetingInfo]:
+    """Return meetings from `now` (default: real now) through end-of-local-day.
+
+    Used by the "Pick from Calendar..." button in New Session, which lets
+    the user pre-create a session that will be associated with an upcoming
+    meeting. Returns [] if Outlook is unreachable.
+    """
+    if now is None:
+        now = datetime.now()
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    if end_of_day < now:
+        # Sanity: never happens (microsecond=0 doesn't move things backwards),
+        # but guard anyway.
+        end_of_day = now
+    return fetch_calendar_range(now, end_of_day)
 
 
 def _item_to_info(item) -> MeetingInfo:
