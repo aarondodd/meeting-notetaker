@@ -452,14 +452,15 @@ class SessionView(QWidget):
         """Render the active tab into a QTextDocument bound to the session dir.
 
         Returns (doc, tab_label) or (None, "") if the active tab can't be
-        printed. The session dir as baseUrl makes relative image refs
-        (`images/foo.png`) resolve, which the QPrinter and PDF writer both
-        rely on.
+        printed. Uses PrintTextDocument so that relative image refs like
+        `images/foo.png` resolve to real files on every QPrinter
+        loadResource() call -- QTextDocument's own setBaseUrl is only
+        honored on the first call, which produced broken-image icons in
+        printed PDFs.
         """
         if self._session is None:
             return None, ""
-        from PyQt6.QtCore import QUrl
-        from PyQt6.QtGui import QTextDocument
+        from .print_document import PrintTextDocument
 
         current = self._tabs.currentWidget()
         if current is self._live_notes_editor:
@@ -471,9 +472,8 @@ class SessionView(QWidget):
         else:
             return None, ""
 
-        doc = QTextDocument(self)
         sdir = session_dir(self._session.id)
-        doc.setBaseUrl(QUrl.fromLocalFile(str(sdir) + "/"))
+        doc = PrintTextDocument(sdir, parent=self)
         doc.setMarkdown(markdown_source)
         return doc, tab_label
 
