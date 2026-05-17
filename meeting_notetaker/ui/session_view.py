@@ -55,6 +55,12 @@ class SessionView(QWidget):
     # without archiving on every save -- archiving only happens on the
     # wholesale Paste-Response-Back replacement.
     synthesis_notes_changed = pyqtSignal(str, str)  # session_id, body
+    # Emitted when the user clicks Review Speakers. The handler walks
+    # through every detected cluster in the session's diarization.json,
+    # showing example transcript lines so the user can confirm /
+    # rename / forget each one. Feeds corrections back to the speaker
+    # store for the self-learning loop.
+    review_speakers_clicked = pyqtSignal(str)  # session_id
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -146,6 +152,19 @@ class SessionView(QWidget):
         )
         self._export_pdf_btn.clicked.connect(self._on_export_pdf)
         synthesis.addWidget(self._export_pdf_btn)
+        # Speaker review button. Hidden until the session has a
+        # diarization.json on disk (set_session enables it).
+        self._review_speakers_btn = QPushButton("Review Speakers...", self)
+        self._review_speakers_btn.setToolTip(
+            "Walk through each detected speaker with example transcript "
+            "lines. Rename a mislabeled cluster or forget one. Updates "
+            "the on-disk transcript and feeds corrections back to the "
+            "speaker store so future meetings auto-recognize the same "
+            "voices."
+        )
+        self._review_speakers_btn.clicked.connect(self._on_review_speakers)
+        self._review_speakers_btn.setVisible(False)
+        synthesis.addWidget(self._review_speakers_btn)
         synthesis.addStretch(1)
         layout.addLayout(synthesis)
 
@@ -249,6 +268,9 @@ class SessionView(QWidget):
             session.state,
             has_transcript=session.has_transcript or bool(transcript.strip()),
             has_notes=session.has_notes or bool(notes.strip()),
+        )
+        self._review_speakers_btn.setVisible(
+            (sdir / "diarization.json").exists()
         )
 
     def update_state(self, state: str) -> None:
@@ -448,6 +470,19 @@ class SessionView(QWidget):
             "notes": "Synthesis",
             "previous": "Previous Notes",
         }.get(tab_id or "", "")
+
+    def _on_review_speakers(self) -> None:
+        if self._session:
+            self.review_speakers_clicked.emit(self._session.id)
+
+    def set_has_diarization(self, has: bool) -> None:
+        """Show or hide the Review Speakers button.
+
+        Called by the app layer after refinement completes (button on)
+        and when a session is loaded that has a diarization.json on
+        disk (also on). Hidden in all other cases.
+        """
+        self._review_speakers_btn.setVisible(has)
 
     def _on_retain_toggled(self, checked: bool) -> None:
         if self._session:

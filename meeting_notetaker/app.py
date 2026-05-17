@@ -13,6 +13,13 @@ from PyQt6.QtCore import QObject, Qt, QTimer
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from .controller import SessionController
+from .diarization.persistence import (
+    load_diarization,
+    save_diarization,
+    update_cluster_name,
+)
+from .diarization.refiner import RefinementResult, apply_labels_to_segments
+from .diarization.store import open_speaker_store
 from .integrations import outlook_calendar
 from .integrations.outlook_calendar import MeetingInfo
 from .models.session import (
@@ -25,7 +32,7 @@ from .models.session import (
     Session,
     SessionStore,
 )
-from .models.transcript import TranscriptStore
+from .models.transcript import TranscriptSegment, TranscriptStore
 from .transcription import model_manager
 from .ui.devices_dialog import DevicesDialog
 from .ui.main_window import MainWindow
@@ -33,12 +40,21 @@ from .ui.new_session_dialog import NewSessionDialog
 from .ui.progress import run_with_progress
 from .ui.prompt_dialog import GeneratePromptDialog, PasteNotesDialog
 from .ui.settings_dialog import SettingsDialog
+from .ui.speaker_walker_dialog import (
+    SpeakerWalkerDecision,
+    SpeakerWalkerDialog,
+)
+from .ui.speaker_walker_helpers import (
+    entries_from_persistence,
+    entries_from_refinement,
+    gather_suggestions,
+)
 from .ui.tray import TrayIcon
 from .utils import prompts as prompts_mod
 from .utils import updater as updater_mod
 from .utils.config import Config
 from .utils.icons import app_icon
-from .utils.live_notes import seed_body_with_calendar
+from .utils.live_notes import extract_section, parse_attendees, seed_body_with_calendar
 from .utils.paths import app_data_dir, calendar_state_path, log_path
 from .utils.single_instance import acquire as acquire_lock, release as release_lock
 from .utils.vocabulary import seed_vocabulary_file
@@ -134,12 +150,22 @@ class MainApp(QObject):
         sv.copy_tab_clicked.connect(self._on_copy_tab)
         sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
+        sv.review_speakers_clicked.connect(self._on_review_speakers)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
 
         self.controller.state_changed.connect(self._on_session_state_changed)
         self.controller.segment_arrived.connect(self._on_segment_arrived)
         self.controller.transcript_replaced.connect(self._on_transcript_replaced)
         self.controller.batch_progress.connect(self._on_batch_progress)
+        self.controller.speaker_refinement_starting.connect(
+            self._on_speaker_refinement_starting
+        )
+        self.controller.speaker_refinement_done.connect(
+            self._on_speaker_refinement_done
+        )
+        self.controller.speaker_refinement_skipped.connect(
+            self._on_speaker_refinement_skipped
+        )
         self.controller.error.connect(self._on_controller_error)
         self.controller.status.connect(lambda msg: self.window.status(msg, timeout_ms=5000))
 
@@ -301,6 +327,238 @@ class MainApp(QObject):
                 self.store.update_session(session_id, has_notes=True)
         except OSError:
             log.exception("failed to save synthesis notes for %s", session_id)
+
+    # ---- speaker refinement + labeling -------------------------------------
+
+    def _on_speaker_refinement_starting(self, session_id: str) -> None:
+        self.window.status("Identifying speakers...", timeout_ms=0)
+
+    def _on_speaker_refinement_skipped(self, session_id: str, reason: str) -> None:
+        log.info("speaker refinement skipped for %s: %s", session_id, reason)
+        # Show a brief one-line note; don't block with a dialog.
+        self.window.status(f"Speaker ID skipped: {reason}", timeout_ms=8000)
+
+    def _on_speaker_refinement_done(
+        self, session_id: str, result: RefinementResult
+    ) -> None:
+        """Pop the Label Unknown Speakers dialog when refinement finds unknowns.
+
+        Show the Review Speakers button regardless so the user can revisit
+        the cluster mapping later. The transcript was already rewritten
+        with names (or `Speaker N` fallbacks for unknowns) by the
+        controller before this signal fired.
+        """
+        sv = self.window.session_view
+        # The session may have changed in the UI since refinement started.
+        # Only flip the Review button on if we're still on this session.
+        if sv._session is not None and sv._session.id == session_id:
+            sv.set_has_diarization(True)
+        if not result.has_unknown():
+            count = len(result.clusters)
+            if count > 0:
+                self.window.status(
+                    f"Identified {count} speaker(s); all matched the store.",
+                    timeout_ms=8000,
+                )
+            return
+        try:
+            self._launch_label_dialog(session_id, result)
+        except Exception:
+            log.exception("label dialog failed; users can still use Review Speakers")
+
+    def _launch_label_dialog(self, session_id: str, result: RefinementResult) -> None:
+        suggestions = self._suggestion_pool_for(session_id)
+        transcript_segments = self._read_transcript_segments(session_id)
+        entries = entries_from_refinement(
+            result,
+            transcript_segments,
+            suggestions=suggestions,
+            only_unknown=True,
+        )
+        if not entries:
+            return
+        session = self.store.get_session(session_id)
+        title = session.title if session else ""
+        dialog = SpeakerWalkerDialog(entries, mode="label", session_title=title, parent=self.window)
+        if dialog.exec() != SpeakerWalkerDialog.DialogCode.Accepted:
+            return
+        self._apply_walker_decisions(session_id, dialog.decisions(), transcript_segments)
+
+    def _on_review_speakers(self, session_id: str) -> None:
+        """Manual review walker. Reads diarization.json for the session."""
+        store = TranscriptStore(session_id)
+        data = load_diarization(store.session_dir)
+        if data is None:
+            QMessageBox.information(
+                self.window,
+                "Review Speakers",
+                "No speaker data is available for this session yet. "
+                "Speaker identification runs after a recording stops; "
+                "if you ran with the loopback channel off or with "
+                "speaker ID disabled in Settings, there's nothing to "
+                "review here.",
+            )
+            return
+        suggestions = self._suggestion_pool_for(session_id)
+        transcript_segments = self._read_transcript_segments(session_id)
+        entries = entries_from_persistence(
+            data,
+            transcript_segments,
+            suggestions=suggestions,
+            only_unknown=False,
+        )
+        if not entries:
+            QMessageBox.information(
+                self.window,
+                "Review Speakers",
+                "No detected speakers to review.",
+            )
+            return
+        session = self.store.get_session(session_id)
+        title = session.title if session else ""
+        dialog = SpeakerWalkerDialog(entries, mode="review", session_title=title, parent=self.window)
+        if dialog.exec() != SpeakerWalkerDialog.DialogCode.Accepted:
+            return
+        self._apply_walker_decisions(session_id, dialog.decisions(), transcript_segments)
+
+    def _apply_walker_decisions(
+        self,
+        session_id: str,
+        decisions: list[SpeakerWalkerDecision],
+        transcript_segments: list[TranscriptSegment],
+    ) -> None:
+        """Persist the user's labeling choices and rewrite the transcript.
+
+        Side effects:
+        - For each decision with a non-empty `name`:
+            - Update diarization.json: cluster.name = name
+            - Speaker store: add_sample(name, centroid) for the
+              running-average learning loop.
+        - For each decision flagged should_forget:
+            - Update diarization.json: cluster.name = None
+            - (We do NOT delete the speaker from the global store; that
+              is the Settings > Speakers job.)
+        - After all updates land, rewrite raw.transcript.md so any
+          rename / forget reflects in the on-disk file.
+        """
+        sdir = TranscriptStore(session_id).session_dir
+        speaker_store = open_speaker_store()
+        try:
+            for decision in decisions:
+                if decision.should_forget:
+                    update_cluster_name(sdir, decision.cluster_id, None)
+                    continue
+                if not decision.name:
+                    continue  # no change
+                update_cluster_name(sdir, decision.cluster_id, decision.name)
+                speaker_store.add_sample(decision.name, decision.centroid)
+        finally:
+            speaker_store.close()
+        self._rewrite_transcript_from_diarization(session_id, transcript_segments)
+        # If the UI is still on this session, refresh its transcript view.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            fresh = TranscriptStore(session_id).read_transcript()
+            sv.set_transcript_text(fresh)
+
+    def _rewrite_transcript_from_diarization(
+        self,
+        session_id: str,
+        transcript_segments: list[TranscriptSegment],
+    ) -> None:
+        """Re-apply diarization.json's cluster->name map to the transcript."""
+        store = TranscriptStore(session_id)
+        data = load_diarization(store.session_dir)
+        if data is None:
+            return
+        name_by_cluster = {c.cluster_id: c.name for c in data.clusters}
+        cluster_by_segment_index = {
+            s.segment_index: s.cluster_id for s in data.segments
+        }
+        labeled: list[TranscriptSegment] = []
+        for i, seg in enumerate(transcript_segments):
+            cluster_id = cluster_by_segment_index.get(i)
+            if cluster_id is None or seg.source != "sys":
+                labeled.append(seg)
+                continue
+            name = name_by_cluster.get(cluster_id)
+            if name:
+                new_seg = TranscriptSegment(
+                    source=seg.source,
+                    text=seg.text,
+                    t_start=seg.t_start,
+                    t_end=seg.t_end,
+                    is_provisional=seg.is_provisional,
+                    speaker_name=name,
+                )
+            else:
+                # Fall back to "Speaker N" so reverted clusters still
+                # render distinctly from the original "Them:" label.
+                new_seg = TranscriptSegment(
+                    source=seg.source,
+                    text=seg.text,
+                    t_start=seg.t_start,
+                    t_end=seg.t_end,
+                    is_provisional=seg.is_provisional,
+                    speaker_name=f"Speaker {cluster_id + 1}",
+                )
+            labeled.append(new_seg)
+        store.write_segments(labeled)
+
+    def _read_transcript_segments(self, session_id: str) -> list[TranscriptSegment]:
+        """Parse raw.transcript.md back into TranscriptSegments.
+
+        We don't persist segments structurally on disk (the markdown file
+        is the source of truth), so this re-parses on demand. The shape
+        is what the walker needs for example-line rendering and the
+        cluster->name rewrite path.
+        """
+        import re
+
+        store = TranscriptStore(session_id)
+        text = store.read_transcript()
+        segments: list[TranscriptSegment] = []
+        line_re = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\] ([^:]+): (.*)$")
+        for line in text.splitlines():
+            m = line_re.match(line)
+            if not m:
+                continue
+            h, mn, s, label, content = m.groups()
+            t_start = int(h) * 3600 + int(mn) * 60 + int(s)
+            # Source is mic if the label resolves to the user's name (or "Me");
+            # everything else is sys. The walker only cares about sys segments
+            # but we keep mic ones in the list to preserve indices.
+            user_label = (self.config.ui.user_name or "Me").strip()
+            source = "mic" if label.strip() in ("Me", user_label) else "sys"
+            speaker_name = None if source == "mic" or label.strip() == "Them" else label.strip()
+            segments.append(TranscriptSegment(
+                source=source,
+                text=content,
+                t_start=float(t_start),
+                t_end=float(t_start) + 1.0,  # approximation -- only used for ordering
+                is_provisional=False,
+                speaker_name=speaker_name,
+            ))
+        return segments
+
+    def _suggestion_pool_for(self, session_id: str) -> list[str]:
+        """Build the name suggestion pool for the walker combo box.
+
+        Pulls known speakers from the store plus attendees from the
+        session's live_notes.md. Empty if either source is empty.
+        """
+        store = TranscriptStore(session_id)
+        try:
+            live_notes = store.read_live_notes()
+        except OSError:
+            live_notes = ""
+        attendees = parse_attendees(live_notes) if live_notes else []
+        speaker_store = open_speaker_store()
+        try:
+            known = [s.name for s in speaker_store.list_all()]
+        finally:
+            speaker_store.close()
+        return gather_suggestions(known, attendees)
 
     def _on_copy_tab(self, session_id: str, tab_id: str) -> None:
         import pyperclip
