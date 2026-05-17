@@ -69,8 +69,17 @@ time you paste a new response, the prior `notes.md` is archived to
 
 ![New Session dialog](docs/screenshots/06-dialog-new-session.png)
 
-**Settings** -- model size, capture / refinement toggles, VAD, your
-name, theme, and a shortcut to the prompt-templates folder:
+**New Session pre-filled from an Outlook calendar invite** -- click the
+"Meeting starting" tray notification and the dialog opens with the
+meeting subject already entered; attendees + agenda land in My Notes
+when you accept:
+
+![New Session dialog (calendar pre-fill)](docs/screenshots/10-dialog-new-session-calendar-prefill.png)
+
+**Settings** -- model size, capture / refinement toggles, custom
+vocabulary, audio device picker, Outlook calendar watch, VAD, your
+name, theme, and a shortcut to the prompt-templates folder. The dialog
+scrolls if your screen is short:
 
 ![Settings dialog](docs/screenshots/07-dialog-settings.png)
 
@@ -104,9 +113,13 @@ hand-off.
 
 ## Status
 
-v0.1 alpha. Transcription works end-to-end; performance tuning is
-ongoing (the final refinement pass can take a while on CPU; see
-"Why transcription can take a while" below).
+v0.4 alpha. End-to-end capture + transcription + synthesis works;
+v0.4 adds calendar-aware capture (Outlook COM polling -> tray
+notification -> pre-filled New Session) plus custom vocabulary (global
+plus per-session hotwords from attendees + agenda) plus an explicit
+audio-device picker. Performance tuning is ongoing; the final
+refinement pass can take a while on CPU (see "Why transcription can
+take a while" below).
 
 The WASAPI loopback path is cribbed from
 [Danaor/WhisperType](https://github.com/Danaor/WhisperType).
@@ -284,6 +297,11 @@ these are also editable directly in `config.toml`.
 | Enable VAD | on | Trim silent stretches before Whisper decodes them. Saves CPU. Disable if it ever clips speech. |
 | VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. 250-2000 ms range. |
 | Theme | auto | UI theme. (Stub for v0.1; `auto` follows the OS.) |
+| Mic device | (System default) | Which input device to capture from. Persists by name so the same device is picked after replug or reboot. |
+| Loopback device | (System default) | Which WASAPI loopback device to capture system audio from. Windows-only. |
+| Custom vocabulary | (empty) | One phrase per line in `vocabulary.txt`. Biases the transcriber toward proper nouns and corporate terms it would otherwise mis-hear ("Plantronics", "EDAPA-737", "Snowflake Cortex"). Per-session hotwords are also auto-derived from your `# Attendees` block and the agenda body when present. |
+| Watch Outlook calendar | off | Poll Outlook for upcoming meetings and pop a tray notification a few minutes before each one starts. Click the notification to open New Session with the meeting subject, attendees, and agenda pre-filled. Recording is never started automatically. Windows + Outlook only. |
+| Notify within (min) | 5 | How far in advance to surface the calendar notification. |
 
 ### Why transcription can take a while (and what to do about it)
 
