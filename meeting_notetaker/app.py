@@ -133,6 +133,7 @@ class MainApp(QObject):
         sv.paste_notes_clicked.connect(self._on_paste_notes)
         sv.copy_tab_clicked.connect(self._on_copy_tab)
         sv.live_notes_changed.connect(self._on_live_notes_changed)
+        sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
 
         self.controller.state_changed.connect(self._on_session_state_changed)
@@ -284,6 +285,22 @@ class MainApp(QObject):
             TranscriptStore(session_id).save_live_notes(body)
         except OSError:
             log.exception("failed to save live notes for %s", session_id)
+
+    def _on_synthesis_notes_changed(self, session_id: str, body: str) -> None:
+        """Persist inline edits to the Synthesis tab.
+
+        archive_existing=False -- we're editing the current note in place,
+        not replacing it with a new one. The Paste Response Back flow
+        retains the original archiving behavior so each fresh synthesis
+        preserves the prior version under notes-YYYYMMDD-HHMM.md.
+        """
+        try:
+            TranscriptStore(session_id).save_notes(body, archive_existing=False)
+            session = self.store.get_session(session_id)
+            if session is not None and not session.has_notes and body.strip():
+                self.store.update_session(session_id, has_notes=True)
+        except OSError:
+            log.exception("failed to save synthesis notes for %s", session_id)
 
     def _on_copy_tab(self, session_id: str, tab_id: str) -> None:
         import pyperclip

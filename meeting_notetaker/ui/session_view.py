@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTabWidget,
-    QTextBrowser,
     QPlainTextEdit,
     QVBoxLayout,
     QWidget,
@@ -51,6 +50,11 @@ class SessionView(QWidget):
     copy_tab_clicked = pyqtSignal(str, str)        # session_id, tab_id
     retain_audio_toggled = pyqtSignal(str, bool)   # session_id, value
     live_notes_changed = pyqtSignal(str, str)      # session_id, body
+    # Emitted when the Synthesis tab body changes through inline editing
+    # (not via Paste Response Back). The controller writes notes.md
+    # without archiving on every save -- archiving only happens on the
+    # wholesale Paste-Response-Back replacement.
+    synthesis_notes_changed = pyqtSignal(str, str)  # session_id, body
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -64,6 +68,15 @@ class SessionView(QWidget):
         self._live_notes_save_timer.setInterval(800)
         self._live_notes_save_timer.timeout.connect(self._flush_live_notes)
         self._suppress_live_notes_signal = False
+        # Mirror of the above for the editable Synthesis tab. notes.md is
+        # the latest LLM synthesis (or the user's edit of it); save on
+        # debounce, no archive (Paste Response Back is the only path
+        # that archives the prior version).
+        self._notes_save_timer = QTimer(self)
+        self._notes_save_timer.setSingleShot(True)
+        self._notes_save_timer.setInterval(800)
+        self._notes_save_timer.timeout.connect(self._flush_notes)
+        self._suppress_notes_signal = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -156,8 +169,18 @@ class SessionView(QWidget):
         self._live_notes_editor.textChanged.connect(self._on_live_notes_changed)
         self._tabs.addTab(self._live_notes_editor, "My Notes")
 
-        self._notes_view = QTextBrowser(self)
-        self._notes_view.setOpenExternalLinks(True)
+        # Synthesis is editable (v0.5). Uses LiveNotesWidget for the same
+        # Markdown edit/preview toggle + image-paste affordances as the
+        # My Notes tab, with debounced save back to notes.md so tweaks
+        # to the LLM-generated note persist.
+        self._notes_view = LiveNotesWidget(self)
+        self._notes_view.setPlaceholderText(
+            "The LLM-generated synthesis lands here when you click Paste "
+            "Response Back. The tab is editable -- tweak the rendered "
+            "output before sharing. Click Edit to switch to the Markdown "
+            "source, Preview to read it back rendered. Saved continuously."
+        )
+        self._notes_view.textChanged.connect(self._on_notes_changed)
         self._tabs.addTab(self._notes_view, "Synthesis")
 
         self._previous_view = QPlainTextEdit(self)
@@ -181,10 +204,13 @@ class SessionView(QWidget):
         previous_notes_paths: list,
         live_notes: str = "",
     ) -> None:
-        # Flush any pending live-notes save before swapping out the editor.
+        # Flush any pending live-notes / synthesis save before swapping out.
         if self._live_notes_save_timer.isActive():
             self._live_notes_save_timer.stop()
             self._flush_live_notes()
+        if self._notes_save_timer.isActive():
+            self._notes_save_timer.stop()
+            self._flush_notes()
         self._session = session
         self._provisional_segments.clear()
         if session is None:
@@ -192,8 +218,8 @@ class SessionView(QWidget):
             self._state_label.setText("")
             self._raw_transcript_text = ""
             self._transcript_view.setPlainText("")
-            self._notes_view.setSearchPaths([])
-            self._notes_view.setMarkdown("")
+            self._notes_view.set_session_dir(None)
+            self._set_notes_text("")
             self._previous_view.setPlainText("")
             self._live_notes_editor.set_session_dir(None)
             self._set_live_notes_text("")
@@ -206,8 +232,12 @@ class SessionView(QWidget):
         self._raw_transcript_text = transcript
         self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
         sdir = session_dir(session.id)
-        self._notes_view.setSearchPaths([str(sdir)])
-        self._notes_view.setMarkdown(notes)
+        self._notes_view.set_session_dir(sdir)
+        self._set_notes_text(notes)
+        # Synthesis defaults to preview mode (read-first UX); the user can
+        # flip to Edit on demand. Empty body stays in edit so a fresh
+        # paste-back lands directly in the editable buffer.
+        self._notes_view.set_preview_mode(bool(notes.strip()))
         self._live_notes_editor.set_session_dir(sdir)
         self._set_live_notes_text(live_notes)
         self._retain_checkbox.setEnabled(True)
@@ -277,7 +307,16 @@ class SessionView(QWidget):
         )
 
     def set_notes_text(self, text: str) -> None:
-        self._notes_view.setMarkdown(text)
+        """Replace the Synthesis body. Used by Paste-Response-Back and reload.
+
+        Bypasses the debounce-and-emit path so this call doesn't trigger a
+        synthesis_notes_changed signal back to the controller -- only
+        user-typed edits should drive that save loop.
+        """
+        self._set_notes_text(text)
+        # Flip to preview mode when there's actually content to read,
+        # otherwise keep the editor focused (matching set_session).
+        self._notes_view.set_preview_mode(bool(text.strip()))
 
     def set_previous_notes(self, paths: list) -> None:
         self._previous_view.setPlainText(_summarize_previous(paths))
@@ -295,12 +334,38 @@ class SessionView(QWidget):
             self._live_notes_save_timer.stop()
             self._flush_live_notes()
 
+    def flush_pending_notes(self) -> None:
+        """Force any debounced synthesis-tab save to commit immediately."""
+        if self._notes_save_timer.isActive():
+            self._notes_save_timer.stop()
+            self._flush_notes()
+
     def _set_live_notes_text(self, text: str) -> None:
         self._suppress_live_notes_signal = True
         try:
             self._live_notes_editor.setPlainText(text)
         finally:
             self._suppress_live_notes_signal = False
+
+    def _set_notes_text(self, text: str) -> None:
+        self._suppress_notes_signal = True
+        try:
+            self._notes_view.setPlainText(text)
+        finally:
+            self._suppress_notes_signal = False
+
+    def _on_notes_changed(self) -> None:
+        if self._suppress_notes_signal:
+            return
+        if self._session is None:
+            return
+        self._notes_save_timer.start()
+
+    def _flush_notes(self) -> None:
+        if self._session is None:
+            return
+        body = self._notes_view.toPlainText()
+        self.synthesis_notes_changed.emit(self._session.id, body)
 
     def _on_live_notes_changed(self) -> None:
         if self._suppress_live_notes_signal:
@@ -369,7 +434,7 @@ class SessionView(QWidget):
         if tab_id == "live_notes":
             return self._live_notes_editor.toPlainText()
         if tab_id == "notes":
-            return self._notes_view.toMarkdown()
+            return self._notes_view.toPlainText()
         if tab_id == "previous":
             return self._previous_view.toPlainText()
         return ""
@@ -467,7 +532,7 @@ class SessionView(QWidget):
             markdown_source = self._live_notes_editor.toPlainText()
             tab_label = "My Notes"
         elif current is self._notes_view:
-            markdown_source = self._notes_view.toMarkdown()
+            markdown_source = self._notes_view.toPlainText()
             tab_label = "Synthesis"
         else:
             return None, ""
