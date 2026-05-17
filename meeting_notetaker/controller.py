@@ -39,6 +39,7 @@ from .transcription import model_manager
 from .transcription.worker import LiveTranscriptionWorker, batch_transcribe, interleave
 from .utils.config import Config
 from .utils.paths import session_audio_dir
+from .utils.vocabulary import join_hotwords, load_vocabulary
 
 
 log = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class _BatchTranscribeThread(QThread):
         vad_filter: bool,
         vad_min_silence_ms: int,
         beam_size: int = 5,
+        hotwords: str = "",
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -79,6 +81,7 @@ class _BatchTranscribeThread(QThread):
         self.vad_filter = vad_filter
         self.vad_min_silence_ms = vad_min_silence_ms
         self.beam_size = beam_size
+        self.hotwords = hotwords
 
     def run(self) -> None:
         try:
@@ -114,6 +117,7 @@ class _BatchTranscribeThread(QThread):
                         beam_size=self.beam_size,
                         vad_filter=self.vad_filter,
                         vad_min_silence_ms=self.vad_min_silence_ms,
+                        hotwords=self.hotwords,
                         progress=self.progress.emit,
                         on_progress_pct=on_pct,
                     ): src
@@ -150,6 +154,15 @@ class SessionController(QObject):
         self._mic_wav: Optional[Path] = None
         self._sys_wav: Optional[Path] = None
         self._batch_thread: Optional[_BatchTranscribeThread] = None
+        self._session_hotwords: str = ""
+
+    def _collect_hotwords(self, session: Session) -> str:
+        """Combine global vocabulary into a hotwords string.
+
+        Per-session derivation (attendees, calendar body) plugs in here in a
+        follow-up commit.
+        """
+        return join_hotwords(load_vocabulary())
 
     @property
     def active_session(self) -> Optional[Session]:
@@ -163,6 +176,7 @@ class SessionController(QObject):
             return
         self._active_session = session
         self._live_segments = []
+        hotwords = self._collect_hotwords(session)
         try:
             audio_dir = session_audio_dir(session.id)
             self._mic_wav = audio_dir / "mic.wav"
@@ -185,6 +199,7 @@ class SessionController(QObject):
                         model=model,
                         vad_filter=self.config.audio.vad_enabled,
                         vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
+                        hotwords=hotwords,
                     )
                     worker.chunk_done.connect(self._on_live_segment)
                     worker.error.connect(self.error.emit)
@@ -222,6 +237,7 @@ class SessionController(QObject):
                 self.status.emit("PyAudioWPatch not installed; recording mic only.")
 
             self._t_start_wall = time.monotonic()
+            self._session_hotwords = hotwords
             self.store.update_session(
                 session.id,
                 state=STATE_RECORDING,
@@ -342,6 +358,7 @@ class SessionController(QObject):
             vad_filter=self.config.audio.vad_enabled,
             vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
             beam_size=beam_size,
+            hotwords=self._session_hotwords,
         )
         self._batch_thread.progress.connect(self.status.emit)
         self._batch_thread.progress_pct.connect(

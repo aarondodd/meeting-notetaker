@@ -68,6 +68,10 @@ def config_path() -> Path:
     return app_data_dir() / "config.toml"
 
 
+def vocabulary_path() -> Path:
+    return app_data_dir() / "vocabulary.txt"
+
+
 def db_path() -> Path:
     return app_data_dir() / "sessions.db"
 

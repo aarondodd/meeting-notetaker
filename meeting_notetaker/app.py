@@ -37,6 +37,7 @@ from .utils.config import Config
 from .utils.icons import app_icon
 from .utils.paths import app_data_dir, log_path
 from .utils.single_instance import acquire as acquire_lock, release as release_lock
+from .utils.vocabulary import seed_vocabulary_file
 
 
 log = logging.getLogger("meeting_notetaker")
@@ -59,6 +60,7 @@ class MainApp(QObject):
         self.qt_app = qt_app
         self.config = Config.load()
         prompts_mod.seed_user_prompts()
+        seed_vocabulary_file()
         self.store = SessionStore()
         self.controller = SessionController(self.store, self.config, parent=self)
         self.window = MainWindow()

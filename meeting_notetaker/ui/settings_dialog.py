@@ -28,7 +28,8 @@ from PyQt6.QtGui import QDesktopServices
 
 from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
 from ..utils.config import Config, VALID_MODEL_SIZES, VALID_THEMES
-from ..utils.paths import prompts_dir
+from ..utils.paths import prompts_dir, vocabulary_path
+from ..utils.vocabulary import seed_vocabulary_file
 
 
 class SettingsDialog(QDialog):
@@ -94,6 +95,19 @@ class SettingsDialog(QDialog):
             "Skip refinement is on."
         )
         tx_form.addRow(self._fast_batch)
+
+        vocab_blurb = QLabel(
+            "Custom vocabulary biases the transcriber toward proper nouns and "
+            "corporate terms it would otherwise mis-hear (\"Plantronics\", "
+            "\"EDAPA-737\", \"Snowflake Cortex\"). One phrase per line; '#' is a "
+            "comment. Edits take effect on the next session.",
+            self,
+        )
+        vocab_blurb.setWordWrap(True)
+        tx_form.addRow(vocab_blurb)
+        self._open_vocab_btn = QPushButton("Open Vocabulary File", self)
+        self._open_vocab_btn.clicked.connect(self._open_vocabulary_file)
+        tx_form.addRow(self._open_vocab_btn)
         layout.addWidget(tx_group)
 
         # Audio group ------------------------------------------------------
@@ -229,6 +243,10 @@ class SettingsDialog(QDialog):
 
     def _open_prompts_folder(self) -> None:
         path = prompts_dir()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_vocabulary_file(self) -> None:
+        path = seed_vocabulary_file()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
