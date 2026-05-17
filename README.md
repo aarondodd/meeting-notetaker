@@ -323,16 +323,32 @@ delete the session.
 ## Updates
 
 The Help menu has **Check for Updates...** (manual) and **Upgrade...**
-(download + rebuild via pyinstaller). On startup the app also runs a
-silent weekly check against GitHub releases for
+(download + rebuild + install in place via pyinstaller). On startup
+the app also runs a silent weekly check against GitHub releases for
 `aarondodd/meeting-notetaker`; if a newer tag exists you'll see a
 prompt. Network failures or a restricted release feed degrade to
 silent no-op, so the check never blocks startup.
 
-The Upgrade flow downloads the release zipball, extracts it, and runs
-`build.ps1` (Windows) or `build.sh` (POSIX) -- the same script you'd
-run for a manual build. After it finishes, restart the app to pick up
-the new build.
+The Upgrade flow:
+
+1. Downloads the release zipball and extracts it to a temp dir.
+2. Runs `build.ps1` (Windows) or `build.sh` (POSIX) -- the same
+   script you would run for a manual build.
+3. Copies the freshly built `dist/meeting-notetaker.exe` over the
+   running executable. On Windows the running .exe cannot be
+   deleted, but NTFS does allow renaming it; the old binary is
+   renamed to `meeting-notetaker.exe.old` and the new one takes
+   the canonical name.
+4. Offers a **Restart now?** prompt. On Yes, the app launches the
+   new build as a detached subprocess and quits; on No, the user
+   keeps working and picks up the new build on the next manual
+   launch.
+5. On the next startup, the old `.exe.old` sibling is cleaned up
+   automatically.
+
+When running from source (dev mode), there's no installed .exe to
+replace -- the upgrade reports where the new `dist/meeting-notetaker`
+binary was written and leaves it to you.
 
 ## Settings
 

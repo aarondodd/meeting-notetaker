@@ -79,6 +79,17 @@ class MainApp(QObject):
         self._warn_if_store_python()
         self._apply_calendar_config()
         self._refresh_status_indicators()
+        # Clean up the .old file left over from a prior in-place upgrade.
+        # On Windows the previous .exe is renamed (not deleted) when the
+        # new one is installed; the rename succeeds while the app is
+        # running, but the unlink can only happen once the old binary
+        # is no longer loaded. The next launch is the natural cleanup
+        # point.
+        try:
+            if updater_mod.cleanup_old_exe():
+                log.info("Cleaned up stale .old executable from prior upgrade.")
+        except Exception:
+            log.exception("cleanup of stale .old exec failed")
 
         self.window.show()
         self.tray.set_state("idle")
@@ -610,6 +621,61 @@ class MainApp(QObject):
             parent=self.window,
         )
         dialog.exec()
+        ok, message = dialog.result_summary()
+        if not ok:
+            return
+        # Only offer Restart Now when we actually installed in place;
+        # in dev (non-frozen) the new build is in dist/ and the user
+        # has to move it manually, so a restart wouldn't pick up the
+        # new code.
+        if not updater_mod.is_frozen():
+            return
+        target = updater_mod.current_exe_path()
+        if target is None:
+            return
+        choice = QMessageBox.question(
+            self.window,
+            "Restart to finish upgrade",
+            "The upgrade is installed. Restart Meeting Notetaker now to "
+            "load the new build?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self._restart_app(target)
+
+    def _restart_app(self, exe_path) -> None:
+        """Launch the freshly installed exe and quit this process.
+
+        On Windows a detached subprocess survives the parent exit; the
+        new process opens its own window and re-acquires the single-
+        instance lock once this one releases it. POSIX doesn't have a
+        bundled .exe in this app's workflow, so the branch is included
+        for completeness but is essentially unused.
+        """
+        import subprocess
+        try:
+            kwargs = {}
+            if sys.platform.startswith("win"):
+                # DETACHED_PROCESS so the child doesn't inherit our
+                # console handles; CREATE_NEW_PROCESS_GROUP so a
+                # Ctrl-C in a parent terminal doesn't kill it.
+                kwargs["creationflags"] = (
+                    getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                )
+                kwargs["close_fds"] = True
+            subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent), **kwargs)
+        except OSError as exc:
+            log.exception("failed to launch new build at %s", exe_path)
+            QMessageBox.warning(
+                self.window,
+                "Restart failed",
+                f"Could not launch the new build:\n\n{exc}\n\n"
+                "Quit and start the app manually to pick up the new "
+                "version.",
+            )
+            return
+        self.qt_app.quit()
 
     # ---- environment warnings ---------------------------------------------
 

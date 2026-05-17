@@ -34,7 +34,7 @@ from ..models.transcript import (
     label_for,
     rewrite_user_label,
 )
-from ..utils.export import default_export_filename
+from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
 from .live_notes_widget import LiveNotesWidget
 
@@ -472,9 +472,29 @@ class SessionView(QWidget):
         else:
             return None, ""
 
+        # Parse the session's created_at into a datetime for the header.
+        # Falls through silently if the stored string is unparseable;
+        # the header just renders without the date.
+        session_when = None
+        if self._session.created_at:
+            from datetime import datetime
+            try:
+                session_when = datetime.fromisoformat(
+                    self._session.created_at.replace("Z", "+00:00")
+                )
+            except ValueError:
+                session_when = None
+
+        printable = build_print_markdown(
+            session_title=self._session.title,
+            tab_label=tab_label,
+            session_date=session_when,
+            body=markdown_source,
+        )
+
         sdir = session_dir(self._session.id)
         doc = PrintTextDocument(sdir, parent=self)
-        doc.setMarkdown(markdown_source)
+        doc.setMarkdown(printable)
         return doc, tab_label
 
     def _on_print(self) -> None:

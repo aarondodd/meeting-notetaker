@@ -235,3 +235,130 @@ def test_check_for_updates_returns_none_when_same(tmp_path: Path, monkeypatch):
         },
     )
     assert updater.check_for_updates(last_check_path=path) is None
+
+
+# --------- in-place install ---------------------------------------------------
+
+
+def test_is_frozen_false_normally(monkeypatch):
+    # The pytest interpreter is never pyinstaller-frozen.
+    monkeypatch.delattr(updater.sys, "frozen", raising=False)
+    assert updater.is_frozen() is False
+
+
+def test_is_frozen_true_when_attr_set(monkeypatch):
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    assert updater.is_frozen() is True
+
+
+def test_current_exe_path_none_when_not_frozen(monkeypatch):
+    monkeypatch.delattr(updater.sys, "frozen", raising=False)
+    assert updater.current_exe_path() is None
+
+
+def test_old_exe_path_appends_old_suffix(tmp_path: Path):
+    target = tmp_path / "meeting-notetaker.exe"
+    assert updater.old_exe_path(target) == tmp_path / "meeting-notetaker.exe.old"
+
+    posix_target = tmp_path / "meeting-notetaker"
+    assert updater.old_exe_path(posix_target) == tmp_path / "meeting-notetaker.old"
+
+
+def test_find_built_exe_in_dist(tmp_path: Path, monkeypatch):
+    # Simulate POSIX behavior for the binary name regardless of host.
+    monkeypatch.setattr(updater.platform, "system", lambda: "Linux")
+    (tmp_path / "dist").mkdir()
+    exe = tmp_path / "dist" / "meeting-notetaker"
+    exe.write_bytes(b"\x7fELF stub")
+    assert updater.find_built_exe(tmp_path) == exe
+
+
+def test_find_built_exe_in_wrapped_dir(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(updater.platform, "system", lambda: "Linux")
+    inner = tmp_path / "aarondodd-meeting-notetaker-abc1234"
+    (inner / "dist").mkdir(parents=True)
+    exe = inner / "dist" / "meeting-notetaker"
+    exe.write_bytes(b"stub")
+    # find_built_exe walks rglob; depth-limited search finds it.
+    assert updater.find_built_exe(tmp_path) == exe
+
+
+def test_find_built_exe_returns_none_when_missing(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(updater.platform, "system", lambda: "Linux")
+    assert updater.find_built_exe(tmp_path) is None
+
+
+def test_find_built_exe_windows_name(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(updater.platform, "system", lambda: "Windows")
+    (tmp_path / "dist").mkdir()
+    win_exe = tmp_path / "dist" / "meeting-notetaker.exe"
+    win_exe.write_bytes(b"MZ stub")
+    assert updater.find_built_exe(tmp_path) == win_exe
+
+
+def test_install_in_place_replaces_target(tmp_path: Path):
+    target = tmp_path / "meeting-notetaker"
+    target.write_bytes(b"OLD")
+    new_exe = tmp_path / "dist" / "meeting-notetaker"
+    new_exe.parent.mkdir()
+    new_exe.write_bytes(b"NEW")
+
+    ok, msg = updater.install_in_place(new_exe, target)
+    assert ok, msg
+    assert target.read_bytes() == b"NEW"
+    backup = updater.old_exe_path(target)
+    assert backup.exists()
+    assert backup.read_bytes() == b"OLD"
+
+
+def test_install_in_place_overwrites_leftover_backup(tmp_path: Path):
+    """A stale .old from a previous run should not block a new install."""
+    target = tmp_path / "meeting-notetaker"
+    target.write_bytes(b"CURRENT")
+    backup = updater.old_exe_path(target)
+    backup.write_bytes(b"STALE")
+    new_exe = tmp_path / "new"
+    new_exe.write_bytes(b"NEW")
+
+    ok, _msg = updater.install_in_place(new_exe, target)
+    assert ok
+    assert target.read_bytes() == b"NEW"
+    assert backup.read_bytes() == b"CURRENT"  # current was rotated in
+
+
+def test_install_in_place_missing_new_exe(tmp_path: Path):
+    target = tmp_path / "meeting-notetaker"
+    target.write_bytes(b"OLD")
+    ok, msg = updater.install_in_place(tmp_path / "does-not-exist", target)
+    assert not ok
+    assert "New executable not found" in msg
+    # Target untouched.
+    assert target.read_bytes() == b"OLD"
+
+
+def test_install_in_place_missing_target(tmp_path: Path):
+    new_exe = tmp_path / "new"
+    new_exe.write_bytes(b"NEW")
+    ok, msg = updater.install_in_place(new_exe, tmp_path / "missing-target")
+    assert not ok
+    assert "Target executable not found" in msg
+
+
+def test_cleanup_old_exe_removes_backup(tmp_path: Path):
+    target = tmp_path / "meeting-notetaker"
+    backup = updater.old_exe_path(target)
+    backup.write_bytes(b"stale")
+    assert updater.cleanup_old_exe(target) is True
+    assert not backup.exists()
+
+
+def test_cleanup_old_exe_returns_false_when_nothing_to_do(tmp_path: Path):
+    target = tmp_path / "meeting-notetaker"
+    assert updater.cleanup_old_exe(target) is False
+
+
+def test_cleanup_old_exe_skips_when_not_frozen(monkeypatch):
+    monkeypatch.delattr(updater.sys, "frozen", raising=False)
+    # No `target` arg -> uses current_exe_path() -> returns None when
+    # not frozen, so cleanup is a no-op.
+    assert updater.cleanup_old_exe() is False

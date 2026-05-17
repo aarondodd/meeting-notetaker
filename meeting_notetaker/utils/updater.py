@@ -7,7 +7,11 @@ On a successful check the latest release is fetched from:
 If the response tag_name parses to a higher version tuple than the
 bundled __version__, the offer is surfaced and -- on accept -- the
 source zipball is downloaded, extracted, and build.ps1 (Windows) or
-build.sh (POSIX) is invoked to drive pyinstaller.
+build.sh (POSIX) is invoked to drive pyinstaller. The freshly built
+executable is then copied over the currently running .exe via the
+NTFS rename-while-running trick: the old binary becomes <name>.old
+and the new one takes its place. A subsequent startup cleans the
+.old file up.
 
 Failures are deliberately swallowed and reported back as "no update
 available" rather than raising:
@@ -19,10 +23,12 @@ None of those should crash the host app.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -33,6 +39,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..version import __version__
 from .paths import app_data_dir
+
+
+log = logging.getLogger(__name__)
 
 
 CHECK_INTERVAL_DAYS = 7  # Weekly auto-check; same cadence as progman-py.
@@ -250,19 +259,158 @@ def run_build_script(
     return False, f"Build failed with exit code {process.returncode}\n\n{joined}"
 
 
+# --------- in-place install -------------------------------------------------
+
+
+def _exe_filename() -> str:
+    """Filename of the bundled executable for this platform."""
+    return "meeting-notetaker.exe" if platform.system() == "Windows" else "meeting-notetaker"
+
+
+def is_frozen() -> bool:
+    """True iff this Python is running from a pyinstaller bundle."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def current_exe_path() -> Optional[Path]:
+    """Path to the currently running bundled executable, or None.
+
+    Returns None when running from source (sys.executable would point
+    at the python interpreter), so callers can skip the in-place
+    install and surface a "your dev install built a fresh dist/" message
+    instead.
+    """
+    if not is_frozen():
+        return None
+    try:
+        path = Path(sys.executable)
+        if path.exists():
+            return path
+    except OSError:
+        return None
+    return None
+
+
+def find_built_exe(source_dir: Path) -> Optional[Path]:
+    """Locate the freshly built executable under source_dir/dist/.
+
+    Walks at most three levels deep so a zipball that wraps the project
+    in an extra folder still resolves. Returns the first match by name.
+    """
+    target_name = _exe_filename()
+    dist = source_dir / "dist"
+    if dist.exists():
+        direct = dist / target_name
+        if direct.exists():
+            return direct
+    for candidate in source_dir.rglob(target_name):
+        try:
+            depth = len(candidate.relative_to(source_dir).parts)
+        except ValueError:
+            continue
+        if depth <= 4 and candidate.is_file():
+            return candidate
+    return None
+
+
+def old_exe_path(target: Path) -> Path:
+    """Sibling path the running .exe gets renamed to during an install."""
+    return target.with_suffix(target.suffix + ".old")
+
+
+def install_in_place(new_exe: Path, target: Path) -> Tuple[bool, str]:
+    """Replace `target` with `new_exe` in place.
+
+    On Windows, the running .exe cannot be deleted while in use, but
+    NTFS does allow renaming it. The standard pattern is:
+
+      1. Move any leftover <target>.old out of the way.
+      2. Rename current target -> target.old (frees the canonical path).
+      3. Copy new_exe over target.
+      4. On next launch, cleanup_old_exe removes <target>.old.
+
+    Returns (ok, message). On failure, attempts to undo step 2 so the
+    running install isn't left in a half-replaced state.
+    """
+    new_exe = Path(new_exe)
+    target = Path(target)
+    if not new_exe.exists() or not new_exe.is_file():
+        return False, f"New executable not found at {new_exe}."
+    if not target.exists():
+        return False, f"Target executable not found at {target}."
+
+    backup = old_exe_path(target)
+    if backup.exists():
+        try:
+            backup.unlink()
+        except OSError:
+            # The previous .old is still locked (rare); leave it for
+            # the next launch's cleanup. Rename below will overwrite
+            # only if Python's os.rename allows it on this OS; otherwise
+            # we fall through and the rename fails cleanly.
+            pass
+
+    try:
+        os.rename(target, backup)
+    except OSError as exc:
+        return False, f"Could not rename current executable: {exc}"
+
+    try:
+        shutil.copy2(new_exe, target)
+    except OSError as exc:
+        # Try to roll back so the user is left with a working install.
+        try:
+            if not target.exists():
+                os.rename(backup, target)
+        except OSError:
+            pass
+        return False, f"Could not copy new executable into place: {exc}"
+
+    return True, f"Installed {new_exe.name} in place at {target}."
+
+
+def cleanup_old_exe(target: Optional[Path] = None) -> bool:
+    """Delete the .old sibling left by a previous install_in_place().
+
+    Returns True if a stale .old existed and was removed; False if
+    there was nothing to clean or the removal failed (we just retry on
+    the next launch).
+    """
+    if target is None:
+        current = current_exe_path()
+        if current is None:
+            return False
+        target = current
+    backup = old_exe_path(target)
+    if not backup.exists():
+        return False
+    try:
+        backup.unlink()
+        return True
+    except OSError:
+        log.debug("could not remove stale %s; will retry on next launch", backup)
+        return False
+
+
 def upgrade(
     *,
     owner: str = DEFAULT_GITHUB_OWNER,
     repo: str = DEFAULT_GITHUB_REPO,
     progress_callback: Optional[Callable[[str, str], None]] = None,
 ) -> Tuple[bool, str]:
-    """End-to-end upgrade: fetch -> verify -> download -> extract -> build.
+    """End-to-end upgrade: fetch -> verify -> download -> extract -> build -> install.
 
     progress_callback receives (stage, message) tuples; stages are:
-      'fetch', 'download', 'extract', 'build', 'build_output', 'done'.
-    The 'build_output' stage receives a line of stdout/stderr per call so
-    the UI can stream it into a text view; everything else is a status
-    update for a label.
+      'fetch', 'download', 'extract', 'build', 'build_output',
+      'install', 'done'.
+    The 'build_output' stage receives a line of stdout/stderr per call
+    so the UI can stream it into a text view; everything else is a
+    status update for a label.
+
+    When running from a pyinstaller bundle, the freshly built exe is
+    installed over the running one via install_in_place. When running
+    from source, the dist/ path is reported and the caller is expected
+    to copy the build out manually.
     """
     def notify(stage: str, message: str) -> None:
         if progress_callback:
@@ -301,5 +449,34 @@ def upgrade(
         if not ok:
             return False, f"Build failed:\n{build_output}"
 
+        # Locate the freshly built executable. The build script writes
+        # to <source_dir>/dist/<name>{,.exe}; if the zipball wrapped
+        # the project in an extra folder, find_built_exe walks down.
+        built = find_built_exe(source_dir)
+        if built is None:
+            return False, (
+                "Build succeeded but the new executable could not be found "
+                f"under {source_dir / 'dist'}."
+            )
+
+        target = current_exe_path()
+        if target is None:
+            # Running from source -- there's no installed exe to replace.
+            # Report where the new build is so the user can move it
+            # into place manually.
+            return True, (
+                f"Built {built.name} for {remote_version}, but this Python "
+                "process is running from source -- there is no installed "
+                "executable to replace.\n\nNew build: " + str(built)
+            )
+
+        notify("install", f"Installing {built.name} in place...")
+        ok_install, install_msg = install_in_place(built, target)
+        if not ok_install:
+            return False, install_msg + f"\n\nNew build is at: {built}"
+
     notify("done", f"Upgraded {__version__} -> {remote_version}.")
-    return True, f"Upgraded to {remote_version}. Restart the app to load the new build."
+    return True, (
+        f"Upgraded to {remote_version} in place at {target}.\n\n"
+        "Restart the app to load the new build."
+    )

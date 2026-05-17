@@ -2,8 +2,9 @@
 
 The bulk of the work happens at the UI layer (it owns the QTextDocument
 that carries the rendered Markdown). The pieces here are the pure-Python
-bits worth unit-testing without Qt: filename generation and the dialog
-filter strings.
+bits worth unit-testing without Qt: filename generation, the dialog
+filter strings, and the header that gets prepended to the printable
+Markdown so the PDF identifies what it is.
 """
 from __future__ import annotations
 
@@ -47,6 +48,42 @@ def default_export_filename(
     ext = extension if extension.startswith(".") else f".{extension}"
     stem = sanitize_filename_stem(f"{session_title} -- {tab_label} -- {when}")
     return f"{stem}{ext}"
+
+
+def build_print_markdown(
+    *,
+    session_title: str,
+    tab_label: str,
+    session_date: Optional[datetime],
+    body: str,
+) -> str:
+    """Prepend a title + metadata header to `body` for the printable doc.
+
+    The header gives the printed page / PDF a clear identity (session
+    title, which tab the content came from, the session's date). The
+    horizontal rule separates the header from the note content; we
+    insert a blank line before `body` so a leading `# Heading` in the
+    note doesn't get glued to the rule by the Markdown converter.
+    """
+    title = (session_title or "Untitled session").strip() or "Untitled session"
+    tab = (tab_label or "Notes").strip() or "Notes"
+    if session_date is not None:
+        try:
+            date_str = session_date.strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError):
+            date_str = ""
+    else:
+        date_str = ""
+
+    lines = [f"# {title} -- {tab}"]
+    if date_str:
+        lines.append("")
+        lines.append(f"*{date_str}*")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append(body or "")
+    return "\n".join(lines)
 
 
 def unique_export_path(target: Path) -> Path:
