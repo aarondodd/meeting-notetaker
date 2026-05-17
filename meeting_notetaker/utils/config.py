@@ -6,6 +6,8 @@ Schema (config.toml):
     retain_audio_default = false
     vad_enabled = true
     vad_min_silence_ms = 500
+    mic_device_name = ""               # empty -> system default; substring match
+    loopback_device_name = ""          # empty -> system default; substring match (Windows-only)
 
     [transcription]
     model_size = "small.en"
@@ -45,6 +47,8 @@ class AudioConfig:
     retain_audio_default: bool = False
     vad_enabled: bool = True
     vad_min_silence_ms: int = 500
+    mic_device_name: str = ""
+    loopback_device_name: str = ""
 
 
 @dataclass

@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
+from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
 from ..utils.config import Config, VALID_MODEL_SIZES, VALID_THEMES
 from ..utils.paths import prompts_dir
 
@@ -98,6 +99,37 @@ class SettingsDialog(QDialog):
         # Audio group ------------------------------------------------------
         audio_group = QGroupBox("Audio", self)
         audio_form = QFormLayout(audio_group)
+
+        self._mic_devices = list_input_devices()
+        self._mic_picker = QComboBox(self)
+        _populate_device_picker(
+            self._mic_picker, self._mic_devices, config.audio.mic_device_name
+        )
+        self._mic_picker.setToolTip(
+            "Microphone capture device. (System default) follows the OS-level "
+            "default, which is usually correct. Persists by name so the same "
+            "device is picked after replug or reboot."
+        )
+        audio_form.addRow("Mic device:", self._mic_picker)
+
+        self._loopback_devices = list_loopback_devices()
+        self._loopback_picker = QComboBox(self)
+        _populate_device_picker(
+            self._loopback_picker, self._loopback_devices, config.audio.loopback_device_name
+        )
+        if not self._loopback_devices:
+            # Not on Windows, or pyaudiowpatch missing -- nothing meaningful to pick.
+            self._loopback_picker.setEnabled(False)
+            self._loopback_picker.setToolTip(
+                "System-audio loopback is Windows-only (requires pyaudiowpatch). "
+                "Disabled on this platform."
+            )
+        else:
+            self._loopback_picker.setToolTip(
+                "System audio capture (WASAPI loopback). (System default) picks "
+                "the loopback paired with the OS default output."
+            )
+        audio_form.addRow("Loopback device:", self._loopback_picker)
 
         self._retain_default = QCheckBox(
             "Retain audio files after transcription (default for new sessions)", self
@@ -189,6 +221,8 @@ class SettingsDialog(QDialog):
         self._config.audio.retain_audio_default = self._retain_default.isChecked()
         self._config.audio.vad_enabled = self._vad_enabled.isChecked()
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()
+        self._config.audio.mic_device_name = self._mic_picker.currentData() or ""
+        self._config.audio.loopback_device_name = self._loopback_picker.currentData() or ""
         self._config.ui.theme = self._theme_picker.currentText()
         self._config.ui.user_name = self._user_name_edit.text().strip()
         self.accept()
@@ -196,3 +230,60 @@ class SettingsDialog(QDialog):
     def _open_prompts_folder(self) -> None:
         path = prompts_dir()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+
+def _populate_device_picker(
+    combo: QComboBox, devices: list[AudioDevice], saved_name: str
+) -> None:
+    """Fill the combobox with (System default) + each device. Selects saved_name.
+
+    If saved_name doesn't match any currently-available device, prepend a
+    "(saved: <name>) -- not currently connected" item so the user sees their
+    saved selection wasn't lost when they reopen Settings without the device
+    plugged in. Selecting another option overwrites it on accept.
+    """
+    combo.clear()
+    combo.addItem("(System default)", "")
+
+    saved = (saved_name or "").strip()
+    matched_index: int | None = None
+    saved_lower = saved.lower()
+    # Decide if the saved name matches an available device (matches the
+    # resolution policy in devices.resolve_device_index).
+    if saved:
+        for d in devices:
+            if d.name == saved:
+                matched_index = d.index
+                break
+        if matched_index is None:
+            for d in devices:
+                if d.name.lower() == saved_lower:
+                    matched_index = d.index
+                    break
+        if matched_index is None:
+            for d in devices:
+                if saved_lower in d.name.lower():
+                    matched_index = d.index
+                    break
+
+    for d in devices:
+        suffix = f"  [#{d.index}]"
+        combo.addItem(d.name + suffix, d.name)
+
+    if saved and matched_index is None:
+        combo.addItem(f"(saved: {saved}) -- not currently connected", saved)
+        combo.setCurrentIndex(combo.count() - 1)
+    elif saved:
+        # Select the entry whose userData matches the saved name (preferring
+        # exact device-name match if present, otherwise the substring one).
+        for i in range(combo.count()):
+            if combo.itemData(i) == saved:
+                combo.setCurrentIndex(i)
+                return
+        # Fall through: substring match -- select the first device whose name
+        # contains saved.
+        for i in range(1, combo.count()):
+            data = combo.itemData(i) or ""
+            if saved_lower in data.lower():
+                combo.setCurrentIndex(i)
+                return

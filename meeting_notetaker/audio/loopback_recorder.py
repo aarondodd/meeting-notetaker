@@ -44,12 +44,14 @@ class LoopbackRecorder(QObject):
         wav_path: Path,
         *,
         source_name: str = "sys",
+        device_name: str = "",
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self.chunk_buffer = chunk_buffer
         self.wav_path = Path(wav_path)
         self.source_name = source_name
+        self.device_name = device_name
         self._pa = None
         self._stream = None
         self._wf: Optional[wave.Wave_write] = None
@@ -68,14 +70,40 @@ class LoopbackRecorder(QObject):
             return False
 
     @staticmethod
-    def find_loopback_device():
-        """Return the default-output loopback device info dict, or None."""
+    def find_loopback_device(saved_name: str = ""):
+        """Return a loopback device info dict, or None.
+
+        If `saved_name` is set, prefer the loopback whose name matches
+        (exact, then case-insensitive substring). Otherwise return the
+        loopback paired with the system default output.
+        """
         try:
             import pyaudiowpatch as pyaudio
         except ImportError:
             return None
         pa = pyaudio.PyAudio()
         try:
+            if saved_name:
+                target = saved_name.strip()
+                target_lower = target.lower()
+                substring_match = None
+                for loopback in pa.get_loopback_device_info_generator():
+                    name = str(loopback.get("name", ""))
+                    if name == target:
+                        return loopback
+                    if substring_match is None and target_lower and target_lower in name.lower():
+                        substring_match = loopback
+                if substring_match is not None:
+                    log.info(
+                        "picked loopback device (substring match for saved %r): %s",
+                        saved_name, substring_match.get("name", "?"),
+                    )
+                    return substring_match
+                log.warning(
+                    "saved loopback device %r not found; falling back to default-output loopback",
+                    saved_name,
+                )
+
             wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
             default_speakers = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
             if default_speakers.get("isLoopbackDevice"):
@@ -97,7 +125,7 @@ class LoopbackRecorder(QObject):
 
     def start(self) -> None:
         import pyaudiowpatch as pyaudio
-        device = self.find_loopback_device()
+        device = self.find_loopback_device(saved_name=self.device_name)
         if device is None:
             raise LoopbackUnavailable("no WASAPI loopback device found for default output")
         self._native_rate = int(device["defaultSampleRate"])

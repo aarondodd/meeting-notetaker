@@ -193,7 +193,12 @@ class SessionController(QObject):
 
             # Mic recorder.
             from .audio.mic_recorder import MicRecorder
-            self._mic_recorder = MicRecorder(self._chunk_buffer, self._mic_wav, source_name=MIC)
+            self._mic_recorder = MicRecorder(
+                self._chunk_buffer,
+                self._mic_wav,
+                source_name=MIC,
+                device_name=self.config.audio.mic_device_name,
+            )
             self._mic_recorder.error.connect(self.error.emit)
             self._mic_recorder.start()
 
@@ -201,7 +206,10 @@ class SessionController(QObject):
             from .audio.loopback_recorder import LoopbackRecorder, LoopbackUnavailable
             if LoopbackRecorder.is_available():
                 self._loopback_recorder = LoopbackRecorder(
-                    self._chunk_buffer, self._sys_wav, source_name=SYS
+                    self._chunk_buffer,
+                    self._sys_wav,
+                    source_name=SYS,
+                    device_name=self.config.audio.loopback_device_name,
                 )
                 self._loopback_recorder.error.connect(self.error.emit)
                 try:

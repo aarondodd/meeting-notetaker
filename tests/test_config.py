@@ -52,3 +52,20 @@ def test_validate_rejects_bad_values(isolated_data_dir):
     assert any("model_size" in e for e in errors)
     assert any("theme" in e for e in errors)
     assert any("vad_min_silence_ms" in e for e in errors)
+
+
+def test_device_name_round_trip(isolated_data_dir):
+    cfg = Config()
+    cfg.audio.mic_device_name = "Headset Microphone (Plantronics Voyager)"
+    cfg.audio.loopback_device_name = "Speakers (Realtek(R) Audio) [Loopback]"
+    cfg.save()
+
+    loaded = Config.load()
+    assert loaded.audio.mic_device_name == "Headset Microphone (Plantronics Voyager)"
+    assert loaded.audio.loopback_device_name == "Speakers (Realtek(R) Audio) [Loopback]"
+
+
+def test_device_name_defaults_to_empty(isolated_data_dir):
+    cfg = Config()
+    assert cfg.audio.mic_device_name == ""
+    assert cfg.audio.loopback_device_name == ""
