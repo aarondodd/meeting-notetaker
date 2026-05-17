@@ -88,12 +88,23 @@ def record_version_check(
 
 
 def parse_version(version_str: str) -> Optional[Tuple[int, ...]]:
-    """Parse 'v1.2.3' or '1.2.3' into (1, 2, 3). Returns None on failure."""
+    """Parse 'v1.2.3' or '1.2.3[-pre]' into (1, 2, 3). Returns None on failure.
+
+    Strips a leading 'v' and any pre-release suffix (anything after the
+    first '-'), so '0.5.0-dev' parses the same as '0.5.0'. Pre-release
+    builds therefore compare equal to their final release, which is
+    appropriate for the update-check use case: an in-place upgrade from
+    a -dev build to the published x.y.z should still trigger.
+    """
     if not version_str:
         return None
     cleaned = version_str.strip()
     if cleaned.startswith(("v", "V")):
         cleaned = cleaned[1:]
+    # Drop pre-release suffix ('-dev', '-rc1', '+build42', etc.).
+    for sep in ("-", "+"):
+        if sep in cleaned:
+            cleaned = cleaned.split(sep, 1)[0]
     try:
         return tuple(int(part) for part in cleaned.split("."))
     except (ValueError, AttributeError):

@@ -1,0 +1,288 @@
+"""End-to-end post-meeting speaker-identification pass.
+
+Composes segmenter + embedder + clusterer + store into one entry point:
+
+    result = refine_loopback(
+        wav_path=session_dir/'audio'/'sys.wav',
+        transcript_segments=[...TranscriptSegment, sys-source only...],
+        speaker_store=open_speaker_store(),
+        encoder=default_encoder,
+    )
+
+`result` carries the segment-by-segment speaker assignments and a list of
+unknown clusters the UI can prompt the user to label. The caller (the
+controller) rewrites raw.transcript.md from the labelled segments and
+calls the Label Unknown Speakers dialog for any unmatched clusters.
+
+This module is pure-Python; the encoder is the only Resemblyzer dependency
+and it's pluggable (anything with an `embed_turn(turn) -> np.ndarray`
+method works, which is what tests use).
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Protocol
+
+import numpy as np
+
+from .cluster import ClusterAssignment, cluster_segments, compute_centroid, cosine_similarity
+from .segmenter import Turn, find_turns_in_wav
+from .store import MatchResult, SpeakerStore
+
+
+log = logging.getLogger(__name__)
+
+
+class Embedder(Protocol):
+    """Anything that can turn a Turn into a fixed-length vector."""
+
+    def embed_turn(self, turn: Turn) -> np.ndarray: ...
+
+
+@dataclass
+class ClusterSummary:
+    """One detected anonymous speaker cluster.
+
+    `name` is None for unmatched clusters (UI must prompt the user) and
+    set to the matched speaker's name for known clusters.
+    `match_similarity` is the cosine similarity of the best match, or
+    None if no match exceeded threshold.
+    `turn_indices` indexes into the refinement's `turns` list -- handy
+    for the UI to pull a sample audio clip from any turn.
+    """
+
+    cluster_id: int
+    centroid: np.ndarray
+    turn_indices: list[int]
+    name: Optional[str] = None
+    match_similarity: Optional[float] = None
+
+
+@dataclass
+class SegmentLabel:
+    """Per-transcript-segment speaker assignment.
+
+    `segment_index` is the position of the segment in the input list
+    (interleaved or sys-only -- the caller decides). `cluster_id` is
+    None when no diarization turn overlaps the segment (e.g. very
+    short utterances filtered out by the segmenter). `name` mirrors
+    the cluster's name at refinement time.
+    """
+
+    segment_index: int
+    cluster_id: Optional[int]
+    name: Optional[str]
+    confidence: Optional[float]
+
+
+@dataclass
+class RefinementResult:
+    turns: list[Turn]
+    clusters: list[ClusterSummary]
+    segment_labels: list[SegmentLabel]
+    # Convenience for the UI: quick lookup of which clusters need labeling.
+    unknown_cluster_ids: list[int] = field(default_factory=list)
+
+    def has_unknown(self) -> bool:
+        return bool(self.unknown_cluster_ids)
+
+
+def refine_loopback(
+    wav_path: Path,
+    transcript_segments,
+    *,
+    speaker_store: SpeakerStore,
+    encoder: Embedder,
+    sys_source: str = "sys",
+    match_threshold: float = 0.75,
+    merge_threshold: float = 0.75,
+    min_overlap_sec: float = 0.25,
+) -> RefinementResult:
+    """Run the full pipeline.
+
+    Returns a RefinementResult with per-segment labels and per-cluster
+    summaries. Only segments whose `source` equals `sys_source` get
+    labels (mic = self, no clustering needed).
+
+    The caller is responsible for any side effects (rewriting
+    raw.transcript.md, persisting decisions, prompting the user for
+    unknown-cluster names). This function does not mutate the store.
+    """
+    turns = find_turns_in_wav(Path(wav_path))
+    if not turns:
+        log.info("refiner: no turns detected in %s; nothing to label", wav_path)
+        return _empty_result(transcript_segments)
+
+    embeddings: list[np.ndarray] = []
+    for t in turns:
+        embeddings.append(np.asarray(encoder.embed_turn(t), dtype=np.float32))
+
+    assignment = cluster_segments(embeddings, merge_threshold=merge_threshold)
+    clusters = _summarize_clusters(assignment, turns, speaker_store, match_threshold)
+    segment_labels = _label_transcript_segments(
+        transcript_segments,
+        turns,
+        assignment,
+        clusters,
+        sys_source=sys_source,
+        min_overlap_sec=min_overlap_sec,
+    )
+    unknown_ids = [c.cluster_id for c in clusters if c.name is None]
+    return RefinementResult(
+        turns=turns,
+        clusters=clusters,
+        segment_labels=segment_labels,
+        unknown_cluster_ids=unknown_ids,
+    )
+
+
+def _empty_result(transcript_segments) -> RefinementResult:
+    return RefinementResult(
+        turns=[],
+        clusters=[],
+        segment_labels=[
+            SegmentLabel(segment_index=i, cluster_id=None, name=None, confidence=None)
+            for i, _ in enumerate(transcript_segments)
+        ],
+        unknown_cluster_ids=[],
+    )
+
+
+def _summarize_clusters(
+    assignment: ClusterAssignment,
+    turns: list[Turn],
+    store: SpeakerStore,
+    match_threshold: float,
+) -> list[ClusterSummary]:
+    summaries: list[ClusterSummary] = []
+    for cid in range(assignment.cluster_count()):
+        members = assignment.segments_for(cid)
+        centroid = assignment.centroids[cid]
+        match = store.match(centroid, threshold=match_threshold)
+        summary = ClusterSummary(
+            cluster_id=cid,
+            centroid=centroid,
+            turn_indices=members,
+            name=match.speaker.name if match else None,
+            match_similarity=match.similarity if match else None,
+        )
+        summaries.append(summary)
+    return summaries
+
+
+def _label_transcript_segments(
+    transcript_segments,
+    turns: list[Turn],
+    assignment: ClusterAssignment,
+    clusters: list[ClusterSummary],
+    *,
+    sys_source: str,
+    min_overlap_sec: float,
+) -> list[SegmentLabel]:
+    """For each transcript segment, pick the cluster with maximum time overlap.
+
+    Skips mic-source segments (those keep the user's name from the existing
+    rewrite_user_label pipeline). For sys-source segments, sums total
+    overlap per cluster across all member turns. The cluster with the
+    largest overlap wins, provided the overlap exceeds `min_overlap_sec`
+    (avoids spurious assignment from tiny turn-boundary intersections).
+    """
+    cluster_by_id = {c.cluster_id: c for c in clusters}
+    labels: list[SegmentLabel] = []
+    for i, seg in enumerate(transcript_segments):
+        if getattr(seg, "source", None) != sys_source:
+            labels.append(SegmentLabel(
+                segment_index=i,
+                cluster_id=None,
+                name=None,
+                confidence=None,
+            ))
+            continue
+        seg_start = float(seg.t_start)
+        seg_end = float(seg.t_end)
+        # Sum overlap per cluster.
+        overlaps: dict[int, float] = {}
+        for turn_idx, turn in enumerate(turns):
+            cluster_id = assignment.labels[turn_idx]
+            overlap = _interval_overlap(seg_start, seg_end, turn.t_start, turn.t_end)
+            if overlap > 0:
+                overlaps[cluster_id] = overlaps.get(cluster_id, 0.0) + overlap
+        if not overlaps:
+            labels.append(SegmentLabel(
+                segment_index=i,
+                cluster_id=None,
+                name=None,
+                confidence=None,
+            ))
+            continue
+        best_cluster_id = max(overlaps, key=overlaps.get)
+        best_overlap = overlaps[best_cluster_id]
+        if best_overlap < min_overlap_sec:
+            labels.append(SegmentLabel(
+                segment_index=i,
+                cluster_id=None,
+                name=None,
+                confidence=None,
+            ))
+            continue
+        summary = cluster_by_id[best_cluster_id]
+        labels.append(SegmentLabel(
+            segment_index=i,
+            cluster_id=best_cluster_id,
+            name=summary.name,
+            confidence=summary.match_similarity,
+        ))
+    return labels
+
+
+def _interval_overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def apply_labels_to_segments(
+    transcript_segments,
+    segment_labels: list[SegmentLabel],
+    *,
+    fallback_template: str = "Speaker {cid}",
+) -> list:
+    """Return a new list of TranscriptSegments with `speaker_name` set.
+
+    Mic-source segments are returned unchanged (the existing user-name
+    rewrite pipeline owns those). Sys-source segments get `speaker_name`
+    set to the matched name, or to `Speaker N` for unknown clusters that
+    the user hasn't labeled yet. Source channel ("sys") is preserved so
+    downstream code can still tell mic from system audio.
+    """
+    out = []
+    label_by_index = {lbl.segment_index: lbl for lbl in segment_labels}
+    for i, seg in enumerate(transcript_segments):
+        label = label_by_index.get(i)
+        if label is None or label.cluster_id is None:
+            out.append(seg)
+            continue
+        speaker_name = label.name or fallback_template.format(cid=label.cluster_id + 1)
+        out.append(_with_speaker(seg, speaker_name))
+    return out
+
+
+def _with_speaker(seg, speaker_name: str):
+    """Return a copy of `seg` with `speaker_name` set.
+
+    Uses dataclasses.replace when available; falls back to a manual
+    rebuild so the refiner can accept simple SimpleNamespace test doubles.
+    """
+    try:
+        from dataclasses import replace as dc_replace
+        return dc_replace(seg, speaker_name=speaker_name)
+    except TypeError:
+        clone = type(seg)(
+            source=seg.source,
+            text=seg.text,
+            t_start=seg.t_start,
+            t_end=seg.t_end,
+            is_provisional=getattr(seg, "is_provisional", False),
+            speaker_name=speaker_name,
+        )
+        return clone
