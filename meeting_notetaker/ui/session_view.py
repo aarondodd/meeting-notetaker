@@ -33,6 +33,7 @@ from ..models.transcript import (
     label_for,
     rewrite_user_label,
 )
+from ..utils.paths import session_dir
 from .live_notes_widget import LiveNotesWidget
 
 
@@ -166,8 +167,10 @@ class SessionView(QWidget):
             self._state_label.setText("")
             self._raw_transcript_text = ""
             self._transcript_view.setPlainText("")
+            self._notes_view.setSearchPaths([])
             self._notes_view.setMarkdown("")
             self._previous_view.setPlainText("")
+            self._live_notes_editor.set_session_dir(None)
             self._set_live_notes_text("")
             self._retain_checkbox.setChecked(False)
             self._retain_checkbox.setEnabled(False)
@@ -177,7 +180,10 @@ class SessionView(QWidget):
         self._state_label.setText(_pretty_state(session.state))
         self._raw_transcript_text = transcript
         self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
+        sdir = session_dir(session.id)
+        self._notes_view.setSearchPaths([str(sdir)])
         self._notes_view.setMarkdown(notes)
+        self._live_notes_editor.set_session_dir(sdir)
         self._set_live_notes_text(live_notes)
         self._retain_checkbox.setEnabled(True)
         self._retain_checkbox.blockSignals(True)

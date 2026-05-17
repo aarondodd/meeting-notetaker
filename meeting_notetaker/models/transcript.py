@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
+from ..utils.images import images_subdir
 from ..utils.live_notes import seed_body as live_notes_seed_body
 from ..utils.paths import session_dir
 
@@ -100,6 +101,16 @@ class TranscriptStore:
         self.live_notes_path = self.session_dir / "live_notes.md"
         self.notes_path = self.session_dir / "notes.md"
         self.metadata_path = self.session_dir / "metadata.json"
+
+    @property
+    def images_dir(self) -> Path:
+        """Session-local folder for images pasted/inserted into notes.
+
+        Markdown references in live_notes.md / notes.md point at this
+        directory using the relative path 'images/<filename>'. Created
+        on first access so callers can pass it straight to save helpers.
+        """
+        return images_subdir(self.session_dir)
 
     # ---- transcript ----
     def append_segments(self, segments: Iterable[TranscriptSegment]) -> None:
