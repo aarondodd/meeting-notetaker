@@ -41,10 +41,19 @@ the example below); the other side of the call is labeled `Them`.
 
 ![Main window -- Transcript tab](docs/screenshots/01-main-transcript.png)
 
+The session list has two narrow indicator columns to the left of each
+title: a speaker icon if the audio recording is still on disk, and a
+state dot (red while recording, yellow while the post-Stop refinement
+pass is running, green when refined). Hover any cell to see what that
+column conveys.
+
 **My Notes -- your running buffer alongside the transcript.** Markdown
 source with a small formatting toolbar. Sections (`# Attendees / # Agenda
 / # Notes / # Action Items`) auto-seed on first open. Everything you
 type auto-saves continuously and is fed back into the synthesis prompt.
+Paste an image from the clipboard (or click **Image** in the toolbar to
+insert a file) and the app copies it into the session's `images/` folder
+and inserts a Markdown reference -- ideal for screenshares.
 
 ![Main window -- My Notes (edit mode)](docs/screenshots/02-main-my-notes-edit.png)
 
@@ -54,6 +63,13 @@ Click **Preview** in the toolbar to render the Markdown source in place:
 
 **Synthesis -- the response from your chatbot, rendered as Markdown.**
 Populated after you click *Paste Response Back* with the LLM's reply.
+The **Print...** button above the tabs sends the active tab to a
+physical printer. For a PDF copy use **Export PDF...** -- it writes a
+PDF directly via Qt's PDF backend, which preserves images and
+clickable links (the Windows "Print to PDF" driver rasterizes both
+away). The **Copy** button copies whichever tab is currently active
+(its label updates to match: "Copy Transcript", "Copy My Notes",
+"Copy Synthesis").
 
 ![Main window -- Synthesis tab](docs/screenshots/04-main-synthesis.png)
 
@@ -65,12 +81,31 @@ time you paste a new response, the prior `notes.md` is archived to
 
 ### Dialogs
 
-**New Session** -- title plus a per-session "Keep recording" override:
+**New Session** -- title plus a per-session "Keep recording" override.
+When Outlook is reachable, a **Pick from Calendar...** button appears so
+you can pre-create a session for an upcoming meeting:
 
 ![New Session dialog](docs/screenshots/06-dialog-new-session.png)
 
-**Settings** -- model size, capture / refinement toggles, VAD, your
-name, theme, and a shortcut to the prompt-templates folder:
+**Pick from Calendar** -- lists today's remaining meetings; select one
+to pre-fill the session title (still editable) and queue the attendees
++ agenda for the new session's My Notes:
+
+![Calendar picker](docs/screenshots/11-dialog-calendar-picker.png)
+
+**New Session pre-filled from an Outlook calendar invite** -- click the
+"Meeting starting" tray notification and the dialog opens with the
+meeting subject already entered; attendees + agenda land in My Notes
+when you accept:
+
+![New Session dialog (calendar pre-fill)](docs/screenshots/10-dialog-new-session-calendar-prefill.png)
+
+**Settings** -- model size, capture / refinement toggles, custom
+vocabulary, audio device picker, Outlook calendar watch, VAD, your
+name, and a shortcut to the prompt-templates folder. The dialog
+scrolls if your screen is short. The interface follows the OS
+dark/light setting automatically -- there is no separate theme
+picker.
 
 ![Settings dialog](docs/screenshots/07-dialog-settings.png)
 
@@ -104,9 +139,21 @@ hand-off.
 
 ## Status
 
-v0.1 alpha. Transcription works end-to-end; performance tuning is
-ongoing (the final refinement pass can take a while on CPU; see
-"Why transcription can take a while" below).
+v0.4 alpha. End-to-end capture + transcription + synthesis works;
+v0.4 adds calendar-aware capture (Outlook COM polling -> tray
+notification -> pre-filled New Session) plus custom vocabulary (global
+plus per-session hotwords from attendees + agenda) plus an explicit
+audio-device picker, image paste / insert into My Notes, native PDF
+export (Print for paper; Export PDF for files; both preserve images
+and links), a "Copy" button that always copies the active tab, a
+non-modal log viewer (Help > View Log), an Outlook reachability
+diagnostic (Help > Diagnose Outlook), a permanent status bar at the
+bottom showing input device + system-audio device + calendar state,
+and a weekly GitHub-releases update check (Help > Check for
+Updates...). The interface follows the OS dark/light setting
+automatically. Performance tuning is ongoing; the final refinement
+pass can take a while on CPU (see "Why transcription can take a
+while" below).
 
 The WASAPI loopback path is cribbed from
 [Danaor/WhisperType](https://github.com/Danaor/WhisperType).
@@ -188,9 +235,12 @@ The Whisper model itself is downloaded on first run into
    Response Back...**, paste, save. The Synthesis tab now shows the
    rendered response. If a prior notes file existed it is auto-archived
    as `notes-YYYYMMDD-HHMM.md` and shown under the Previous Notes tab.
-10. Click **Copy Notes to Clipboard** any time after step 9 to grab the
-    raw Markdown -- ready to paste into whichever note-taking app you
-    use long-term.
+10. Click **Copy** any time to grab the active tab's contents in raw
+    text form (Transcript / My Notes / Synthesis / Previous Notes).
+    The button label updates to match the active tab.
+11. Click **Print...** to print whichever of My Notes / Synthesis is
+    active, or **Export PDF...** to save a PDF that keeps images
+    embedded and Markdown links clickable.
 
 ### Taking notes in parallel (the My Notes tab)
 
@@ -266,7 +316,39 @@ delete the session.
       metadata.json
       audio\                     # mic.wav + sys.wav (deleted after transcription
                                  # unless 'Keep audio' was set for the session)
+    images\                    # images pasted/inserted into live_notes.md
+                               # or notes.md (referenced as images/<name>)
 ```
+
+## Updates
+
+The Help menu has **Check for Updates...** (manual) and **Upgrade...**
+(download + rebuild + install in place via pyinstaller). On startup
+the app also runs a silent weekly check against GitHub releases for
+`aarondodd/meeting-notetaker`; if a newer tag exists you'll see a
+prompt. Network failures or a restricted release feed degrade to
+silent no-op, so the check never blocks startup.
+
+The Upgrade flow:
+
+1. Downloads the release zipball and extracts it to a temp dir.
+2. Runs `build.ps1` (Windows) or `build.sh` (POSIX) -- the same
+   script you would run for a manual build.
+3. Copies the freshly built `dist/meeting-notetaker.exe` over the
+   running executable. On Windows the running .exe cannot be
+   deleted, but NTFS does allow renaming it; the old binary is
+   renamed to `meeting-notetaker.exe.old` and the new one takes
+   the canonical name.
+4. Offers a **Restart now?** prompt. On Yes, the app launches the
+   new build as a detached subprocess and quits; on No, the user
+   keeps working and picks up the new build on the next manual
+   launch.
+5. On the next startup, the old `.exe.old` sibling is cleaned up
+   automatically.
+
+When running from source (dev mode), there's no installed .exe to
+replace -- the upgrade reports where the new `dist/meeting-notetaker`
+binary was written and leaves it to you.
 
 ## Settings
 
@@ -283,7 +365,11 @@ these are also editable directly in `config.toml`.
 | Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. Per-session override stays available. |
 | Enable VAD | on | Trim silent stretches before Whisper decodes them. Saves CPU. Disable if it ever clips speech. |
 | VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. 250-2000 ms range. |
-| Theme | auto | UI theme. (Stub for v0.1; `auto` follows the OS.) |
+| Mic device | (System default) | Which input device to capture from. Persists by name so the same device is picked after replug or reboot. |
+| Loopback device | (System default) | Which WASAPI loopback device to capture system audio from. Windows-only. |
+| Custom vocabulary | (empty) | One phrase per line in `vocabulary.txt`. Biases the transcriber toward proper nouns and corporate terms it would otherwise mis-hear ("Plantronics", "EDAPA-737", "Snowflake Cortex"). Per-session hotwords are also auto-derived from your `# Attendees` block and the agenda body when present. |
+| Watch Outlook calendar | off | Poll Outlook for upcoming meetings and pop a tray notification a few minutes before each one starts. Click the notification to open New Session with the meeting subject, attendees, and agenda pre-filled. Recording is never started automatically. Windows + Outlook only. |
+| Notify within (min) | 5 | How far in advance to surface the calendar notification. |
 
 ### Why transcription can take a while (and what to do about it)
 

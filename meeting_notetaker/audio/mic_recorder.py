@@ -36,12 +36,14 @@ class MicRecorder(QObject):
         wav_path: Path,
         *,
         source_name: str = "mic",
+        device_name: str = "",
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self.chunk_buffer = chunk_buffer
         self.wav_path = Path(wav_path)
         self.source_name = source_name
+        self.device_name = device_name
         self._pa = None
         self._stream = None
         self._wf: Optional[wave.Wave_write] = None
@@ -63,7 +65,7 @@ class MicRecorder(QObject):
     def start(self) -> None:
         import pyaudio  # local import; PortAudio dep
         self._pa = pyaudio.PyAudio()
-        device_index, info = _pick_input_device(self._pa)
+        device_index, info = _pick_input_device(self._pa, saved_name=self.device_name)
         self._device_index = device_index
         self._native_rate = int(info.get("defaultSampleRate", 16000)) or 16000
         # Force mono on the mic side. Whisper does not benefit from stereo
@@ -176,17 +178,45 @@ def list_all_devices(pa) -> list[dict]:
     return out
 
 
-def _pick_input_device(pa) -> tuple[Optional[int], dict]:
+def _pick_input_device(pa, saved_name: str = "") -> tuple[Optional[int], dict]:
     """Choose an input device. Returns (device_index_or_None, device_info).
 
-    PyAudio's `get_default_input_device_info()` is unreliable on Windows --
-    it often raises 'No Default Input Device Available' even when working
-    input devices exist (especially when MME is the active host API but the
-    user's default is WASAPI). We fall back to enumerating all devices and
-    prefer the first WASAPI input, then any input, then a helpful error.
+    If `saved_name` is set and matches an available device (exact, then
+    case-insensitive substring), use it. Otherwise fall back to:
+    PyAudio's `get_default_input_device_info()` (often unreliable on
+    Windows -- raises 'No Default Input Device Available' even when working
+    input devices exist), then enumerate and prefer the first WASAPI input,
+    then any input, then a helpful error.
     """
     import pyaudio
     import sys
+
+    if saved_name:
+        target = saved_name.strip()
+        target_lower = target.lower()
+        # Exact, then case-insensitive substring across all input-capable devices.
+        substring_match: Optional[tuple[int, dict]] = None
+        for i in range(pa.get_device_count()):
+            try:
+                d = pa.get_device_info_by_index(i)
+            except Exception:
+                continue
+            if int(d.get("maxInputChannels") or 0) <= 0:
+                continue
+            name = str(d.get("name", ""))
+            if name == target:
+                log.info("picked saved input device #%d: %s", i, name)
+                return i, d
+            if substring_match is None and target_lower and target_lower in name.lower():
+                substring_match = (i, d)
+        if substring_match is not None:
+            idx, d = substring_match
+            log.info(
+                "picked input device #%d: %s (substring match for saved %r)",
+                idx, d.get("name", "?"), saved_name,
+            )
+            return idx, d
+        log.warning("saved input device %r not found; falling back to default", saved_name)
 
     try:
         info = pa.get_default_input_device_info()

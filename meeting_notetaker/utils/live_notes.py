@@ -43,6 +43,32 @@ def seed_body() -> str:
     return LIVE_NOTES_TEMPLATE
 
 
+def seed_body_with_calendar(
+    *,
+    attendees: list[str] | None = None,
+    agenda: str = "",
+) -> str:
+    """Pre-fill the live-notes template with calendar-derived content.
+
+    Used when a session is created via the Outlook calendar imminent-meeting
+    flow. `attendees` populates the bulleted list under '# Attendees';
+    `agenda` is dropped verbatim under '# Agenda' so the user keeps the
+    Outlook invite text for reference.
+    """
+    names = [n for n in (attendees or []) if n]
+    if names:
+        attendee_block = "\n".join(f"- {n}" for n in names)
+    else:
+        attendee_block = "-\x20"
+    agenda_block = (agenda or "").strip()
+    return (
+        f"# Attendees\n{attendee_block}\n\n"
+        f"# Agenda\n{agenda_block}\n\n"
+        f"# Notes\n\n"
+        f"# Action Items\n"
+    )
+
+
 def parse_attendees(body: str) -> list[str]:
     """Extract attendee names from the bulleted list under '# Attendees'.
 
@@ -114,3 +140,27 @@ def has_user_content(body: str) -> bool:
     if not stripped:
         return False
     return stripped != LIVE_NOTES_TEMPLATE.strip()
+
+
+def extract_section(body: str, heading: str) -> str:
+    """Return the text under the matching '# Heading' (case-insensitive).
+
+    Stops at the next H1..H6. Returns "" if the heading is absent or empty.
+    Bullets, prose, blank lines under the heading are all returned verbatim.
+    """
+    if not body:
+        return ""
+    target = heading.strip().lower()
+    in_section = False
+    out_lines: list[str] = []
+    for raw in body.splitlines():
+        h = _HEADING_RE.match(raw)
+        if h:
+            if in_section:
+                break
+            if h.group(1).strip().lower() == target:
+                in_section = True
+            continue
+        if in_section:
+            out_lines.append(raw)
+    return "\n".join(out_lines).strip()

@@ -56,6 +56,7 @@ if _HAS_QT:  # pragma: no cover -- exercised in the Qt-enabled runtime
             vad_filter: bool = True,
             vad_min_silence_ms: int = 500,
             language: str = "en",
+            hotwords: str = "",
             poll_interval_sec: float = 1.0,
             parent: Optional[QObject] = None,
         ) -> None:
@@ -67,6 +68,7 @@ if _HAS_QT:  # pragma: no cover -- exercised in the Qt-enabled runtime
             self.vad_filter = vad_filter
             self.vad_min_silence_ms = vad_min_silence_ms
             self.language = language
+            self.hotwords = hotwords
             self.poll_interval_sec = poll_interval_sec
             self._stop = threading.Event()
             self._drain_on_stop = True
@@ -101,6 +103,7 @@ if _HAS_QT:  # pragma: no cover -- exercised in the Qt-enabled runtime
                 vad_filter=self.vad_filter,
                 vad_min_silence_ms=self.vad_min_silence_ms,
                 language=self.language,
+                hotwords=self.hotwords,
             )
             if not text:
                 return
@@ -122,6 +125,7 @@ def transcribe_pcm(
     vad_filter: bool = True,
     vad_min_silence_ms: int = 500,
     language: str = "en",
+    hotwords: str = "",
 ) -> str:
     """Transcribe a mono-16k int16 PCM array. Returns concatenated text (may be empty)."""
     fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="mn_chunk_")
@@ -129,13 +133,15 @@ def transcribe_pcm(
     tmp_path = Path(tmp_name)
     try:
         write_window_wav(Window(source="_tmp", pcm=pcm, t_start=0.0, t_end=0.0), tmp_path)
-        segments, _info = model.transcribe(
-            str(tmp_path),
+        kwargs = dict(
             language=language,
             beam_size=beam_size,
             vad_filter=vad_filter,
             vad_parameters=dict(min_silence_duration_ms=vad_min_silence_ms),
         )
+        if hotwords:
+            kwargs["hotwords"] = hotwords
+        segments, _info = model.transcribe(str(tmp_path), **kwargs)
         text = " ".join((seg.text or "").strip() for seg in segments).strip()
         return text
     finally:
@@ -155,6 +161,7 @@ def batch_transcribe(
     vad_filter: bool = True,
     vad_min_silence_ms: int = 500,
     language: str = "en",
+    hotwords: str = "",
     progress: Optional[Callable[[str], None]] = None,
     on_progress_pct: Optional[Callable[[str, float], None]] = None,
 ) -> list[TranscriptSegment]:
@@ -168,13 +175,15 @@ def batch_transcribe(
     """
     if progress:
         progress(f"Transcribing {source}...")
-    segments_iter, info = model.transcribe(
-        str(wav_path),
+    kwargs = dict(
         language=language,
         beam_size=beam_size,
         vad_filter=vad_filter,
         vad_parameters=dict(min_silence_duration_ms=vad_min_silence_ms),
     )
+    if hotwords:
+        kwargs["hotwords"] = hotwords
+    segments_iter, info = model.transcribe(str(wav_path), **kwargs)
     duration = max(float(getattr(info, "duration", 0.0) or 0.0), 0.001)
     result: list[TranscriptSegment] = []
     for seg in segments_iter:

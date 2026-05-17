@@ -38,7 +38,9 @@ from .models.transcript import MIC, SYS, TranscriptSegment, TranscriptStore
 from .transcription import model_manager
 from .transcription.worker import LiveTranscriptionWorker, batch_transcribe, interleave
 from .utils.config import Config
+from .utils.live_notes import extract_section, parse_attendees
 from .utils.paths import session_audio_dir
+from .utils.vocabulary import derive_session_hotwords, join_hotwords, load_vocabulary
 
 
 log = logging.getLogger(__name__)
@@ -70,6 +72,7 @@ class _BatchTranscribeThread(QThread):
         vad_filter: bool,
         vad_min_silence_ms: int,
         beam_size: int = 5,
+        hotwords: str = "",
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -79,6 +82,7 @@ class _BatchTranscribeThread(QThread):
         self.vad_filter = vad_filter
         self.vad_min_silence_ms = vad_min_silence_ms
         self.beam_size = beam_size
+        self.hotwords = hotwords
 
     def run(self) -> None:
         try:
@@ -114,6 +118,7 @@ class _BatchTranscribeThread(QThread):
                         beam_size=self.beam_size,
                         vad_filter=self.vad_filter,
                         vad_min_silence_ms=self.vad_min_silence_ms,
+                        hotwords=self.hotwords,
                         progress=self.progress.emit,
                         on_progress_pct=on_pct,
                     ): src
@@ -150,6 +155,29 @@ class SessionController(QObject):
         self._mic_wav: Optional[Path] = None
         self._sys_wav: Optional[Path] = None
         self._batch_thread: Optional[_BatchTranscribeThread] = None
+        self._session_hotwords: str = ""
+
+    def _collect_hotwords(self, session: Session) -> str:
+        """Combine global vocabulary + this session's attendees + agenda proper nouns.
+
+        Attendee names come from the live_notes '# Attendees' block (whether
+        the user typed them or the calendar pre-fill seeded them). Proper
+        nouns get pulled out of the '# Agenda' block via a coarse capitalized-
+        phrase match -- false positives are cheap so we err toward inclusive.
+        """
+        live_notes = ""
+        try:
+            live_notes = TranscriptStore(session.id).read_live_notes()
+        except OSError:
+            log.exception("could not read live_notes for hotword derivation")
+        attendees = parse_attendees(live_notes) if live_notes else []
+        agenda = extract_section(live_notes, "Agenda") if live_notes else ""
+        derived = derive_session_hotwords(
+            load_vocabulary(),
+            attendees=attendees,
+            agenda=agenda,
+        )
+        return join_hotwords(derived)
 
     @property
     def active_session(self) -> Optional[Session]:
@@ -163,6 +191,7 @@ class SessionController(QObject):
             return
         self._active_session = session
         self._live_segments = []
+        hotwords = self._collect_hotwords(session)
         try:
             audio_dir = session_audio_dir(session.id)
             self._mic_wav = audio_dir / "mic.wav"
@@ -185,6 +214,7 @@ class SessionController(QObject):
                         model=model,
                         vad_filter=self.config.audio.vad_enabled,
                         vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
+                        hotwords=hotwords,
                     )
                     worker.chunk_done.connect(self._on_live_segment)
                     worker.error.connect(self.error.emit)
@@ -193,7 +223,12 @@ class SessionController(QObject):
 
             # Mic recorder.
             from .audio.mic_recorder import MicRecorder
-            self._mic_recorder = MicRecorder(self._chunk_buffer, self._mic_wav, source_name=MIC)
+            self._mic_recorder = MicRecorder(
+                self._chunk_buffer,
+                self._mic_wav,
+                source_name=MIC,
+                device_name=self.config.audio.mic_device_name,
+            )
             self._mic_recorder.error.connect(self.error.emit)
             self._mic_recorder.start()
 
@@ -201,7 +236,10 @@ class SessionController(QObject):
             from .audio.loopback_recorder import LoopbackRecorder, LoopbackUnavailable
             if LoopbackRecorder.is_available():
                 self._loopback_recorder = LoopbackRecorder(
-                    self._chunk_buffer, self._sys_wav, source_name=SYS
+                    self._chunk_buffer,
+                    self._sys_wav,
+                    source_name=SYS,
+                    device_name=self.config.audio.loopback_device_name,
                 )
                 self._loopback_recorder.error.connect(self.error.emit)
                 try:
@@ -214,6 +252,7 @@ class SessionController(QObject):
                 self.status.emit("PyAudioWPatch not installed; recording mic only.")
 
             self._t_start_wall = time.monotonic()
+            self._session_hotwords = hotwords
             self.store.update_session(
                 session.id,
                 state=STATE_RECORDING,
@@ -334,6 +373,7 @@ class SessionController(QObject):
             vad_filter=self.config.audio.vad_enabled,
             vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
             beam_size=beam_size,
+            hotwords=self._session_hotwords,
         )
         self._batch_thread.progress.connect(self.status.emit)
         self._batch_thread.progress_pct.connect(

@@ -11,3 +11,5 @@ tomli>=2.0.0; python_version < '3.11'
 # proxies (Netskope, Zscaler, etc.) work without manual CA bundles. Pure
 # Python wheel; no compiled artifact.
 truststore>=0.9.0; sys_platform == 'win32'
+# Outlook calendar integration via COM. Windows-only; provides win32com.client.
+pywin32>=306; sys_platform == 'win32'
