@@ -161,24 +161,19 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
 
-        # Right-aligned permanent indicators on the status bar.
-        # Each is added with stretch=0 so the transient showMessage() text on
-        # the left side gets the whole leftover row. Labels are populated by
-        # app.py via set_status_indicators().
-        self._mic_indicator = QLabel("", self)
-        self._loopback_indicator = QLabel("", self)
-        self._calendar_indicator = QLabel("", self)
-        for ind in (
-            self._mic_indicator,
-            self._loopback_indicator,
-            self._calendar_indicator,
-        ):
-            ind.setContentsMargins(8, 0, 8, 0)
-            self.statusBar().addPermanentWidget(ind)
+        # Single right-aligned permanent indicator that joins all sub-items
+        # with " | " explicitly. Using one QLabel rather than multiple
+        # addPermanentWidget() calls avoids Qt's Windows-native style
+        # painting a separator line *after* the last permanent widget
+        # (which read as a trailing pipe).
+        self._indicators_label = QLabel("", self)
+        self._indicators_label.setContentsMargins(8, 0, 8, 0)
+        self.statusBar().addPermanentWidget(self._indicators_label)
 
     def set_status_indicators(
         self,
         *,
+        version: str = "",
         mic_label: str,
         mic_tooltip: str = "",
         loopback_label: str,
@@ -186,13 +181,27 @@ class MainWindow(QMainWindow):
         calendar_label: str,
         calendar_tooltip: str = "",
     ) -> None:
-        """Update the bottom status bar's right-side indicators."""
-        self._mic_indicator.setText(mic_label)
-        self._mic_indicator.setToolTip(mic_tooltip or mic_label)
-        self._loopback_indicator.setText(loopback_label)
-        self._loopback_indicator.setToolTip(loopback_tooltip or loopback_label)
-        self._calendar_indicator.setText(calendar_label)
-        self._calendar_indicator.setToolTip(calendar_tooltip or calendar_label)
+        """Update the bottom status bar's right-side indicator string.
+
+        Sub-items are joined with " | "; we explicitly avoid trailing
+        the string with a separator. The full per-sub-item tooltip text
+        is joined into a single multi-line tooltip so the user can still
+        hover the indicator to see the long form (the QLabel doesn't
+        expose per-character tooltips).
+        """
+        parts: list[str] = []
+        tooltip_parts: list[str] = []
+        if version:
+            parts.append(f"v{version}")
+            tooltip_parts.append(f"Running version: v{version}")
+        parts.append(mic_label)
+        tooltip_parts.append(mic_tooltip or mic_label)
+        parts.append(loopback_label)
+        tooltip_parts.append(loopback_tooltip or loopback_label)
+        parts.append(calendar_label)
+        tooltip_parts.append(calendar_tooltip or calendar_label)
+        self._indicators_label.setText(" | ".join(parts))
+        self._indicators_label.setToolTip("\n".join(tooltip_parts))
 
     def set_sessions(self, sessions: Iterable[Session]) -> None:
         self._list.blockSignals(True)

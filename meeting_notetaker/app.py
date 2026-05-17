@@ -424,6 +424,7 @@ class MainApp(QObject):
             )
 
         self.window.set_status_indicators(
+            version=__version__,
             mic_label=f"Mic: {_short_device_label(mic)}",
             mic_tooltip=f"Microphone device: {mic}",
             loopback_label=f"System audio: {_short_device_label(loopback)}",
