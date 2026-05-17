@@ -361,7 +361,24 @@ class MainApp(QObject):
         self.window.activateWindow()
 
 
+def _set_windows_app_user_model_id() -> None:
+    # Without this, the tray icon, taskbar grouping, and toast notifications
+    # inherit the interpreter's AUMID -- "Python" when launched via python.exe.
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "AaronDodd.MeetingNotetaker"
+        )
+    except (OSError, AttributeError):
+        pass
+
+
 def main() -> int:
+    _set_windows_app_user_model_id()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -373,7 +390,9 @@ def main() -> int:
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName("Meeting Notetaker")
-    qt_app.setOrganizationName("MeetingNotetaker")
+    qt_app.setApplicationDisplayName("Meeting Notetaker")
+    qt_app.setOrganizationName("Aaron Dodd")
+    qt_app.setOrganizationDomain("aarondodd.com")
     qt_app.setQuitOnLastWindowClosed(False)
     qt_app.setWindowIcon(app_icon())
 
