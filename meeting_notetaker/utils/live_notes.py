@@ -140,3 +140,27 @@ def has_user_content(body: str) -> bool:
     if not stripped:
         return False
     return stripped != LIVE_NOTES_TEMPLATE.strip()
+
+
+def extract_section(body: str, heading: str) -> str:
+    """Return the text under the matching '# Heading' (case-insensitive).
+
+    Stops at the next H1..H6. Returns "" if the heading is absent or empty.
+    Bullets, prose, blank lines under the heading are all returned verbatim.
+    """
+    if not body:
+        return ""
+    target = heading.strip().lower()
+    in_section = False
+    out_lines: list[str] = []
+    for raw in body.splitlines():
+        h = _HEADING_RE.match(raw)
+        if h:
+            if in_section:
+                break
+            if h.group(1).strip().lower() == target:
+                in_section = True
+            continue
+        if in_section:
+            out_lines.append(raw)
+    return "\n".join(out_lines).strip()

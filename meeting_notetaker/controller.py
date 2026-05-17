@@ -38,8 +38,9 @@ from .models.transcript import MIC, SYS, TranscriptSegment, TranscriptStore
 from .transcription import model_manager
 from .transcription.worker import LiveTranscriptionWorker, batch_transcribe, interleave
 from .utils.config import Config
+from .utils.live_notes import extract_section, parse_attendees
 from .utils.paths import session_audio_dir
-from .utils.vocabulary import join_hotwords, load_vocabulary
+from .utils.vocabulary import derive_session_hotwords, join_hotwords, load_vocabulary
 
 
 log = logging.getLogger(__name__)
@@ -157,12 +158,26 @@ class SessionController(QObject):
         self._session_hotwords: str = ""
 
     def _collect_hotwords(self, session: Session) -> str:
-        """Combine global vocabulary into a hotwords string.
+        """Combine global vocabulary + this session's attendees + agenda proper nouns.
 
-        Per-session derivation (attendees, calendar body) plugs in here in a
-        follow-up commit.
+        Attendee names come from the live_notes '# Attendees' block (whether
+        the user typed them or the calendar pre-fill seeded them). Proper
+        nouns get pulled out of the '# Agenda' block via a coarse capitalized-
+        phrase match -- false positives are cheap so we err toward inclusive.
         """
-        return join_hotwords(load_vocabulary())
+        live_notes = ""
+        try:
+            live_notes = TranscriptStore(session.id).read_live_notes()
+        except OSError:
+            log.exception("could not read live_notes for hotword derivation")
+        attendees = parse_attendees(live_notes) if live_notes else []
+        agenda = extract_section(live_notes, "Agenda") if live_notes else ""
+        derived = derive_session_hotwords(
+            load_vocabulary(),
+            attendees=attendees,
+            agenda=agenda,
+        )
+        return join_hotwords(derived)
 
     @property
     def active_session(self) -> Optional[Session]:
