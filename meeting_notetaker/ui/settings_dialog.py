@@ -14,11 +14,13 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -37,10 +39,22 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self.resize(520, 460)
+        self.resize(560, 600)
         self._config = config
 
-        layout = QVBoxLayout(self)
+        # Outer layout: scroll area on top, button bar at the bottom outside
+        # the scroll region so OK/Cancel are always reachable. The content
+        # widget's layout is what every group below adds to.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(scroll, 1)
+
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
 
         # Transcription group ---------------------------------------------
         tx_group = QGroupBox("Transcription", self)
@@ -263,7 +277,9 @@ class SettingsDialog(QDialog):
         )
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # Button bar lives outside the scroll area so OK/Cancel are always
+        # reachable, even if the content overflows.
+        outer.addWidget(buttons)
 
     def _on_accept(self) -> None:
         self._config.transcription.model_size = self._model_picker.currentText()
