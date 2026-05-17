@@ -6,26 +6,25 @@ Meet calls), transcribes both streams locally with faster-whisper, and
 hands the resulting transcript to you for synthesis by any LLM you trust,
 via clipboard. No audio leaves the machine; no API key required.
 
-```
-+----------------+      mic.wav      +-----------------+
-|   Microphone   | ----------------> |                 |
-+----------------+                   |  Local Whisper  |  --> raw.transcript.md
-+----------------+      sys.wav      |  (faster-whisper|
-| System audio   | ----------------> |   on CPU, int8) |  --> Generate Prompt
-| (WASAPI loop.) |                   |                 |       |
-+----------------+                   +-----------------+       v
-                                                          [Clipboard]
-                                                               |
-                                                               v
-                                                  Your chosen chatbot
-                                                  (Claude.ai, Copilot,
-                                                   ChatGPT, etc.)
-                                                               |
-                                                               v
-                                                       Paste Response Back
-                                                               |
-                                                               v
-                                                          notes.md
+```mermaid
+flowchart LR
+    mic[Microphone]
+    sys["System audio<br/>(WASAPI loopback)"]
+    whisper["Local Whisper<br/>faster-whisper, CPU, int8"]
+    transcript[raw.transcript.md]
+    diar["Speaker ID pass<br/>(v0.5+)"]
+    prompt[Generate<br/>Synthesis Prompt]
+    clip[Clipboard]
+    chatbot["Your chosen chatbot<br/>(Claude.ai, Copilot, ChatGPT, ...)"]
+    paste[Paste Response Back]
+    notes[notes.md]
+
+    mic -->|mic.wav| whisper
+    sys -->|sys.wav| whisper
+    whisper --> transcript
+    sys -. loopback only .-> diar
+    diar -->|rewrites with<br/>speaker names| transcript
+    transcript --> prompt --> clip --> chatbot --> paste --> notes
 ```
 
 ## Screenshots
@@ -397,6 +396,138 @@ When running from source (dev mode), there's no installed .exe to
 replace -- the upgrade reports where the new `dist/meeting-notetaker`
 binary was written and leaves it to you.
 
+## Speaker identification (v0.5+)
+
+After each recording, the app tries to label the *system audio* side of
+the transcript with real names ("Alice:", "Bob:") instead of the
+generic "Them:". It learns who's who over time -- the first meeting
+with a new colleague needs one quick labeling pass; subsequent
+meetings recognize that voice automatically. All processing is
+on-device. No audio, transcript, or voice embedding ever leaves the
+machine.
+
+### The pipeline
+
+```mermaid
+flowchart TD
+    A[sys.wav] --> B[Segment by voice activity<br/>webrtcvad, ~30ms frames]
+    B --> C[Embed each turn<br/>Resemblyzer, 256-dim vector]
+    C --> D[Cluster by cosine similarity<br/>greedy agglomerative]
+    D --> E{Match centroid<br/>vs speakers.db<br/>at threshold}
+    E -->|matched| F[Auto-label cluster<br/>with stored name]
+    E -->|no match| G[Label Speaker N<br/>and prompt user]
+    F --> H[Rewrite raw.transcript.md<br/>with real names]
+    G --> H
+    G -. user assigns name .-> I[Save embedding to<br/>speakers.db]
+    I -. next meeting .-> E
+    H --> J[diarization.json<br/>cluster -> name map for<br/>Review Speakers later]
+```
+
+The mic channel is always the user; it does not go through this
+pipeline and keeps the "{{user_name}}:" / "Me:" rendering it always had.
+
+### What runs automatically
+
+When you click **Stop** on a recording, the controller chains:
+
+1. **Final transcription** (existing batch pass; rewrites the live
+   transcript with a cleaner version).
+2. **Voice segmentation** on `sys.wav`: webrtcvad + energy heuristics
+   chop the loopback channel into per-turn voiced spans (typical
+   meeting: 30-200 turns).
+3. **Embedding**: Resemblyzer produces a 256-dim vector per turn (~10 ms each).
+4. **Clustering**: greedy agglomerative cosine merge collapses turns
+   into per-speaker clusters (threshold tunable in Settings, default 0.75).
+5. **Matching**: each cluster centroid is compared against every name
+   in `speakers.db`. Above the threshold (default 0.75 cosine
+   similarity), the cluster auto-labels with the stored name.
+6. **Transcript rewrite**: `raw.transcript.md` is rewritten with the
+   resolved names where matched, `Speaker N` fallback where not.
+7. **`diarization.json` saved** alongside the transcript so the Review
+   Speakers walker works on this session forever, even after the
+   `sys.wav` audio is cleaned up.
+8. **Unknown-speaker dialog**: if any cluster did not match, the
+   Label Unknown Speakers dialog pops with example transcript lines
+   per cluster and a name picker seeded from Outlook attendees +
+   names already in your speaker library.
+
+All of this is automatic. You don't have to enable the pipeline per
+session -- it runs unless **Settings > Enable speaker identification**
+is unchecked, the recording has no system audio (mic-only session),
+or Resemblyzer fails to load.
+
+### What you do to help it improve
+
+The library starts empty. It grows as you label voices and the
+running-average centroid update tightens each stored embedding with
+every confirmation. A few minutes of attention up front pays off
+across every subsequent meeting with the same colleagues.
+
+- **Label voices the first time you see them.** When the Label
+  Unknown Speakers dialog pops at end of meeting, type or pick a name
+  for each card and click OK. Use a consistent form (`Alice Smith`
+  every time, not `Alice` sometimes and `Alice S.` other times) --
+  the store keys on the exact string, so two variants become two
+  separate records.
+- **Skip what you don't recognize, rather than guessing.** A bad
+  label trains the wrong embedding into the store and you'll need to
+  Forget it later. Skip the dialog (or specific cards) when you're
+  not sure; the cluster keeps its `Speaker N` label and the embedding
+  doesn't get persisted.
+- **Use Review Speakers when something looks wrong.** The button
+  appears on any session that has a `diarization.json`. If the
+  auto-labeling called Bob "Alice", click Rename on the card,
+  pick the correct name, OK. The transcript rewrites on disk and the
+  centroid update goes to the *new* name's record (it does not undo
+  the old one -- if Alice now has a Bob-sounding embedding in her
+  history, use Manage Speakers > Forget Alice and start her over).
+- **Lean on the Outlook attendee list.** When you record a meeting
+  that has a calendar invite, the attendee names are pre-populated
+  in the name combo box. This is the easiest way to keep your
+  library consistent across colleagues.
+- **Periodically prune the library.** Settings > Manage Speakers
+  shows the full list with sample counts and last-seen dates.
+  Forget anyone you'll never recognize again (a one-time vendor on
+  a single call) -- a smaller library is faster to match against
+  and keeps the auto-recognition cleaner.
+
+### Things that limit accuracy
+
+Realistic expectations: this is a small CPU-only model running on
+recorded audio. It is excellent at distinguishing two or three
+clearly-different voices in a quiet meeting. It struggles with:
+
+- **Overlapping speech.** Cross-talk or two people speaking at the
+  same time produces a turn with mixed embeddings; the cluster goes
+  somewhere ambiguous. Most of the time this surfaces as an extra
+  `Speaker N` cluster you can ignore or forget.
+- **The same person on different microphones.** A colleague who
+  joins one meeting from a headset and another from a phone speaker
+  may not match across meetings. The match threshold (Settings,
+  default 75%) is the knob; loosening it improves recall on this
+  case at the cost of more false matches.
+- **Very short utterances.** A "thanks" or "agreed" turn under
+  about half a second gets dropped by the segmenter (too little
+  audio for a reliable embedding). The transcript still has the
+  line; the diarization just doesn't try to attribute it.
+- **Channel changes.** Different Teams / Zoom audio paths,
+  bluetooth-vs-USB, codec changes, or aggressive noise suppression
+  can shift the embedding enough to miss a match. Re-label once on
+  the new channel and the running-average will accommodate.
+
+### Privacy + footprint notes
+
+- Audio, embeddings, and the speaker library all live on the local
+  machine. The Resemblyzer model is bundled with the pip wheel;
+  nothing downloads at runtime; nothing in the speaker-ID path
+  makes a network call.
+- The speaker library is just `%APPDATA%/MeetingNotetaker/speakers.db`
+  (sqlite). To wipe it, delete the file or use **Settings >
+  Manage Speakers > Forget All**.
+- Wheel manifest impact for v0.5 (IT review): Resemblyzer transitively
+  pulls `librosa`, `scipy`, and `torch`. The frozen `.exe` grows
+  substantially (~300 MB -> ~1 GB).
+
 ## Settings
 
 Open via **File -> Settings...** (`Ctrl+,`) or the tray menu. All of
@@ -479,46 +610,6 @@ recordings (mic only) get no benefit from this.
 
 Switching models reloads at the start of the next recording.
 Already-recorded sessions are not re-transcribed automatically.
-
-### Speaker identification (v0.5+)
-
-After the post-meeting refinement pass commits the final transcript,
-a second pass runs the loopback (system audio) recording through
-speaker identification. The flow:
-
-1. Energy + VAD segmentation splits the loopback channel into
-   per-turn voiced spans.
-2. Each turn is embedded with Resemblyzer into a 256-dim vector.
-3. The vectors are clustered by cosine similarity (greedy agglomerative;
-   threshold tunable in Settings, default 0.75).
-4. Each cluster centroid is matched against `speakers.db`. Matches
-   above the threshold auto-label the cluster with the stored name.
-5. The transcript on disk is rewritten with names where matched, or
-   "Speaker N" for clusters that didn't match.
-6. If any clusters remain unmatched, the **Label Unknown Speakers**
-   dialog pops with example transcript lines and a name picker
-   seeded from Outlook attendees + already-stored speakers. Confirmed
-   names get added to `speakers.db` so future meetings auto-recognize
-   the same voices.
-
-The mic channel is always the user; it doesn't go through this pipeline
-and keeps the "Me:" / "Your name" rendering it always had.
-
-The **Review Speakers...** button on the session view re-opens the
-walker on a previously-completed session. Walks every detected cluster
-(known + unknown) so you can rename a mis-clustered speaker or
-forget a wrong label. Updates the on-disk transcript and feeds the
-correction back to the speaker store on accept.
-
-Privacy: no audio or embeddings ever leave the machine. The Resemblyzer
-model is bundled in the pip wheel; nothing downloads at runtime.
-**Manage Speakers...** in Settings shows the full list and gives
-per-row Forget + Forget All for a clean slate.
-
-Wheel manifest additions in v0.5 (IT review): Resemblyzer transitively
-pulls `librosa`, `scipy`, and `torch`. The frozen exe grows
-substantially (~300MB -> ~1GB). All on-device; no network calls in
-the speaker-identification path.
 
 ### Adding or editing synthesis prompts
 

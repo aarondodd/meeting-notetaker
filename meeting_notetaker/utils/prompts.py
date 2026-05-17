@@ -25,17 +25,21 @@ from .paths import prompts_dir, resource_path
 _PRIOR_BUNDLED_HASHES: dict[str, set[str]] = {
     # v0.1 -- pre-merge templates without {{live_notes}} / {{attendees}}.
     # v0.2 -- merged-synthesis templates without {{user_name}} support.
+    # v0.4 -- final pre-diarization bodies (single "Them:" label scheme).
     "default.md": {
         "ec67b04a5c86bb91e9dcd61e31455b1130bd123681c6f89ca9d66ecacd14bdf4",
         "dd281f15122bfdc4f0466c13576a7d45ecd8acc27e14d23092181ff470132309",
+        "0004ea62bf061e95be43c27326a7fbb7d9bef3d44fc9de71251519918e3f7c98",
     },
     "one-on-one.md": {
         "2a140d9fd7d1ae7687bfd5f7fba0d517b6f41135e467a98cdd13abd8e1ca87f5",
         "b756a457b03b3903f2eb2350fba6c93a8e6f20097355402388fb0e62a12829c9",
+        "91cb2de98164f71722cf520f167f2882280d5329266ab9a80fb14f603bb25ed1",
     },
     "standup.md": {
         "d46aff489d5c60cdcc3fa95318a027b06da0125dcfda79aa650be4c3b18991e5",
         "f03f06ef0fb6ffd79ac6f8d5fee034159e3406cc5b7764312e56ec874ef8356d",
+        "a2cc0a5d0279043db4d94a77aea79edd0c71c6baef687721aaa673cd71051519",
     },
 }
 

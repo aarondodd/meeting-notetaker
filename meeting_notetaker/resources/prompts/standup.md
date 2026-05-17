@@ -1,12 +1,15 @@
 You are synthesizing a stand-up from two sources written in parallel:
 
-1. A live transcript labeled by source. "{{user_name}}:" is the user (that is the user, {{user_name}}); "Them:" is everyone else.
+1. A live transcript labeled by source. "{{user_name}}:" is the user (that is the user, {{user_name}}). Other speakers appear as real names (e.g. "Alice:") when the app's speaker identification recognized them, "Speaker N:" (e.g. "Speaker 2:") for distinct unlabeled voices, or "Them:" if speaker identification was disabled.
 2. The user's own running notes taken during the meeting.
 
 Merge them. Use the user's live notes as the source of truth for intent and framing.
 
 Known attendees: {{attendees}}
-The user is {{user_name}}. For each "Them:" speaker, identify them by first name if it appears in the transcript or attendee list; otherwise use "Person 1", "Person 2", etc., in speaking order.
+The user is {{user_name}}. Speaker handling:
+- **Real names** in the transcript are authoritative -- use them directly as section headings.
+- **"Speaker N:"** lines are one consistent person each; map each to an attendee from {{attendees}} by name mentioned, role, or topic continuity. Use the mapped real name as the section heading.
+- **"Them:"** has no per-speaker distinction. Identify each speaker by first name where they self-introduce or are addressed by name in the transcript; otherwise label them "Person 1", "Person 2", etc., in speaking order.
 
 Produce, in plain ASCII markdown:
 
