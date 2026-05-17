@@ -41,6 +41,12 @@ the example below); the other side of the call is labeled `Them`.
 
 ![Main window -- Transcript tab](docs/screenshots/01-main-transcript.png)
 
+The session list has two narrow indicator columns to the left of each
+title: a speaker icon if the audio recording is still on disk, and a
+state dot (red while recording, yellow while the post-Stop refinement
+pass is running, green when refined). Hover any cell to see what that
+column conveys.
+
 **My Notes -- your running buffer alongside the transcript.** Markdown
 source with a small formatting toolbar. Sections (`# Attendees / # Agenda
 / # Notes / # Action Items`) auto-seed on first open. Everything you
@@ -65,9 +71,17 @@ time you paste a new response, the prior `notes.md` is archived to
 
 ### Dialogs
 
-**New Session** -- title plus a per-session "Keep recording" override:
+**New Session** -- title plus a per-session "Keep recording" override.
+When Outlook is reachable, a **Pick from Calendar...** button appears so
+you can pre-create a session for an upcoming meeting:
 
 ![New Session dialog](docs/screenshots/06-dialog-new-session.png)
+
+**Pick from Calendar** -- lists today's remaining meetings; select one
+to pre-fill the session title (still editable) and queue the attendees
++ agenda for the new session's My Notes:
+
+![Calendar picker](docs/screenshots/11-dialog-calendar-picker.png)
 
 **New Session pre-filled from an Outlook calendar invite** -- click the
 "Meeting starting" tray notification and the dialog opens with the
