@@ -180,6 +180,8 @@ class MainWindow(QMainWindow):
         loopback_tooltip: str = "",
         calendar_label: str,
         calendar_tooltip: str = "",
+        speakers_label: str = "",
+        speakers_tooltip: str = "",
     ) -> None:
         """Update the bottom status bar's right-side indicator string.
 
@@ -188,6 +190,10 @@ class MainWindow(QMainWindow):
         is joined into a single multi-line tooltip so the user can still
         hover the indicator to see the long form (the QLabel doesn't
         expose per-character tooltips).
+
+        `speakers_label` is shown only when non-empty -- the indicator
+        is hidden entirely when speaker ID is disabled or no speakers
+        are stored yet, since "Speakers: 0" would just add noise.
         """
         parts: list[str] = []
         tooltip_parts: list[str] = []
@@ -200,6 +206,9 @@ class MainWindow(QMainWindow):
         tooltip_parts.append(loopback_tooltip or loopback_label)
         parts.append(calendar_label)
         tooltip_parts.append(calendar_tooltip or calendar_label)
+        if speakers_label:
+            parts.append(speakers_label)
+            tooltip_parts.append(speakers_tooltip or speakers_label)
         self._indicators_label.setText(" | ".join(parts))
         self._indicators_label.setToolTip("\n".join(tooltip_parts))
 

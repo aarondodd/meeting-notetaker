@@ -31,9 +31,11 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
 from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
+from ..diarization.store import open_speaker_store
 from ..utils.config import Config, VALID_MODEL_SIZES
 from ..utils.paths import prompts_dir, vocabulary_path
 from ..utils.vocabulary import seed_vocabulary_file
+from .speakers_manage_dialog import SpeakersManageDialog
 
 
 class SettingsDialog(QDialog):
@@ -204,6 +206,64 @@ class SettingsDialog(QDialog):
         audio_form.addRow("", self._vad_value_label)
         layout.addWidget(audio_group)
 
+        # Speakers group ---------------------------------------------------
+        speakers_group = QGroupBox("Speakers", self)
+        speakers_form = QFormLayout(speakers_group)
+        speakers_blurb = QLabel(
+            "After each meeting, the app runs a speaker-identification "
+            "pass on the system-audio loopback channel: it groups the "
+            "recording into per-speaker turns and matches each group "
+            "against the stored speaker library, prompting you to label "
+            "any unrecognized voices. Future meetings auto-recognize "
+            "the same speakers and label the transcript with real "
+            "names instead of \"Them:\". Disable to skip the post-stop "
+            "identification pass entirely. Nothing leaves the machine -- "
+            "embeddings are stored locally in speakers.db.",
+            self,
+        )
+        speakers_blurb.setWordWrap(True)
+        speakers_form.addRow(speakers_blurb)
+
+        self._speakers_enabled = QCheckBox("Enable speaker identification", self)
+        self._speakers_enabled.setChecked(config.speakers.enabled)
+        self._speakers_enabled.setToolTip(
+            "When off, recordings still transcribe normally but use "
+            "the generic \"Them:\" label for everyone besides the mic. "
+            "No speaker library is consulted or updated."
+        )
+        speakers_form.addRow(self._speakers_enabled)
+
+        self._match_threshold_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._match_threshold_slider.setMinimum(50)
+        self._match_threshold_slider.setMaximum(95)
+        self._match_threshold_slider.setSingleStep(1)
+        self._match_threshold_slider.setPageStep(5)
+        self._match_threshold_slider.setValue(int(round(config.speakers.match_threshold * 100)))
+        self._match_threshold_label = QLabel(
+            f"{int(round(config.speakers.match_threshold * 100))}%", self
+        )
+        self._match_threshold_slider.valueChanged.connect(
+            lambda v: self._match_threshold_label.setText(f"{v}%")
+        )
+        self._match_threshold_slider.setToolTip(
+            "Cosine-similarity threshold to auto-match a meeting voice "
+            "against a stored speaker. Higher = stricter (fewer false "
+            "matches but more unknowns surfaced for manual labeling); "
+            "lower = looser (more auto-labels but higher risk of "
+            "calling Bob Alice). 75% is a reasonable default for the "
+            "Resemblyzer embedding."
+        )
+        speakers_form.addRow("Match threshold:", self._match_threshold_slider)
+        speakers_form.addRow("", self._match_threshold_label)
+
+        self._manage_speakers_btn = QPushButton("Manage Speakers...", self)
+        self._manage_speakers_btn.setToolTip(
+            "Open the stored speakers list to rename or remove entries."
+        )
+        self._manage_speakers_btn.clicked.connect(self._open_manage_speakers)
+        speakers_form.addRow(self._manage_speakers_btn)
+        layout.addWidget(speakers_group)
+
         # Calendar group ---------------------------------------------------
         calendar_group = QGroupBox("Calendar (Outlook)", self)
         calendar_form = QFormLayout(calendar_group)
@@ -301,6 +361,8 @@ class SettingsDialog(QDialog):
         self._config.audio.loopback_device_name = self._loopback_picker.currentData() or ""
         self._config.calendar.watch_calendar = self._watch_calendar.isChecked()
         self._config.calendar.window_minutes = int(self._window_slider.value())
+        self._config.speakers.enabled = self._speakers_enabled.isChecked()
+        self._config.speakers.match_threshold = self._match_threshold_slider.value() / 100.0
         self._config.ui.user_name = self._user_name_edit.text().strip()
         self.accept()
 
@@ -311,6 +373,14 @@ class SettingsDialog(QDialog):
     def _open_vocabulary_file(self) -> None:
         path = seed_vocabulary_file()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_manage_speakers(self) -> None:
+        store = open_speaker_store()
+        try:
+            dialog = SpeakersManageDialog(store, parent=self)
+            dialog.exec()
+        finally:
+            store.close()
 
 
 def _populate_device_picker(

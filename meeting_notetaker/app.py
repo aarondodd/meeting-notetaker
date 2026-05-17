@@ -460,6 +460,8 @@ class MainApp(QObject):
         if sv._session is not None and sv._session.id == session_id:
             fresh = TranscriptStore(session_id).read_transcript()
             sv.set_transcript_text(fresh)
+        # Speaker library may have grown / shrunk; refresh the indicator.
+        self._refresh_status_indicators()
 
     def _rewrite_transcript_from_diarization(
         self,
@@ -643,7 +645,12 @@ class MainApp(QObject):
 
     def _on_settings(self) -> None:
         dialog = SettingsDialog(self.config, parent=self.window)
-        if dialog.exec() != dialog.DialogCode.Accepted:
+        accepted = dialog.exec() == dialog.DialogCode.Accepted
+        # The Manage Speakers sub-dialog can mutate the store regardless
+        # of whether the parent Settings dialog is accepted or canceled,
+        # so refresh the status indicator on the way out either way.
+        if not accepted:
+            self._refresh_status_indicators()
             return
         errors = self.config.validate()
         if errors:
@@ -698,6 +705,7 @@ class MainApp(QObject):
                 "step in the chain is failing."
             )
 
+        speakers_label, speakers_tooltip = self._speakers_indicator()
         self.window.set_status_indicators(
             version=__version__,
             mic_label=f"Mic: {_short_device_label(mic)}",
@@ -706,7 +714,37 @@ class MainApp(QObject):
             loopback_tooltip=f"System audio capture (loopback): {loopback}",
             calendar_label=cal_label,
             calendar_tooltip=cal_tooltip,
+            speakers_label=speakers_label,
+            speakers_tooltip=speakers_tooltip,
         )
+
+    def _speakers_indicator(self) -> tuple[str, str]:
+        """Return (label, tooltip) for the status-bar speakers segment.
+
+        Hidden (empty label) when speaker ID is disabled or no speakers
+        are stored yet -- "Speakers: 0" would just be noise on a fresh
+        install. The tooltip lists up to 8 stored names so the user can
+        sanity-check the library without opening Settings.
+        """
+        if not self.config.speakers.enabled:
+            return "", ""
+        try:
+            store = open_speaker_store()
+            try:
+                records = store.list_all()
+            finally:
+                store.close()
+        except Exception:
+            log.exception("speakers indicator: store unreadable")
+            return "", ""
+        if not records:
+            return "", ""
+        names = [r.name for r in records]
+        preview = ", ".join(names[:8])
+        if len(names) > 8:
+            preview += f" (+{len(names) - 8} more)"
+        tooltip = f"Known speakers ({len(names)}): {preview}"
+        return f"Speakers: {len(names)}", tooltip
 
     # ---- calendar integration ---------------------------------------------
 
