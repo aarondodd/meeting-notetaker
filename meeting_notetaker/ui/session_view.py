@@ -109,6 +109,14 @@ class SessionView(QWidget):
         self._copy_notes_btn = QPushButton("Copy Notes to Clipboard", self)
         self._copy_notes_btn.clicked.connect(self._on_copy_notes)
         synthesis.addWidget(self._copy_notes_btn)
+        self._print_btn = QPushButton("Print...", self)
+        self._print_btn.setToolTip(
+            "Print the active tab (My Notes or Synthesis). Use the printer "
+            "dialog's destination dropdown to pick \"Microsoft Print to PDF\" "
+            "for a PDF copy."
+        )
+        self._print_btn.clicked.connect(self._on_print)
+        synthesis.addWidget(self._print_btn)
         synthesis.addStretch(1)
         layout.addLayout(synthesis)
 
@@ -141,6 +149,7 @@ class SessionView(QWidget):
         self._tabs.addTab(self._previous_view, "Previous Notes")
 
         layout.addWidget(self._tabs, 1)
+        self._tabs.currentChanged.connect(self._on_tab_changed)
 
         self._set_buttons_for_state(STATE_NEW, has_transcript=False, has_notes=False)
         self.set_session(None, transcript="", notes="", previous_notes_paths=[])
@@ -346,6 +355,68 @@ class SessionView(QWidget):
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
         self._copy_notes_btn.setEnabled(has_session and has_notes)
+        self._update_print_button(has_session=has_session, has_notes=has_notes)
+
+    def _on_tab_changed(self, _index: int) -> None:
+        has_session = self._session is not None
+        has_notes = bool(
+            self._session and (self._session.has_notes or self._notes_view.toPlainText().strip())
+        )
+        self._update_print_button(has_session=has_session, has_notes=has_notes)
+
+    def _update_print_button(self, *, has_session: bool, has_notes: bool) -> None:
+        """Print is only meaningful on My Notes / Synthesis tabs."""
+        if not has_session:
+            self._print_btn.setEnabled(False)
+            return
+        current = self._tabs.currentWidget()
+        if current is self._live_notes_editor:
+            # Always allow printing the user's own notes (even if empty -- the
+            # printer dialog and a blank page is harmless).
+            self._print_btn.setEnabled(True)
+        elif current is self._notes_view:
+            self._print_btn.setEnabled(has_notes)
+        else:
+            self._print_btn.setEnabled(False)
+
+    def _on_print(self) -> None:
+        """Print the active tab via QPrinter.
+
+        QPrintDialog exposes whatever printers Windows reports, including
+        "Microsoft Print to PDF" -- the user's stated path for saving to
+        PDF. We render Markdown into a temporary QTextDocument so the
+        printer output reflects the rendered view, not the raw source.
+        """
+        if self._session is None:
+            return
+        current = self._tabs.currentWidget()
+        if current is self._live_notes_editor:
+            markdown_source = self._live_notes_editor.toPlainText()
+            doc_title = f"{self._session.title} -- My Notes"
+        elif current is self._notes_view:
+            markdown_source = self._notes_view.toMarkdown()
+            doc_title = f"{self._session.title} -- Synthesis"
+        else:
+            return
+
+        # Lazy-imported so headless test envs without QtPrintSupport still
+        # import this module cleanly.
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QTextDocument
+        from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
+
+        doc = QTextDocument(self)
+        sdir = session_dir(self._session.id)
+        doc.setBaseUrl(QUrl.fromLocalFile(str(sdir) + "/"))
+        doc.setMarkdown(markdown_source)
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setDocName(doc_title)
+        dialog = QPrintDialog(printer, self)
+        dialog.setWindowTitle(f"Print -- {doc_title}")
+        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+        doc.print(printer)
 
 
 def _pretty_state(state: str) -> str:
