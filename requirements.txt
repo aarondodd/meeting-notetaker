@@ -13,3 +13,9 @@ tomli>=2.0.0; python_version < '3.11'
 truststore>=0.9.0; sys_platform == 'win32'
 # Outlook calendar integration via COM. Windows-only; provides win32com.client.
 pywin32>=306; sys_platform == 'win32'
+# Speaker embedding model for post-meeting speaker identification.
+# Pulls librosa, scipy, torch transitively. Used only during the
+# refinement pass on the loopback channel; the embedding model is small
+# (~17MB of weights) but the dep footprint is non-trivial -- see the
+# Wheel Manifest section in README.md for the IT-review summary.
+Resemblyzer>=0.1.4
