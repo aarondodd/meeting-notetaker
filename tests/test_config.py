@@ -69,3 +69,25 @@ def test_device_name_defaults_to_empty(isolated_data_dir):
     cfg = Config()
     assert cfg.audio.mic_device_name == ""
     assert cfg.audio.loopback_device_name == ""
+
+
+def test_calendar_defaults_and_round_trip(isolated_data_dir):
+    cfg = Config()
+    assert cfg.calendar.watch_calendar is False
+    assert cfg.calendar.window_minutes == 5
+    cfg.calendar.watch_calendar = True
+    cfg.calendar.window_minutes = 10
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.calendar.watch_calendar is True
+    assert loaded.calendar.window_minutes == 10
+
+
+def test_calendar_window_validation(isolated_data_dir):
+    cfg = Config()
+    cfg.calendar.window_minutes = 90
+    errors = cfg.validate()
+    assert any("calendar.window_minutes" in e for e in errors)
+    cfg.calendar.window_minutes = 0
+    errors = cfg.validate()
+    assert any("calendar.window_minutes" in e for e in errors)

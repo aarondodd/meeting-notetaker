@@ -43,6 +43,32 @@ def seed_body() -> str:
     return LIVE_NOTES_TEMPLATE
 
 
+def seed_body_with_calendar(
+    *,
+    attendees: list[str] | None = None,
+    agenda: str = "",
+) -> str:
+    """Pre-fill the live-notes template with calendar-derived content.
+
+    Used when a session is created via the Outlook calendar imminent-meeting
+    flow. `attendees` populates the bulleted list under '# Attendees';
+    `agenda` is dropped verbatim under '# Agenda' so the user keeps the
+    Outlook invite text for reference.
+    """
+    names = [n for n in (attendees or []) if n]
+    if names:
+        attendee_block = "\n".join(f"- {n}" for n in names)
+    else:
+        attendee_block = "-\x20"
+    agenda_block = (agenda or "").strip()
+    return (
+        f"# Attendees\n{attendee_block}\n\n"
+        f"# Agenda\n{agenda_block}\n\n"
+        f"# Notes\n\n"
+        f"# Action Items\n"
+    )
+
+
 def parse_attendees(body: str) -> list[str]:
     """Extract attendee names from the bulleted list under '# Attendees'.
 

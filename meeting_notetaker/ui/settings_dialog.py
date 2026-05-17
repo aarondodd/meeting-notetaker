@@ -177,6 +177,44 @@ class SettingsDialog(QDialog):
         audio_form.addRow("", self._vad_value_label)
         layout.addWidget(audio_group)
 
+        # Calendar group ---------------------------------------------------
+        calendar_group = QGroupBox("Calendar (Outlook)", self)
+        calendar_form = QFormLayout(calendar_group)
+        calendar_blurb = QLabel(
+            "When enabled, the app polls your local Outlook profile (via COM, "
+            "no network calls) and pops a tray notification a few minutes "
+            "before each meeting starts. Click the notification to open New "
+            "Session pre-filled with the meeting subject, attendees, and "
+            "agenda. Recording is never started automatically -- you click "
+            "Start when you're ready.",
+            self,
+        )
+        calendar_blurb.setWordWrap(True)
+        calendar_form.addRow(calendar_blurb)
+
+        self._watch_calendar = QCheckBox("Watch Outlook calendar", self)
+        self._watch_calendar.setChecked(config.calendar.watch_calendar)
+        self._watch_calendar.setToolTip(
+            "Requires Outlook installed and running on this machine. "
+            "Windows-only; safely no-ops on other platforms."
+        )
+        calendar_form.addRow(self._watch_calendar)
+
+        self._window_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._window_slider.setMinimum(1)
+        self._window_slider.setMaximum(30)
+        self._window_slider.setSingleStep(1)
+        self._window_slider.setValue(config.calendar.window_minutes)
+        self._window_value_label = QLabel(
+            f"{config.calendar.window_minutes} min", self
+        )
+        self._window_slider.valueChanged.connect(
+            lambda v: self._window_value_label.setText(f"{v} min")
+        )
+        calendar_form.addRow("Notify within:", self._window_slider)
+        calendar_form.addRow("", self._window_value_label)
+        layout.addWidget(calendar_group)
+
         # UI group ---------------------------------------------------------
         ui_group = QGroupBox("Interface", self)
         ui_form = QFormLayout(ui_group)
@@ -237,6 +275,8 @@ class SettingsDialog(QDialog):
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()
         self._config.audio.mic_device_name = self._mic_picker.currentData() or ""
         self._config.audio.loopback_device_name = self._loopback_picker.currentData() or ""
+        self._config.calendar.watch_calendar = self._watch_calendar.isChecked()
+        self._config.calendar.window_minutes = int(self._window_slider.value())
         self._config.ui.theme = self._theme_picker.currentText()
         self._config.ui.user_name = self._user_name_edit.text().strip()
         self.accept()

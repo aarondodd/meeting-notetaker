@@ -22,16 +22,29 @@ class NewSessionResult:
 
 
 class NewSessionDialog(QDialog):
-    def __init__(self, *, retain_audio_default: bool = False, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        *,
+        retain_audio_default: bool = False,
+        title_prefill: str = "",
+        prefill_note: str = "",
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("New Session")
         self.setModal(True)
-        self.resize(420, 180)
+        self.resize(420, 200)
 
         layout = QVBoxLayout(self)
+        if prefill_note:
+            prefill_label = QLabel(prefill_note, self)
+            prefill_label.setWordWrap(True)
+            layout.addWidget(prefill_label)
         layout.addWidget(QLabel("Session title:"))
         self._title_edit = QLineEdit(self)
         self._title_edit.setPlaceholderText("e.g. 1:1 with Manager, Standup, Customer Call")
+        if title_prefill:
+            self._title_edit.setText(title_prefill)
         layout.addWidget(self._title_edit)
 
         self._retain_checkbox = QCheckBox("Keep the audio recording after transcription", self)
@@ -54,7 +67,9 @@ class NewSessionDialog(QDialog):
                 bool(self._title_edit.text().strip())
             )
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+            bool(self._title_edit.text().strip())
+        )
 
     def _on_accept(self) -> None:
         if self._title_edit.text().strip():

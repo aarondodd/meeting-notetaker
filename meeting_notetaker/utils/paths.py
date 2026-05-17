@@ -72,6 +72,10 @@ def vocabulary_path() -> Path:
     return app_data_dir() / "vocabulary.txt"
 
 
+def calendar_state_path() -> Path:
+    return app_data_dir() / "calendar_state.json"
+
+
 def db_path() -> Path:
     return app_data_dir() / "sessions.db"
 

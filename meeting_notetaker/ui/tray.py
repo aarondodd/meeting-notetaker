@@ -20,6 +20,9 @@ class TrayIcon(QObject):
     stop_requested = pyqtSignal()
     settings_requested = pyqtSignal()
     quit_requested = pyqtSignal()
+    # Fires when the user clicks the most-recent meeting notification toast.
+    # Payload: the MeetingInfo passed to notify_meeting().
+    meeting_notification_clicked = pyqtSignal(object)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -30,10 +33,12 @@ class TrayIcon(QObject):
         self._build_menu()
         self._tray.setContextMenu(self._menu)
         self._tray.activated.connect(self._on_activated)
+        self._tray.messageClicked.connect(self._on_message_clicked)
         self._pulse_timer = QTimer(self)
         self._pulse_timer.setInterval(700)
         self._pulse_timer.timeout.connect(self._pulse_step)
         self._pulse_phase = False
+        self._last_meeting_info = None
         self._tray.show()
 
     def _build_menu(self) -> None:
@@ -106,3 +111,30 @@ class TrayIcon(QObject):
     @property
     def state(self) -> str:
         return self._state
+
+    def notify_meeting(self, info, *, title: str, body: str, timeout_ms: int = 15000) -> None:
+        """Surface an imminent-meeting toast. Click -> meeting_notification_clicked.
+
+        QSystemTrayIcon.showMessage's clicked signal fires per-toast but does
+        not carry payload; we stash the latest MeetingInfo on the wrapper and
+        emit it back when the user clicks.
+        """
+        self._last_meeting_info = info
+        try:
+            self._tray.showMessage(
+                title,
+                body,
+                QSystemTrayIcon.MessageIcon.Information,
+                int(timeout_ms),
+            )
+        except Exception:
+            # showMessage can fail on platforms without a notification daemon
+            # (some Linux WMs); a missed toast is non-fatal -- the user can
+            # still launch a session from the tray menu or main window.
+            pass
+
+    def _on_message_clicked(self) -> None:
+        info = self._last_meeting_info
+        self._last_meeting_info = None
+        if info is not None:
+            self.meeting_notification_clicked.emit(info)

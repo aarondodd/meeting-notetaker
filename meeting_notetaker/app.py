@@ -13,6 +13,8 @@ from PyQt6.QtCore import QObject, Qt
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from .controller import SessionController
+from .integrations import outlook_calendar
+from .integrations.outlook_calendar import MeetingInfo
 from .models.session import (
     STATE_COMPLETE,
     STATE_ERROR,
@@ -35,7 +37,8 @@ from .ui.tray import TrayIcon
 from .utils import prompts as prompts_mod
 from .utils.config import Config
 from .utils.icons import app_icon
-from .utils.paths import app_data_dir, log_path
+from .utils.live_notes import seed_body_with_calendar
+from .utils.paths import app_data_dir, calendar_state_path, log_path
 from .utils.single_instance import acquire as acquire_lock, release as release_lock
 from .utils.vocabulary import seed_vocabulary_file
 
@@ -65,12 +68,14 @@ class MainApp(QObject):
         self.controller = SessionController(self.store, self.config, parent=self)
         self.window = MainWindow()
         self.tray = TrayIcon(self.window)
+        self._calendar_monitor = None  # set lazily by _apply_calendar_config
 
         self._wire_signals()
         self._apply_user_name()
         self._refresh_session_list()
         self._handle_crash_recovery()
         self._warn_if_store_python()
+        self._apply_calendar_config()
 
         self.window.show()
         self.tray.set_state("idle")
@@ -95,6 +100,7 @@ class MainApp(QObject):
         self.tray.stop_requested.connect(self.controller.stop_session)
         self.tray.settings_requested.connect(self._on_settings)
         self.tray.quit_requested.connect(self.qt_app.quit)
+        self.tray.meeting_notification_clicked.connect(self._on_create_session_from_calendar)
 
         sv = self.window.session_view
         sv.start_clicked.connect(self._on_start_clicked)
@@ -309,7 +315,96 @@ class MainApp(QObject):
             return
         self.config.save()
         self._apply_user_name()
+        self._apply_calendar_config()
         self.window.status("Settings saved.", timeout_ms=4000)
+
+    # ---- calendar integration ---------------------------------------------
+
+    def _apply_calendar_config(self) -> None:
+        """Start/stop/reconfigure the Outlook monitor to match self.config.calendar."""
+        if outlook_calendar.OutlookCalendarMonitor is None:
+            return  # PyQt6 missing in this runtime; integration disabled.
+        want = self.config.calendar.watch_calendar
+        if want and not outlook_calendar.is_available():
+            # User asked to watch but pywin32/Outlook aren't reachable. Quiet log;
+            # one-time warning the first time only -- avoid nagging on every reopen.
+            if not getattr(self, "_calendar_unavailable_warned", False):
+                log.info("Calendar watch enabled but pywin32 / Outlook unavailable.")
+                self._calendar_unavailable_warned = True
+            self._stop_calendar_monitor()
+            return
+        if not want:
+            self._stop_calendar_monitor()
+            return
+        # Want it on; (re)create if missing or window changed.
+        existing = self._calendar_monitor
+        if existing is not None and existing.window_minutes == self.config.calendar.window_minutes:
+            if not existing.is_running():
+                existing.start()
+            return
+        self._stop_calendar_monitor()
+        self._calendar_monitor = outlook_calendar.OutlookCalendarMonitor(
+            calendar_state_path(),
+            window_minutes=self.config.calendar.window_minutes,
+            parent=self,
+        )
+        self._calendar_monitor.meeting_imminent.connect(self._on_meeting_imminent)
+        self._calendar_monitor.start()
+
+    def _stop_calendar_monitor(self) -> None:
+        if self._calendar_monitor is not None:
+            try:
+                self._calendar_monitor.stop()
+            except Exception:
+                log.exception("calendar monitor stop failed")
+            self._calendar_monitor = None
+
+    def _on_meeting_imminent(self, info: MeetingInfo) -> None:
+        try:
+            local_start = info.start_time.strftime("%H:%M")
+        except Exception:
+            local_start = "soon"
+        body_parts = [f"Starts at {local_start}"]
+        if info.location:
+            body_parts.append(info.location)
+        body_parts.append("Click to create a session (recording does not auto-start).")
+        self.tray.notify_meeting(
+            info,
+            title=f"Meeting: {info.subject}",
+            body=" -- ".join(body_parts),
+        )
+
+    def _on_create_session_from_calendar(self, info: MeetingInfo) -> None:
+        self._foreground_window()
+        dialog = NewSessionDialog(
+            retain_audio_default=self.config.audio.retain_audio_default,
+            title_prefill=info.subject,
+            prefill_note=(
+                f"Pre-filled from your Outlook invite. Attendees + agenda will "
+                f"appear in My Notes. Starts at "
+                f"{info.start_time.strftime('%H:%M')}."
+            ),
+            parent=self.window,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        result = dialog.result_value()
+        session = self.store.create_session(
+            title=result.title, retain_audio=result.retain_audio
+        )
+        attendee_names = [a.display for a in info.attendees if a.display]
+        try:
+            TranscriptStore(session.id).save_live_notes(
+                seed_body_with_calendar(
+                    attendees=attendee_names, agenda=info.body
+                )
+            )
+        except OSError:
+            log.exception("failed to seed live notes from calendar")
+        self._refresh_session_list(select=session.id)
+        self.window.status(
+            f"Created session from calendar: {info.subject}", timeout_ms=5000
+        )
 
     # ---- environment warnings ---------------------------------------------
 

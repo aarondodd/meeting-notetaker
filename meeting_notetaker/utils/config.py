@@ -20,6 +20,10 @@ Schema (config.toml):
     user_name = ""               # how the user's mic is labeled (defaults to "Me" when empty)
     first_run_complete = false
 
+    [calendar]
+    watch_calendar = false       # poll Outlook for imminent meetings (Windows + Outlook only)
+    window_minutes = 5           # notify if a meeting starts within +- N min
+
 Reads use tomllib (3.11+) or the tomli fallback. Writes are emitted by hand
 since our schema is flat and tomli-w is not a stdlib component.
 """
@@ -67,10 +71,17 @@ class UiConfig:
 
 
 @dataclass
+class CalendarConfig:
+    watch_calendar: bool = False
+    window_minutes: int = 5
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    calendar: CalendarConfig = field(default_factory=CalendarConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -83,6 +94,7 @@ class Config:
             audio=AudioConfig(**data.get("audio", {})),
             transcription=TranscriptionConfig(**data.get("transcription", {})),
             ui=UiConfig(**data.get("ui", {})),
+            calendar=CalendarConfig(**data.get("calendar", {})),
         )
 
     def save(self, path: Path | None = None) -> None:
@@ -103,6 +115,11 @@ class Config:
                 f"audio.vad_min_silence_ms must be between 50 and 5000, "
                 f"got {self.audio.vad_min_silence_ms}"
             )
+        if not (1 <= self.calendar.window_minutes <= 60):
+            errors.append(
+                f"calendar.window_minutes must be between 1 and 60, "
+                f"got {self.calendar.window_minutes}"
+            )
         return errors
 
     def _dump_toml(self) -> str:
@@ -111,6 +128,7 @@ class Config:
             ("audio", self.audio),
             ("transcription", self.transcription),
             ("ui", self.ui),
+            ("calendar", self.calendar),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():
