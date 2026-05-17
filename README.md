@@ -61,15 +61,18 @@ Click **Preview** in the toolbar to render the Markdown source in place:
 
 ![Main window -- My Notes (preview mode)](docs/screenshots/03-main-my-notes-preview.png)
 
-**Synthesis -- the response from your chatbot, rendered as Markdown.**
-Populated after you click *Paste Response Back* with the LLM's reply.
-The **Print...** button above the tabs sends the active tab to a
-physical printer. For a PDF copy use **Export PDF...** -- it writes a
-PDF directly via Qt's PDF backend, which preserves images and
-clickable links (the Windows "Print to PDF" driver rasterizes both
-away). The **Copy** button copies whichever tab is currently active
-(its label updates to match: "Copy Transcript", "Copy My Notes",
-"Copy Synthesis").
+**Synthesis -- the response from your chatbot, editable in place
+(v0.5+).** Populated after you click *Paste Response Back* with the
+LLM's reply. The tab is a Markdown editor with the same Preview /
+Edit toggle as My Notes, so you can tweak the generated note before
+sharing -- the previous read-only view was a tell that the field was
+mostly correct but never exactly what we wanted. The **Print...**
+button above the tabs sends the active tab to a physical printer.
+For a PDF copy use **Export PDF...** -- it writes a PDF directly via
+Qt's PDF backend, which preserves images and clickable links (the
+Windows "Print to PDF" driver rasterizes both away). The **Copy**
+button copies whichever tab is currently active (its label updates
+to match: "Copy Transcript", "Copy My Notes", "Copy Synthesis").
 
 ![Main window -- Synthesis tab](docs/screenshots/04-main-synthesis.png)
 
@@ -120,6 +123,32 @@ notes file is auto-archived (toggle controls whether):
 
 ![Paste Response Back dialog](docs/screenshots/09-dialog-paste-response.png)
 
+**Label Unknown Speakers (v0.5+)** -- pops automatically after the
+post-meeting speaker-identification pass if any voice in the
+recording didn't match the speaker library. Each card shows the
+top example transcript lines for that cluster + a name field that
+autocompletes from Outlook attendees and known speakers. Skip the
+ones you don't recognize; confirmed names get stored so future
+meetings auto-recognize the same voices:
+
+![Label Unknown Speakers dialog](docs/screenshots/12-dialog-label-unknown-speakers.png)
+
+**Review Speakers (v0.5+)** -- a button on the session view that
+walks every detected speaker for after-the-fact correction. Rename
+a mis-clustered speaker (Bob -> Alice), forget a wrong label, or
+just confirm the existing assignments to reinforce them in the
+store:
+
+![Review Speakers dialog](docs/screenshots/13-dialog-review-speakers.png)
+
+**Manage Speakers (v0.5+)** -- the speaker library lives at
+`%APPDATA%/MeetingNotetaker/speakers.db`. Open via Settings >
+Manage Speakers...; lists every stored name with sample count and
+last-seen date, with Rename / Forget per row and a Forget All
+escape hatch:
+
+![Manage Speakers dialog](docs/screenshots/14-dialog-manage-speakers.png)
+
 ## Why this exists
 
 Many workstations forbid:
@@ -139,21 +168,36 @@ hand-off.
 
 ## Status
 
-v0.4 alpha. End-to-end capture + transcription + synthesis works;
-v0.4 adds calendar-aware capture (Outlook COM polling -> tray
-notification -> pre-filled New Session) plus custom vocabulary (global
-plus per-session hotwords from attendees + agenda) plus an explicit
-audio-device picker, image paste / insert into My Notes, native PDF
-export (Print for paper; Export PDF for files; both preserve images
-and links), a "Copy" button that always copies the active tab, a
-non-modal log viewer (Help > View Log), an Outlook reachability
-diagnostic (Help > Diagnose Outlook), a permanent status bar at the
-bottom showing input device + system-audio device + calendar state,
-and a weekly GitHub-releases update check (Help > Check for
-Updates...). The interface follows the OS dark/light setting
-automatically. Performance tuning is ongoing; the final refinement
-pass can take a while on CPU (see "Why transcription can take a
-while" below).
+v0.5 alpha. End-to-end capture + transcription + synthesis works.
+v0.5 adds **post-meeting speaker identification with persistent
+self-learning**: after a recording stops, the app segments the
+system-audio loopback channel into per-speaker turns, embeds each
+turn with Resemblyzer, clusters them, and matches the clusters
+against a local speaker library (`speakers.db`). Unrecognized voices
+prompt a *Label Unknown Speakers* dialog with example transcript
+lines per cluster + suggestions seeded from the Outlook attendee
+list -- assign once, and future meetings auto-label them. A *Review
+Speakers...* button on each session walks every detected cluster
+for after-the-fact corrections (rename / forget); the speaker store
+gets a running-average centroid update on each confirmation so the
+match quality improves over meetings. v0.5 also makes the Synthesis
+tab editable in place (same Markdown editor as My Notes), so the
+LLM-generated note can be tweaked before sharing.
+
+v0.4 (kept in v0.5) brings calendar-aware capture (Outlook COM
+polling -> tray notification -> pre-filled New Session), custom
+vocabulary (global plus per-session hotwords from attendees +
+agenda), audio-device picker, image paste / insert into My Notes,
+native PDF export (Print for paper; Export PDF for files; both
+preserve images and links), a "Copy" button that always copies the
+active tab, a non-modal log viewer (Help > View Log), an Outlook
+reachability diagnostic (Help > Diagnose Outlook), a permanent
+status bar at the bottom showing input device + system-audio device
++ calendar state + speaker count, and a weekly GitHub-releases
+update check (Help > Check for Updates...). The interface follows
+the OS dark/light setting automatically. Performance tuning is
+ongoing; the final refinement pass can take a while on CPU (see
+"Why transcription can take a while" below).
 
 The WASAPI loopback path is cribbed from
 [Danaor/WhisperType](https://github.com/Danaor/WhisperType).
@@ -302,17 +346,20 @@ delete the session.
 ```
 %APPDATA%\MeetingNotetaker\
   sessions.db                    # SQLite session + folder metadata (WAL)
+  speakers.db                    # SQLite speaker library (name + centroid + samples)
   config.toml                    # user settings
   instance.lock                  # single-instance pidfile
   meeting_notetaker.log          # rotating app log
   models\                        # faster-whisper model cache
   prompts\                       # user-editable synthesis prompts (auto-seeded)
+  vocabulary.txt                 # user-editable global hotwords
   sessions\
     <session-uuid>\
       raw.transcript.md          # interleaved transcript, source-labeled
       live_notes.md              # your own running notes (auto-seeded, auto-saved)
       notes.md                   # latest LLM-generated (merged) notes
       notes-YYYYMMDD-HHMM.md     # archived prior notes (if any)
+      diarization.json           # per-cluster speaker mapping + centroids (v0.5+)
       metadata.json
       audio\                     # mic.wav + sys.wav (deleted after transcription
                                  # unless 'Keep audio' was set for the session)
@@ -370,6 +417,9 @@ these are also editable directly in `config.toml`.
 | Custom vocabulary | (empty) | One phrase per line in `vocabulary.txt`. Biases the transcriber toward proper nouns and corporate terms it would otherwise mis-hear ("Plantronics", "EDAPA-737", "Snowflake Cortex"). Per-session hotwords are also auto-derived from your `# Attendees` block and the agenda body when present. |
 | Watch Outlook calendar | off | Poll Outlook for upcoming meetings and pop a tray notification a few minutes before each one starts. Click the notification to open New Session with the meeting subject, attendees, and agenda pre-filled. Recording is never started automatically. Windows + Outlook only. |
 | Notify within (min) | 5 | How far in advance to surface the calendar notification. |
+| Enable speaker identification | on | After each meeting, group the system-audio loopback channel into per-speaker turns and try to match each group against the stored speaker library. Unmatched groups prompt the Label Unknown Speakers dialog so you can name them. Disable to keep the generic "Them:" labels. |
+| Match threshold | 75% | Cosine-similarity floor for auto-matching a meeting voice against a stored speaker. Higher = stricter (more unknowns surfaced for manual labeling); lower = looser (more auto-labels, higher risk of calling Bob Alice). 50-95% range. |
+| Manage Speakers... | -- | Opens a list of every stored speaker with sample count, last-seen date, Rename + Forget per row, and Forget All. The library lives at `speakers.db` and never leaves the machine. |
 
 ### Why transcription can take a while (and what to do about it)
 
@@ -429,6 +479,46 @@ recordings (mic only) get no benefit from this.
 
 Switching models reloads at the start of the next recording.
 Already-recorded sessions are not re-transcribed automatically.
+
+### Speaker identification (v0.5+)
+
+After the post-meeting refinement pass commits the final transcript,
+a second pass runs the loopback (system audio) recording through
+speaker identification. The flow:
+
+1. Energy + VAD segmentation splits the loopback channel into
+   per-turn voiced spans.
+2. Each turn is embedded with Resemblyzer into a 256-dim vector.
+3. The vectors are clustered by cosine similarity (greedy agglomerative;
+   threshold tunable in Settings, default 0.75).
+4. Each cluster centroid is matched against `speakers.db`. Matches
+   above the threshold auto-label the cluster with the stored name.
+5. The transcript on disk is rewritten with names where matched, or
+   "Speaker N" for clusters that didn't match.
+6. If any clusters remain unmatched, the **Label Unknown Speakers**
+   dialog pops with example transcript lines and a name picker
+   seeded from Outlook attendees + already-stored speakers. Confirmed
+   names get added to `speakers.db` so future meetings auto-recognize
+   the same voices.
+
+The mic channel is always the user; it doesn't go through this pipeline
+and keeps the "Me:" / "Your name" rendering it always had.
+
+The **Review Speakers...** button on the session view re-opens the
+walker on a previously-completed session. Walks every detected cluster
+(known + unknown) so you can rename a mis-clustered speaker or
+forget a wrong label. Updates the on-disk transcript and feeds the
+correction back to the speaker store on accept.
+
+Privacy: no audio or embeddings ever leave the machine. The Resemblyzer
+model is bundled in the pip wheel; nothing downloads at runtime.
+**Manage Speakers...** in Settings shows the full list and gives
+per-row Forget + Forget All for a clean slate.
+
+Wheel manifest additions in v0.5 (IT review): Resemblyzer transitively
+pulls `librosa`, `scipy`, and `torch`. The frozen exe grows
+substantially (~300MB -> ~1GB). All on-device; no network calls in
+the speaker-identification path.
 
 ### Adding or editing synthesis prompts
 
