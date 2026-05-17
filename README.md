@@ -51,6 +51,9 @@ column conveys.
 source with a small formatting toolbar. Sections (`# Attendees / # Agenda
 / # Notes / # Action Items`) auto-seed on first open. Everything you
 type auto-saves continuously and is fed back into the synthesis prompt.
+Paste an image from the clipboard (or click **Image** in the toolbar to
+insert a file) and the app copies it into the session's `images/` folder
+and inserts a Markdown reference -- ideal for screenshares.
 
 ![Main window -- My Notes (edit mode)](docs/screenshots/02-main-my-notes-edit.png)
 
@@ -60,6 +63,9 @@ Click **Preview** in the toolbar to render the Markdown source in place:
 
 **Synthesis -- the response from your chatbot, rendered as Markdown.**
 Populated after you click *Paste Response Back* with the LLM's reply.
+The **Print...** button above the tabs prints whichever of My Notes or
+Synthesis is active; pick "Microsoft Print to PDF" in the printer
+dialog to save to PDF.
 
 ![Main window -- Synthesis tab](docs/screenshots/04-main-synthesis.png)
 
@@ -131,9 +137,11 @@ v0.4 alpha. End-to-end capture + transcription + synthesis works;
 v0.4 adds calendar-aware capture (Outlook COM polling -> tray
 notification -> pre-filled New Session) plus custom vocabulary (global
 plus per-session hotwords from attendees + agenda) plus an explicit
-audio-device picker. Performance tuning is ongoing; the final
-refinement pass can take a while on CPU (see "Why transcription can
-take a while" below).
+audio-device picker, image paste / insert into My Notes, a Print
+button (for "Microsoft Print to PDF" or any other printer), and a
+weekly GitHub-releases update check (Help > Check for Updates...).
+Performance tuning is ongoing; the final refinement pass can take a
+while on CPU (see "Why transcription can take a while" below).
 
 The WASAPI loopback path is cribbed from
 [Danaor/WhisperType](https://github.com/Danaor/WhisperType).
@@ -293,7 +301,23 @@ delete the session.
       metadata.json
       audio\                     # mic.wav + sys.wav (deleted after transcription
                                  # unless 'Keep audio' was set for the session)
+    images\                    # images pasted/inserted into live_notes.md
+                               # or notes.md (referenced as images/<name>)
 ```
+
+## Updates
+
+The Help menu has **Check for Updates...** (manual) and **Upgrade...**
+(download + rebuild via pyinstaller). On startup the app also runs a
+silent weekly check against GitHub releases for
+`aarondodd/meeting-notetaker`; if a newer tag exists you'll see a
+prompt. Network failures or a restricted release feed degrade to
+silent no-op, so the check never blocks startup.
+
+The Upgrade flow downloads the release zipball, extracts it, and runs
+`build.ps1` (Windows) or `build.sh` (POSIX) -- the same script you'd
+run for a manual build. After it finishes, restart the app to pick up
+the new build.
 
 ## Settings
 
