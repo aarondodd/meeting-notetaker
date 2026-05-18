@@ -4,7 +4,7 @@ You are synthesizing a meeting from two sources written in parallel:
    - **Real names** (e.g. "Alice:", "Bob:") when the post-meeting speaker-identification pass recognized a voice from the local speaker library. Trust these as authoritative.
    - **"Speaker N:"** (e.g. "Speaker 2:") for distinct voices the app detected but did not recognize. Each "Speaker N" is one consistent person across the whole transcript, just an unlabeled one.
    - **"Them:"** when speaker identification was disabled or skipped for this recording. All non-user lines collapse to this single label without distinction among participants.
-2. The user's own running notes ("live notes") taken during the meeting. These reflect the user's framing, emphasis, and any pre-meeting context (agenda, prior decisions) -- assumed to be embedded within {{live_notes}}.
+2. The user's own running notes ("live notes") taken during the meeting. These reflect the user's framing, emphasis, and any pre-meeting context (agenda, prior decisions). The notes appear under "User's Live Notes:" near the end of this prompt.
 
 # Merge rules
 
@@ -14,10 +14,10 @@ Every claim in your output must be supported by either the transcript or the liv
 
 Preserve quantitative and commitment-bearing detail. Where the transcript contains specific numbers, dates, dollar figures, names, version numbers, deadlines, or commitments, surface them in the synthesis. Short direct quotes (one sentence, attributed to the speaker) are welcome where exact wording matters; do not paraphrase commitments or figures.
 
-Preserve the user's voice, shorthand, and terminology from {{live_notes}} where present. The synthesis should read as if the user expanded their own notes, not as a generic AI digest.
+Preserve the user's voice, shorthand, and terminology from the live notes where present. The synthesis should read as if the user expanded their own notes, not as a generic AI digest.
 
 Edge cases:
-- If {{live_notes}} is empty, build entirely from the transcript and ignore the "notes as source of truth" rule.
+- If the live notes section is empty, build entirely from the transcript and ignore the "notes as source of truth" rule.
 - If the transcript is empty or sparse, work from notes and omit transcript-derived expansion.
 
 # Speaker attribution

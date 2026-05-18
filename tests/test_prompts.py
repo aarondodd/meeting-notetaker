@@ -66,6 +66,23 @@ def test_render_accepts_pre_formatted_date_string(isolated_data_dir):
     assert out == "custom"
 
 
+def test_bundled_templates_use_live_notes_placeholder_once(isolated_data_dir):
+    """Every {{live_notes}} occurrence in a bundled template should be the
+    actual insertion point for the user's notes -- not a placeholder used
+    as a textual reference. Multiple occurrences cause the full notes
+    blob to get spliced into prompt prose, which broke the rendered
+    prompt prior to this regression test.
+    """
+    for name in ("default", "one-on-one", "standup"):
+        tpl = prompts_mod.get_template(name)
+        assert tpl is not None, f"missing bundled template: {name}"
+        count = tpl.body.count("{{live_notes}}")
+        assert count == 1, (
+            f"{name}.md has {count} {{live_notes}} occurrences; "
+            "expected exactly 1 (the final substitution point)."
+        )
+
+
 def test_seed_refreshes_unmodified_prior_bundled_template(isolated_data_dir):
     """If a user file matches a prior-shipped hash, re-seed refreshes it."""
     user_dir = prompts_dir()
