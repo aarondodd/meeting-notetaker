@@ -51,7 +51,8 @@ _STATE_BADGE: dict[str, tuple[str, str]] = {
 
 _COL_AUDIO = 0
 _COL_STATE = 1
-_COL_TITLE = 2
+_COL_DATE = 2
+_COL_TITLE = 3
 
 
 class MainWindow(QMainWindow):
@@ -127,7 +128,7 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self._new_btn)
         left_layout.addLayout(header_row)
         self._list = QTreeWidget(left)
-        self._list.setColumnCount(3)
+        self._list.setColumnCount(4)
         self._list.setHeaderHidden(True)
         self._list.setRootIsDecorated(False)
         self._list.setUniformRowHeights(True)
@@ -136,12 +137,15 @@ class MainWindow(QMainWindow):
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_list_menu)
         header = self._list.header()
-        # The indicator columns are narrow; the title column takes the rest.
+        # Audio + state are narrow glyph columns; date is fixed-width
+        # to fit "YYYY-MM-DD HH:MM"; title takes the remaining space.
         header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
         self._list.setColumnWidth(_COL_AUDIO, 28)
         self._list.setColumnWidth(_COL_STATE, 28)
+        self._list.setColumnWidth(_COL_DATE, 110)
         left_layout.addWidget(self._list, 1)
         bulk_row = QHBoxLayout()
         bulk_row.addStretch(1)
@@ -156,7 +160,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.session_view)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([300, 700])
+        splitter.setSizes([340, 660])
 
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
@@ -182,6 +186,8 @@ class MainWindow(QMainWindow):
         calendar_tooltip: str = "",
         speakers_label: str = "",
         speakers_tooltip: str = "",
+        voice_label: str = "",
+        voice_tooltip: str = "",
     ) -> None:
         """Update the bottom status bar's right-side indicator string.
 
@@ -191,9 +197,8 @@ class MainWindow(QMainWindow):
         hover the indicator to see the long form (the QLabel doesn't
         expose per-character tooltips).
 
-        `speakers_label` is shown only when non-empty -- the indicator
-        is hidden entirely when speaker ID is disabled or no speakers
-        are stored yet, since "Speakers: 0" would just add noise.
+        `speakers_label` and `voice_label` only render when non-empty --
+        clean installs and not-applicable states leave them out.
         """
         parts: list[str] = []
         tooltip_parts: list[str] = []
@@ -209,6 +214,9 @@ class MainWindow(QMainWindow):
         if speakers_label:
             parts.append(speakers_label)
             tooltip_parts.append(speakers_tooltip or speakers_label)
+        if voice_label:
+            parts.append(voice_label)
+            tooltip_parts.append(voice_tooltip or voice_label)
         self._indicators_label.setText(" | ".join(parts))
         self._indicators_label.setToolTip("\n".join(tooltip_parts))
 
@@ -249,10 +257,12 @@ class MainWindow(QMainWindow):
         state_glyph, state_tooltip = _STATE_BADGE.get(s.state, ("", s.state))
         state_tooltip = f"Transcription state: {state_tooltip}"
 
+        when, title = _session_date_and_title(s)
         item = QTreeWidgetItem([
             audio_glyph,
             state_glyph,
-            _session_list_label(s),
+            when,
+            title,
         ])
         item.setTextAlignment(_COL_AUDIO, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_STATE, Qt.AlignmentFlag.AlignCenter)
@@ -292,12 +302,12 @@ class MainWindow(QMainWindow):
             self.delete_sessions_requested.emit(ids)
 
 
-def _session_list_label(s: Session) -> str:
-    """Date + title for the title column. State is conveyed by its own column."""
+def _session_date_and_title(s: Session) -> tuple[str, str]:
+    """Return ('YYYY-MM-DD HH:MM', title) for the list's two main columns."""
     try:
         when = datetime.fromisoformat(s.created_at.replace("Z", "+00:00")).strftime(
             "%Y-%m-%d %H:%M"
         )
     except ValueError:
         when = s.created_at
-    return f"{when}  --  {s.title}"
+    return when, s.title

@@ -96,6 +96,10 @@ def refine_loopback(
     speaker_store: SpeakerStore,
     encoder: Embedder,
     sys_source: str = "sys",
+    mic_source: str = "mic",
+    mic_wav: Optional[Path] = None,
+    user_voiceprint: Optional[np.ndarray] = None,
+    user_match_threshold: float = 0.7,
     match_threshold: float = 0.75,
     merge_threshold: float = 0.75,
     min_overlap_sec: float = 0.25,
@@ -103,8 +107,15 @@ def refine_loopback(
     """Run the full pipeline.
 
     Returns a RefinementResult with per-segment labels and per-cluster
-    summaries. Only segments whose `source` equals `sys_source` get
-    labels (mic = self, no clustering needed).
+    summaries. System-audio segments get labeled against clusters derived
+    from `wav_path`. When `mic_wav` and `user_voiceprint` are supplied,
+    microphone-channel segments also get vetted: a mic turn that fails
+    to match the voiceprint but overlaps a system-audio cluster turn is
+    relabeled with that cluster's name -- the bleed case where the room
+    mic picks up another speaker via speakers / headset bleed. Mic
+    turns that match the voiceprint (or that don't overlap any sys
+    cluster) keep the default "user" labeling via the source-aware
+    rewrite pipeline.
 
     The caller is responsible for any side effects (rewriting
     raw.transcript.md, persisting decisions, prompting the user for
@@ -121,6 +132,26 @@ def refine_loopback(
 
     assignment = cluster_segments(embeddings, merge_threshold=merge_threshold)
     clusters = _summarize_clusters(assignment, turns, speaker_store, match_threshold)
+
+    mic_bleed_assignments: dict[int, int] = {}
+    if (
+        mic_wav is not None
+        and Path(mic_wav).exists()
+        and user_voiceprint is not None
+        and user_voiceprint.size > 0
+    ):
+        mic_bleed_assignments = _detect_mic_bleed(
+            Path(mic_wav),
+            transcript_segments,
+            mic_source=mic_source,
+            sys_turns=turns,
+            sys_assignment=assignment,
+            encoder=encoder,
+            user_voiceprint=user_voiceprint,
+            user_match_threshold=user_match_threshold,
+            min_overlap_sec=min_overlap_sec,
+        )
+
     segment_labels = _label_transcript_segments(
         transcript_segments,
         turns,
@@ -128,7 +159,14 @@ def refine_loopback(
         clusters,
         sys_source=sys_source,
         min_overlap_sec=min_overlap_sec,
+        mic_bleed_assignments=mic_bleed_assignments,
     )
+    # Drop clusters whose voice turns never overlapped any transcript
+    # segment with enough margin to win an assignment. They're a
+    # speaker-walker dead end -- no example lines to show -- and tend to
+    # come from short non-speech blips silero+webrtcvad called voiced
+    # but Whisper produced nothing for.
+    clusters = _drop_clusters_without_segments(clusters, segment_labels)
     unknown_ids = [c.cluster_id for c in clusters if c.name is None]
     return RefinementResult(
         turns=turns,
@@ -136,6 +174,90 @@ def refine_loopback(
         segment_labels=segment_labels,
         unknown_cluster_ids=unknown_ids,
     )
+
+
+def _detect_mic_bleed(
+    mic_wav: Path,
+    transcript_segments,
+    *,
+    mic_source: str,
+    sys_turns: list[Turn],
+    sys_assignment: ClusterAssignment,
+    encoder: Embedder,
+    user_voiceprint: np.ndarray,
+    user_match_threshold: float,
+    min_overlap_sec: float,
+) -> dict[int, int]:
+    """Find mic-source segments that should be reattributed to a sys cluster.
+
+    A mic turn is considered "bleed" if it (a) does NOT match the user's
+    stored voiceprint and (b) substantially overlaps a sys cluster turn.
+    The bleed mic turn inherits that sys cluster's id, and any mic-source
+    transcript segment falling inside the bleed turn gets relabeled.
+
+    Returns a mapping of `segment_index -> sys_cluster_id`. Segments not
+    in the mapping fall through to the existing mic-source default
+    (user_name in the display label).
+
+    The implementation only embeds the few mic turns that overlap at
+    least one mic-source transcript segment -- silent stretches of
+    mic.wav (most of a meeting where the user isn't talking) get skipped.
+    """
+    mic_segment_spans = [
+        (i, float(seg.t_start), float(seg.t_end))
+        for i, seg in enumerate(transcript_segments)
+        if getattr(seg, "source", None) == mic_source
+    ]
+    if not mic_segment_spans:
+        return {}
+    mic_turns = find_turns_in_wav(mic_wav)
+    if not mic_turns:
+        return {}
+    voiceprint = np.asarray(user_voiceprint, dtype=np.float32).reshape(-1)
+    bleed: dict[int, int] = {}
+    for turn in mic_turns:
+        overlapping_segs = [
+            (idx, s_start, s_end)
+            for (idx, s_start, s_end) in mic_segment_spans
+            if _interval_overlap(turn.t_start, turn.t_end, s_start, s_end) > 0
+        ]
+        if not overlapping_segs:
+            continue
+        # Voiceprint check first -- if this is the user talking, leave
+        # the segment alone (mic-default labeling already attributes it
+        # correctly).
+        mic_embedding = np.asarray(encoder.embed_turn(turn), dtype=np.float32)
+        if np.linalg.norm(mic_embedding) > 1e-6:
+            sim_user = cosine_similarity(mic_embedding, voiceprint)
+            if sim_user >= user_match_threshold:
+                continue
+        # Not the user. Look for a sys cluster whose turns overlap this
+        # mic turn -- the same speech is on both channels (bleed).
+        cluster_overlap: dict[int, float] = {}
+        for sys_idx, sys_turn in enumerate(sys_turns):
+            ov = _interval_overlap(
+                turn.t_start, turn.t_end, sys_turn.t_start, sys_turn.t_end
+            )
+            if ov > 0:
+                cid = sys_assignment.labels[sys_idx]
+                cluster_overlap[cid] = cluster_overlap.get(cid, 0.0) + ov
+        if not cluster_overlap:
+            continue
+        best_cluster = max(cluster_overlap, key=cluster_overlap.get)
+        if cluster_overlap[best_cluster] < min_overlap_sec:
+            continue
+        # Tag every mic-source transcript segment inside this bleed turn.
+        for (idx, _, _) in overlapping_segs:
+            bleed[idx] = best_cluster
+    return bleed
+
+
+def _drop_clusters_without_segments(
+    clusters: list[ClusterSummary],
+    segment_labels: list[SegmentLabel],
+) -> list[ClusterSummary]:
+    used = {lbl.cluster_id for lbl in segment_labels if lbl.cluster_id is not None}
+    return [c for c in clusters if c.cluster_id in used]
 
 
 def _empty_result(transcript_segments) -> RefinementResult:
@@ -180,25 +302,40 @@ def _label_transcript_segments(
     *,
     sys_source: str,
     min_overlap_sec: float,
+    mic_bleed_assignments: Optional[dict[int, int]] = None,
 ) -> list[SegmentLabel]:
     """For each transcript segment, pick the cluster with maximum time overlap.
 
-    Skips mic-source segments (those keep the user's name from the existing
-    rewrite_user_label pipeline). For sys-source segments, sums total
-    overlap per cluster across all member turns. The cluster with the
-    largest overlap wins, provided the overlap exceeds `min_overlap_sec`
+    Mic-source segments stay unlabeled by default so the existing
+    rewrite_user_label pipeline attributes them to the user. When
+    `mic_bleed_assignments` flags a mic-source segment as overlapping a
+    system-audio cluster (bleed), that segment gets the sys cluster's
+    label instead. For sys-source segments, sums total overlap per
+    cluster across all member turns. The cluster with the largest
+    overlap wins, provided the overlap exceeds `min_overlap_sec`
     (avoids spurious assignment from tiny turn-boundary intersections).
     """
+    bleed = mic_bleed_assignments or {}
     cluster_by_id = {c.cluster_id: c for c in clusters}
     labels: list[SegmentLabel] = []
     for i, seg in enumerate(transcript_segments):
         if getattr(seg, "source", None) != sys_source:
-            labels.append(SegmentLabel(
-                segment_index=i,
-                cluster_id=None,
-                name=None,
-                confidence=None,
-            ))
+            cluster_id = bleed.get(i)
+            if cluster_id is not None and cluster_id in cluster_by_id:
+                summary = cluster_by_id[cluster_id]
+                labels.append(SegmentLabel(
+                    segment_index=i,
+                    cluster_id=cluster_id,
+                    name=summary.name,
+                    confidence=summary.match_similarity,
+                ))
+            else:
+                labels.append(SegmentLabel(
+                    segment_index=i,
+                    cluster_id=None,
+                    name=None,
+                    confidence=None,
+                ))
             continue
         seg_start = float(seg.t_start)
         seg_end = float(seg.t_end)

@@ -24,6 +24,7 @@ from typing import Callable, Optional
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
 from .audio.chunk_buffer import ChunkBuffer
+from .diarization import user_voiceprint as user_voiceprint_module
 from .diarization.embeddings import EmbedderUnavailable, default_encoder
 from .diarization.persistence import save_diarization
 from .diarization.refiner import (
@@ -141,6 +142,22 @@ class _BatchTranscribeThread(QThread):
             self.failed.emit(str(exc))
 
 
+def _load_user_voiceprint_for_refinement():
+    """Return the stored user-voiceprint embedding, or None.
+
+    The refiner only consults it when present; absence means mic-source
+    transcript segments stay attributed to the user by default (legacy
+    behavior). Catches and logs file-level errors so a bad on-disk
+    voiceprint never blocks the refinement pass.
+    """
+    try:
+        vp = user_voiceprint_module.load()
+    except Exception:
+        log.exception("user voiceprint load failed; refinement falls back to default")
+        return None
+    return vp.embedding if vp is not None else None
+
+
 class _SpeakerRefinementThread(QThread):
     """Runs the post-meeting speaker-identification pass off the UI thread.
 
@@ -167,13 +184,17 @@ class _SpeakerRefinementThread(QThread):
         *,
         match_threshold: float,
         merge_threshold: float,
+        mic_wav: Optional[Path] = None,
+        user_voiceprint=None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self.sys_wav = sys_wav
+        self.mic_wav = mic_wav
         self.transcript_segments = transcript_segments
         self.match_threshold = match_threshold
         self.merge_threshold = merge_threshold
+        self.user_voiceprint = user_voiceprint
 
     def run(self) -> None:
         try:
@@ -199,6 +220,9 @@ class _SpeakerRefinementThread(QThread):
                     speaker_store=speaker_store,
                     encoder=default_encoder,
                     sys_source=SYS,
+                    mic_source=MIC,
+                    mic_wav=self.mic_wav,
+                    user_voiceprint=self.user_voiceprint,
                     match_threshold=self.match_threshold,
                     merge_threshold=self.merge_threshold,
                 )
@@ -535,11 +559,14 @@ class SessionController(QObject):
 
         self.speaker_refinement_starting.emit(session.id)
         self.status.emit("Identifying speakers...")
+        voiceprint = _load_user_voiceprint_for_refinement()
         self._refinement_thread = _SpeakerRefinementThread(
             self._sys_wav,
             refinement_input,
             match_threshold=self.config.speakers.match_threshold,
             merge_threshold=self.config.speakers.merge_threshold,
+            mic_wav=self._mic_wav,
+            user_voiceprint=voiceprint,
         )
         self._refinement_thread.progress.connect(self.status.emit)
         self._refinement_thread.done.connect(

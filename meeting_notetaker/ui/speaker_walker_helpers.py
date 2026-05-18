@@ -45,6 +45,10 @@ def entries_from_refinement(
         example_lines = _example_lines_for_cluster(
             summary.cluster_id, result, transcript_segments
         )
+        if not example_lines:
+            # Cluster has no transcript-segment evidence; the walker
+            # can't help the user act on it. Skip.
+            continue
         entries.append(SpeakerWalkerEntry(
             cluster_id=summary.cluster_id,
             current_name=summary.name,
@@ -85,6 +89,10 @@ def entries_from_persistence(
             continue
         seg_indices = by_cluster.get(cluster.cluster_id, [])
         example_lines = _format_examples(seg_indices, transcript_segments)
+        if not example_lines:
+            # Legacy persisted clusters from before the refiner pruned
+            # empty ones; skip rather than show an unactionable card.
+            continue
         entries.append(SpeakerWalkerEntry(
             cluster_id=cluster.cluster_id,
             current_name=cluster.name,

@@ -31,11 +31,13 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
 from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
+from ..diarization import user_voiceprint
 from ..diarization.store import open_speaker_store
 from ..utils.config import Config, VALID_MODEL_SIZES
 from ..utils.paths import prompts_dir, vocabulary_path
 from ..utils.vocabulary import seed_vocabulary_file
 from .speakers_manage_dialog import SpeakersManageDialog
+from .voice_enrollment_dialog import VoiceEnrollmentDialog
 
 
 class SettingsDialog(QDialog):
@@ -262,6 +264,34 @@ class SettingsDialog(QDialog):
         )
         self._manage_speakers_btn.clicked.connect(self._open_manage_speakers)
         speakers_form.addRow(self._manage_speakers_btn)
+
+        # Voice enrollment -- a stored embedding of the user's own voice.
+        # Lets the refiner attribute mic-channel speech that actually came
+        # from the loopback (bleed) to the right system-audio speaker
+        # rather than blanket-labeling everything on the mic as the user.
+        self._voice_status_label = QLabel("", self)
+        self._voice_status_label.setWordWrap(True)
+        self._voice_status_label.setStyleSheet("color: palette(text);")
+        self._record_voice_btn = QPushButton("", self)
+        self._record_voice_btn.setToolTip(
+            "Record a short sample of your voice. The embedding stays on "
+            "this machine -- no audio leaves it. Used to disambiguate mic "
+            "vs system audio when both pick up the same speaker."
+        )
+        self._record_voice_btn.clicked.connect(self._open_voice_enrollment)
+        self._clear_voice_btn = QPushButton("Clear Sample", self)
+        self._clear_voice_btn.setToolTip(
+            "Delete the stored voiceprint. Mic-channel speech will go back "
+            "to being labeled as the user by default."
+        )
+        self._clear_voice_btn.clicked.connect(self._clear_voiceprint)
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(self._record_voice_btn)
+        voice_row.addWidget(self._clear_voice_btn)
+        voice_row.addStretch(1)
+        speakers_form.addRow("Your voice:", self._voice_status_label)
+        speakers_form.addRow("", voice_row)
+        self._refresh_voiceprint_row()
         layout.addWidget(speakers_group)
 
         # Calendar group ---------------------------------------------------
@@ -382,6 +412,32 @@ class SettingsDialog(QDialog):
         finally:
             store.close()
 
+    def _refresh_voiceprint_row(self) -> None:
+        """Sync the Your-voice row to whatever is on disk right now."""
+        vp = user_voiceprint.load()
+        if vp is None:
+            self._voice_status_label.setText("Not enrolled.")
+            self._record_voice_btn.setText("Record voice sample...")
+            self._clear_voice_btn.setEnabled(False)
+        else:
+            self._voice_status_label.setText(
+                f"Enrolled (recorded {_format_recorded_at(vp.recorded_at)})."
+            )
+            self._record_voice_btn.setText("Re-record sample...")
+            self._clear_voice_btn.setEnabled(True)
+
+    def _open_voice_enrollment(self) -> None:
+        device_name = self._mic_picker.currentData() or ""
+        dialog = VoiceEnrollmentDialog(device_name=device_name, parent=self)
+        dialog.exec()
+        # Whether the dialog saved or cancelled, re-read disk so the row
+        # always reflects truth.
+        self._refresh_voiceprint_row()
+
+    def _clear_voiceprint(self) -> None:
+        if user_voiceprint.clear():
+            self._refresh_voiceprint_row()
+
 
 def _populate_device_picker(
     combo: QComboBox, devices: list[AudioDevice], saved_name: str
@@ -438,3 +494,15 @@ def _populate_device_picker(
             if saved_lower in data.lower():
                 combo.setCurrentIndex(i)
                 return
+
+
+def _format_recorded_at(iso: str) -> str:
+    """Render an ISO-8601 UTC timestamp as a local YYYY-MM-DD HH:MM."""
+    if not iso:
+        return "unknown date"
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return iso

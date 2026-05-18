@@ -172,6 +172,42 @@ def test_refiner_matches_known_speaker(two_voice_wav, two_voice_segments, tmp_pa
     assert label_a_first.name == "Alice"
 
 
+def test_refiner_drops_clusters_with_no_segment_evidence(tmp_path):
+    """A loopback can contain voiced turns that no transcript segment
+    overlaps (e.g. short non-speech that VAD accepted but Whisper produced
+    no text for). Those clusters should not appear in the result -- the
+    speaker walker has nothing to show for them.
+    """
+    sr = 16000
+    pcm = np.concatenate([
+        _silence(0.6, sr),
+        _sine(200, 2.0, sr),       # voice A, 0.6-2.6s -- covered by sys segment
+        _silence(0.8, sr),
+        _sine(500, 2.0, sr),       # voice B, 3.4-5.4s -- no sys segment overlaps
+        _silence(0.8, sr),
+        _sine(800, 2.0, sr),       # voice C, 6.2-8.2s -- no sys segment overlaps
+    ])
+    wav_path = tmp_path / "sys.wav"
+    _write_wav(wav_path, pcm, sr)
+    segments = [
+        TranscriptSegment(source="sys", text="Only voice A is transcribed",
+                          t_start=0.6, t_end=2.6),
+    ]
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        wav_path,
+        segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+    )
+    # Refiner detected 3 voiced spans but only one had transcript coverage.
+    assert len(result.clusters) == 1
+    assert len(result.unknown_cluster_ids) == 1
+    # The retained cluster is the one assigned to the sole sys segment.
+    sole_label = next(lbl for lbl in result.segment_labels if lbl.segment_index == 0)
+    assert sole_label.cluster_id == result.clusters[0].cluster_id
+
+
 def test_refiner_empty_loopback_returns_no_labels(tmp_path):
     """Silent WAV -> no turns -> all segments unlabeled."""
     sr = 16000
@@ -191,6 +227,135 @@ def test_refiner_empty_loopback_returns_no_labels(tmp_path):
     assert result.clusters == []
     assert all(lbl.cluster_id is None for lbl in result.segment_labels)
     assert result.unknown_cluster_ids == []
+
+
+def test_refiner_relabels_mic_bleed_to_sys_speaker(tmp_path):
+    """A mic-source segment whose audio bled in from the loopback (and
+    therefore matches the sys speaker's voiceprint, not the user's)
+    should be relabeled with the sys speaker's name instead of the
+    user's default mic label.
+    """
+    sr = 16000
+    sys_pcm = np.concatenate([
+        _silence(0.4, sr),
+        _sine(500, 2.5, sr),       # voice B on loopback, 0.4-2.9s
+    ])
+    sys_wav = tmp_path / "sys.wav"
+    _write_wav(sys_wav, sys_pcm, sr)
+
+    # Mic.wav contains the SAME 500Hz tone (room mic picked up the
+    # speakers playing voice B) -- the voiceprint check will fail and
+    # the timing overlap will succeed, so this becomes a bleed.
+    mic_pcm = np.concatenate([
+        _silence(0.4, sr),
+        _sine(500, 2.5, sr),
+    ])
+    mic_wav = tmp_path / "mic.wav"
+    _write_wav(mic_wav, mic_pcm, sr)
+
+    segments = [
+        # Mic-source transcript line of Bob's words leaking onto Aaron's mic.
+        TranscriptSegment(source="mic", text="Bob bled onto the mic",
+                          t_start=0.5, t_end=2.5),
+        # Sys-source transcript line for the same speech on the loopback.
+        TranscriptSegment(source="sys", text="Bob speaking",
+                          t_start=0.5, t_end=2.5),
+    ]
+    store = SpeakerStore(tmp_path / "speakers.db")
+    # User voiceprint is the 200Hz signature -- the (0,1,0) bucket from
+    # FrequencyEmbedder. The mic bleed at 500Hz will land in (0,0,1) and
+    # fail to match.
+    user_voiceprint = _unit_vec(0.0, 1.0, 0.0)
+
+    result = refine_loopback(
+        sys_wav,
+        segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        mic_wav=mic_wav,
+        user_voiceprint=user_voiceprint,
+        user_match_threshold=0.7,
+    )
+
+    mic_label = next(lbl for lbl in result.segment_labels if lbl.segment_index == 0)
+    sys_label = next(lbl for lbl in result.segment_labels if lbl.segment_index == 1)
+    # The mic-bleed segment should now share a cluster with the sys segment.
+    assert mic_label.cluster_id is not None
+    assert mic_label.cluster_id == sys_label.cluster_id
+
+
+def test_refiner_keeps_user_mic_segments_unlabeled(tmp_path):
+    """When a mic turn matches the user's voiceprint, the segment must
+    stay unlabeled so the default mic->user rendering wins. Without
+    this, the refiner would clobber genuine user speech with whichever
+    sys cluster happens to overlap in time.
+    """
+    sr = 16000
+    sys_pcm = np.concatenate([
+        _silence(0.4, sr),
+        _sine(500, 2.5, sr),       # voice B on loopback, 0.4-2.9s
+    ])
+    sys_wav = tmp_path / "sys.wav"
+    _write_wav(sys_wav, sys_pcm, sr)
+    # Mic.wav holds the user (200Hz) speaking at the same time as voice B.
+    mic_pcm = np.concatenate([
+        _silence(0.4, sr),
+        _sine(200, 2.5, sr),
+    ])
+    mic_wav = tmp_path / "mic.wav"
+    _write_wav(mic_wav, mic_pcm, sr)
+    segments = [
+        TranscriptSegment(source="mic", text="user replying",
+                          t_start=0.5, t_end=2.5),
+        TranscriptSegment(source="sys", text="voice B",
+                          t_start=0.5, t_end=2.5),
+    ]
+    store = SpeakerStore(tmp_path / "speakers.db")
+    # User voiceprint matches the mic (200Hz -> mid bucket).
+    user_voiceprint = _unit_vec(0.0, 1.0, 0.0)
+
+    result = refine_loopback(
+        sys_wav,
+        segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        mic_wav=mic_wav,
+        user_voiceprint=user_voiceprint,
+        user_match_threshold=0.7,
+    )
+    mic_label = next(lbl for lbl in result.segment_labels if lbl.segment_index == 0)
+    # User mic stays unlabeled -> mic-default user rendering wins.
+    assert mic_label.cluster_id is None
+
+
+def test_refiner_no_voiceprint_preserves_legacy_mic_behavior(tmp_path):
+    """Regression: when no voiceprint is provided, mic-source segments
+    must not be touched by the refiner -- caller still owns the user
+    attribution via the existing rewrite pipeline.
+    """
+    sr = 16000
+    sys_pcm = np.concatenate([_silence(0.4, sr), _sine(500, 2.0, sr)])
+    sys_wav = tmp_path / "sys.wav"
+    _write_wav(sys_wav, sys_pcm, sr)
+    mic_pcm = np.concatenate([_silence(0.4, sr), _sine(500, 2.0, sr)])
+    mic_wav = tmp_path / "mic.wav"
+    _write_wav(mic_wav, mic_pcm, sr)
+    segments = [
+        TranscriptSegment(source="mic", text="something",
+                          t_start=0.5, t_end=2.3),
+    ]
+    store = SpeakerStore(tmp_path / "speakers.db")
+    # No user_voiceprint passed -- bleed detection should be skipped.
+    result = refine_loopback(
+        sys_wav,
+        segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        mic_wav=mic_wav,
+    )
+    mic_label = next(lbl for lbl in result.segment_labels if lbl.segment_index == 0)
+    assert mic_label.cluster_id is None
+    assert mic_label.name is None
 
 
 def test_apply_labels_sets_speaker_name_on_matched_sys_segments():

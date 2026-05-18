@@ -227,6 +227,8 @@ def _build_main_window() -> MainWindow:
         mic_label="Mic: (System default)",
         loopback_label="System audio: (System default)",
         calendar_label="Calendar: off",
+        voice_label="Voice: not enrolled",
+        voice_tooltip="No voice sample has been recorded.",
     )
     win.show()
     QApplication.processEvents()

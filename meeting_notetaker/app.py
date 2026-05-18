@@ -18,6 +18,7 @@ from .diarization.persistence import (
     save_diarization,
     update_cluster_name,
 )
+from .diarization import user_voiceprint
 from .diarization.refiner import RefinementResult, apply_labels_to_segments
 from .diarization.store import open_speaker_store
 from .integrations import outlook_calendar
@@ -706,6 +707,7 @@ class MainApp(QObject):
             )
 
         speakers_label, speakers_tooltip = self._speakers_indicator()
+        voice_label, voice_tooltip = self._voice_indicator()
         self.window.set_status_indicators(
             version=__version__,
             mic_label=f"Mic: {_short_device_label(mic)}",
@@ -716,6 +718,8 @@ class MainApp(QObject):
             calendar_tooltip=cal_tooltip,
             speakers_label=speakers_label,
             speakers_tooltip=speakers_tooltip,
+            voice_label=voice_label,
+            voice_tooltip=voice_tooltip,
         )
 
     def _speakers_indicator(self) -> tuple[str, str]:
@@ -745,6 +749,30 @@ class MainApp(QObject):
             preview += f" (+{len(names) - 8} more)"
         tooltip = f"Known speakers ({len(names)}): {preview}"
         return f"Speakers: {len(names)}", tooltip
+
+    def _voice_indicator(self) -> tuple[str, str]:
+        """Return (label, tooltip) for the user-voice enrollment indicator.
+
+        Only surfaces when speaker ID is enabled but no voiceprint has
+        been recorded -- the goal is to remind the user there's a setup
+        step they haven't completed. Once enrolled (or with speaker ID
+        off entirely) the indicator is omitted so it doesn't clutter
+        the status bar.
+        """
+        if not self.config.speakers.enabled:
+            return "", ""
+        try:
+            if user_voiceprint.exists():
+                return "", ""
+        except Exception:
+            log.exception("voice indicator: voiceprint check failed")
+            return "", ""
+        return (
+            "Voice: not enrolled",
+            "No voice sample has been recorded. Settings > Speaker "
+            "Identification > Record voice sample lets the refiner "
+            "tell your microphone from system-audio bleed.",
+        )
 
     # ---- calendar integration ---------------------------------------------
 
