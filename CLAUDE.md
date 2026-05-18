@@ -160,11 +160,12 @@ sanity-check tool.
 
 ### Why linear resample instead of scipy
 
-scipy is ~120 MB of native code. Whisper accepts somewhat imprecise input
-(the model itself was trained on 16 kHz mono with various provenance).
-Linear interpolation through numpy is plenty for our 48 kHz -> 16 kHz
-downsample step. Test coverage in `tests/test_resample.py` includes the
-basic correctness assertions.
+Whisper accepts somewhat imprecise input (the model itself was trained
+on 16 kHz mono with various provenance). Linear interpolation through
+numpy is plenty for our 48 kHz -> 16 kHz downsample step, and keeps
+`audio/resample.py` testable without dragging scipy into the pure-Python
+test path. Test coverage in `tests/test_resample.py` includes the basic
+correctness assertions.
 
 ## Conventions
 
@@ -191,8 +192,6 @@ basic correctness assertions.
 - **faster-whisper is thread-safe for `transcribe()`.** Two workers can
   share one model instance. Do not instantiate per-thread; CPU + memory
   cost is too high.
-- **Avoid scipy / librosa.** The marginal accuracy improvement is not worth
-  the install footprint or the IT-review pain of additional native wheels.
 - **Keep PortAudio off the critical path for unit tests.** Anything that
   imports `pyaudio` or `pyaudiowpatch` lives behind a local import so
   pure-Python modules can be tested without PortAudio installed.
