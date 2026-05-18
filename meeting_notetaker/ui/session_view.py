@@ -318,6 +318,22 @@ class SessionView(QWidget):
         self._raw_transcript_text = text
         self._transcript_view.setPlainText(rewrite_user_label(text, self._user_name))
 
+    def set_title(self, new_title: str) -> None:
+        """Update the displayed session title in place after a rename.
+
+        No-op when no session is currently bound. Mutates the bound
+        Session's `title` field so subsequent calls (e.g. the synthesis
+        prompt render) see the new value without needing a full
+        set_session() round-trip.
+        """
+        if self._session is None:
+            return
+        cleaned = (new_title or "").strip()
+        if not cleaned:
+            return
+        self._session.title = cleaned
+        self._title_label.setText(cleaned)
+
     def set_user_name(self, name: str) -> None:
         """Update the display label for the user's mic and refresh the transcript view."""
         new_name = (name or "").strip()

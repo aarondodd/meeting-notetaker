@@ -97,3 +97,30 @@ def test_active_tab_text_returns_notes_source_for_synthesis(qt_app, fake_session
     view._tabs.setCurrentIndex(2)
     assert view.active_tab_text() == "# Hello"
     assert view.active_tab_label() == "Synthesis"
+
+
+def test_set_title_updates_label_and_session(qt_app, fake_session):
+    """Rename UX path: set_title updates the visible label AND the bound
+    Session.title so downstream consumers (synthesis prompt render) see
+    the new value without a full set_session round-trip."""
+    view = SessionView()
+    view.set_session(fake_session, transcript="", notes="", previous_notes_paths=[])
+    assert view._title_label.text() == "Editable Synthesis Test"
+    view.set_title("Renamed Session")
+    assert view._title_label.text() == "Renamed Session"
+    assert view._session.title == "Renamed Session"
+
+
+def test_set_title_ignores_empty_and_whitespace(qt_app, fake_session):
+    view = SessionView()
+    view.set_session(fake_session, transcript="", notes="", previous_notes_paths=[])
+    view.set_title("   ")
+    assert view._title_label.text() == "Editable Synthesis Test"
+    view.set_title("")
+    assert view._title_label.text() == "Editable Synthesis Test"
+
+
+def test_set_title_is_safe_with_no_session(qt_app):
+    view = SessionView()
+    # No session bound -- must not crash.
+    view.set_title("anything")

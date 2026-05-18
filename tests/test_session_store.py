@@ -42,6 +42,17 @@ def test_session_create_get_list_update_delete(isolated_data_dir):
         assert store.get_session(s.id) is None
 
 
+def test_rename_session_via_update(isolated_data_dir):
+    """`update_session(title=...)` is the path the rename UX uses; round-trip
+    must reflect the new title on subsequent get_session calls."""
+    with SessionStore() as store:
+        s = store.create_session("Old Title")
+        store.update_session(s.id, title="New Title")
+        refreshed = store.get_session(s.id)
+        assert refreshed is not None
+        assert refreshed.title == "New Title"
+
+
 def test_folder_create_assign_delete_unfiles_sessions(isolated_data_dir):
     with SessionStore() as store:
         folder = store.create_folder("Customers")

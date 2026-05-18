@@ -131,6 +131,7 @@ class MainApp(QObject):
         self.window.quit_requested.connect(self.qt_app.quit)
         self.window.session_selected.connect(self._on_session_selected)
         self.window.delete_sessions_requested.connect(self._on_delete_sessions)
+        self.window.rename_session_requested.connect(self._on_rename_session)
 
         self.tray.open_main_window.connect(self._foreground_window)
         self.tray.new_session_requested.connect(self._on_new_session)
@@ -606,6 +607,26 @@ class MainApp(QObject):
             self.window.status(f"Notes saved. Prior notes archived to {archive_path.name}", timeout_ms=8000)
         else:
             self.window.status("Notes saved.", timeout_ms=5000)
+
+    # ---- rename ------------------------------------------------------------
+
+    def _on_rename_session(self, session_id: str, new_title: str) -> None:
+        new_title = (new_title or "").strip()
+        if not new_title:
+            return
+        session = self.store.get_session(session_id)
+        if session is None or session.title == new_title:
+            return
+        self.store.update_session(session_id, title=new_title)
+        # Preserve the user's current selection across the refresh.
+        self._refresh_session_list(select=session_id)
+        # Update the right pane in place if the renamed session is the
+        # one currently displayed; avoids a full set_session() reload that
+        # would discard in-flight live notes / synthesis edits.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            sv.set_title(new_title)
+        self.window.status(f"Renamed to '{new_title}'", timeout_ms=4000)
 
     # ---- bulk delete -------------------------------------------------------
 

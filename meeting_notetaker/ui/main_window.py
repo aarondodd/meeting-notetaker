@@ -5,12 +5,14 @@ from datetime import datetime
 from typing import Callable, Iterable, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMenuBar,
@@ -65,6 +67,7 @@ class MainWindow(QMainWindow):
     upgrade_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     delete_sessions_requested = pyqtSignal(list)   # list of session_ids
+    rename_session_requested = pyqtSignal(str, str)  # session_id, new_title
     session_selected = pyqtSignal(str)             # session_id
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -136,6 +139,9 @@ class MainWindow(QMainWindow):
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_list_menu)
+        self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self._list)
+        rename_shortcut.activated.connect(self._rename_selected)
         header = self._list.header()
         # Audio + state are narrow glyph columns; date is fixed-width
         # to fit "YYYY-MM-DD HH:MM"; title takes the remaining space.
@@ -279,13 +285,57 @@ class MainWindow(QMainWindow):
             )
 
     def _show_list_menu(self, pos) -> None:
-        if not self._list.selectedItems():
+        selected = self._list.selectedItems()
+        if not selected:
             return
         menu = QMenu(self._list)
+        action_rename = menu.addAction("Rename...")
+        # Rename targets exactly one session -- multi-rename would be
+        # an awkward UX (whose title applies?). Disable when the user
+        # has multi-selected.
+        action_rename.setEnabled(len(selected) == 1)
         action_delete = menu.addAction("Delete...")
         action = menu.exec(self._list.viewport().mapToGlobal(pos))
-        if action is action_delete:
+        if action is action_rename:
+            self._rename_selected()
+        elif action is action_delete:
             self._delete_selected()
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        # Treat any double-click as "rename this session". Other columns
+        # (audio/state glyphs, date) double-click into rename too -- the
+        # whole row is one logical thing.
+        self._rename_selected()
+
+    def _rename_selected(self) -> None:
+        ids = self.selected_session_ids()
+        if len(ids) != 1:
+            return
+        session_id = ids[0]
+        item = self._list.currentItem()
+        if item is None:
+            return
+        current_title = item.text(_COL_TITLE)
+        new_title, ok = QInputDialog.getText(
+            self,
+            "Rename Session",
+            "Title:",
+            QLineEdit.EchoMode.Normal,
+            current_title,
+        )
+        if not ok:
+            return
+        new_title = new_title.strip()
+        if not new_title:
+            QMessageBox.warning(
+                self,
+                "Rename Session",
+                "Title cannot be empty.",
+            )
+            return
+        if new_title == current_title:
+            return
+        self.rename_session_requested.emit(session_id, new_title)
 
     def _delete_selected(self) -> None:
         ids = self.selected_session_ids()
