@@ -29,11 +29,14 @@ _PRIOR_BUNDLED_HASHES: dict[str, set[str]] = {
     # v0.5 -- diarization-aware body with the {{live_notes}} reference bug
     # (placeholder substituted at every textual mention, not just the
     # final section). Replaced post-v0.5 with literal "live notes" references.
+    # Post-v0.5.1 -- bullet-led Notes spec rewritten as prose with stronger
+    # directive + shape example; Output preamble made explicit per section.
     "default.md": {
         "ec67b04a5c86bb91e9dcd61e31455b1130bd123681c6f89ca9d66ecacd14bdf4",
         "dd281f15122bfdc4f0466c13576a7d45ecd8acc27e14d23092181ff470132309",
         "0004ea62bf061e95be43c27326a7fbb7d9bef3d44fc9de71251519918e3f7c98",
         "81ff640c2ea393feb8520d440b340802cb36347aca56f4646c35f4945fe2192e",
+        "e98c35805be75f90c36212dd5852164c09ef49d930d28836d32a5077b6aae4bb",
     },
     "one-on-one.md": {
         "2a140d9fd7d1ae7687bfd5f7fba0d517b6f41135e467a98cdd13abd8e1ca87f5",
