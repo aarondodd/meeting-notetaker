@@ -37,3 +37,8 @@ pywin32>=306; sys_platform == 'win32'
 librosa>=0.9.1
 scipy>=1.11.0
 torch>=2.0.0
+# Voice-activity detection used by the diarization turn segmenter (and
+# `audio/vad.py`). Bundles the silero VAD model weights, so it works
+# offline -- important behind corporate MITM proxies where torch.hub
+# downloads are unreliable. Reuses the torch install above.
+silero-vad>=5.1

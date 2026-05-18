@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from meeting_notetaker.diarization import segmenter as _segmenter
 from meeting_notetaker.diarization.refiner import (
     SegmentLabel,
     apply_labels_to_segments,
@@ -22,6 +23,21 @@ from meeting_notetaker.diarization.refiner import (
 )
 from meeting_notetaker.diarization.store import SpeakerStore
 from meeting_notetaker.models.transcript import TranscriptSegment
+
+
+@pytest.fixture(autouse=True)
+def _disable_silero_for_refiner_tests(monkeypatch):
+    """Force find_turns through webrtcvad. These tests feed synthetic
+    sine waves; silero (correctly) classifies them as non-speech.
+    See the matching fixture in test_diarization_segmenter.py.
+    """
+    monkeypatch.setattr(
+        _segmenter,
+        "_voiced_mask_silero",
+        lambda pcm_16k, **_kwargs: np.zeros(0, dtype=bool),
+    )
+    monkeypatch.setattr(_segmenter, "_silero_load_attempted", False)
+    monkeypatch.setattr(_segmenter, "_silero_model", None)
 
 
 def _sine(freq_hz: float, duration_sec: float, sample_rate: int, amplitude: float = 0.5) -> np.ndarray:

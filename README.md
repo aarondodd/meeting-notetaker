@@ -437,7 +437,7 @@ machine.
 
 ```mermaid
 flowchart TD
-    A[sys.wav] --> B[Segment by voice activity<br/>webrtcvad, ~30ms frames]
+    A[sys.wav] --> B[Segment by voice activity<br/>silero-vad, ~30ms frames]
     B --> C[Embed each turn<br/>Resemblyzer, 256-dim vector]
     C --> D[Cluster by cosine similarity<br/>greedy agglomerative]
     D --> E{Match centroid<br/>vs speakers.db<br/>at threshold}
@@ -459,9 +459,10 @@ When you click **Stop** on a recording, the controller chains:
 
 1. **Final transcription** (existing batch pass; rewrites the live
    transcript with a cleaner version).
-2. **Voice segmentation** on `sys.wav`: webrtcvad + energy heuristics
-   chop the loopback channel into per-turn voiced spans (typical
-   meeting: 30-200 turns).
+2. **Voice segmentation** on `sys.wav`: silero-vad (a small bundled
+   torch model) chops the loopback channel into per-turn voiced
+   spans (typical meeting: 30-200 turns). Falls back to webrtcvad
+   and then an energy threshold if silero or torch can't load.
 3. **Embedding**: Resemblyzer produces a 256-dim vector per turn (~10 ms each).
 4. **Clustering**: greedy agglomerative cosine merge collapses turns
    into per-speaker clusters (threshold tunable in Settings, default 0.75).
