@@ -194,6 +194,8 @@ class MainWindow(QMainWindow):
         speakers_tooltip: str = "",
         voice_label: str = "",
         voice_tooltip: str = "",
+        detect_label: str = "",
+        detect_tooltip: str = "",
     ) -> None:
         """Update the bottom status bar's right-side indicator string.
 
@@ -203,8 +205,9 @@ class MainWindow(QMainWindow):
         hover the indicator to see the long form (the QLabel doesn't
         expose per-character tooltips).
 
-        `speakers_label` and `voice_label` only render when non-empty --
-        clean installs and not-applicable states leave them out.
+        `speakers_label`, `voice_label`, and `detect_label` only render
+        when non-empty -- clean installs and not-applicable states leave
+        them out.
         """
         parts: list[str] = []
         tooltip_parts: list[str] = []
@@ -223,6 +226,9 @@ class MainWindow(QMainWindow):
         if voice_label:
             parts.append(voice_label)
             tooltip_parts.append(voice_tooltip or voice_label)
+        if detect_label:
+            parts.append(detect_label)
+            tooltip_parts.append(detect_tooltip or detect_label)
         self._indicators_label.setText(" | ".join(parts))
         self._indicators_label.setToolTip("\n".join(tooltip_parts))
 

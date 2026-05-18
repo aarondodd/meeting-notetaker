@@ -16,6 +16,11 @@ tomli>=2.0.0; python_version < '3.11'
 truststore>=0.9.0; sys_platform == 'win32'
 # Outlook calendar integration via COM. Windows-only; provides win32com.client.
 pywin32>=306; sys_platform == 'win32'
+# Ad-hoc meeting auto-detect: enumerate Windows audio sessions per process
+# via IAudioSessionManager2 (no audio capture). pycaw wraps the COM calls;
+# psutil resolves process IDs to executable names. Windows-only.
+pycaw>=20240210; sys_platform == 'win32'
+psutil>=5.9.0; sys_platform == 'win32'
 
 # --- Speaker identification (v0.5+) ---
 # Resemblyzer is installed via a SECOND pip command, not from this file:

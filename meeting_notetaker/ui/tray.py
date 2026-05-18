@@ -23,6 +23,9 @@ class TrayIcon(QObject):
     # Fires when the user clicks the most-recent meeting notification toast.
     # Payload: the MeetingInfo passed to notify_meeting().
     meeting_notification_clicked = pyqtSignal(object)
+    # Fires when the user clicks the most-recent ad-hoc audio-detected toast.
+    # Payload: the MeetingAudioInfo passed to notify_audio_detected().
+    audio_notification_clicked = pyqtSignal(object)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -38,7 +41,10 @@ class TrayIcon(QObject):
         self._pulse_timer.setInterval(700)
         self._pulse_timer.timeout.connect(self._pulse_step)
         self._pulse_phase = False
-        self._last_meeting_info = None
+        # Each notify_* call registers a callable here; clicking the most-
+        # recent toast invokes it. Cleared after dispatch so a stale click
+        # cannot re-fire later.
+        self._pending_click: Optional[Callable[[], None]] = None
         self._tray.show()
 
     def _build_menu(self) -> None:
@@ -116,10 +122,25 @@ class TrayIcon(QObject):
         """Surface an imminent-meeting toast. Click -> meeting_notification_clicked.
 
         QSystemTrayIcon.showMessage's clicked signal fires per-toast but does
-        not carry payload; we stash the latest MeetingInfo on the wrapper and
-        emit it back when the user clicks.
+        not carry payload; we stash a click callback on the wrapper and
+        emit the right signal when the user clicks. The most-recent toast
+        wins -- only one notification can be pending at a time.
         """
-        self._last_meeting_info = info
+        self._pending_click = lambda: self.meeting_notification_clicked.emit(info)
+        self._show_message(title, body, timeout_ms)
+
+    def notify_audio_detected(
+        self, info, *, title: str, body: str, timeout_ms: int = 15000
+    ) -> None:
+        """Surface an ad-hoc-meeting-audio toast. Click -> audio_notification_clicked.
+
+        Same single-pending-callback contract as notify_meeting; whichever
+        notify_* was called most recently is what a tray click dispatches.
+        """
+        self._pending_click = lambda: self.audio_notification_clicked.emit(info)
+        self._show_message(title, body, timeout_ms)
+
+    def _show_message(self, title: str, body: str, timeout_ms: int) -> None:
         try:
             self._tray.showMessage(
                 title,
@@ -134,7 +155,7 @@ class TrayIcon(QObject):
             pass
 
     def _on_message_clicked(self) -> None:
-        info = self._last_meeting_info
-        self._last_meeting_info = None
-        if info is not None:
-            self.meeting_notification_clicked.emit(info)
+        cb = self._pending_click
+        self._pending_click = None
+        if cb is not None:
+            cb()

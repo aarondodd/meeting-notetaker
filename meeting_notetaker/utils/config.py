@@ -28,6 +28,12 @@ Schema (config.toml):
     match_threshold = 0.75       # cosine-similarity floor to auto-label a cluster from the store
     merge_threshold = 0.75       # cosine-similarity floor for two turns to land in one cluster
 
+    [detection]
+    enabled = false              # ad-hoc meeting auto-detect (Windows-only; pycaw + psutil required)
+    min_duration_sec = 25        # how long audio must sustain before prompting
+    cooldown_minutes = 10        # per-app cooldown after a prompt is dismissed
+    app_allowlist = ["Teams.exe", "ms-teams.exe", "Zoom.exe", ...]
+
 Reads use tomllib (3.11+) or the tomli fallback. Writes are emitted by hand
 since our schema is flat and tomli-w is not a stdlib component.
 """
@@ -86,12 +92,36 @@ class SpeakersConfig:
 
 
 @dataclass
+class DetectionConfig:
+    enabled: bool = False
+    min_duration_sec: int = 25
+    cooldown_minutes: int = 10
+    app_allowlist: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_DETECTION_ALLOWLIST)
+    )
+
+
+_DEFAULT_DETECTION_ALLOWLIST: tuple[str, ...] = (
+    "Teams.exe",
+    "ms-teams.exe",
+    "Zoom.exe",
+    "ZoomPhone.exe",
+    "slack.exe",
+    "WebexMta.exe",
+    "atmgr.exe",
+    "GoToMeetingWinStore.exe",
+    "Discord.exe",
+)
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     ui: UiConfig = field(default_factory=UiConfig)
     calendar: CalendarConfig = field(default_factory=CalendarConfig)
     speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
+    detection: DetectionConfig = field(default_factory=DetectionConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -113,6 +143,9 @@ class Config:
             ),
             speakers=SpeakersConfig(
                 **_filter_fields(SpeakersConfig, data.get("speakers", {}))
+            ),
+            detection=DetectionConfig(
+                **_filter_fields(DetectionConfig, data.get("detection", {}))
             ),
         )
 
@@ -147,6 +180,16 @@ class Config:
                 f"speakers.merge_threshold must be in (0, 1], "
                 f"got {self.speakers.merge_threshold}"
             )
+        if not (5 <= self.detection.min_duration_sec <= 300):
+            errors.append(
+                f"detection.min_duration_sec must be between 5 and 300, "
+                f"got {self.detection.min_duration_sec}"
+            )
+        if not (1 <= self.detection.cooldown_minutes <= 120):
+            errors.append(
+                f"detection.cooldown_minutes must be between 1 and 120, "
+                f"got {self.detection.cooldown_minutes}"
+            )
         return errors
 
     def _dump_toml(self) -> str:
@@ -157,6 +200,7 @@ class Config:
             ("ui", self.ui),
             ("calendar", self.calendar),
             ("speakers", self.speakers),
+            ("detection", self.detection),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():
@@ -178,4 +222,6 @@ def _toml_repr(value: Any) -> str:
         return str(value)
     if isinstance(value, str):
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_repr(v) for v in value) + "]"
     raise TypeError(f"unsupported TOML value: {value!r}")

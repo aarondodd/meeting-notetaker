@@ -102,9 +102,18 @@ when you accept:
 
 ![New Session dialog (calendar pre-fill)](docs/screenshots/10-dialog-new-session-calendar-prefill.png)
 
+**Ad-hoc meeting detection** -- opt-in setting (Settings > Detect ad-hoc
+meetings) that watches the Windows audio mixer via pycaw for an active
+session from a known meeting app (Teams, Zoom, Slack, WebEx, ...). When
+audio sustains long enough to look like a call rather than a notification
+chirp (configurable, default 25s), a tray toast offers to open New Session
+pre-filled with the app name and timestamp. Recording never auto-starts.
+No audio is captured -- the OS already exposes which apps are playing; we
+read the metadata, not the stream.
+
 **Settings** -- model size, capture / refinement toggles, custom
-vocabulary, audio device picker, Outlook calendar watch, VAD, your
-name, and a shortcut to the prompt-templates folder. The dialog
+vocabulary, audio device picker, Outlook calendar watch, ad-hoc meeting
+detection, VAD, your name, and a shortcut to the prompt-templates folder. The dialog
 scrolls if your screen is short. The interface follows the OS
 dark/light setting automatically -- there is no separate theme
 picker.

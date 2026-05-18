@@ -21,7 +21,8 @@ from .diarization.persistence import (
 from .diarization import user_voiceprint
 from .diarization.refiner import RefinementResult, apply_labels_to_segments
 from .diarization.store import open_speaker_store
-from .integrations import outlook_calendar
+from .integrations import audio_session_monitor, outlook_calendar
+from .integrations.audio_session_monitor import MeetingAudioInfo
 from .integrations.outlook_calendar import MeetingInfo
 from .models.session import (
     STATE_COMPLETE,
@@ -56,7 +57,12 @@ from .utils import updater as updater_mod
 from .utils.config import Config
 from .utils.icons import app_icon
 from .utils.live_notes import extract_section, parse_attendees, seed_body_with_calendar
-from .utils.paths import app_data_dir, calendar_state_path, log_path
+from .utils.paths import (
+    app_data_dir,
+    audio_session_state_path,
+    calendar_state_path,
+    log_path,
+)
 from .utils.single_instance import acquire as acquire_lock, release as release_lock
 from .utils.vocabulary import seed_vocabulary_file
 from .version import __version__
@@ -88,6 +94,7 @@ class MainApp(QObject):
         self.window = MainWindow()
         self.tray = TrayIcon(self.window)
         self._calendar_monitor = None  # set lazily by _apply_calendar_config
+        self._audio_monitor = None  # set lazily by _apply_audio_monitor_config
 
         self._wire_signals()
         self._apply_user_name()
@@ -95,6 +102,7 @@ class MainApp(QObject):
         self._handle_crash_recovery()
         self._warn_if_store_python()
         self._apply_calendar_config()
+        self._apply_audio_monitor_config()
         self._refresh_status_indicators()
         # Clean up the .old file left over from a prior in-place upgrade.
         # On Windows the previous .exe is renamed (not deleted) when the
@@ -141,6 +149,7 @@ class MainApp(QObject):
         self.tray.settings_requested.connect(self._on_settings)
         self.tray.quit_requested.connect(self.qt_app.quit)
         self.tray.meeting_notification_clicked.connect(self._on_create_session_from_calendar)
+        self.tray.audio_notification_clicked.connect(self._on_create_session_from_audio)
 
         sv = self.window.session_view
         sv.start_clicked.connect(self._on_start_clicked)
@@ -681,6 +690,7 @@ class MainApp(QObject):
         self.config.save()
         self._apply_user_name()
         self._apply_calendar_config()
+        self._apply_audio_monitor_config()
         self._refresh_status_indicators()
         self.window.status("Settings saved.", timeout_ms=4000)
 
@@ -729,6 +739,7 @@ class MainApp(QObject):
 
         speakers_label, speakers_tooltip = self._speakers_indicator()
         voice_label, voice_tooltip = self._voice_indicator()
+        detect_label, detect_tooltip = self._detection_indicator()
         self.window.set_status_indicators(
             version=__version__,
             mic_label=f"Mic: {_short_device_label(mic)}",
@@ -741,6 +752,8 @@ class MainApp(QObject):
             speakers_tooltip=speakers_tooltip,
             voice_label=voice_label,
             voice_tooltip=voice_tooltip,
+            detect_label=detect_label,
+            detect_tooltip=detect_tooltip,
         )
 
     def _speakers_indicator(self) -> tuple[str, str]:
@@ -770,6 +783,36 @@ class MainApp(QObject):
             preview += f" (+{len(names) - 8} more)"
         tooltip = f"Known speakers ({len(names)}): {preview}"
         return f"Speakers: {len(names)}", tooltip
+
+    def _detection_indicator(self) -> tuple[str, str]:
+        """Return (label, tooltip) for the ad-hoc-meeting-detect indicator.
+
+        Hidden (empty label) when detection is off; surfaces the running /
+        unavailable / idle state to mirror the Calendar indicator pattern.
+        """
+        if not self.config.detection.enabled:
+            return "", ""
+        if not audio_session_monitor.is_available():
+            return (
+                "Detect: pycaw unavailable",
+                "Ad-hoc meeting detection is enabled, but pycaw / psutil "
+                "are not importable. Install them in this environment to "
+                "use this feature (Windows wheels)."
+            )
+        running = self._audio_monitor is not None and self._audio_monitor.is_running()
+        if running:
+            allowlist_size = len(self.config.detection.app_allowlist)
+            return (
+                "Detect: watching",
+                f"Watching system audio for {allowlist_size} known meeting "
+                f"app(s); prompting after audio sustains "
+                f"{self.config.detection.min_duration_sec}s.",
+            )
+        return (
+            "Detect: idle",
+            "Ad-hoc meeting detection is enabled but the monitor is not "
+            "running. Try toggling it off and on in Settings.",
+        )
 
     def _voice_indicator(self) -> tuple[str, str]:
         """Return (label, tooltip) for the user-voice enrollment indicator.
@@ -876,6 +919,100 @@ class MainApp(QObject):
         self._refresh_session_list(select=session.id)
         self.window.status(
             f"Created session from calendar: {info.subject}", timeout_ms=5000
+        )
+
+    # ---- ad-hoc meeting auto-detect ---------------------------------------
+
+    def _apply_audio_monitor_config(self) -> None:
+        """Start/stop/reconfigure the audio session monitor to match config."""
+        if audio_session_monitor.AudioSessionMonitor is None:
+            return  # PyQt6 missing in this runtime; integration disabled.
+        want = self.config.detection.enabled
+        if want and not audio_session_monitor.is_available():
+            if not getattr(self, "_audio_monitor_unavailable_warned", False):
+                log.info(
+                    "Audio session detection enabled but pycaw / psutil "
+                    "unavailable on this host."
+                )
+                self._audio_monitor_unavailable_warned = True
+            self._stop_audio_monitor()
+            return
+        if not want:
+            self._stop_audio_monitor()
+            return
+        existing = self._audio_monitor
+        same_config = (
+            existing is not None
+            and existing.min_duration_sec == self.config.detection.min_duration_sec
+            and existing.cooldown_minutes == self.config.detection.cooldown_minutes
+            and existing.allowlist == list(self.config.detection.app_allowlist)
+        )
+        if same_config:
+            if not existing.is_running():
+                existing.start()
+            return
+        self._stop_audio_monitor()
+        self._audio_monitor = audio_session_monitor.AudioSessionMonitor(
+            audio_session_state_path(),
+            allowlist=list(self.config.detection.app_allowlist),
+            min_duration_sec=self.config.detection.min_duration_sec,
+            cooldown_minutes=self.config.detection.cooldown_minutes,
+            is_recording=self._is_session_active,
+            parent=self,
+        )
+        self._audio_monitor.meeting_audio_detected.connect(
+            self._on_meeting_audio_detected
+        )
+        self._audio_monitor.start()
+
+    def _stop_audio_monitor(self) -> None:
+        if self._audio_monitor is not None:
+            try:
+                self._audio_monitor.stop()
+            except Exception:
+                log.exception("audio monitor stop failed")
+            self._audio_monitor = None
+
+    def _is_session_active(self) -> bool:
+        """True when a session is currently recording or paused -- the
+        monitor uses this to suppress prompts during an existing call."""
+        active = self.controller.active_session
+        if active is None:
+            return False
+        return active.state in (STATE_RECORDING, STATE_PAUSED, STATE_PROCESSING)
+
+    def _on_meeting_audio_detected(self, info: MeetingAudioInfo) -> None:
+        self.tray.notify_audio_detected(
+            info,
+            title=f"{info.app_label} call detected",
+            body=(
+                f"{info.app_label} has been playing audio for "
+                f"{int(info.sustained_seconds)}s. Click to start a session."
+            ),
+        )
+
+    def _on_create_session_from_audio(self, info: MeetingAudioInfo) -> None:
+        self._foreground_window()
+        prefill_title = f"{info.app_label} - {info.first_detected_at.strftime('%Y-%m-%d %H:%M')}"
+        dialog = NewSessionDialog(
+            retain_audio_default=self.config.audio.retain_audio_default,
+            title_prefill=prefill_title,
+            prefill_note=(
+                f"Detected active audio from {info.app_label}. "
+                "Rename the session if you'd like, then click OK to "
+                "create it -- recording starts only when you click Start."
+            ),
+            parent=self.window,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        result = dialog.result_value()
+        session = self.store.create_session(
+            title=result.title, retain_audio=result.retain_audio
+        )
+        self._refresh_session_list(select=session.id)
+        self.window.status(
+            f"Created session from {info.app_label} audio.", timeout_ms=5000
         )
 
     # ---- update checks ----------------------------------------------------

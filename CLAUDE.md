@@ -24,6 +24,9 @@ meeting_notetaker/
   transcription/
     model_manager.py             # lazy-loaded faster-whisper instance, per-size cache
     worker.py                    # LiveTranscriptionWorker QThread + batch_transcribe()
+  integrations/
+    outlook_calendar.py          # Outlook COM monitor + meeting-imminent toast
+    audio_session_monitor.py     # pycaw-based ad-hoc meeting detect (opt-in)
   ui/
     main_window.py               # left pane: session list + bulk delete + new
     session_view.py              # right pane: transcript / my-notes / synthesis / previous + controls

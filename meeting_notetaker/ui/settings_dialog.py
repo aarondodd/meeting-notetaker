@@ -332,6 +332,69 @@ class SettingsDialog(QDialog):
         calendar_form.addRow("", self._window_value_label)
         layout.addWidget(calendar_group)
 
+        # Ad-hoc meeting detection group -----------------------------------
+        detection_group = QGroupBox("Detect ad-hoc meetings", self)
+        detection_form = QFormLayout(detection_group)
+        detection_blurb = QLabel(
+            "When enabled, the app watches your system audio for an active "
+            "session from a known meeting app (Teams, Zoom, etc.). If audio "
+            "sustains long enough to look like a call rather than a "
+            "notification chirp, the tray pops a toast: click to open New "
+            "Session. Recording never auto-starts. Windows-only; no audio "
+            "is captured -- the OS already exposes which apps are playing.",
+            self,
+        )
+        detection_blurb.setWordWrap(True)
+        detection_form.addRow(detection_blurb)
+
+        self._detect_enabled = QCheckBox("Detect active meeting audio", self)
+        self._detect_enabled.setChecked(config.detection.enabled)
+        self._detect_enabled.setToolTip(
+            "Requires pycaw + psutil (Windows wheels). Safely no-ops on "
+            "other platforms or when pycaw is unavailable."
+        )
+        detection_form.addRow(self._detect_enabled)
+
+        self._detect_duration_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._detect_duration_slider.setMinimum(5)
+        self._detect_duration_slider.setMaximum(120)
+        self._detect_duration_slider.setSingleStep(5)
+        self._detect_duration_slider.setValue(config.detection.min_duration_sec)
+        self._detect_duration_label = QLabel(
+            f"{config.detection.min_duration_sec} sec", self
+        )
+        self._detect_duration_slider.valueChanged.connect(
+            lambda v: self._detect_duration_label.setText(f"{v} sec")
+        )
+        detection_form.addRow("Sustained for:", self._detect_duration_slider)
+        detection_form.addRow("", self._detect_duration_label)
+
+        self._detect_cooldown_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._detect_cooldown_slider.setMinimum(1)
+        self._detect_cooldown_slider.setMaximum(60)
+        self._detect_cooldown_slider.setSingleStep(1)
+        self._detect_cooldown_slider.setValue(config.detection.cooldown_minutes)
+        self._detect_cooldown_label = QLabel(
+            f"{config.detection.cooldown_minutes} min", self
+        )
+        self._detect_cooldown_slider.valueChanged.connect(
+            lambda v: self._detect_cooldown_label.setText(f"{v} min")
+        )
+        detection_form.addRow("Re-prompt after:", self._detect_cooldown_slider)
+        detection_form.addRow("", self._detect_cooldown_label)
+
+        self._detect_allowlist_edit = QLineEdit(self)
+        self._detect_allowlist_edit.setText(
+            ", ".join(config.detection.app_allowlist)
+        )
+        self._detect_allowlist_edit.setToolTip(
+            "Comma-separated list of process executable names to watch "
+            "(case-insensitive). Browser-based meetings are intentionally "
+            "excluded -- chrome.exe / msedge.exe also play music + video."
+        )
+        detection_form.addRow("Watch apps:", self._detect_allowlist_edit)
+        layout.addWidget(detection_group)
+
         # UI group ---------------------------------------------------------
         ui_group = QGroupBox("Interface", self)
         ui_form = QFormLayout(ui_group)
@@ -393,6 +456,14 @@ class SettingsDialog(QDialog):
         self._config.calendar.window_minutes = int(self._window_slider.value())
         self._config.speakers.enabled = self._speakers_enabled.isChecked()
         self._config.speakers.match_threshold = self._match_threshold_slider.value() / 100.0
+        self._config.detection.enabled = self._detect_enabled.isChecked()
+        self._config.detection.min_duration_sec = int(self._detect_duration_slider.value())
+        self._config.detection.cooldown_minutes = int(self._detect_cooldown_slider.value())
+        self._config.detection.app_allowlist = [
+            piece.strip()
+            for piece in self._detect_allowlist_edit.text().split(",")
+            if piece.strip()
+        ]
         self._config.ui.user_name = self._user_name_edit.text().strip()
         self.accept()
 
