@@ -216,27 +216,38 @@ pip wheel ships PortAudio binaries; no extra system install is needed.
 
 ```powershell
 # Windows PowerShell
-python -m venv .venv
+.\install-deps.ps1        # creates .venv, installs everything
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt
-pip install --no-deps Resemblyzer>=0.1.4    # see note below
 python main.py
 ```
 
-The second `pip install` line is what avoids a known build failure on
-Windows. Resemblyzer's `setup.py` lists `webrtcvad` (the original PyPI
-package) as a hard dependency. That package has no maintained Windows
-wheel for Python 3.10+, so a normal `pip install Resemblyzer` falls
-through to building the C extension from source and fails unless you
-have Microsoft Visual C++ Build Tools installed. `webrtcvad-wheels`
-(already in `requirements.txt`) provides the same `webrtcvad` *import*
-but pip resolves by PyPI name, so it can't satisfy Resemblyzer's
-requirement automatically. Installing Resemblyzer with `--no-deps`
-skips the resolution step; its other transitive deps (`librosa`,
-`scipy`, `torch`, `numpy`) are already in `requirements.txt` with
-their normal wheels. `build.ps1` / `build.sh` do this for you when
-producing a packaged build; the two-step is only needed when you run
-pip by hand.
+```bash
+# Linux / macOS
+./install-deps.sh
+source .venv/bin/activate
+python main.py
+```
+
+`install-deps.ps1` / `install-deps.sh` wrap a two-step pip install:
+
+```
+pip install -r requirements-dev.txt
+pip install --no-deps Resemblyzer
+```
+
+The second line avoids a known Windows build failure. Resemblyzer's
+`setup.py` lists `webrtcvad` (the original PyPI package) as a hard
+dependency. That package has no maintained Windows wheel for Python
+3.10+, so a normal `pip install Resemblyzer` falls through to
+compiling the C extension from source and fails unless you have
+Microsoft Visual C++ Build Tools installed. `webrtcvad-wheels`
+(already in `requirements.txt`) provides the same `webrtcvad`
+*import* but pip resolves by PyPI name, so it can't satisfy
+Resemblyzer's requirement automatically. Installing Resemblyzer with
+`--no-deps` skips the resolution step; its other transitive deps
+(`librosa`, `scipy`, `torch`, `numpy`) are already in
+`requirements.txt` with their normal wheels. `build.ps1` / `build.sh`
+also do the two-step internally when producing a packaged build.
 
 **Important on Windows:** make sure the `python` you use is from
 [python.org](https://www.python.org/downloads/), **not** the Microsoft
