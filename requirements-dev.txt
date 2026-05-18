@@ -3,3 +3,8 @@ pytest>=7.0.0
 pytest-qt>=4.2.0
 pyinstaller>=6.0.0
 pre-commit>=3.0.0
+# NOTE: after `pip install -r requirements-dev.txt`, also run
+#     pip install --no-deps Resemblyzer>=0.1.4
+# build.ps1 / build.sh do this for you; if you run pip by hand,
+# add the second command. See the speaker-identification block in
+# requirements.txt for why.

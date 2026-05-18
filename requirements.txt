@@ -3,6 +3,9 @@ PyAudio>=0.2.14
 PyAudioWPatch>=0.2.12.7; sys_platform == 'win32'
 faster-whisper>=1.1.0
 numpy>=1.24.0
+# webrtcvad-wheels is a Windows-wheel fork of webrtcvad. Provides the
+# same `webrtcvad` import; published as a different PyPI name because
+# the original project has no maintained wheels for Python 3.10+.
 webrtcvad-wheels>=2.0.14
 pyperclip>=1.8.2
 sounddevice>=0.4.6
@@ -13,9 +16,24 @@ tomli>=2.0.0; python_version < '3.11'
 truststore>=0.9.0; sys_platform == 'win32'
 # Outlook calendar integration via COM. Windows-only; provides win32com.client.
 pywin32>=306; sys_platform == 'win32'
-# Speaker embedding model for post-meeting speaker identification.
-# Pulls librosa, scipy, torch transitively. Used only during the
-# refinement pass on the loopback channel; the embedding model is small
-# (~17MB of weights) but the dep footprint is non-trivial -- see the
-# Wheel Manifest section in README.md for the IT-review summary.
-Resemblyzer>=0.1.4
+
+# --- Speaker identification (v0.5+) ---
+# Resemblyzer is installed via a SECOND pip command, not from this file:
+#
+#     pip install --no-deps Resemblyzer>=0.1.4
+#
+# Reason: Resemblyzer's own setup.py lists `webrtcvad` (the original
+# package) as a hard dependency. On Python 3.10+ that package has no
+# Windows wheel on PyPI -- pip falls through to building from source,
+# which fails without MSVC Build Tools installed. webrtcvad-wheels
+# (above) provides the same `webrtcvad` import, but pip resolves by
+# PyPI name, not by import name, so it cannot satisfy Resemblyzer's
+# requirement automatically.
+#
+# Installing Resemblyzer with --no-deps skips the resolution step
+# entirely. The transitive deps Resemblyzer actually needs at runtime
+# (librosa, scipy, torch, numpy, webrtcvad-import) are listed below /
+# above so they install via this file with their normal wheels.
+librosa>=0.9.1
+scipy>=1.11.0
+torch>=2.0.0
