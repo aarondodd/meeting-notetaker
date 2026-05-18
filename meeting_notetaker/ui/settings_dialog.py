@@ -116,8 +116,8 @@ class SettingsDialog(QDialog):
 
         vocab_blurb = QLabel(
             "Custom vocabulary biases the transcriber toward proper nouns and "
-            "corporate terms it would otherwise mis-hear (\"Plantronics\", "
-            "\"EDAPA-737\", \"Snowflake Cortex\"). One phrase per line; '#' is a "
+            "in-house terms it would otherwise mis-hear (product names, "
+            "internal acronyms, vendor names). One phrase per line; '#' is a "
             "comment. Edits take effect on the next session.",
             self,
         )
