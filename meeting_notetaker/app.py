@@ -151,6 +151,7 @@ class MainApp(QObject):
         self.window.session_selected.connect(self._on_session_selected)
         self.window.delete_sessions_requested.connect(self._on_delete_sessions)
         self.window.rename_session_requested.connect(self._on_rename_session)
+        self.window.edit_session_timestamp_requested.connect(self._on_edit_session_timestamp)
 
         self.tray.open_main_window.connect(self._foreground_window)
         self.tray.new_session_requested.connect(self._on_new_session)
@@ -229,6 +230,7 @@ class MainApp(QObject):
             retain_audio=result.retain_audio,
         )
         if result.calendar_meeting is not None:
+            self._align_created_at_to_meeting(session.id, result.calendar_meeting)
             self._seed_live_notes_from_meeting(session.id, result.calendar_meeting)
         self._refresh_session_list(select=session.id)
 
@@ -244,6 +246,26 @@ class MainApp(QObject):
             )
         except OSError:
             log.exception("failed to seed live notes from calendar")
+
+    def _align_created_at_to_meeting(
+        self, session_id: str, info: MeetingInfo
+    ) -> None:
+        """Set the session's created_at to the meeting's start time.
+
+        MeetingInfo.start_time is a naive local datetime (per the Outlook
+        COM converter); the session store keeps timestamps as UTC ISO. Local
+        -> UTC conversion uses the host's current local offset.
+        """
+        try:
+            local_tz = datetime.now().astimezone().tzinfo
+            aware_local = info.start_time.replace(tzinfo=local_tz)
+            iso = aware_local.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        except (AttributeError, ValueError, OSError):
+            log.exception("failed to align created_at to meeting start time")
+            return
+        self.store.update_session(session_id, created_at=iso)
 
     def _on_start_clicked(self, session_id: str) -> None:
         session = self.store.get_session(session_id)
@@ -648,6 +670,27 @@ class MainApp(QObject):
             sv.set_title(new_title)
         self.window.status(f"Renamed to '{new_title}'", timeout_ms=4000)
 
+    # ---- edit timestamp ----------------------------------------------------
+
+    def _on_edit_session_timestamp(
+        self, session_id: str, new_created_at_iso: str
+    ) -> None:
+        new_created_at_iso = (new_created_at_iso or "").strip()
+        if not new_created_at_iso:
+            return
+        session = self.store.get_session(session_id)
+        if session is None or session.created_at == new_created_at_iso:
+            return
+        self.store.update_session(session_id, created_at=new_created_at_iso)
+        self._refresh_session_list(select=session_id)
+        # Mirror the rename path: keep the in-memory session.created_at on the
+        # right pane in sync so synthesis prompts + printing pick up the new
+        # date without a full set_session() reload.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            sv.set_created_at(new_created_at_iso)
+        self.window.status("Session timestamp updated.", timeout_ms=4000)
+
     # ---- bulk delete -------------------------------------------------------
 
     def _on_delete_sessions(self, session_ids: list[str]) -> None:
@@ -927,6 +970,7 @@ class MainApp(QObject):
             title=result.title, retain_audio=result.retain_audio
         )
         meeting = result.calendar_meeting or info
+        self._align_created_at_to_meeting(session.id, meeting)
         self._seed_live_notes_from_meeting(session.id, meeting)
         self._refresh_session_list(select=session.id)
         self.window.status(

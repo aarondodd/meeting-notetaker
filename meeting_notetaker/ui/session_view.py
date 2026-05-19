@@ -334,6 +334,22 @@ class SessionView(QWidget):
         self._session.title = cleaned
         self._title_label.setText(cleaned)
 
+    def set_created_at(self, new_created_at_iso: str) -> None:
+        """Update the bound session's created_at after a timestamp edit.
+
+        No-op when no session is currently bound. Mirrors set_title():
+        keeps the in-memory Session dataclass in sync so the synthesis
+        prompt + print header pick up the new date without a full
+        set_session() round-trip (which would discard in-flight live
+        notes / synthesis edits).
+        """
+        if self._session is None:
+            return
+        cleaned = (new_created_at_iso or "").strip()
+        if not cleaned:
+            return
+        self._session.created_at = cleaned
+
     def set_user_name(self, name: str) -> None:
         """Update the display label for the user's mic and refresh the transcript view."""
         new_name = (name or "").strip()

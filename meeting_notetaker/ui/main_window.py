@@ -1,13 +1,16 @@
 """Main window -- session list (left) + SessionView (right)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Iterable, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QDateTime, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QDateTimeEdit,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -68,6 +71,7 @@ class MainWindow(QMainWindow):
     quit_requested = pyqtSignal()
     delete_sessions_requested = pyqtSignal(list)   # list of session_ids
     rename_session_requested = pyqtSignal(str, str)  # session_id, new_title
+    edit_session_timestamp_requested = pyqtSignal(str, str)  # session_id, new_created_at_iso (UTC)
     session_selected = pyqtSignal(str)             # session_id
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -281,6 +285,10 @@ class MainWindow(QMainWindow):
         item.setToolTip(_COL_AUDIO, audio_tooltip)
         item.setToolTip(_COL_STATE, state_tooltip)
         item.setData(_COL_TITLE, Qt.ItemDataRole.UserRole, s.id)
+        # Stash the full ISO created_at so Edit Timestamp can seed the
+        # dialog without losing sub-minute precision (the visible "YYYY-MM-DD
+        # HH:MM" column drops seconds + timezone).
+        item.setData(_COL_DATE, Qt.ItemDataRole.UserRole, s.created_at)
         self._list.addTopLevelItem(item)
 
     def _on_selection_changed(self) -> None:
@@ -300,10 +308,14 @@ class MainWindow(QMainWindow):
         # an awkward UX (whose title applies?). Disable when the user
         # has multi-selected.
         action_rename.setEnabled(len(selected) == 1)
+        action_edit_timestamp = menu.addAction("Edit timestamp...")
+        action_edit_timestamp.setEnabled(len(selected) == 1)
         action_delete = menu.addAction("Delete...")
         action = menu.exec(self._list.viewport().mapToGlobal(pos))
         if action is action_rename:
             self._rename_selected()
+        elif action is action_edit_timestamp:
+            self._edit_timestamp_selected()
         elif action is action_delete:
             self._delete_selected()
 
@@ -343,6 +355,24 @@ class MainWindow(QMainWindow):
             return
         self.rename_session_requested.emit(session_id, new_title)
 
+    def _edit_timestamp_selected(self) -> None:
+        ids = self.selected_session_ids()
+        if len(ids) != 1:
+            return
+        session_id = ids[0]
+        item = self._list.currentItem()
+        if item is None:
+            return
+        stored_iso = item.data(_COL_DATE, Qt.ItemDataRole.UserRole) or ""
+        current_local = _parse_iso_to_local(stored_iso) or datetime.now()
+        dialog = _EditTimestampDialog(initial=current_local, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_iso = dialog.result_utc_iso()
+        if not new_iso or new_iso == stored_iso:
+            return
+        self.edit_session_timestamp_requested.emit(session_id, new_iso)
+
     def _delete_selected(self) -> None:
         ids = self.selected_session_ids()
         if not ids:
@@ -367,3 +397,50 @@ def _session_date_and_title(s: Session) -> tuple[str, str]:
     except ValueError:
         when = s.created_at
     return when, s.title
+
+
+def _parse_iso_to_local(iso_str: str) -> Optional[datetime]:
+    """Parse a stored UTC ISO timestamp back into a local naive datetime
+    suitable for seeding QDateTimeEdit. Returns None on parse failure."""
+    if not iso_str:
+        return None
+    try:
+        utc_aware = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return utc_aware.astimezone().replace(tzinfo=None)
+
+
+class _EditTimestampDialog(QDialog):
+    """Tiny dialog wrapping a QDateTimeEdit. Edits the session's local
+    timestamp; result_utc_iso() returns the UTC ISO form the store wants."""
+
+    def __init__(self, *, initial: datetime, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit Session Timestamp")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Session date and time (your local timezone):", self
+        ))
+        self._editor = QDateTimeEdit(self)
+        self._editor.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self._editor.setCalendarPopup(True)
+        self._editor.setDateTime(QDateTime(
+            initial.year, initial.month, initial.day,
+            initial.hour, initial.minute, initial.second,
+        ))
+        layout.addWidget(self._editor)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def result_utc_iso(self) -> str:
+        qdt = self._editor.dateTime().toPyDateTime()  # naive local
+        local_tz = datetime.now().astimezone().tzinfo
+        aware_local = qdt.replace(tzinfo=local_tz)
+        return aware_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
