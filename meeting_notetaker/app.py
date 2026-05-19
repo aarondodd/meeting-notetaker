@@ -19,6 +19,7 @@ from .diarization.persistence import (
     update_cluster_name,
 )
 from .diarization import user_voiceprint
+from .diarization.encoder_prewarm import EncoderPrewarmThread
 from .diarization.refiner import RefinementResult, apply_labels_to_segments
 from .diarization.store import open_speaker_store
 from .integrations import audio_session_monitor, outlook_calendar
@@ -95,6 +96,7 @@ class MainApp(QObject):
         self.tray = TrayIcon(self.window)
         self._calendar_monitor = None  # set lazily by _apply_calendar_config
         self._audio_monitor = None  # set lazily by _apply_audio_monitor_config
+        self._encoder_prewarm: Optional[EncoderPrewarmThread] = None
 
         self._wire_signals()
         self._apply_user_name()
@@ -122,6 +124,15 @@ class MainApp(QObject):
         # Weekly background check for a newer release on GitHub. Defer 2s
         # after show() so the network call never blocks the first paint.
         QTimer.singleShot(2000, self._auto_check_for_updates)
+
+        # Pre-warm the speaker-embedding encoder on a background thread.
+        # The first batch refinement OR voice enrollment after a fresh
+        # install otherwise blocks the UI for the ~22 MB ECAPA-TDNN
+        # model download; doing it here means the model is ready (or
+        # downloading visibly in the status bar) before the user
+        # opens enrollment.
+        if self.config.speakers.enabled:
+            QTimer.singleShot(500, self._start_encoder_prewarm)
 
     def _apply_user_name(self) -> None:
         self.window.session_view.set_user_name(self.config.ui.user_name)
@@ -1014,6 +1025,47 @@ class MainApp(QObject):
         self._refresh_session_list(select=session.id)
         self.window.status(
             f"Created session from {info.app_label} audio.", timeout_ms=5000
+        )
+
+    # ---- encoder pre-warm -------------------------------------------------
+
+    def _start_encoder_prewarm(self) -> None:
+        """Fire the background encoder pre-warm thread.
+
+        No-ops if PyQt6 is missing in the runtime (unlikely in this
+        codepath) or if a prewarm is already in flight. Designed to be
+        safe to call multiple times; subsequent calls reuse the
+        already-loaded model.
+        """
+        if EncoderPrewarmThread is None:
+            return
+        if self._encoder_prewarm is not None and self._encoder_prewarm.isRunning():
+            return
+        self._encoder_prewarm = EncoderPrewarmThread(parent=self)
+        self._encoder_prewarm.download_started.connect(
+            self._on_encoder_download_started
+        )
+        self._encoder_prewarm.finished_ok.connect(self._on_encoder_ready)
+        self._encoder_prewarm.failed.connect(self._on_encoder_failed)
+        self._encoder_prewarm.start()
+
+    def _on_encoder_download_started(self) -> None:
+        self.window.status(
+            "Downloading speaker identification model (~22 MB, first run only)...",
+            timeout_ms=0,
+        )
+
+    def _on_encoder_ready(self) -> None:
+        # Only clear the status if the user hasn't navigated away to a
+        # more recent message. A short "Ready" with a timeout lets the
+        # next status update overwrite it naturally.
+        self.window.status("Speaker identification model ready.", timeout_ms=4000)
+
+    def _on_encoder_failed(self, message: str) -> None:
+        log.warning("encoder pre-warm failed: %s", message)
+        self.window.status(
+            "Speaker identification model failed to load; see log for details.",
+            timeout_ms=8000,
         )
 
     # ---- update checks ----------------------------------------------------

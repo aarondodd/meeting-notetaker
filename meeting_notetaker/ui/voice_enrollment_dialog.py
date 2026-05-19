@@ -1,17 +1,22 @@
 """Voice enrollment dialog.
 
-Captures a fixed-length sample of the user's voice, computes a Resemblyzer
-embedding, and persists it via `diarization.user_voiceprint.save`. The
-embedding is the centerpiece of Option D speaker attribution: at session
-refinement time the refiner matches each mic-channel voice turn against
-this embedding -- a match attributes the segment to the user; a miss
-falls back to cross-checking against system-audio clusters (catches
-microphone bleed when the room hears the meeting through speakers).
+Captures a fixed-length sample of the user's voice, computes an
+ECAPA-TDNN embedding, and persists it via
+`diarization.user_voiceprint.save`. The embedding is the centerpiece
+of speaker attribution: at session refinement time the refiner
+matches each mic-channel voice turn against this embedding -- a match
+attributes the segment to the user; a miss falls back to
+cross-checking against system-audio clusters (catches microphone
+bleed when the room hears the meeting through speakers).
 
-The capture itself runs on a worker thread (`_EnrollmentWorker`); the
-PyAudio synchronous read loop would otherwise block the Qt event loop
-for the duration. The worker emits progress (0..1) and finishes with
-the captured PCM, which the dialog hands to the encoder.
+Two worker threads keep the Qt event loop responsive:
+- `_EnrollmentWorker`: runs the PyAudio synchronous capture loop.
+- `_EmbedWorker`: runs `default_encoder.embed_pcm`, which on first
+  call after a fresh install triggers a ~22 MB SpeechBrain model
+  download. The encoder is usually pre-warmed by MainApp on boot, but
+  if a user opens enrollment before the pre-warm finishes the dialog
+  still handles it gracefully -- the worker drives the download and
+  the dialog shows pulsing progress until the embedding lands.
 """
 from __future__ import annotations
 
@@ -89,6 +94,38 @@ class _EnrollmentWorker(QThread):
         self.finished_ok.emit(pcm, sr)
 
 
+class _EmbedWorker(QThread):
+    """Computes an embedding off the main thread.
+
+    The first call after a fresh install triggers a ~22 MB SpeechBrain
+    model download inside `default_encoder.embed_pcm`; running it on a
+    worker thread keeps the dialog responsive while the network fetch
+    completes.
+    """
+
+    finished_ok = pyqtSignal(object)  # np.ndarray embedding
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        pcm: np.ndarray,
+        sample_rate: int,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._pcm = pcm
+        self._sample_rate = int(sample_rate)
+
+    def run(self) -> None:
+        try:
+            embedding = default_encoder.embed_pcm(self._pcm, self._sample_rate)
+        except Exception as exc:  # pragma: no cover - thread safety net
+            log.exception("voice enrollment embedding failed")
+            self.failed.emit(str(exc))
+            return
+        self.finished_ok.emit(embedding)
+
+
 class VoiceEnrollmentDialog(QDialog):
     """Records ~10 seconds of the user's voice and stores the embedding.
 
@@ -112,6 +149,7 @@ class VoiceEnrollmentDialog(QDialog):
         self._device_name = device_name
         self._duration_sec = duration_sec
         self._worker: Optional[_EnrollmentWorker] = None
+        self._embed_worker: Optional[_EmbedWorker] = None
         self._captured_pcm: Optional[np.ndarray] = None
         self._captured_sr: Optional[int] = None
         self._saved = False
@@ -120,7 +158,7 @@ class VoiceEnrollmentDialog(QDialog):
 
         intro = QLabel(
             f"This records a {int(duration_sec)}-second sample of your voice "
-            "and stores it locally as a Resemblyzer embedding "
+            "and stores it locally as a SpeechBrain ECAPA-TDNN embedding "
             "(no audio leaves this machine). The embedding is used to "
             "attribute microphone-channel speech to you when system-audio "
             "bleed makes another speaker sound like the microphone. You "
@@ -213,18 +251,37 @@ class VoiceEnrollmentDialog(QDialog):
     def _on_accept(self) -> None:
         if self._captured_pcm is None or self._captured_sr is None:
             return
-        self._status_label.setText("Computing embedding... this takes a moment.")
-        # Force a paint so the user sees the change before Resemblyzer
-        # blocks the event loop briefly.
-        self.repaint()
-        try:
-            embedding = default_encoder.embed_pcm(
-                self._captured_pcm, self._captured_sr
+        # Disable buttons + show indeterminate progress while the embed
+        # worker runs. The encoder is usually pre-warmed by MainApp at
+        # boot so this returns in well under a second; on a cold first
+        # launch it includes the ~22 MB model download from HF Hub and
+        # can take 5-30s on a corporate network.
+        if default_encoder.is_loaded:
+            self._status_label.setText("Computing voiceprint...")
+        else:
+            self._status_label.setText(
+                "Loading speaker identification model (~22 MB, first run "
+                "only), then computing voiceprint..."
             )
-        except Exception as exc:
-            log.exception("embedding the enrolled sample failed")
-            self._status_label.setText(f"Failed to compute embedding: {exc}")
-            return
+        # Indeterminate (-1 to -1 makes the bar animate as a busy spinner)
+        # because SpeechBrain doesn't expose per-byte download progress.
+        self._progress.setRange(0, 0)
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+        self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(False)
+        self._record_btn.setEnabled(False)
+
+        self._embed_worker = _EmbedWorker(
+            self._captured_pcm, self._captured_sr, parent=self
+        )
+        self._embed_worker.finished_ok.connect(self._on_embed_ok)
+        self._embed_worker.failed.connect(self._on_embed_failed)
+        self._embed_worker.start()
+
+    def _on_embed_ok(self, embedding: np.ndarray) -> None:
+        self._progress.setRange(0, 100)
+        self._progress.setValue(100)
+        self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
+        self._record_btn.setEnabled(True)
         norm = float(np.linalg.norm(embedding))
         if norm < 1e-6:
             self._status_label.setText(
@@ -232,21 +289,35 @@ class VoiceEnrollmentDialog(QDialog):
             )
             self._captured_pcm = None
             self._captured_sr = None
-            self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
             return
         try:
             user_voiceprint.save(embedding)
         except Exception as exc:
             log.exception("saving the voiceprint failed")
             self._status_label.setText(f"Failed to save: {exc}")
+            self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
             return
         self._saved = True
         self.accept()
+
+    def _on_embed_failed(self, message: str) -> None:
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
+        self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setEnabled(True)
+        self._record_btn.setEnabled(True)
+        self._status_label.setText(f"Failed to compute embedding: {message}")
 
     def _on_reject(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(2000)
+        if self._embed_worker is not None and self._embed_worker.isRunning():
+            # No clean cancel for an in-flight HF download / model load;
+            # wait briefly for it to finish so we don't tear down the
+            # parent widget while a worker is using it. Worst case the
+            # user sees a small delay before the dialog closes.
+            self._embed_worker.wait(2000)
         self.reject()
 
     # ---- public ------------------------------------------------------------
