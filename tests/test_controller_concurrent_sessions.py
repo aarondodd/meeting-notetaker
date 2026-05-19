@@ -187,6 +187,114 @@ def test_teardown_recording_does_not_touch_processing_dict(qt_app, isolated_data
     assert proc.sys_wav == Path("/tmp/sys.wav")
 
 
+def test_start_session_status_message_when_prior_is_processing(qt_app, isolated_data_dir, monkeypatch):
+    """When a new recording starts with prior sessions still in batch /
+    refinement processing, the user gets a status-bar heads-up that live
+    transcription may share CPU with the background passes."""
+    controller, store = _make_controller(qt_app, isolated_data_dir)
+    # Seed: one prior session is processing.
+    a = _make_session(store, title="A")
+    a.state = STATE_PROCESSING
+    controller._processing_sessions[a.id] = _ProcessingState(
+        session=a, mic_wav=None, sys_wav=None, live_segments=[]
+    )
+
+    # Stub the parts of start_session that need real audio hardware so
+    # the lightweight path under test can run on CI.
+    monkeypatch.setattr(
+        "meeting_notetaker.controller.session_audio_dir",
+        lambda _sid: isolated_data_dir / "audio_b",
+    )
+    monkeypatch.setattr(controller, "_collect_hotwords", lambda _s: "")
+    # Force capture-only mode so the transcription model + live workers
+    # are skipped (no faster-whisper import path under test).
+    controller.config.transcription.capture_only_mode = True
+
+    # Stub the recorders.
+    class _StubRecorder:
+        is_recording = False
+        def __init__(self, *a, **kw):
+            self.error = _SignalStub()
+        def start(self): pass
+        def stop(self): pass
+        def pause(self): pass
+        def resume(self): pass
+
+    class _StubLoopback(_StubRecorder):
+        @classmethod
+        def is_available(cls) -> bool:
+            return False
+
+    monkeypatch.setattr("meeting_notetaker.audio.mic_recorder.MicRecorder", _StubRecorder)
+    monkeypatch.setattr(
+        "meeting_notetaker.audio.loopback_recorder.LoopbackRecorder", _StubLoopback
+    )
+
+    status_messages: list[str] = []
+    controller.status.connect(status_messages.append)
+    errors: list[str] = []
+    controller.error.connect(errors.append)
+
+    b = _make_session(store, title="B")
+    controller.start_session(b)
+
+    assert errors == [], f"start_session emitted errors: {errors}"
+    assert controller.active_session is b
+    # The concurrent-processing heads-up must land on the status bar.
+    assert any(
+        "prior" in m.lower() and "may be slow" in m.lower()
+        for m in status_messages
+    ), f"expected concurrent-processing warning in {status_messages!r}"
+
+
+def test_start_session_no_warning_when_nothing_is_processing(qt_app, isolated_data_dir, monkeypatch):
+    """The warning is conditional on the processing dict being non-empty.
+    Solo starts must not leak a misleading 'live may be slow' toast."""
+    controller, store = _make_controller(qt_app, isolated_data_dir)
+
+    monkeypatch.setattr(
+        "meeting_notetaker.controller.session_audio_dir",
+        lambda _sid: isolated_data_dir / "audio_b",
+    )
+    monkeypatch.setattr(controller, "_collect_hotwords", lambda _s: "")
+    controller.config.transcription.capture_only_mode = True
+
+    class _StubRecorder:
+        is_recording = False
+        def __init__(self, *a, **kw):
+            self.error = _SignalStub()
+        def start(self): pass
+        def stop(self): pass
+
+    class _StubLoopback(_StubRecorder):
+        @classmethod
+        def is_available(cls) -> bool:
+            return False
+
+    monkeypatch.setattr("meeting_notetaker.audio.mic_recorder.MicRecorder", _StubRecorder)
+    monkeypatch.setattr(
+        "meeting_notetaker.audio.loopback_recorder.LoopbackRecorder", _StubLoopback
+    )
+
+    status_messages: list[str] = []
+    controller.status.connect(status_messages.append)
+
+    s = _make_session(store, title="solo")
+    controller.start_session(s)
+
+    assert all("may be slow" not in m.lower() for m in status_messages), (
+        f"unexpected concurrent warning on a solo start: {status_messages!r}"
+    )
+
+
+class _SignalStub:
+    """Stand-in for a pyqtSignal that supports .connect/.emit in tests
+    where the recorder is mocked but Qt-style signal access still happens."""
+
+    def connect(self, *_a, **_kw): pass
+    def emit(self, *_a, **_kw): pass
+
+
 def test_set_retain_audio_updates_processing_entry(qt_app, isolated_data_dir):
     """When the user flips Keep Audio on a session that's mid-processing,
     the change must reach the in-memory copy the finalize step inspects,

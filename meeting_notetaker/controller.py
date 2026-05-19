@@ -421,6 +421,17 @@ class SessionController(QObject):
             )
             session.state = STATE_RECORDING
             self.state_changed.emit(session.id, STATE_RECORDING)
+            # When a prior session is still post-processing, the live
+            # workers will share CPU with that session's batch + refinement
+            # threads. faster-whisper transcribe() is thread-safe but not
+            # priority-managed, so live decode can fall behind real-time
+            # under load. Surface the situation rather than letting the
+            # user wonder why the transcript pane is lagging.
+            if self._processing_sessions:
+                self.status.emit(
+                    f"Recording started. {len(self._processing_sessions)} prior "
+                    "session(s) still processing; live transcription may be slow."
+                )
         except Exception as exc:
             log.exception("start_session failed")
             # Stop anything that managed to start before we bailed.
