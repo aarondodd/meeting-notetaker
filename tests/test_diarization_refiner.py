@@ -334,7 +334,7 @@ def test_refiner_relabels_mic_bleed_to_sys_speaker(tmp_path):
     _write_wav(mic_wav, mic_pcm, sr)
 
     segments = [
-        # Mic-source transcript line of Bob's words leaking onto Aaron's mic.
+        # Mic-source transcript line of Bob's words bleeding onto the user's mic.
         TranscriptSegment(source="mic", text="Bob bled onto the mic",
                           t_start=0.5, t_end=2.5),
         # Sys-source transcript line for the same speech on the loopback.

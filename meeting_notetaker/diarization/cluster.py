@@ -11,7 +11,9 @@ above `merge_threshold`. Stops when no two clusters are similar enough.
 
 For a typical meeting (10-200 turns) this is fast enough (~ms) that we
 don't need k-means or HDBSCAN. The threshold is the only knob worth tuning;
-default 0.75 is a reasonable starting point for Resemblyzer embeddings.
+default 0.75 is a reasonable starting point for ECAPA-TDNN embeddings,
+which typically place same-speaker pairs at cosine similarity 0.7-0.9 and
+different-speaker pairs at 0.1-0.3.
 """
 from __future__ import annotations
 

@@ -166,7 +166,7 @@ class _SpeakerRefinementThread(QThread):
     the RefinementResult on success so the controller can rewrite the
     transcript with names and surface unknown clusters to the UI.
 
-    Failure modes: Resemblyzer not importable (`EmbedderUnavailable`) or
+    Failure modes: SpeechBrain not importable (`EmbedderUnavailable`) or
     the loopback WAV doesn't exist / is empty. Both are reported via
     `skipped` rather than `failed` so the controller treats them as a
     soft no-op and proceeds straight to STATE_COMPLETE.
@@ -208,7 +208,7 @@ class _SpeakerRefinementThread(QThread):
             if not default_encoder.is_available:
                 self.skipped.emit(
                     "speaker-embedding model unavailable "
-                    "(Resemblyzer not installed)"
+                    "(SpeechBrain not installed)"
                 )
                 return
             self.progress.emit("Identifying speakers...")
@@ -534,7 +534,7 @@ class SessionController(QObject):
 
         Refinement is skipped when (a) speakers.enabled is False, (b) the
         loopback WAV is missing or empty (mic-only session), or (c) the
-        Resemblyzer embedder isn't importable. In any of those cases the
+        SpeechBrain embedder isn't importable. In any of those cases the
         session moves straight to STATE_COMPLETE via _finalize_session.
 
         Otherwise a worker thread runs the diarization pass on the

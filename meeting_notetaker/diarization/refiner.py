@@ -14,7 +14,7 @@ unknown clusters the UI can prompt the user to label. The caller (the
 controller) rewrites raw.transcript.md from the labelled segments and
 calls the Label Unknown Speakers dialog for any unmatched clusters.
 
-This module is pure-Python; the encoder is the only Resemblyzer dependency
+This module is pure-Python; the encoder is the only SpeechBrain dependency
 and it's pluggable (anything with an `embed_turn(turn) -> np.ndarray`
 method works, which is what tests use).
 """

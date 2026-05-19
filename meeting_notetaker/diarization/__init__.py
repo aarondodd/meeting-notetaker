@@ -6,7 +6,7 @@ Post-meeting refinement pipeline that runs after the batch-transcribe pass:
         -> list of (start, end) spans where someone in the room was talking
 
     embeddings.VoiceEncoder.embed_segment(pcm)
-        -> fixed-length speaker embedding (Resemblyzer; 256-dim float32)
+        -> fixed-length speaker embedding (ECAPA-TDNN; 192-dim float32)
 
     cluster.cluster_segments(embeddings)
         -> assigns each segment to an anonymous cluster id
@@ -19,9 +19,9 @@ Post-meeting refinement pipeline that runs after the batch-transcribe pass:
            where confidence >= threshold; returns the unlabeled clusters so
            the UI can prompt the user.
 
-Only `embeddings` requires Resemblyzer (and therefore torch + librosa +
-scipy). The other modules are pure-numpy/stdlib so they can be unit-tested
-without the heavy dep installed.
+Only `embeddings` requires SpeechBrain (and therefore torch + torchaudio).
+The other modules are pure-numpy/stdlib so they can be unit-tested without
+the heavy dep installed.
 """
 from __future__ import annotations
 

@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # Install all Python dependencies into the local venv.
 # Usage:  ./install-deps.sh
-#
-# Single-step install. As of v0.5, the speaker-embedding encoder is
-# SpeechBrain ECAPA-TDNN, which installs cleanly from PyPI -- the
-# Resemblyzer two-step (--no-deps to skip the webrtcvad pin) is no
-# longer needed.
 set -euo pipefail
 
 cd "$(dirname "$0")"

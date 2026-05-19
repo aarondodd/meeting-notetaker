@@ -22,18 +22,13 @@ pywin32>=306; sys_platform == 'win32'
 pycaw>=20240210; sys_platform == 'win32'
 psutil>=5.9.0; sys_platform == 'win32'
 
-# --- Speaker identification (v0.5+) ---
+# --- Speaker identification ---
 # Speaker embeddings via SpeechBrain's ECAPA-TDNN model
 # (speechbrain/spkrec-ecapa-voxceleb, Apache-2.0). Public download from
 # Hugging Face Hub on first use -- no token, no license accept. The
 # checkpoint is ~22 MB; cached under <app_data>/models/ecapa/ for
 # offline runs. SpeechBrain transitively pulls huggingface_hub +
 # sentencepiece + torchaudio; all have Windows wheels.
-#
-# This replaces the v0.4 Resemblyzer dep -- ECAPA-TDNN has roughly
-# seven times lower equal-error-rate on VoxCeleb1-E, particularly for
-# same-gender speakers, which is the failure mode that previously
-# showed up as two real people getting merged into one cluster.
 speechbrain>=1.0.0
 huggingface_hub>=0.20.0
 # torchaudio is pulled in by SpeechBrain for audio I/O. Pin it loosely

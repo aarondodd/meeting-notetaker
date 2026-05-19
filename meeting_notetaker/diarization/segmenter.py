@@ -11,13 +11,13 @@ Three-tier VAD fallback for the per-frame voiced/silent decision:
    `silero-vad` PyPI package -- noticeably more accurate than
    webrtcvad on real meeting audio (HVAC noise, keyboard clatter,
    overlapping speech). Reuses the torch install pulled in by
-   Resemblyzer, so the marginal cost is just ~2MB of bundled model
+   SpeechBrain, so the marginal cost is just ~2MB of bundled model
    weights. Loaded lazily so the import side of this module stays
    cheap.
-2. webrtcvad (fallback). The original v0.5 path. Still present so the
-   segmenter works in environments where silero-vad or torch can't
-   load (the bundled torch wheel can fail on very old CPUs; the
-   webrtcvad path keeps the pipeline alive).
+2. webrtcvad (fallback). Still present so the segmenter works in
+   environments where silero-vad or torch can't load (the bundled
+   torch wheel can fail on very old CPUs; the webrtcvad path keeps
+   the pipeline alive).
 3. Energy-threshold mask (last resort). Fixed RMS threshold; used
    only when neither library is importable. Robust enough to keep
    `tests/test_diarization_segmenter.py` running in stripped CI envs
