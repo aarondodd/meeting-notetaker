@@ -40,6 +40,19 @@ def test_parse_version_two_component():
     assert updater.parse_version("1.2") == (1, 2)
 
 
+def test_parse_version_strips_prerelease_suffix():
+    assert updater.parse_version("0.5.0-dev") == (0, 5, 0)
+    assert updater.parse_version("v1.2.3-rc1") == (1, 2, 3)
+    assert updater.parse_version("1.0.0+build42") == (1, 0, 0)
+
+
+def test_is_newer_version_prerelease_compares_equal_to_final():
+    # A dev build of x.y.z should regard the released x.y.z as not newer
+    # (parses to same tuple). Upgrade from 0.5.0-dev to 0.6.0 still works.
+    assert updater.is_newer_version("0.5.0", "0.5.0-dev") is False
+    assert updater.is_newer_version("0.6.0", "0.5.0-dev") is True
+
+
 def test_is_newer_version_basic():
     assert updater.is_newer_version("0.5.0", "0.4.0") is True
     assert updater.is_newer_version("0.4.0", "0.4.0") is False

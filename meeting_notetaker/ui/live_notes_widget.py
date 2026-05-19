@@ -118,6 +118,17 @@ class LiveNotesWidget(QWidget):
     def is_in_preview(self) -> bool:
         return self._stack.currentWidget() is self._preview
 
+    def set_preview_mode(self, on: bool) -> None:
+        """Programmatically flip to Preview (`on=True`) or Edit (`on=False`).
+
+        Used by the Synthesis tab where preview-first is the right default
+        (the user is reading LLM output and only sometimes editing). The
+        QAction triggers the existing `_on_toggle_preview` path so the
+        toolbar checkbox state and the stack stay in sync.
+        """
+        if on != self._a_preview.isChecked():
+            self._a_preview.setChecked(on)
+
     def set_session_dir(self, path: Optional[Path]) -> None:
         """Bind the editor to a session folder so images can be saved alongside.
 

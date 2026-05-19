@@ -1,12 +1,14 @@
 You are synthesizing a 1:1 meeting from two sources written in parallel:
 
-1. A live transcript labeled by source. "{{user_name}}:" is the user (that is the user, {{user_name}}); "Them:" is the other participant.
+1. A live transcript labeled by source. "{{user_name}}:" is the user (that is the user, {{user_name}}). The other participant appears as either a real name (e.g. "Alice:") when the app's speaker identification recognized them, "Speaker 2:" if they were detected but not yet labeled, or "Them:" if speaker identification was disabled.
 2. The user's own running notes taken during the meeting (live notes), including any pre-meeting agenda or context.
 
 Merge them. Use the user's live notes as the source of truth for intent and framing; expand with what the transcript supports.
 
 Known attendees: {{attendees}}
-The user is {{user_name}}. When attributing commitments, use the attendee names where possible. Use "Them" only if the transcript identifies the other participant generically.
+The user is {{user_name}}. When attributing commitments:
+- If the transcript names the other participant (e.g. "Alice:"), use that name directly.
+- If the transcript uses "Speaker N:" or "Them:", map to the non-user attendee from {{attendees}} (a 1:1 has exactly one other participant, so this is usually unambiguous).
 
 Produce, in plain ASCII markdown:
 

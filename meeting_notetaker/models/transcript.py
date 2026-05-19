@@ -39,11 +39,16 @@ _USER_LABEL_LINE_RE = re.compile(r"^(\[\d{2}:\d{2}:\d{2}\]) Me: ", re.MULTILINE)
 
 @dataclass
 class TranscriptSegment:
-    source: str            # 'mic' or 'sys'
+    source: str            # 'mic' or 'sys' -- physical capture channel
     text: str
     t_start: float         # seconds since session start
     t_end: float
     is_provisional: bool = False
+    # Resolved speaker label, set by the diarization refinement pass for
+    # sys-source segments once a cluster has been assigned. Takes precedence
+    # over the source-based "Them" fallback when rendering. None for mic
+    # segments and for sys segments before refinement.
+    speaker_name: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -56,15 +61,18 @@ class TranscriptSegment:
             t_start=float(d["t_start"]),
             t_end=float(d["t_end"]),
             is_provisional=bool(d.get("is_provisional", False)),
+            speaker_name=d.get("speaker_name"),
         )
 
 
 def label_for(source: str, user_name: str = "") -> str:
-    """Render the speaker label for a segment.
+    """Render the speaker label for a segment based on capture source.
 
     `user_name` is the user's preferred display name (e.g. "John Smith").
     Empty string keeps the default "Me" label so the on-disk transcript
-    stays consistent across name changes.
+    stays consistent across name changes. Diarization-resolved labels
+    (real names from the speaker store) bypass this function entirely --
+    `format_segment` checks `speaker_name` first.
     """
     if source == "mic":
         return user_name.strip() or DEFAULT_USER_LABEL
@@ -74,7 +82,11 @@ def label_for(source: str, user_name: str = "") -> str:
 def format_segment(seg: TranscriptSegment, user_name: str = "") -> str:
     h, rem = divmod(int(seg.t_start), 3600)
     m, s = divmod(rem, 60)
-    return f"[{h:02d}:{m:02d}:{s:02d}] {label_for(seg.source, user_name)}: {seg.text.strip()}"
+    if seg.speaker_name:
+        label = seg.speaker_name
+    else:
+        label = label_for(seg.source, user_name)
+    return f"[{h:02d}:{m:02d}:{s:02d}] {label}: {seg.text.strip()}"
 
 
 def rewrite_user_label(text: str, user_name: str) -> str:

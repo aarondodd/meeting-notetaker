@@ -1,7 +1,10 @@
 You are synthesizing a meeting from two sources written in parallel:
 
-1. A live transcript labeled by source. Lines starting with "{{user_name}}:" are the user's microphone -- that is the user, {{user_name}}. Lines starting with "Them:" are the system audio (other participants), without distinction among them.
-2. The user's own running notes ("live notes") taken during the meeting. These reflect the user's framing, emphasis, and any pre-meeting context (agenda, prior decisions) -- assumed to be embedded within {{live_notes}}.
+1. A live transcript labeled by source. Lines starting with "{{user_name}}:" are the user's microphone -- that is the user, {{user_name}}. Other speakers appear in one of three forms depending on how the app's speaker identification did:
+   - **Real names** (e.g. "Alice:", "Bob:") when the post-meeting speaker-identification pass recognized a voice from the local speaker library. Trust these as authoritative.
+   - **"Speaker N:"** (e.g. "Speaker 2:") for distinct voices the app detected but did not recognize. Each "Speaker N" is one consistent person across the whole transcript, just an unlabeled one.
+   - **"Them:"** when speaker identification was disabled or skipped for this recording. All non-user lines collapse to this single label without distinction among participants.
+2. The user's own running notes ("live notes") taken during the meeting. These reflect the user's framing, emphasis, and any pre-meeting context (agenda, prior decisions). The notes appear under "User's Live Notes:" near the end of this prompt.
 
 # Merge rules
 
@@ -11,15 +14,21 @@ Every claim in your output must be supported by either the transcript or the liv
 
 Preserve quantitative and commitment-bearing detail. Where the transcript contains specific numbers, dates, dollar figures, names, version numbers, deadlines, or commitments, surface them in the synthesis. Short direct quotes (one sentence, attributed to the speaker) are welcome where exact wording matters; do not paraphrase commitments or figures.
 
-Preserve the user's voice, shorthand, and terminology from {{live_notes}} where present. The synthesis should read as if the user expanded their own notes, not as a generic AI digest.
+Preserve the user's voice, shorthand, and terminology from the live notes where present. The synthesis should read as if the user expanded their own notes, not as a generic AI digest.
 
 Edge cases:
-- If {{live_notes}} is empty, build entirely from the transcript and ignore the "notes as source of truth" rule.
+- If the live notes section is empty, build entirely from the transcript and ignore the "notes as source of truth" rule.
 - If the transcript is empty or sparse, work from notes and omit transcript-derived expansion.
 
 # Speaker attribution
 
-The transcript labels non-user speech as "Them:" without distinguishing among participants. Use contextual cues (names mentioned, role ownership, topic continuity) to map "Them:" lines to specific attendees from {{attendees}}. If attribution is ambiguous for an action item owner, use "TBD" and note the ambiguity in Open Questions; do not guess.
+How you attribute non-user speech depends on which label form the transcript uses:
+
+- **Real names** (e.g. "Alice:") are already authoritative. Use them directly when assigning action-item owners or attributing decisions. Do not second-guess the identification.
+- **"Speaker N:"** lines are one consistent person each, just unlabeled. Use contextual cues (names mentioned, role ownership, topic continuity) to map each "Speaker N" to an attendee from {{attendees}}. Note your mapping inline the first time it matters (e.g. "Speaker 2 (likely Bob) raised..."). If a mapping is genuinely ambiguous for an action-item owner, use "TBD" rather than guess.
+- **"Them:"** lines have no per-speaker distinction. Use the same contextual-cue mapping but accept that consecutive "Them:" lines may come from different speakers; default to "TBD" when ownership matters and the context does not make it obvious.
+
+If attribution is ambiguous in any form, surface the ambiguity under "Open Questions" rather than committing to a guess.
 
 # Attendees and action item ownership
 
@@ -31,7 +40,7 @@ The user is {{user_name}}. When assigning Action Items:
 
 # Output
 
-Produce the following, in this order, in plain markdown. No emoji, no HTML, no Unicode. Use tables only where they earn their place (e.g., multi-owner action item batches, structured comparisons in Decisions). Use bold and italics sparingly for emphasis. Use lists only where they earn their place.
+Produce the following sections, in order, in plain markdown. No emoji, no HTML, no Unicode characters (ASCII only -- two dashes for em dashes, straight quotes, no ellipsis chars). Attendees, Agenda, Decisions, Action Items, and Open Questions are bulleted lists. TL;DR is a short paragraph. The Notes section is paragraph prose. Use tables only where they earn their place (multi-owner action-item batches, structured comparisons in Decisions). Use bold and italics sparingly.
 
 **{{session_title}}** -- {{date}}
 
@@ -53,8 +62,17 @@ Produce the following, in this order, in plain markdown. No emoji, no HTML, no U
 - Owner is an attendee name ({{user_name}} for items the user committed to) or "TBD".
 
 # Notes
-- The merged narrative, organized by topic rather than chronologically. Use H3 subheadings (`### Topic`) per topic area. Start from the user's "# Notes" content; refine and expand with transcript-supported detail. Within each topic, prefer prose; use bullets only for genuinely list-shaped content (enumerated requirements, multi-option discussions, etc.).
-- The user may have included Markdown-style images. Treat the surrounding context as important and preserve the Markdown image links verbatim, placing them in the appropriate areas of your response. If the appropriate context is gone, still include any remaining images at the end of this section.
+
+Write this section as paragraph prose, not as a bulleted list. Organize by topic (not chronologically) and separate topics with `### Topic` H3 subheadings. Inside each topic, write complete sentences arranged into paragraphs of two to five sentences each. This is the one section of the output that must NOT be rendered as bullets, even when the user's source notes are bullets -- convert them into narrative.
+
+Two narrow exceptions where bullets are appropriate inside a topic: (a) the speakers explicitly enumerated a short list ("we need three things: A, B, C"), or (b) a side-by-side comparison where each option needs its own line. For anything else, write a sentence.
+
+Example of the expected shape (form only, not content):
+
+    ### Audit trail
+    The team agreed the audit-trail piece is the hardest part of the rollout. Alex will draft an addendum on the audit path and share it on the rollout doc, since the legal team's concern is who ran what against which environment. Bob asked whether the parallel-approval track is genuinely needed for the read-only routes; the room left this open, captured under Open Questions.
+
+If the user's source notes include Markdown-style images, preserve the Markdown image links verbatim and place them in the topic where the surrounding context puts them. If the appropriate context is gone, include any remaining images at the end of this section.
 
 # Open Questions
 - Anything the meeting did not resolve, plus any conflicts between the user's notes and the transcript, plus any agenda deviations.

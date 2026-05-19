@@ -100,3 +100,58 @@ def test_calendar_window_validation(isolated_data_dir):
     cfg.calendar.window_minutes = 0
     errors = cfg.validate()
     assert any("calendar.window_minutes" in e for e in errors)
+
+
+def test_speakers_defaults_and_round_trip(isolated_data_dir):
+    cfg = Config()
+    assert cfg.speakers.enabled is True
+    assert cfg.speakers.match_threshold == 0.75
+    assert cfg.speakers.merge_threshold == 0.75
+    cfg.speakers.enabled = False
+    cfg.speakers.match_threshold = 0.80
+    cfg.speakers.merge_threshold = 0.65
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.speakers.enabled is False
+    assert loaded.speakers.match_threshold == 0.80
+    assert loaded.speakers.merge_threshold == 0.65
+
+
+def test_speakers_threshold_validation(isolated_data_dir):
+    cfg = Config()
+    cfg.speakers.match_threshold = 1.5
+    errors = cfg.validate()
+    assert any("speakers.match_threshold" in e for e in errors)
+    cfg.speakers.match_threshold = 0.75
+    cfg.speakers.merge_threshold = 0.0
+    errors = cfg.validate()
+    assert any("speakers.merge_threshold" in e for e in errors)
+
+
+def test_detection_defaults_and_round_trip(isolated_data_dir):
+    cfg = Config()
+    assert cfg.detection.enabled is False
+    assert cfg.detection.min_duration_sec == 25
+    assert cfg.detection.cooldown_minutes == 10
+    assert "Teams.exe" in cfg.detection.app_allowlist
+    cfg.detection.enabled = True
+    cfg.detection.min_duration_sec = 45
+    cfg.detection.cooldown_minutes = 30
+    cfg.detection.app_allowlist = ["Custom.exe", "Other.exe"]
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.detection.enabled is True
+    assert loaded.detection.min_duration_sec == 45
+    assert loaded.detection.cooldown_minutes == 30
+    assert loaded.detection.app_allowlist == ["Custom.exe", "Other.exe"]
+
+
+def test_detection_validation_rejects_extremes(isolated_data_dir):
+    cfg = Config()
+    cfg.detection.min_duration_sec = 1
+    errors = cfg.validate()
+    assert any("detection.min_duration_sec" in e for e in errors)
+    cfg.detection.min_duration_sec = 25
+    cfg.detection.cooldown_minutes = 999
+    errors = cfg.validate()
+    assert any("detection.cooldown_minutes" in e for e in errors)

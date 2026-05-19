@@ -29,10 +29,9 @@ _DEFAULT_SEED = """# Custom vocabulary for Meeting Notetaker
 # acronyms, and corporate terms it would otherwise mis-hear.
 #
 # Examples (delete and replace with your own):
-# Snowflake Cortex
-# Informatica MDM
-# EDAPA-737
-# Plantronics Voyager
+# ProductName
+# TICKET-1234
+# Internal Acronym
 
 """
 

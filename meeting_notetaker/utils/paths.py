@@ -76,6 +76,10 @@ def calendar_state_path() -> Path:
     return app_data_dir() / "calendar_state.json"
 
 
+def audio_session_state_path() -> Path:
+    return app_data_dir() / "audio_session_state.json"
+
+
 def db_path() -> Path:
     return app_data_dir() / "sessions.db"
 

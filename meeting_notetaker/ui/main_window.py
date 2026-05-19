@@ -5,12 +5,14 @@ from datetime import datetime
 from typing import Callable, Iterable, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMenuBar,
@@ -51,7 +53,8 @@ _STATE_BADGE: dict[str, tuple[str, str]] = {
 
 _COL_AUDIO = 0
 _COL_STATE = 1
-_COL_TITLE = 2
+_COL_DATE = 2
+_COL_TITLE = 3
 
 
 class MainWindow(QMainWindow):
@@ -64,6 +67,7 @@ class MainWindow(QMainWindow):
     upgrade_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     delete_sessions_requested = pyqtSignal(list)   # list of session_ids
+    rename_session_requested = pyqtSignal(str, str)  # session_id, new_title
     session_selected = pyqtSignal(str)             # session_id
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -127,7 +131,7 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self._new_btn)
         left_layout.addLayout(header_row)
         self._list = QTreeWidget(left)
-        self._list.setColumnCount(3)
+        self._list.setColumnCount(4)
         self._list.setHeaderHidden(True)
         self._list.setRootIsDecorated(False)
         self._list.setUniformRowHeights(True)
@@ -135,13 +139,19 @@ class MainWindow(QMainWindow):
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._show_list_menu)
+        self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self._list)
+        rename_shortcut.activated.connect(self._rename_selected)
         header = self._list.header()
-        # The indicator columns are narrow; the title column takes the rest.
+        # Audio + state are narrow glyph columns; date is fixed-width
+        # to fit "YYYY-MM-DD HH:MM"; title takes the remaining space.
         header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
         self._list.setColumnWidth(_COL_AUDIO, 28)
         self._list.setColumnWidth(_COL_STATE, 28)
+        self._list.setColumnWidth(_COL_DATE, 110)
         left_layout.addWidget(self._list, 1)
         bulk_row = QHBoxLayout()
         bulk_row.addStretch(1)
@@ -156,7 +166,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.session_view)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([300, 700])
+        splitter.setSizes([340, 660])
 
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
@@ -180,6 +190,12 @@ class MainWindow(QMainWindow):
         loopback_tooltip: str = "",
         calendar_label: str,
         calendar_tooltip: str = "",
+        speakers_label: str = "",
+        speakers_tooltip: str = "",
+        voice_label: str = "",
+        voice_tooltip: str = "",
+        detect_label: str = "",
+        detect_tooltip: str = "",
     ) -> None:
         """Update the bottom status bar's right-side indicator string.
 
@@ -188,6 +204,10 @@ class MainWindow(QMainWindow):
         is joined into a single multi-line tooltip so the user can still
         hover the indicator to see the long form (the QLabel doesn't
         expose per-character tooltips).
+
+        `speakers_label`, `voice_label`, and `detect_label` only render
+        when non-empty -- clean installs and not-applicable states leave
+        them out.
         """
         parts: list[str] = []
         tooltip_parts: list[str] = []
@@ -200,6 +220,15 @@ class MainWindow(QMainWindow):
         tooltip_parts.append(loopback_tooltip or loopback_label)
         parts.append(calendar_label)
         tooltip_parts.append(calendar_tooltip or calendar_label)
+        if speakers_label:
+            parts.append(speakers_label)
+            tooltip_parts.append(speakers_tooltip or speakers_label)
+        if voice_label:
+            parts.append(voice_label)
+            tooltip_parts.append(voice_tooltip or voice_label)
+        if detect_label:
+            parts.append(detect_label)
+            tooltip_parts.append(detect_tooltip or detect_label)
         self._indicators_label.setText(" | ".join(parts))
         self._indicators_label.setToolTip("\n".join(tooltip_parts))
 
@@ -240,10 +269,12 @@ class MainWindow(QMainWindow):
         state_glyph, state_tooltip = _STATE_BADGE.get(s.state, ("", s.state))
         state_tooltip = f"Transcription state: {state_tooltip}"
 
+        when, title = _session_date_and_title(s)
         item = QTreeWidgetItem([
             audio_glyph,
             state_glyph,
-            _session_list_label(s),
+            when,
+            title,
         ])
         item.setTextAlignment(_COL_AUDIO, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_STATE, Qt.AlignmentFlag.AlignCenter)
@@ -260,13 +291,57 @@ class MainWindow(QMainWindow):
             )
 
     def _show_list_menu(self, pos) -> None:
-        if not self._list.selectedItems():
+        selected = self._list.selectedItems()
+        if not selected:
             return
         menu = QMenu(self._list)
+        action_rename = menu.addAction("Rename...")
+        # Rename targets exactly one session -- multi-rename would be
+        # an awkward UX (whose title applies?). Disable when the user
+        # has multi-selected.
+        action_rename.setEnabled(len(selected) == 1)
         action_delete = menu.addAction("Delete...")
         action = menu.exec(self._list.viewport().mapToGlobal(pos))
-        if action is action_delete:
+        if action is action_rename:
+            self._rename_selected()
+        elif action is action_delete:
             self._delete_selected()
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        # Treat any double-click as "rename this session". Other columns
+        # (audio/state glyphs, date) double-click into rename too -- the
+        # whole row is one logical thing.
+        self._rename_selected()
+
+    def _rename_selected(self) -> None:
+        ids = self.selected_session_ids()
+        if len(ids) != 1:
+            return
+        session_id = ids[0]
+        item = self._list.currentItem()
+        if item is None:
+            return
+        current_title = item.text(_COL_TITLE)
+        new_title, ok = QInputDialog.getText(
+            self,
+            "Rename Session",
+            "Title:",
+            QLineEdit.EchoMode.Normal,
+            current_title,
+        )
+        if not ok:
+            return
+        new_title = new_title.strip()
+        if not new_title:
+            QMessageBox.warning(
+                self,
+                "Rename Session",
+                "Title cannot be empty.",
+            )
+            return
+        if new_title == current_title:
+            return
+        self.rename_session_requested.emit(session_id, new_title)
 
     def _delete_selected(self) -> None:
         ids = self.selected_session_ids()
@@ -283,12 +358,12 @@ class MainWindow(QMainWindow):
             self.delete_sessions_requested.emit(ids)
 
 
-def _session_list_label(s: Session) -> str:
-    """Date + title for the title column. State is conveyed by its own column."""
+def _session_date_and_title(s: Session) -> tuple[str, str]:
+    """Return ('YYYY-MM-DD HH:MM', title) for the list's two main columns."""
     try:
         when = datetime.fromisoformat(s.created_at.replace("Z", "+00:00")).strftime(
             "%Y-%m-%d %H:%M"
         )
     except ValueError:
         when = s.created_at
-    return f"{when}  --  {s.title}"
+    return when, s.title

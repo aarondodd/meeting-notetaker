@@ -31,9 +31,13 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
 from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
+from ..diarization import user_voiceprint
+from ..diarization.store import open_speaker_store
 from ..utils.config import Config, VALID_MODEL_SIZES
 from ..utils.paths import prompts_dir, vocabulary_path
 from ..utils.vocabulary import seed_vocabulary_file
+from .speakers_manage_dialog import SpeakersManageDialog
+from .voice_enrollment_dialog import VoiceEnrollmentDialog
 
 
 class SettingsDialog(QDialog):
@@ -114,8 +118,8 @@ class SettingsDialog(QDialog):
 
         vocab_blurb = QLabel(
             "Custom vocabulary biases the transcriber toward proper nouns and "
-            "corporate terms it would otherwise mis-hear (\"Plantronics\", "
-            "\"EDAPA-737\", \"Snowflake Cortex\"). One phrase per line; '#' is a "
+            "in-house terms it would otherwise mis-hear (product names, "
+            "internal acronyms, vendor names). One phrase per line; '#' is a "
             "comment. Edits take effect on the next session.",
             self,
         )
@@ -204,6 +208,123 @@ class SettingsDialog(QDialog):
         audio_form.addRow("", self._vad_value_label)
         layout.addWidget(audio_group)
 
+        # Speakers group ---------------------------------------------------
+        speakers_group = QGroupBox("Speakers", self)
+        speakers_form = QFormLayout(speakers_group)
+        speakers_blurb = QLabel(
+            "After each meeting, the app runs a speaker-identification "
+            "pass on the system-audio loopback channel: it groups the "
+            "recording into per-speaker turns and matches each group "
+            "against the stored speaker library, prompting you to label "
+            "any unrecognized voices. Future meetings auto-recognize "
+            "the same speakers and label the transcript with real "
+            "names instead of \"Them:\". Disable to skip the post-stop "
+            "identification pass entirely. Nothing leaves the machine -- "
+            "embeddings are stored locally in speakers.db.",
+            self,
+        )
+        speakers_blurb.setWordWrap(True)
+        speakers_form.addRow(speakers_blurb)
+
+        self._speakers_enabled = QCheckBox("Enable speaker identification", self)
+        self._speakers_enabled.setChecked(config.speakers.enabled)
+        self._speakers_enabled.setToolTip(
+            "When off, recordings still transcribe normally but use "
+            "the generic \"Them:\" label for everyone besides the mic. "
+            "No speaker library is consulted or updated."
+        )
+        speakers_form.addRow(self._speakers_enabled)
+
+        self._match_threshold_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._match_threshold_slider.setMinimum(50)
+        self._match_threshold_slider.setMaximum(95)
+        self._match_threshold_slider.setSingleStep(1)
+        self._match_threshold_slider.setPageStep(5)
+        self._match_threshold_slider.setValue(int(round(config.speakers.match_threshold * 100)))
+        self._match_threshold_label = QLabel(
+            f"{int(round(config.speakers.match_threshold * 100))}%", self
+        )
+        self._match_threshold_slider.valueChanged.connect(
+            lambda v: self._match_threshold_label.setText(f"{v}%")
+        )
+        self._match_threshold_slider.setToolTip(
+            "Cosine-similarity threshold to auto-match a meeting voice "
+            "against a stored speaker. Higher = stricter (fewer false "
+            "matches but more unknowns surfaced for manual labeling); "
+            "lower = looser (more auto-labels but higher risk of "
+            "calling Bob Alice). The ECAPA-TDNN encoder used in v0.5 "
+            "puts same-speaker pairs around 0.7-0.9 and different "
+            "speakers around 0.1-0.3, so the workable range is "
+            "roughly 0.5-0.8; 0.75 is a reasonable default."
+        )
+        speakers_form.addRow("Match threshold:", self._match_threshold_slider)
+        speakers_form.addRow("", self._match_threshold_label)
+
+        self._merge_threshold_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._merge_threshold_slider.setMinimum(50)
+        self._merge_threshold_slider.setMaximum(95)
+        self._merge_threshold_slider.setSingleStep(1)
+        self._merge_threshold_slider.setPageStep(5)
+        self._merge_threshold_slider.setValue(int(round(config.speakers.merge_threshold * 100)))
+        self._merge_threshold_label = QLabel(
+            f"{int(round(config.speakers.merge_threshold * 100))}%", self
+        )
+        self._merge_threshold_slider.valueChanged.connect(
+            lambda v: self._merge_threshold_label.setText(f"{v}%")
+        )
+        self._merge_threshold_slider.setToolTip(
+            "Cosine-similarity threshold for fusing two voiced turns "
+            "into the same anonymous cluster (speaker isolation). "
+            "Higher = stricter (less risk of merging two real speakers "
+            "into one cluster, but a single speaker may split across "
+            "2-3 clusters that you then merge in the walker); lower = "
+            "looser (cleaner cluster count but more cross-speaker "
+            "merges). Distinct from Match threshold above, which only "
+            "controls auto-labeling from the speaker library. Raise "
+            "this knob first when you see two real people getting "
+            "munged into one cluster. With the v0.5 ECAPA-TDNN encoder "
+            "the workable range is roughly 0.5-0.8; try 0.78-0.82 if "
+            "75% still merges similar voices."
+        )
+        speakers_form.addRow("Merge threshold:", self._merge_threshold_slider)
+        speakers_form.addRow("", self._merge_threshold_label)
+
+        self._manage_speakers_btn = QPushButton("Manage Speakers...", self)
+        self._manage_speakers_btn.setToolTip(
+            "Open the stored speakers list to rename or remove entries."
+        )
+        self._manage_speakers_btn.clicked.connect(self._open_manage_speakers)
+        speakers_form.addRow(self._manage_speakers_btn)
+
+        # Voice enrollment -- a stored embedding of the user's own voice.
+        # Lets the refiner attribute mic-channel speech that actually came
+        # from the loopback (bleed) to the right system-audio speaker
+        # rather than blanket-labeling everything on the mic as the user.
+        self._voice_status_label = QLabel("", self)
+        self._voice_status_label.setWordWrap(True)
+        self._voice_status_label.setStyleSheet("color: palette(text);")
+        self._record_voice_btn = QPushButton("", self)
+        self._record_voice_btn.setToolTip(
+            "Record a short sample of your voice. The embedding stays on "
+            "this machine -- no audio leaves it. Used to disambiguate mic "
+            "vs system audio when both pick up the same speaker."
+        )
+        self._record_voice_btn.clicked.connect(self._open_voice_enrollment)
+        self._clear_voice_btn = QPushButton("Clear Sample", self)
+        self._clear_voice_btn.setToolTip(
+            "Delete the stored voiceprint. Mic-channel speech will go back "
+            "to being labeled as the user by default."
+        )
+        self._clear_voice_btn.clicked.connect(self._clear_voiceprint)
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(self._record_voice_btn)
+        voice_row.addWidget(self._clear_voice_btn)
+        voice_row.addStretch(1)
+        speakers_form.addRow("Your voice:", self._voice_status_label)
+        speakers_form.addRow("", voice_row)
+        self._refresh_voiceprint_row()
+        layout.addWidget(speakers_group)
+
         # Calendar group ---------------------------------------------------
         calendar_group = QGroupBox("Calendar (Outlook)", self)
         calendar_form = QFormLayout(calendar_group)
@@ -241,6 +362,69 @@ class SettingsDialog(QDialog):
         calendar_form.addRow("Notify within:", self._window_slider)
         calendar_form.addRow("", self._window_value_label)
         layout.addWidget(calendar_group)
+
+        # Ad-hoc meeting detection group -----------------------------------
+        detection_group = QGroupBox("Detect ad-hoc meetings", self)
+        detection_form = QFormLayout(detection_group)
+        detection_blurb = QLabel(
+            "When enabled, the app watches your system audio for an active "
+            "session from a known meeting app (Teams, Zoom, etc.). If audio "
+            "sustains long enough to look like a call rather than a "
+            "notification chirp, the tray pops a toast: click to open New "
+            "Session. Recording never auto-starts. Windows-only; no audio "
+            "is captured -- the OS already exposes which apps are playing.",
+            self,
+        )
+        detection_blurb.setWordWrap(True)
+        detection_form.addRow(detection_blurb)
+
+        self._detect_enabled = QCheckBox("Detect active meeting audio", self)
+        self._detect_enabled.setChecked(config.detection.enabled)
+        self._detect_enabled.setToolTip(
+            "Requires pycaw + psutil (Windows wheels). Safely no-ops on "
+            "other platforms or when pycaw is unavailable."
+        )
+        detection_form.addRow(self._detect_enabled)
+
+        self._detect_duration_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._detect_duration_slider.setMinimum(5)
+        self._detect_duration_slider.setMaximum(120)
+        self._detect_duration_slider.setSingleStep(5)
+        self._detect_duration_slider.setValue(config.detection.min_duration_sec)
+        self._detect_duration_label = QLabel(
+            f"{config.detection.min_duration_sec} sec", self
+        )
+        self._detect_duration_slider.valueChanged.connect(
+            lambda v: self._detect_duration_label.setText(f"{v} sec")
+        )
+        detection_form.addRow("Sustained for:", self._detect_duration_slider)
+        detection_form.addRow("", self._detect_duration_label)
+
+        self._detect_cooldown_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._detect_cooldown_slider.setMinimum(1)
+        self._detect_cooldown_slider.setMaximum(60)
+        self._detect_cooldown_slider.setSingleStep(1)
+        self._detect_cooldown_slider.setValue(config.detection.cooldown_minutes)
+        self._detect_cooldown_label = QLabel(
+            f"{config.detection.cooldown_minutes} min", self
+        )
+        self._detect_cooldown_slider.valueChanged.connect(
+            lambda v: self._detect_cooldown_label.setText(f"{v} min")
+        )
+        detection_form.addRow("Re-prompt after:", self._detect_cooldown_slider)
+        detection_form.addRow("", self._detect_cooldown_label)
+
+        self._detect_allowlist_edit = QLineEdit(self)
+        self._detect_allowlist_edit.setText(
+            ", ".join(config.detection.app_allowlist)
+        )
+        self._detect_allowlist_edit.setToolTip(
+            "Comma-separated list of process executable names to watch "
+            "(case-insensitive). Browser-based meetings are intentionally "
+            "excluded -- chrome.exe / msedge.exe also play music + video."
+        )
+        detection_form.addRow("Watch apps:", self._detect_allowlist_edit)
+        layout.addWidget(detection_group)
 
         # UI group ---------------------------------------------------------
         ui_group = QGroupBox("Interface", self)
@@ -301,6 +485,17 @@ class SettingsDialog(QDialog):
         self._config.audio.loopback_device_name = self._loopback_picker.currentData() or ""
         self._config.calendar.watch_calendar = self._watch_calendar.isChecked()
         self._config.calendar.window_minutes = int(self._window_slider.value())
+        self._config.speakers.enabled = self._speakers_enabled.isChecked()
+        self._config.speakers.match_threshold = self._match_threshold_slider.value() / 100.0
+        self._config.speakers.merge_threshold = self._merge_threshold_slider.value() / 100.0
+        self._config.detection.enabled = self._detect_enabled.isChecked()
+        self._config.detection.min_duration_sec = int(self._detect_duration_slider.value())
+        self._config.detection.cooldown_minutes = int(self._detect_cooldown_slider.value())
+        self._config.detection.app_allowlist = [
+            piece.strip()
+            for piece in self._detect_allowlist_edit.text().split(",")
+            if piece.strip()
+        ]
         self._config.ui.user_name = self._user_name_edit.text().strip()
         self.accept()
 
@@ -311,6 +506,40 @@ class SettingsDialog(QDialog):
     def _open_vocabulary_file(self) -> None:
         path = seed_vocabulary_file()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_manage_speakers(self) -> None:
+        store = open_speaker_store()
+        try:
+            dialog = SpeakersManageDialog(store, parent=self)
+            dialog.exec()
+        finally:
+            store.close()
+
+    def _refresh_voiceprint_row(self) -> None:
+        """Sync the Your-voice row to whatever is on disk right now."""
+        vp = user_voiceprint.load()
+        if vp is None:
+            self._voice_status_label.setText("Not enrolled.")
+            self._record_voice_btn.setText("Record voice sample...")
+            self._clear_voice_btn.setEnabled(False)
+        else:
+            self._voice_status_label.setText(
+                f"Enrolled (recorded {_format_recorded_at(vp.recorded_at)})."
+            )
+            self._record_voice_btn.setText("Re-record sample...")
+            self._clear_voice_btn.setEnabled(True)
+
+    def _open_voice_enrollment(self) -> None:
+        device_name = self._mic_picker.currentData() or ""
+        dialog = VoiceEnrollmentDialog(device_name=device_name, parent=self)
+        dialog.exec()
+        # Whether the dialog saved or cancelled, re-read disk so the row
+        # always reflects truth.
+        self._refresh_voiceprint_row()
+
+    def _clear_voiceprint(self) -> None:
+        if user_voiceprint.clear():
+            self._refresh_voiceprint_row()
 
 
 def _populate_device_picker(
@@ -368,3 +597,15 @@ def _populate_device_picker(
             if saved_lower in data.lower():
                 combo.setCurrentIndex(i)
                 return
+
+
+def _format_recorded_at(iso: str) -> str:
+    """Render an ISO-8601 UTC timestamp as a local YYYY-MM-DD HH:MM."""
+    if not iso:
+        return "unknown date"
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return iso

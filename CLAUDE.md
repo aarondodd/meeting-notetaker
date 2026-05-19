@@ -20,10 +20,13 @@ meeting_notetaker/
     loopback_recorder.py         # PyAudioWPatch WASAPI loopback (Win-only, cribbed from WhisperType)
     chunk_buffer.py              # rolling per-source PCM buffers + dedupe_overlap()
     resample.py                  # mono downmix + linear resample (no scipy)
-    vad.py                       # webrtcvad wrapper (optional)
+    vad.py                       # silero-vad wrapper (with webrtcvad + energy fallback)
   transcription/
     model_manager.py             # lazy-loaded faster-whisper instance, per-size cache
     worker.py                    # LiveTranscriptionWorker QThread + batch_transcribe()
+  integrations/
+    outlook_calendar.py          # Outlook COM monitor + meeting-imminent toast
+    audio_session_monitor.py     # pycaw-based ad-hoc meeting detect (opt-in)
   ui/
     main_window.py               # left pane: session list + bulk delete + new
     session_view.py              # right pane: transcript / my-notes / synthesis / previous + controls
@@ -160,11 +163,12 @@ sanity-check tool.
 
 ### Why linear resample instead of scipy
 
-scipy is ~120 MB of native code. Whisper accepts somewhat imprecise input
-(the model itself was trained on 16 kHz mono with various provenance).
-Linear interpolation through numpy is plenty for our 48 kHz -> 16 kHz
-downsample step. Test coverage in `tests/test_resample.py` includes the
-basic correctness assertions.
+Whisper accepts somewhat imprecise input (the model itself was trained
+on 16 kHz mono with various provenance). Linear interpolation through
+numpy is plenty for our 48 kHz -> 16 kHz downsample step, and keeps
+`audio/resample.py` testable without dragging scipy into the pure-Python
+test path. Test coverage in `tests/test_resample.py` includes the basic
+correctness assertions.
 
 ## Conventions
 
@@ -191,8 +195,6 @@ basic correctness assertions.
 - **faster-whisper is thread-safe for `transcribe()`.** Two workers can
   share one model instance. Do not instantiate per-thread; CPU + memory
   cost is too high.
-- **Avoid scipy / librosa.** The marginal accuracy improvement is not worth
-  the install footprint or the IT-review pain of additional native wheels.
 - **Keep PortAudio off the critical path for unit tests.** Anything that
   imports `pyaudio` or `pyaudiowpatch` lives behind a local import so
   pure-Python modules can be tested without PortAudio installed.
@@ -245,3 +247,25 @@ basic correctness assertions.
 - Tighter integration with the chosen synthesis chatbot (M365 Copilot,
   Claude.ai, etc.) for users without admin rights to automate the
   clipboard hand-off.
+- **scipy polyphase resample in `audio/resample.py`.** Replace the
+  numpy linear interp with `scipy.signal.resample_poly` (or
+  `librosa.resample` with `res_type="soxr_hq"`) for proper
+  anti-aliased 48k -> 16k downsampling. Whisper-small.en is tolerant
+  enough that the win is modest; medium.en benefits more. Keep the
+  linear path behind an env var so pure-Python tests still pass
+  without scipy in a stripped venv. Deferred from v0.5 (scipy + torch
+  came in for SpeechBrain; this is incremental).
+- **scipy hierarchical clustering in `diarization/cluster.py`.** Swap
+  the greedy O(N^2) agglomerative sweep for
+  `scipy.cluster.hierarchy.linkage` (average or Ward) plus a single
+  threshold cut. Deterministic and slightly more accurate on
+  conversational audio. The existing
+  `tests/test_diarization_cluster.py` pins current behavior so a swap
+  surfaces as a reviewable test diff. Deferred from v0.5.
+- **WhisperX word-level alignment.** Word-level speaker attribution
+  (instead of segment-level) would meaningfully improve transcripts
+  with overlapping speech. Considered + rejected for v0.5 because the
+  wav2vec2 forced-alignment pass adds ~30% wall-clock to the batch
+  refinement (10 min -> 13 min on a 30-min meeting at small.en) plus
+  a ~360MB model download. Revisit if user feedback shows
+  overlapping-speech misattribution is a real problem.
