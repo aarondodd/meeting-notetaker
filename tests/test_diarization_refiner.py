@@ -208,6 +208,85 @@ def test_refiner_drops_clusters_with_no_segment_evidence(tmp_path):
     assert sole_label.cluster_id == result.clusters[0].cluster_id
 
 
+def test_refiner_drops_sub_one_second_turns_from_clustering(tmp_path):
+    """Turns shorter than MIN_TURN_DURATION_FOR_CLUSTERING_SEC must not
+    drive cluster assignments. Their transcript segments fall back to
+    unlabeled (None cluster_id) -- the source-aware rewriter handles
+    presentation.
+
+    Without this filter, a 0.3s back-channel "yeah" produces a noisy
+    embedding that the clusterer happily places near whichever
+    long-form cluster's centroid happens to be closest, conflating two
+    real speakers.
+    """
+    sr = 16000
+    pcm = np.concatenate([
+        _silence(0.5, sr),
+        _sine(200, 2.0, sr),        # voice A long turn, 0.5-2.5s
+        _silence(0.6, sr),
+        _sine(500, 0.4, sr),        # short backchannel, 3.1-3.5s -- DROPPED
+        _silence(0.6, sr),
+        _sine(200, 2.0, sr),        # voice A long turn, 4.1-6.1s
+    ])
+    wav_path = tmp_path / "sys.wav"
+    _write_wav(wav_path, pcm, sr)
+    segments = [
+        TranscriptSegment(source="sys", text="A speaks",     t_start=0.5, t_end=2.5),
+        TranscriptSegment(source="sys", text="yeah",          t_start=3.1, t_end=3.5),
+        TranscriptSegment(source="sys", text="A again",       t_start=4.1, t_end=6.1),
+    ]
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        wav_path,
+        segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+    )
+    # Two long turns of the same voice -> exactly one cluster.
+    assert len(result.clusters) == 1
+    # The two long-form segments get the cluster; the short one is unlabeled.
+    by_index = {lbl.segment_index: lbl for lbl in result.segment_labels}
+    assert by_index[0].cluster_id == result.clusters[0].cluster_id
+    assert by_index[2].cluster_id == result.clusters[0].cluster_id
+    assert by_index[1].cluster_id is None
+
+
+def test_refiner_returns_empty_when_only_sub_second_turns_present(tmp_path):
+    """If every voiced turn is below the filter threshold, the refiner
+    bails to the empty-result path rather than clustering on garbage.
+
+    This is rare but possible -- a recording made of only short utterances
+    (rapid fire backchannels, system audio prompts) shouldn't produce
+    speaker attributions you can't trust.
+    """
+    sr = 16000
+    pcm = np.concatenate([
+        _silence(0.5, sr),
+        _sine(200, 0.4, sr),
+        _silence(0.6, sr),
+        _sine(500, 0.4, sr),
+        _silence(0.6, sr),
+        _sine(800, 0.4, sr),
+    ])
+    wav_path = tmp_path / "sys.wav"
+    _write_wav(wav_path, pcm, sr)
+    segments = [
+        TranscriptSegment(source="sys", text="ok",   t_start=0.5, t_end=0.9),
+        TranscriptSegment(source="sys", text="yeah", t_start=1.5, t_end=1.9),
+        TranscriptSegment(source="sys", text="mm",   t_start=2.5, t_end=2.9),
+    ]
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        wav_path,
+        segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+    )
+    assert result.clusters == []
+    assert result.unknown_cluster_ids == []
+    assert all(lbl.cluster_id is None for lbl in result.segment_labels)
+
+
 def test_refiner_empty_loopback_returns_no_labels(tmp_path):
     """Silent WAV -> no turns -> all segments unlabeled."""
     sr = 16000

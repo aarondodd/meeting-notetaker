@@ -35,6 +35,19 @@ from .store import MatchResult, SpeakerStore
 log = logging.getLogger(__name__)
 
 
+# Minimum turn duration that gets sent through clustering. Sub-second
+# voiced regions (back-channel "yeah" / "mm-hm", coughs, brief overlap
+# tails) produce noisy fixed-length embeddings -- the encoder doesn't
+# have enough acoustic context to land them at a stable point in the
+# 256-dim space. Including them pulls two real speakers' centroids
+# together and shows up as cluster munging. They still get transcribed;
+# they just don't drive diarization decisions. Transcript segments that
+# only overlap dropped turns fall back to the source-default label
+# (Them: for sys, Me: for mic), which is the same outcome as having no
+# diarization data for that span.
+MIN_TURN_DURATION_FOR_CLUSTERING_SEC = 1.0
+
+
 class Embedder(Protocol):
     """Anything that can turn a Turn into a fixed-length vector."""
 
@@ -121,9 +134,24 @@ def refine_loopback(
     raw.transcript.md, persisting decisions, prompting the user for
     unknown-cluster names). This function does not mutate the store.
     """
-    turns = find_turns_in_wav(Path(wav_path))
-    if not turns:
+    all_turns = find_turns_in_wav(Path(wav_path))
+    if not all_turns:
         log.info("refiner: no turns detected in %s; nothing to label", wav_path)
+        return _empty_result(transcript_segments)
+
+    turns = [t for t in all_turns if t.duration >= MIN_TURN_DURATION_FOR_CLUSTERING_SEC]
+    dropped = len(all_turns) - len(turns)
+    if dropped:
+        log.info(
+            "refiner: dropped %d/%d turns shorter than %.1fs from clustering",
+            dropped, len(all_turns), MIN_TURN_DURATION_FOR_CLUSTERING_SEC,
+        )
+    if not turns:
+        # Every voiced turn was too short to cluster reliably. Bail out
+        # to the empty-result path; transcript still synthesizes normally
+        # but no per-speaker attribution lands on disk.
+        log.info("refiner: no turns >= %.1fs in %s; skipping diarization",
+                 MIN_TURN_DURATION_FOR_CLUSTERING_SEC, wav_path)
         return _empty_result(transcript_segments)
 
     embeddings: list[np.ndarray] = []
@@ -210,7 +238,11 @@ def _detect_mic_bleed(
     ]
     if not mic_segment_spans:
         return {}
-    mic_turns = find_turns_in_wav(mic_wav)
+    mic_turns_all = find_turns_in_wav(mic_wav)
+    mic_turns = [
+        t for t in mic_turns_all
+        if t.duration >= MIN_TURN_DURATION_FOR_CLUSTERING_SEC
+    ]
     if not mic_turns:
         return {}
     voiceprint = np.asarray(user_voiceprint, dtype=np.float32).reshape(-1)

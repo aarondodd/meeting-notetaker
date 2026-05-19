@@ -307,7 +307,7 @@ def shot_settings() -> None:
     # The dialog has a scroll area; force-resize to a tall window so the
     # full content is visible in the screenshot (rather than just the
     # Transcription group at the top).
-    dlg.resize(640, 1100)
+    dlg.resize(640, 1200)
     dlg.show()
     QApplication.processEvents()
     _grab(dlg, "07-dialog-settings.png", autosize=False)

@@ -258,6 +258,33 @@ class SettingsDialog(QDialog):
         speakers_form.addRow("Match threshold:", self._match_threshold_slider)
         speakers_form.addRow("", self._match_threshold_label)
 
+        self._merge_threshold_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._merge_threshold_slider.setMinimum(50)
+        self._merge_threshold_slider.setMaximum(95)
+        self._merge_threshold_slider.setSingleStep(1)
+        self._merge_threshold_slider.setPageStep(5)
+        self._merge_threshold_slider.setValue(int(round(config.speakers.merge_threshold * 100)))
+        self._merge_threshold_label = QLabel(
+            f"{int(round(config.speakers.merge_threshold * 100))}%", self
+        )
+        self._merge_threshold_slider.valueChanged.connect(
+            lambda v: self._merge_threshold_label.setText(f"{v}%")
+        )
+        self._merge_threshold_slider.setToolTip(
+            "Cosine-similarity threshold for fusing two voiced turns "
+            "into the same anonymous cluster (speaker isolation). "
+            "Higher = stricter (less risk of merging two real speakers "
+            "into one cluster, but a single speaker may split across "
+            "2-3 clusters that you then merge in the walker); lower = "
+            "looser (cleaner cluster count but more cross-speaker "
+            "merges). Distinct from Match threshold above, which only "
+            "controls auto-labeling from the speaker library. Raise "
+            "this knob first when you see two real people getting "
+            "munged into one cluster."
+        )
+        speakers_form.addRow("Merge threshold:", self._merge_threshold_slider)
+        speakers_form.addRow("", self._merge_threshold_label)
+
         self._manage_speakers_btn = QPushButton("Manage Speakers...", self)
         self._manage_speakers_btn.setToolTip(
             "Open the stored speakers list to rename or remove entries."
@@ -456,6 +483,7 @@ class SettingsDialog(QDialog):
         self._config.calendar.window_minutes = int(self._window_slider.value())
         self._config.speakers.enabled = self._speakers_enabled.isChecked()
         self._config.speakers.match_threshold = self._match_threshold_slider.value() / 100.0
+        self._config.speakers.merge_threshold = self._merge_threshold_slider.value() / 100.0
         self._config.detection.enabled = self._detect_enabled.isChecked()
         self._config.detection.min_duration_sec = int(self._detect_duration_slider.value())
         self._config.detection.cooldown_minutes = int(self._detect_cooldown_slider.value())
