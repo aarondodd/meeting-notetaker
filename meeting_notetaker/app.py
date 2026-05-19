@@ -986,12 +986,16 @@ class MainApp(QObject):
             self._audio_monitor = None
 
     def _is_session_active(self) -> bool:
-        """True when a session is currently recording or paused -- the
-        monitor uses this to suppress prompts during an existing call."""
+        """True when the live recording engine is in use -- the monitor
+        uses this to suppress prompts during an existing call.
+
+        Sessions in post-Stop processing (STATE_PROCESSING) do not block
+        a new recording, so they do not suppress detection prompts either.
+        """
         active = self.controller.active_session
         if active is None:
             return False
-        return active.state in (STATE_RECORDING, STATE_PAUSED, STATE_PROCESSING)
+        return active.state in (STATE_RECORDING, STATE_PAUSED)
 
     def _on_meeting_audio_detected(self, info: MeetingAudioInfo) -> None:
         self.tray.notify_audio_detected(

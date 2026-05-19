@@ -1,11 +1,21 @@
 """Session lifecycle controller.
 
-Owns:
-  - SessionStore (persistent)
-  - The currently-active session (record/transcribe target)
-  - Recorder lifecycles (mic + loopback)
-  - ChunkBuffer + live transcription workers
-  - Batch transcription on stop (and the optional retain-audio cleanup)
+Owns two independent state surfaces:
+
+  - The **live recording engine**: at most one session at a time, captured
+    in `_active_recording_session` plus the recorder / chunk-buffer /
+    worker fields. Cleared by `_teardown_recording` once the WAVs close
+    and the live workers drain (i.e. at Stop).
+  - **Per-session post-processing**: a dict keyed by session_id of
+    `_ProcessingState` entries, each owning a batch transcription thread
+    and (optionally) a speaker refinement thread for one specific
+    session. Entries live from Stop until the diarization pass finishes
+    and the session is finalized.
+
+Splitting them lets the user start recording session B while session A
+is still post-processing -- the live engine slot is free as soon as
+session A's WAVs close, even though A's batch and refinement threads
+keep running on disk-backed inputs.
 
 This is the bridge between the UI signals and the audio/transcription
 modules; the UI never touches recorders or model_manager directly.
@@ -16,6 +26,7 @@ import logging
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -236,15 +247,34 @@ class _SpeakerRefinementThread(QThread):
             self.failed.emit(str(exc))
 
 
+@dataclass
+class _ProcessingState:
+    """Per-session post-processing state.
+
+    Captured at Stop time so the controller can release the live
+    recording engine immediately while the batch + refinement passes
+    keep running against the on-disk WAVs. Cleared from
+    `SessionController._processing_sessions` once `_finalize_session`
+    commits the final transcript and (optionally) cleans up audio.
+    """
+
+    session: Session
+    mic_wav: Optional[Path]
+    sys_wav: Optional[Path]
+    live_segments: list[TranscriptSegment]
+    batch_thread: Optional["_BatchTranscribeThread"] = None
+    refinement_thread: Optional["_SpeakerRefinementThread"] = None
+
+
 class SessionController(QObject):
     state_changed = pyqtSignal(str, str)               # session_id, state
     segment_arrived = pyqtSignal(str, object)          # session_id, TranscriptSegment
     transcript_replaced = pyqtSignal(str, list)        # session_id, list[TranscriptSegment]
     batch_progress = pyqtSignal(str, int)              # session_id, pct (0..100)
-    # Speaker-refinement signals (v0.5). Fired after the batch transcription
-    # pass commits but before STATE_COMPLETE. The UI uses them to (a) update
-    # the status label while refinement runs, (b) pop the Label Unknown
-    # Speakers dialog when the result has unknown clusters.
+    # Speaker-refinement signals. Fired after the batch transcription pass
+    # commits but before STATE_COMPLETE. The UI uses them to (a) update the
+    # status label while refinement runs, (b) pop the Label Unknown Speakers
+    # dialog when the result has unknown clusters.
     speaker_refinement_starting = pyqtSignal(str)              # session_id
     speaker_refinement_done = pyqtSignal(str, object)          # session_id, RefinementResult
     speaker_refinement_skipped = pyqtSignal(str, str)          # session_id, reason
@@ -255,7 +285,9 @@ class SessionController(QObject):
         super().__init__(parent)
         self.store = store
         self.config = config
-        self._active_session: Optional[Session] = None
+        # Live recording engine slot. Only one session may hold the mic +
+        # loopback at a time; cleared on Stop once the WAVs close.
+        self._active_recording_session: Optional[Session] = None
         self._mic_recorder = None
         self._loopback_recorder = None
         self._chunk_buffer: Optional[ChunkBuffer] = None
@@ -264,9 +296,11 @@ class SessionController(QObject):
         self._live_segments: list[TranscriptSegment] = []
         self._mic_wav: Optional[Path] = None
         self._sys_wav: Optional[Path] = None
-        self._batch_thread: Optional[_BatchTranscribeThread] = None
-        self._refinement_thread: Optional[_SpeakerRefinementThread] = None
         self._session_hotwords: str = ""
+        # Per-session post-processing entries, keyed by session_id. Survives
+        # the live-engine teardown so a follow-on recording can start while
+        # this session's batch + speaker passes run in the background.
+        self._processing_sessions: dict[str, _ProcessingState] = {}
 
     def _collect_hotwords(self, session: Session) -> str:
         """Combine global vocabulary + this session's attendees + agenda proper nouns.
@@ -292,15 +326,29 @@ class SessionController(QObject):
 
     @property
     def active_session(self) -> Optional[Session]:
-        return self._active_session
+        """The session that currently owns the live recording engine.
+
+        Returns None when the mic + loopback are idle, regardless of how
+        many other sessions are in post-Stop processing.
+        """
+        return self._active_recording_session
+
+    @property
+    def processing_session_ids(self) -> list[str]:
+        """IDs of sessions whose batch and/or refinement passes are still
+        running in the background."""
+        return list(self._processing_sessions.keys())
 
     # ---- session lifecycle -------------------------------------------------
 
     def start_session(self, session: Session) -> None:
-        if self._active_session is not None:
-            self.error.emit("Another session is already active. Stop it before starting a new one.")
+        # Only the live-recording slot blocks a new session; sessions in
+        # post-Stop batch / refinement processing run independently and
+        # do not gate the next recording.
+        if self._active_recording_session is not None:
+            self.error.emit("Another session is already recording. Stop it before starting a new one.")
             return
-        self._active_session = session
+        self._active_recording_session = session
         self._live_segments = []
         hotwords = self._collect_hotwords(session)
         try:
@@ -402,33 +450,34 @@ class SessionController(QObject):
             self.state_changed.emit(session.id, STATE_ERROR)
             self.error.emit(f"Failed to start recording: {exc}")
             self._teardown_recording(error=True)
+            return
 
     def pause_session(self) -> None:
-        if self._active_session is None:
+        if self._active_recording_session is None:
             return
         if self._mic_recorder is not None:
             self._mic_recorder.pause()
         if self._loopback_recorder is not None:
             self._loopback_recorder.pause()
-        self.store.update_session(self._active_session.id, state=STATE_PAUSED)
-        self._active_session.state = STATE_PAUSED
-        self.state_changed.emit(self._active_session.id, STATE_PAUSED)
+        self.store.update_session(self._active_recording_session.id, state=STATE_PAUSED)
+        self._active_recording_session.state = STATE_PAUSED
+        self.state_changed.emit(self._active_recording_session.id, STATE_PAUSED)
 
     def resume_session(self) -> None:
-        if self._active_session is None:
+        if self._active_recording_session is None:
             return
         if self._mic_recorder is not None:
             self._mic_recorder.resume()
         if self._loopback_recorder is not None:
             self._loopback_recorder.resume()
-        self.store.update_session(self._active_session.id, state=STATE_RECORDING)
-        self._active_session.state = STATE_RECORDING
-        self.state_changed.emit(self._active_session.id, STATE_RECORDING)
+        self.store.update_session(self._active_recording_session.id, state=STATE_RECORDING)
+        self._active_recording_session.state = STATE_RECORDING
+        self.state_changed.emit(self._active_recording_session.id, STATE_RECORDING)
 
     def stop_session(self) -> None:
-        if self._active_session is None:
+        if self._active_recording_session is None:
             return
-        session = self._active_session
+        session = self._active_recording_session
         duration = int((time.monotonic() - self._t_start_wall) if self._t_start_wall else 0)
         # Stop recorders first so WAV files close cleanly.
         try:
@@ -464,11 +513,28 @@ class SessionController(QObject):
             duration_seconds=duration,
         )
 
+        # Capture per-session post-processing state now, before tearing
+        # down the live engine. The batch + refinement threads will read
+        # the WAV paths off this dataclass instead of self._mic_wav etc.,
+        # so the live engine is free to start a new recording immediately.
+        proc_state = _ProcessingState(
+            session=session,
+            mic_wav=self._mic_wav,
+            sys_wav=self._sys_wav,
+            live_segments=list(self._live_segments),
+        )
+        self._processing_sessions[session.id] = proc_state
+        hotwords = self._session_hotwords
+        skip_batch = self.config.transcription.skip_batch_refinement
+        # Release the live recording engine immediately so the user can
+        # start the next session while this one's batch pass runs.
+        self._teardown_recording()
+
         # Skip batch pass entirely if configured. The live transcript becomes
         # final and the user moves straight to STATE_COMPLETE (and audio
         # cleanup) -- no 30-min wait for a 30-min recording.
-        if self.config.transcription.skip_batch_refinement:
-            self._finalize_session(session, batch_segments=None)
+        if skip_batch:
+            self._finalize_session(session.id, batch_segments=None)
             return
 
         self.store.update_session(session.id, state=STATE_PROCESSING)
@@ -477,26 +543,28 @@ class SessionController(QObject):
         self.batch_progress.emit(session.id, 0)
 
         beam_size = 1 if self.config.transcription.fast_batch else 5
-        self._batch_thread = _BatchTranscribeThread(
-            self._mic_wav,
-            self._sys_wav,
+        batch_thread = _BatchTranscribeThread(
+            proc_state.mic_wav,
+            proc_state.sys_wav,
             self.config.transcription.model_size,
             vad_filter=self.config.audio.vad_enabled,
             vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
             beam_size=beam_size,
-            hotwords=self._session_hotwords,
+            hotwords=hotwords,
         )
-        self._batch_thread.progress.connect(self.status.emit)
-        self._batch_thread.progress_pct.connect(
+        batch_thread.progress.connect(self.status.emit)
+        batch_thread.progress_pct.connect(
             lambda pct, sid=session.id: self.batch_progress.emit(sid, pct)
         )
-        self._batch_thread.done.connect(lambda segs: self._on_batch_done(session, store, segs))
-        self._batch_thread.failed.connect(lambda msg: self._on_batch_failed(session, msg))
-        self._batch_thread.start()
+        sid = session.id
+        batch_thread.done.connect(lambda segs, _sid=sid: self._on_batch_done(_sid, segs))
+        batch_thread.failed.connect(lambda msg, _sid=sid: self._on_batch_failed(_sid, msg))
+        proc_state.batch_thread = batch_thread
+        batch_thread.start()
 
     def _finalize_session(
         self,
-        session: Session,
+        session_id: str,
         *,
         batch_segments: Optional[list[TranscriptSegment]],
     ) -> None:
@@ -505,7 +573,16 @@ class SessionController(QObject):
         If `batch_segments` is provided, the live transcript is replaced by
         the batch result on disk. Otherwise the on-disk live transcript is
         treated as final (the skip-batch-refinement path).
+
+        Pulls per-session state from `_processing_sessions[session_id]` and
+        removes the entry on completion. The live recording engine is
+        already torn down at this point.
         """
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is None:
+            log.warning("finalize called for unknown processing session %s", session_id)
+            return
+        session = proc_state.session
         store = TranscriptStore(session.id)
         if batch_segments is not None and batch_segments:
             store.write_segments(batch_segments)
@@ -521,13 +598,12 @@ class SessionController(QObject):
         self.store.update_session(session.id, state=STATE_COMPLETE)
         session.state = STATE_COMPLETE
         self.state_changed.emit(session.id, STATE_COMPLETE)
-        self._teardown_recording()
+        self._processing_sessions.pop(session_id, None)
         self.status.emit("Transcription complete.")
 
     def _on_batch_done(
         self,
-        session: Session,
-        store: TranscriptStore,
+        session_id: str,
         segments: list[TranscriptSegment],
     ) -> None:
         """Commit the batch transcript, then run speaker refinement.
@@ -541,6 +617,12 @@ class SessionController(QObject):
         loopback WAV. The audio dir is NOT cleaned up until after
         refinement finishes -- the WAV is needed for embedding extraction.
         """
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is None:
+            log.warning("batch done for unknown processing session %s", session_id)
+            return
+        session = proc_state.session
+        store = TranscriptStore(session.id)
         if segments:
             store.write_segments(segments)
             self.store.update_session(session.id, has_transcript=True)
@@ -548,51 +630,52 @@ class SessionController(QObject):
         # Capture the latest on-disk transcript for the refinement input.
         # Use the batch segments when present, else fall back to whatever
         # the live workers wrote at Stop.
-        refinement_input = segments or list(self._live_segments)
+        refinement_input = segments or list(proc_state.live_segments)
 
         if not self.config.speakers.enabled:
-            self._finalize_session(session, batch_segments=None)
+            self._finalize_session(session_id, batch_segments=None)
             return
-        if not self._sys_wav or not self._sys_wav.exists():
-            self._finalize_session(session, batch_segments=None)
+        if not proc_state.sys_wav or not proc_state.sys_wav.exists():
+            self._finalize_session(session_id, batch_segments=None)
             return
 
         self.speaker_refinement_starting.emit(session.id)
         self.status.emit("Identifying speakers...")
         voiceprint = _load_user_voiceprint_for_refinement()
-        self._refinement_thread = _SpeakerRefinementThread(
-            self._sys_wav,
+        refinement_thread = _SpeakerRefinementThread(
+            proc_state.sys_wav,
             refinement_input,
             match_threshold=self.config.speakers.match_threshold,
             merge_threshold=self.config.speakers.merge_threshold,
-            mic_wav=self._mic_wav,
+            mic_wav=proc_state.mic_wav,
             user_voiceprint=voiceprint,
         )
-        self._refinement_thread.progress.connect(self.status.emit)
-        self._refinement_thread.done.connect(
-            lambda res, s=session, segs=refinement_input:
-            self._on_refinement_done(s, segs, res)
+        refinement_thread.progress.connect(self.status.emit)
+        refinement_thread.done.connect(
+            lambda res, sid=session_id, segs=refinement_input:
+            self._on_refinement_done(sid, segs, res)
         )
-        self._refinement_thread.skipped.connect(
-            lambda reason, s=session: self._on_refinement_skipped(s, reason)
+        refinement_thread.skipped.connect(
+            lambda reason, sid=session_id: self._on_refinement_skipped(sid, reason)
         )
-        self._refinement_thread.failed.connect(
-            lambda msg, s=session: self._on_refinement_failed(s, msg)
+        refinement_thread.failed.connect(
+            lambda msg, sid=session_id: self._on_refinement_failed(sid, msg)
         )
-        self._refinement_thread.start()
+        proc_state.refinement_thread = refinement_thread
+        refinement_thread.start()
 
     def _on_refinement_done(
         self,
-        session: Session,
+        session_id: str,
         input_segments: list[TranscriptSegment],
         result: RefinementResult,
     ) -> None:
         """Apply labels, persist diarization metadata, and finalize."""
         try:
             labeled = apply_labels_to_segments(input_segments, result.segment_labels)
-            store = TranscriptStore(session.id)
+            store = TranscriptStore(session_id)
             store.write_segments(labeled)
-            self.transcript_replaced.emit(session.id, labeled)
+            self.transcript_replaced.emit(session_id, labeled)
             save_diarization(
                 store.session_dir,
                 loopback_wav="audio/sys.wav",
@@ -605,30 +688,37 @@ class SessionController(QObject):
         # Surface the result so the UI can pop the Label Unknown Speakers
         # dialog. Emit before finalize so the dialog can grab a fresh
         # sample clip from the loopback WAV (still on disk).
-        self.speaker_refinement_done.emit(session.id, result)
-        self._finalize_session(session, batch_segments=None)
+        self.speaker_refinement_done.emit(session_id, result)
+        self._finalize_session(session_id, batch_segments=None)
 
-    def _on_refinement_skipped(self, session: Session, reason: str) -> None:
-        log.info("speaker refinement skipped for %s: %s", session.id, reason)
-        self.speaker_refinement_skipped.emit(session.id, reason)
-        self._finalize_session(session, batch_segments=None)
+    def _on_refinement_skipped(self, session_id: str, reason: str) -> None:
+        log.info("speaker refinement skipped for %s: %s", session_id, reason)
+        self.speaker_refinement_skipped.emit(session_id, reason)
+        self._finalize_session(session_id, batch_segments=None)
 
-    def _on_refinement_failed(self, session: Session, msg: str) -> None:
-        log.warning("speaker refinement failed for %s: %s", session.id, msg)
+    def _on_refinement_failed(self, session_id: str, msg: str) -> None:
+        log.warning("speaker refinement failed for %s: %s", session_id, msg)
         # Don't fail the whole session over a refinement bug; just skip
         # the labeling step and finalize normally.
-        self.speaker_refinement_skipped.emit(session.id, f"failed: {msg}")
-        self._finalize_session(session, batch_segments=None)
+        self.speaker_refinement_skipped.emit(session_id, f"failed: {msg}")
+        self._finalize_session(session_id, batch_segments=None)
 
-    def _on_batch_failed(self, session: Session, msg: str) -> None:
-        self.store.update_session(session.id, state=STATE_ERROR)
-        session.state = STATE_ERROR
-        self.state_changed.emit(session.id, STATE_ERROR)
+    def _on_batch_failed(self, session_id: str, msg: str) -> None:
+        proc_state = self._processing_sessions.pop(session_id, None)
+        self.store.update_session(session_id, state=STATE_ERROR)
+        if proc_state is not None:
+            proc_state.session.state = STATE_ERROR
+        self.state_changed.emit(session_id, STATE_ERROR)
         self.error.emit(f"Final transcription failed: {msg}")
-        self._teardown_recording(error=True)
 
     def _teardown_recording(self, *, error: bool = False) -> None:
-        self._active_session = None
+        """Release the live recording engine slot.
+
+        Does NOT touch `_processing_sessions` -- per-session batch and
+        refinement threads continue running on disk-backed inputs after
+        this returns.
+        """
+        self._active_recording_session = None
         self._mic_recorder = None
         self._loopback_recorder = None
         self._chunk_buffer = None
@@ -641,17 +731,20 @@ class SessionController(QObject):
     # ---- live segment routing ---------------------------------------------
 
     def _on_live_segment(self, segment: TranscriptSegment) -> None:
-        if self._active_session is None:
+        if self._active_recording_session is None:
             return
         self._live_segments.append(segment)
-        self.segment_arrived.emit(self._active_session.id, segment)
+        self.segment_arrived.emit(self._active_recording_session.id, segment)
 
     # ---- per-session field updates ----------------------------------------
 
     def set_retain_audio(self, session_id: str, retain: bool) -> None:
         self.store.update_session(session_id, retain_audio=retain)
-        if self._active_session and self._active_session.id == session_id:
-            self._active_session.retain_audio = retain
+        if self._active_recording_session and self._active_recording_session.id == session_id:
+            self._active_recording_session.retain_audio = retain
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is not None:
+            proc_state.session.retain_audio = retain
 
     # ---- crash recovery ---------------------------------------------------
 
