@@ -642,3 +642,98 @@ def test_tag_times_seconds_captured_for_badge(
     )
     pat_cluster = next(c for c in result.clusters if c.name == "Pat")
     assert pat_cluster.tag_times_seconds == [1.5, 7.0]
+
+
+# ---- Progress callback bucketing (Phase 2 progress in unified bar) ------
+
+
+def test_refiner_progress_callback_emits_buckets(two_voice_wav, two_voice_segments, tmp_path):
+    """progress_cb fires with monotonically increasing percents that
+    end at exactly 100. The bucket math doesn't have to be precise;
+    the contract is "moves toward 100 and ends at 100 only when done."""
+    store = SpeakerStore(tmp_path / "speakers.db")
+    emitted: list[int] = []
+    refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        progress_cb=emitted.append,
+    )
+    # Monotonic, in range, ends at 100.
+    assert emitted[-1] == 100
+    assert all(0 <= p <= 100 for p in emitted)
+    assert emitted == sorted(emitted)
+    # Saw something other than just (start, 100): the per-turn bucket
+    # in the sys-embedding loop produces intermediate values.
+    intermediates = [p for p in emitted if 5 < p < 100]
+    assert intermediates
+
+
+def test_refiner_progress_callback_throttles_duplicates(two_voice_wav, two_voice_segments, tmp_path):
+    """The emitter must not fire the same percent twice in a row."""
+    store = SpeakerStore(tmp_path / "speakers.db")
+    emitted: list[int] = []
+    refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        progress_cb=emitted.append,
+    )
+    # No two adjacent emissions are equal.
+    for prev, curr in zip(emitted, emitted[1:]):
+        assert prev != curr
+
+
+def test_refiner_progress_callback_reaches_100_on_empty_wav(tmp_path):
+    """Even when the WAV has no voiced turns, the callback must land
+    100 so the UI bar clears."""
+    import wave
+
+    # Write a one-second silent WAV.
+    sr = 16000
+    silent = np.zeros(sr, dtype=np.int16)
+    wav_path = tmp_path / "silent.wav"
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(silent.tobytes())
+    store = SpeakerStore(tmp_path / "speakers.db")
+    emitted: list[int] = []
+    refine_loopback(
+        wav_path,
+        [TranscriptSegment(source="sys", text="placeholder", t_start=0.0, t_end=1.0)],
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        progress_cb=emitted.append,
+    )
+    assert emitted[-1] == 100
+
+
+def test_refiner_progress_callback_optional():
+    """Default progress_cb=None must not be invoked, no AttributeError."""
+    # Just verify the kwarg defaults; full no-cb run is covered by
+    # every other refiner test that omits it.
+    import inspect
+    from meeting_notetaker.diarization.refiner import refine_loopback as fn
+    sig = inspect.signature(fn)
+    assert sig.parameters["progress_cb"].default is None
+
+
+def test_progress_emitter_sub_range_scales_to_outer_band():
+    """The sub_range helper feeds inner 0..100 into an outer [lo, hi]
+    slice. Used for mic-bleed progress to slot into the 80-95 band."""
+    from meeting_notetaker.diarization.refiner import _ProgressEmitter
+    outer: list[int] = []
+    emitter = _ProgressEmitter(outer.append)
+    inner = emitter.sub_range(80, 95)
+    assert inner is not None
+    inner(0)
+    inner(50)
+    inner(100)
+    # Map: 0->80, 50->88 (or 87, depending on rounding), 100->95.
+    assert outer[0] == 80
+    assert outer[-1] == 95
+    assert 80 <= outer[1] <= 95

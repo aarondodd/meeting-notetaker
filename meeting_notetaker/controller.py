@@ -188,6 +188,9 @@ class _SpeakerRefinementThread(QThread):
     skipped = pyqtSignal(str)                # reason text
     failed = pyqtSignal(str)
     progress = pyqtSignal(str)
+    # Refinement-phase percent (0..100). Bucketed inside refine_loopback;
+    # see the docstring there for what each band means.
+    progress_pct = pyqtSignal(int)
 
     def __init__(
         self,
@@ -240,6 +243,7 @@ class _SpeakerRefinementThread(QThread):
                     match_threshold=self.match_threshold,
                     merge_threshold=self.merge_threshold,
                     speaker_tags=self.speaker_tags,
+                    progress_cb=self.progress_pct.emit,
                 )
             finally:
                 speaker_store.close()
@@ -275,7 +279,13 @@ class SessionController(QObject):
     state_changed = pyqtSignal(str, str)               # session_id, state
     segment_arrived = pyqtSignal(str, object)          # session_id, TranscriptSegment
     transcript_replaced = pyqtSignal(str, list)        # session_id, list[TranscriptSegment]
-    batch_progress = pyqtSignal(str, int)              # session_id, pct (0..100)
+    # Unified post-Stop processing percent (0..100). The percent budget
+    # is split across the batch-transcription and speaker-refinement
+    # phases based on which ones will run -- see `_phase_plan` and
+    # `_emit_unified_progress`. The signal name preserves backward compat
+    # with the pre-unification "batch only" semantics; the SessionView
+    # label format ("Refining transcript -- X%") is unchanged.
+    batch_progress = pyqtSignal(str, int)              # session_id, unified pct (0..100)
     # Speaker-refinement signals. Fired after the batch transcription pass
     # commits but before STATE_COMPLETE. The UI uses them to (a) update the
     # status label while refinement runs, (b) pop the Label Unknown Speakers
@@ -317,6 +327,12 @@ class SessionController(QObject):
         # Per-session speaker tag stores. Keyed by session_id; instantiated
         # at start_session and consulted by tag_speaker / refinement.
         self._tag_stores: dict[str, "SpeakerTagStore"] = {}
+        # Per-session phase plan for the unified post-Stop progress bar.
+        # Populated in stop_session when we know which phases will fire.
+        # Shape: {session_id: {"batch": (lo, hi), "refinement": (lo, hi)}}
+        # where each tuple is the slice of the 0..100 unified bar that
+        # phase fills. A phase that won't run is absent from the dict.
+        self._phase_plans: dict[str, dict[str, tuple[int, int]]] = {}
         # Per-session post-processing entries, keyed by session_id. Survives
         # the live-engine teardown so a follow-on recording can start while
         # this session's batch + speaker passes run in the background.
@@ -630,6 +646,20 @@ class SessionController(QObject):
         self._processing_sessions[session.id] = proc_state
         hotwords = self._session_hotwords
         skip_batch = self.config.transcription.skip_batch_refinement
+        # Plan the unified post-Stop progress bar before any signals
+        # fire. Refinement will run if speaker-ID is enabled AND we
+        # captured loopback audio (the encoder-availability check
+        # happens inside _SpeakerRefinementThread; if it bails to
+        # `skipped` the bar will jump to 100 via _finalize anyway).
+        will_run_refinement = bool(
+            self.config.speakers.enabled
+            and proc_state.sys_wav
+            and proc_state.sys_wav.exists()
+        )
+        self._phase_plans[session.id] = self._build_phase_plan(
+            will_run_batch=not skip_batch,
+            will_run_refinement=will_run_refinement,
+        )
         # Release the live recording engine immediately so the user can
         # start the next session while this one's batch pass runs.
         self._teardown_recording()
@@ -644,7 +674,7 @@ class SessionController(QObject):
         self.store.update_session(session.id, state=STATE_PROCESSING)
         session.state = STATE_PROCESSING
         self.state_changed.emit(session.id, STATE_PROCESSING)
-        self.batch_progress.emit(session.id, 0)
+        self._emit_unified_progress(session.id, "batch", 0)
 
         beam_size = 1 if self.config.transcription.fast_batch else 5
         batch_thread = _BatchTranscribeThread(
@@ -658,7 +688,7 @@ class SessionController(QObject):
         )
         batch_thread.progress.connect(self.status.emit)
         batch_thread.progress_pct.connect(
-            lambda pct, sid=session.id: self.batch_progress.emit(sid, pct)
+            lambda pct, sid=session.id: self._emit_unified_progress(sid, "batch", pct)
         )
         sid = session.id
         batch_thread.done.connect(lambda segs, _sid=sid: self._on_batch_done(_sid, segs))
@@ -707,6 +737,14 @@ class SessionController(QObject):
         # could keep showing live counts during processing. Drop it now
         # that the session is done.
         self._tag_stores.pop(session_id, None)
+        # Force the unified progress bar to a clean 100 in case the last
+        # in-phase emit landed below (e.g. refinement got skipped at
+        # runtime for a missing encoder, or the batch path bypassed
+        # refinement entirely). Emit directly so the cleanup is
+        # independent of the phase plan, then drop the plan -- the bar
+        # isn't going to update again for this id.
+        self.batch_progress.emit(session_id, 100)
+        self._phase_plans.pop(session_id, None)
         self.status.emit("Transcription complete.")
 
     def _on_batch_done(
@@ -760,6 +798,9 @@ class SessionController(QObject):
             speaker_tags=proc_state.speaker_tags,
         )
         refinement_thread.progress.connect(self.status.emit)
+        refinement_thread.progress_pct.connect(
+            lambda pct, sid=session_id: self._emit_unified_progress(sid, "refinement", pct)
+        )
         refinement_thread.done.connect(
             lambda res, sid=session_id, segs=refinement_input:
             self._on_refinement_done(sid, segs, res)
@@ -806,6 +847,45 @@ class SessionController(QObject):
         self.speaker_refinement_skipped.emit(session_id, reason)
         self._finalize_session(session_id, batch_segments=None)
 
+    # ---- unified post-Stop progress bar ------------------------------------
+
+    def _build_phase_plan(
+        self,
+        *,
+        will_run_batch: bool,
+        will_run_refinement: bool,
+    ) -> dict[str, tuple[int, int]]:
+        """Allocate slices of 0..100 across whichever phases will run.
+
+        Both phases: batch 0-70%, refinement 70-100% (roughly matches the
+        observed wall-clock split on small.en for a typical meeting).
+        Single-phase cases give that phase the whole bar so 100% always
+        coincides with "actually done."
+        """
+        if will_run_batch and will_run_refinement:
+            return {"batch": (0, 70), "refinement": (70, 100)}
+        if will_run_batch:
+            return {"batch": (0, 100)}
+        if will_run_refinement:
+            return {"refinement": (0, 100)}
+        return {}
+
+    def _emit_unified_progress(self, session_id: str, phase: str, raw_pct: int) -> None:
+        """Map a phase-local 0..100 to the unified 0..100 bar and emit."""
+        plan = self._phase_plans.get(session_id)
+        if plan is None:
+            # No plan recorded (e.g. session was never queued through stop).
+            # Fall through with the raw value as a safety net.
+            self.batch_progress.emit(session_id, max(0, min(100, int(raw_pct))))
+            return
+        slot = plan.get(phase)
+        if slot is None:
+            return
+        lo, hi = slot
+        raw_pct = max(0, min(100, int(raw_pct)))
+        unified = lo + int(round((hi - lo) * raw_pct / 100))
+        self.batch_progress.emit(session_id, unified)
+
     def _self_improve_store_from_tagged_clusters(self, result: RefinementResult) -> None:
         """Feed user-tagged cluster centroids into the cross-meeting
         SpeakerStore. The tag turns each cluster into a labelled
@@ -846,6 +926,7 @@ class SessionController(QObject):
 
     def _on_batch_failed(self, session_id: str, msg: str) -> None:
         proc_state = self._processing_sessions.pop(session_id, None)
+        self._phase_plans.pop(session_id, None)
         self.store.update_session(session_id, state=STATE_ERROR)
         if proc_state is not None:
             proc_state.session.state = STATE_ERROR

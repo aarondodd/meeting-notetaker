@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 import numpy as np
 
@@ -54,6 +54,47 @@ MIN_TURN_DURATION_FOR_CLUSTERING_SEC = 1.0
 # Tags landing further than this from any turn are dropped silently --
 # typically clicks that fell in silence or on filtered-out short turns.
 DEFAULT_TAG_MATCH_TOLERANCE_SEC = 2.0
+
+
+class _ProgressEmitter:
+    """Throttled progress relay for refine_loopback.
+
+    The underlying callback may end up wired to a Qt signal that crosses
+    a thread boundary on every emission, so we only forward when the
+    integer percent changes. Also clamps to [0, 100] and provides
+    `sub_range(lo, hi)` to hand a callable to nested helpers that
+    expects to emit 0..100 within its own work but should land in
+    the outer bar's [lo, hi] band.
+    """
+
+    def __init__(self, cb: Optional[Callable[[int], None]]) -> None:
+        self._cb = cb
+        self._last: int = -1
+
+    def set(self, pct: int) -> None:
+        if self._cb is None:
+            return
+        pct = max(0, min(100, int(pct)))
+        if pct == self._last:
+            return
+        self._last = pct
+        try:
+            self._cb(pct)
+        except Exception:
+            log.exception("refiner progress callback raised; suppressing")
+
+    def sub_range(self, lo: int, hi: int) -> Optional[Callable[[int], None]]:
+        if self._cb is None:
+            return None
+        lo = max(0, min(100, int(lo)))
+        hi = max(lo, min(100, int(hi)))
+        span = hi - lo
+
+        def _scaled(inner_pct: int) -> None:
+            inner_pct = max(0, min(100, int(inner_pct)))
+            self.set(lo + int(round(span * inner_pct / 100)))
+
+        return _scaled
 
 
 class Embedder(Protocol):
@@ -132,6 +173,7 @@ def refine_loopback(
     min_overlap_sec: float = 0.25,
     speaker_tags: Optional[list[SpeakerTag]] = None,
     tag_match_tolerance_sec: float = DEFAULT_TAG_MATCH_TOLERANCE_SEC,
+    progress_cb: Optional[Callable[[int], None]] = None,
 ) -> RefinementResult:
     """Run the full pipeline.
 
@@ -149,10 +191,27 @@ def refine_loopback(
     The caller is responsible for any side effects (rewriting
     raw.transcript.md, persisting decisions, prompting the user for
     unknown-cluster names). This function does not mutate the store.
+
+    `progress_cb`, when supplied, is invoked with a percentage 0..100
+    representing progress through the refinement phase only. The
+    callback runs on whatever thread invoked refine_loopback (the
+    QThread-driven Qt signal it usually wraps handles the cross-thread
+    hop). Emissions are bucketed and throttled to 1% deltas:
+
+        0-5%   find_turns_in_wav(sys.wav)
+        5-80%  sys-turn embedding (per-turn updates)
+        80-95% mic-bleed detection
+        95-99% clustering + per-cluster summary
+        100%   after the result is fully built
     """
+    progress = _ProgressEmitter(progress_cb)
+    progress.set(1)  # signal liveness immediately on entry
+
     all_turns = find_turns_in_wav(Path(wav_path))
+    progress.set(5)
     if not all_turns:
         log.info("refiner: no turns detected in %s; nothing to label", wav_path)
+        progress.set(100)
         return _empty_result(transcript_segments)
 
     turns = [t for t in all_turns if t.duration >= MIN_TURN_DURATION_FOR_CLUSTERING_SEC]
@@ -168,11 +227,15 @@ def refine_loopback(
         # but no per-speaker attribution lands on disk.
         log.info("refiner: no turns >= %.1fs in %s; skipping diarization",
                  MIN_TURN_DURATION_FOR_CLUSTERING_SEC, wav_path)
+        progress.set(100)
         return _empty_result(transcript_segments)
 
     embeddings: list[np.ndarray] = []
-    for t in turns:
+    sys_total = len(turns)
+    for i, t in enumerate(turns):
         embeddings.append(np.asarray(encoder.embed_turn(t), dtype=np.float32))
+        # Map (i+1)/sys_total -> 5..80 of the refinement budget.
+        progress.set(5 + int(round(75 * (i + 1) / sys_total)))
 
     # Match user-supplied speaker tags (captured during recording) to the
     # nearest turn that survived the duration filter. The mapping feeds
@@ -190,6 +253,7 @@ def refine_loopback(
         assignment, turns, speaker_store, match_threshold,
         matched_tags=matched_tags,
     )
+    progress.set(80)
 
     mic_bleed_assignments: dict[int, int] = {}
     if (
@@ -208,7 +272,9 @@ def refine_loopback(
             user_voiceprint=user_voiceprint,
             user_match_threshold=user_match_threshold,
             min_overlap_sec=min_overlap_sec,
+            progress_cb=progress.sub_range(80, 95),
         )
+    progress.set(95)
 
     segment_labels = _label_transcript_segments(
         transcript_segments,
@@ -226,6 +292,7 @@ def refine_loopback(
     # but Whisper produced nothing for.
     clusters = _drop_clusters_without_segments(clusters, segment_labels)
     unknown_ids = [c.cluster_id for c in clusters if c.name is None]
+    progress.set(100)
     return RefinementResult(
         turns=turns,
         clusters=clusters,
@@ -245,6 +312,7 @@ def _detect_mic_bleed(
     user_voiceprint: np.ndarray,
     user_match_threshold: float,
     min_overlap_sec: float,
+    progress_cb: Optional[Callable[[int], None]] = None,
 ) -> dict[int, int]:
     """Find mic-source segments that should be reattributed to a sys cluster.
 
@@ -277,12 +345,15 @@ def _detect_mic_bleed(
         return {}
     voiceprint = np.asarray(user_voiceprint, dtype=np.float32).reshape(-1)
     bleed: dict[int, int] = {}
-    for turn in mic_turns:
+    mic_total = len(mic_turns)
+    for i, turn in enumerate(mic_turns):
         overlapping_segs = [
             (idx, s_start, s_end)
             for (idx, s_start, s_end) in mic_segment_spans
             if _interval_overlap(turn.t_start, turn.t_end, s_start, s_end) > 0
         ]
+        if progress_cb is not None:
+            progress_cb(int(round(100 * (i + 1) / mic_total)))
         if not overlapping_segs:
             continue
         # Voiceprint check first -- if this is the user talking, leave
