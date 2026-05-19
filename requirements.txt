@@ -23,23 +23,22 @@ pycaw>=20240210; sys_platform == 'win32'
 psutil>=5.9.0; sys_platform == 'win32'
 
 # --- Speaker identification (v0.5+) ---
-# Resemblyzer is installed via a SECOND pip command, not from this file:
+# Speaker embeddings via SpeechBrain's ECAPA-TDNN model
+# (speechbrain/spkrec-ecapa-voxceleb, Apache-2.0). Public download from
+# Hugging Face Hub on first use -- no token, no license accept. The
+# checkpoint is ~22 MB; cached under <app_data>/models/ecapa/ for
+# offline runs. SpeechBrain transitively pulls huggingface_hub +
+# sentencepiece + torchaudio; all have Windows wheels.
 #
-#     pip install --no-deps Resemblyzer>=0.1.4
-#
-# Reason: Resemblyzer's own setup.py lists `webrtcvad` (the original
-# package) as a hard dependency. On Python 3.10+ that package has no
-# Windows wheel on PyPI -- pip falls through to building from source,
-# which fails without MSVC Build Tools installed. webrtcvad-wheels
-# (above) provides the same `webrtcvad` import, but pip resolves by
-# PyPI name, not by import name, so it cannot satisfy Resemblyzer's
-# requirement automatically.
-#
-# Installing Resemblyzer with --no-deps skips the resolution step
-# entirely. The transitive deps Resemblyzer actually needs at runtime
-# (librosa, scipy, torch, numpy, webrtcvad-import) are listed below /
-# above so they install via this file with their normal wheels.
-librosa>=0.9.1
+# This replaces the v0.4 Resemblyzer dep -- ECAPA-TDNN has roughly
+# seven times lower equal-error-rate on VoxCeleb1-E, particularly for
+# same-gender speakers, which is the failure mode that previously
+# showed up as two real people getting merged into one cluster.
+speechbrain>=1.0.0
+huggingface_hub>=0.20.0
+# torchaudio is pulled in by SpeechBrain for audio I/O. Pin it loosely
+# since the right version is whatever matches your torch install.
+torchaudio
 scipy>=1.11.0
 torch>=2.0.0
 # Voice-activity detection used by the diarization turn segmenter (and

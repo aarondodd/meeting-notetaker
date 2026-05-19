@@ -77,7 +77,14 @@ def save(embedding: np.ndarray, *, path: Optional[Path] = None, sample_count: in
 
 
 def load(*, path: Optional[Path] = None) -> Optional[UserVoiceprint]:
-    """Return the stored voiceprint, or None if no enrollment exists."""
+    """Return the stored voiceprint, or None if no enrollment exists.
+
+    Also returns None when the stored embedding's dimension does not
+    match what the current encoder produces -- this happens after the
+    encoder swap from Resemblyzer (256-dim) to ECAPA-TDNN (192-dim) in
+    v0.5. Treating a stale-dim voiceprint as "not enrolled" prompts the
+    user to re-record so subsequent matches use comparable vectors.
+    """
     target = Path(path) if path is not None else voiceprint_path()
     if not target.exists():
         return None
@@ -94,6 +101,16 @@ def load(*, path: Optional[Path] = None) -> Optional[UserVoiceprint]:
     embedding = np.asarray(raw.get("embedding", []), dtype=np.float32).reshape(-1)
     if embedding.size == 0:
         return None
+    # Mismatched-dim voiceprints (e.g. stored under Resemblyzer 256-dim,
+    # encoder is now ECAPA 192-dim) are treated as not enrolled. The
+    # file stays on disk so the user can keep the old enrollment around
+    # if they swap encoders back, but the active encoder won't pull it.
+    try:
+        from .embeddings import EMBEDDING_DIM as _CURRENT_DIM
+    except Exception:
+        _CURRENT_DIM = None
+    if _CURRENT_DIM is not None and embedding.size != _CURRENT_DIM:
+        return None
     return UserVoiceprint(
         embedding=embedding,
         sample_count=int(raw.get("sample_count", 1)),
@@ -102,7 +119,14 @@ def load(*, path: Optional[Path] = None) -> Optional[UserVoiceprint]:
 
 
 def exists(*, path: Optional[Path] = None) -> bool:
-    """Cheap presence check used by Settings UI and the status indicator."""
+    """Cheap presence check used by Settings UI and the status indicator.
+
+    Returns True if any voiceprint file is present on disk, regardless
+    of whether its dimension matches the active encoder. The status-bar
+    indicator surfaces "Voice: not enrolled" based on `load()`, which
+    is dim-aware, so a stale-dim file correctly surfaces as needing
+    re-enrollment in the UI even though the file is present.
+    """
     target = Path(path) if path is not None else voiceprint_path()
     return target.exists()
 

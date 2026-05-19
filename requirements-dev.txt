@@ -3,8 +3,3 @@ pytest>=7.0.0
 pytest-qt>=4.2.0
 pyinstaller>=6.0.0
 pre-commit>=3.0.0
-# NOTE: prefer running install-deps.ps1 / install-deps.sh instead of
-# pip directly. The wrapper handles the second pip command needed to
-# install Resemblyzer with --no-deps -- without it, pip tries to
-# compile original webrtcvad from source on Windows and fails. See
-# the speaker-identification block in requirements.txt for why.

@@ -254,7 +254,7 @@ correctness assertions.
   enough that the win is modest; medium.en benefits more. Keep the
   linear path behind an env var so pure-Python tests still pass
   without scipy in a stripped venv. Deferred from v0.5 (scipy + torch
-  came in for Resemblyzer; this is incremental).
+  came in for SpeechBrain; this is incremental).
 - **scipy hierarchical clustering in `diarization/cluster.py`.** Swap
   the greedy O(N^2) agglomerative sweep for
   `scipy.cluster.hierarchy.linkage` (average or Ward) plus a single

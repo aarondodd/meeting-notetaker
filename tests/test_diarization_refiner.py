@@ -1,10 +1,11 @@
 """End-to-end refiner test using a fake embedder.
 
-The real embedder requires Resemblyzer + torch + librosa, which we skip
-here. Instead we inject a deterministic embedder that returns a fixed
-vector per turn based on a "voice id" derived from the synthetic audio's
-dominant frequency. That's enough to exercise: segmenter -> embedder ->
-clusterer -> store-match -> per-segment label assignment.
+The real embedder requires SpeechBrain + torch + a ~22 MB model
+download, which we skip here. Instead we inject a deterministic
+embedder that returns a fixed vector per turn based on a "voice id"
+derived from the synthetic audio's dominant frequency. That's enough
+to exercise: segmenter -> embedder -> clusterer -> store-match ->
+per-segment label assignment.
 """
 from __future__ import annotations
 
@@ -58,8 +59,8 @@ class FrequencyEmbedder:
     """Maps each Turn to a fixed 3-dim vector based on its dominant tone.
 
     Uses an FFT peak as the discriminator. Same frequency -> same
-    embedding (within noise) -> same cluster. Lets us simulate
-    Resemblyzer behavior without the heavy dep.
+    embedding (within noise) -> same cluster. Lets us simulate the
+    real ECAPA-TDNN encoder behavior without the heavy dep.
     """
 
     def embed_turn(self, turn) -> np.ndarray:

@@ -232,13 +232,21 @@ class SpeakerStore:
         """Find the closest known speaker by cosine similarity.
 
         Returns the best match if its similarity is at or above
-        `threshold`, otherwise None.
+        `threshold`, otherwise None. Records whose stored embedding
+        dimension does not match the query are silently skipped --
+        this lets a library that mixes embeddings from different
+        encoder versions (a v0.4 Resemblyzer install upgraded to v0.5
+        ECAPA) keep loading without crashing; the cross-version entries
+        simply never match new queries and can be cleaned up via
+        Manage Speakers when convenient.
         """
         from .cluster import cosine_similarity  # local import: avoids cycle at import time
 
         emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
         best: Optional[MatchResult] = None
         for record in self.list_all():
+            if record.embedding.shape[0] != emb.shape[0]:
+                continue
             sim = cosine_similarity(emb, record.embedding)
             if best is None or sim > best.similarity:
                 best = MatchResult(speaker=record, similarity=sim)

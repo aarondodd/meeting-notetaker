@@ -180,8 +180,9 @@ v0.5 alpha. End-to-end capture + transcription + synthesis works.
 v0.5 adds **post-meeting speaker identification with persistent
 self-learning**: after a recording stops, the app segments the
 system-audio loopback channel into per-speaker turns, embeds each
-turn with Resemblyzer, clusters them, and matches the clusters
-against a local speaker library (`speakers.db`). Unrecognized voices
+turn with SpeechBrain ECAPA-TDNN (Apache-2.0, no Hugging Face
+account required), clusters them, and matches the clusters against
+a local speaker library (`speakers.db`). Unrecognized voices
 prompt a *Label Unknown Speakers* dialog with example transcript
 lines per cluster + suggestions seeded from the Outlook attendee
 list -- assign once, and future meetings auto-label them. A *Review
@@ -237,26 +238,14 @@ source .venv/bin/activate
 python main.py
 ```
 
-`install-deps.ps1` / `install-deps.sh` wrap a two-step pip install:
-
-```
-pip install -r requirements-dev.txt
-pip install --no-deps Resemblyzer
-```
-
-The second line avoids a known Windows build failure. Resemblyzer's
-`setup.py` lists `webrtcvad` (the original PyPI package) as a hard
-dependency. That package has no maintained Windows wheel for Python
-3.10+, so a normal `pip install Resemblyzer` falls through to
-compiling the C extension from source and fails unless you have
-Microsoft Visual C++ Build Tools installed. `webrtcvad-wheels`
-(already in `requirements.txt`) provides the same `webrtcvad`
-*import* but pip resolves by PyPI name, so it can't satisfy
-Resemblyzer's requirement automatically. Installing Resemblyzer with
-`--no-deps` skips the resolution step; its other transitive deps
-(`librosa`, `scipy`, `torch`, `numpy`) are already in
-`requirements.txt` with their normal wheels. `build.ps1` / `build.sh`
-also do the two-step internally when producing a packaged build.
+`install-deps.ps1` / `install-deps.sh` wrap a single `pip install -r
+requirements-dev.txt`. As of v0.5 the speaker-embedding encoder is
+SpeechBrain's ECAPA-TDNN (`speechbrain/spkrec-ecapa-voxceleb`,
+Apache-2.0, public download), which installs cleanly from PyPI; the
+v0.4 Resemblyzer two-step (`--no-deps` to skip a webrtcvad pin) is
+no longer needed. The ECAPA checkpoint is ~22 MB; it downloads from
+Hugging Face Hub on first batch refinement and caches under
+`<app_data>/models/ecapa/` for offline runs after that.
 
 **Important on Windows:** make sure the `python` you use is from
 [python.org](https://www.python.org/downloads/), **not** the Microsoft
@@ -447,7 +436,7 @@ machine.
 ```mermaid
 flowchart TD
     A[sys.wav] --> B[Segment by voice activity<br/>silero-vad, ~30ms frames]
-    B --> C[Embed each turn<br/>Resemblyzer, 256-dim vector]
+    B --> C[Embed each turn<br/>SpeechBrain ECAPA-TDNN, 192-dim vector]
     C --> D[Cluster by cosine similarity<br/>greedy agglomerative]
     D --> E{Match centroid<br/>vs speakers.db<br/>at threshold}
     E -->|matched| F[Auto-label cluster<br/>with stored name]
@@ -472,9 +461,15 @@ When you click **Stop** on a recording, the controller chains:
    torch model) chops the loopback channel into per-turn voiced
    spans (typical meeting: 30-200 turns). Falls back to webrtcvad
    and then an energy threshold if silero or torch can't load.
-3. **Embedding**: Resemblyzer produces a 256-dim vector per turn (~10 ms each).
+3. **Embedding**: SpeechBrain's ECAPA-TDNN produces a 192-dim vector
+   per turn. Voiced turns shorter than 1.0 s are skipped because
+   short-clip embeddings are unreliable and tend to pull two real
+   speakers' centroids together.
 4. **Clustering**: greedy agglomerative cosine merge collapses turns
-   into per-speaker clusters (threshold tunable in Settings, default 0.75).
+   into per-speaker clusters (Merge threshold tunable in Settings,
+   default 0.75). Raise this knob when two real speakers keep getting
+   merged into one cluster; lower it if a single speaker keeps
+   splitting into multiple clusters.
 5. **Matching**: each cluster centroid is compared against every name
    in `speakers.db`. Above the threshold (default 0.75 cosine
    similarity), the cluster auto-labels with the stored name.
@@ -491,7 +486,7 @@ When you click **Stop** on a recording, the controller chains:
 All of this is automatic. You don't have to enable the pipeline per
 session -- it runs unless **Settings > Enable speaker identification**
 is unchecked, the recording has no system audio (mic-only session),
-or Resemblyzer fails to load.
+or SpeechBrain fails to load.
 
 ### What you do to help it improve
 
@@ -555,14 +550,17 @@ clearly-different voices in a quiet meeting. It struggles with:
 ### Privacy + footprint notes
 
 - Audio, embeddings, and the speaker library all live on the local
-  machine. The Resemblyzer model is bundled with the pip wheel;
-  nothing downloads at runtime; nothing in the speaker-ID path
-  makes a network call.
+  machine. The ECAPA-TDNN model checkpoint (~22 MB) is downloaded
+  once from Hugging Face Hub on first batch refinement and cached
+  under `%APPDATA%/MeetingNotetaker/models/ecapa/`. No Hugging Face
+  account or token is required. After the first download, the
+  speaker-ID path makes no network calls.
 - The speaker library is just `%APPDATA%/MeetingNotetaker/speakers.db`
   (sqlite). To wipe it, delete the file or use **Settings >
   Manage Speakers > Forget All**.
-- Wheel manifest impact for v0.5 (IT review): Resemblyzer transitively
-  pulls `librosa`, `scipy`, and `torch`. The frozen `.exe` grows
+- Wheel manifest impact for v0.5 (IT review): SpeechBrain
+  transitively pulls `huggingface_hub`, `sentencepiece`,
+  `torchaudio`, `scipy`, and `torch`. The frozen `.exe` grows
   substantially (~300 MB -> ~1 GB).
 
 ## Settings

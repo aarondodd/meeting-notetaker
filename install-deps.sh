@@ -2,11 +2,10 @@
 # Install all Python dependencies into the local venv.
 # Usage:  ./install-deps.sh
 #
-# Two-step install because Resemblyzer (speaker embedding) pulls original
-# webrtcvad as a hard dep, and that package has no Windows wheel for
-# Python 3.10+. Installing Resemblyzer with --no-deps skips that
-# resolution; the deps it actually uses at runtime (librosa, scipy,
-# torch, numpy, webrtcvad-wheels) are already pinned in requirements.txt.
+# Single-step install. As of v0.5, the speaker-embedding encoder is
+# SpeechBrain ECAPA-TDNN, which installs cleanly from PyPI -- the
+# Resemblyzer two-step (--no-deps to skip the webrtcvad pin) is no
+# longer needed.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -24,7 +23,6 @@ source "$VENV/bin/activate"
 
 pip install --upgrade pip
 pip install -r requirements-dev.txt
-pip install --no-deps "Resemblyzer>=0.1.4"
 
 echo
 echo "Done. Run:  python main.py"

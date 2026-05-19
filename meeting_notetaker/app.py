@@ -817,16 +817,17 @@ class MainApp(QObject):
     def _voice_indicator(self) -> tuple[str, str]:
         """Return (label, tooltip) for the user-voice enrollment indicator.
 
-        Only surfaces when speaker ID is enabled but no voiceprint has
-        been recorded -- the goal is to remind the user there's a setup
-        step they haven't completed. Once enrolled (or with speaker ID
-        off entirely) the indicator is omitted so it doesn't clutter
-        the status bar.
+        Only surfaces when speaker ID is enabled but no usable voiceprint
+        is on disk -- the goal is to remind the user there's a setup
+        step they haven't completed. A voiceprint recorded under a
+        previous encoder (e.g. Resemblyzer before the v0.5 ECAPA swap)
+        is treated as not enrolled because its dim is incompatible with
+        the current encoder's output; the user must re-record.
         """
         if not self.config.speakers.enabled:
             return "", ""
         try:
-            if user_voiceprint.exists():
+            if user_voiceprint.load() is not None:
                 return "", ""
         except Exception:
             log.exception("voice indicator: voiceprint check failed")

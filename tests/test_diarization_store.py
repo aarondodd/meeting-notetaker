@@ -113,6 +113,25 @@ def test_match_with_empty_store(store):
     assert store.match(query) is None
 
 
+def test_match_skips_records_with_mismatched_dim(store):
+    """Library entries stored under a previous encoder (different dim)
+    must be silently skipped, not crash the matcher. This is the
+    behavior that lets a v0.4 install upgraded to v0.5 keep its old
+    Resemblyzer 256-dim entries on disk while the new ECAPA 192-dim
+    encoder builds a parallel library; cross-dim entries just never
+    win a match."""
+    # Stored speaker: 4 dims (simulating "old encoder").
+    store.upsert("OldEncoder", np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    # Query: 3 dims (simulating "new encoder").
+    query = _unit_vec(1.0, 0.0, 0.0)
+    assert store.match(query, threshold=0.0) is None
+    # Add a new-dim entry that should win.
+    store.upsert("NewEncoder", _unit_vec(1.0, 0.0, 0.0))
+    result = store.match(query, threshold=0.0)
+    assert result is not None
+    assert result.speaker.name == "NewEncoder"
+
+
 def test_list_all_sorted_by_last_seen(store):
     import time
 

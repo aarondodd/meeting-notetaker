@@ -1,18 +1,31 @@
-"""Resemblyzer voice-embedding wrapper.
+"""SpeechBrain ECAPA-TDNN voice-embedding wrapper.
 
-We isolate Resemblyzer behind a thin facade so the rest of the diarization
+We isolate the encoder behind a thin facade so the rest of the diarization
 pipeline can be unit-tested with a mock embedder. Real imports happen
 inside `VoiceEncoder._lazy_import` so that test environments without
-Resemblyzer installed can still exercise the segmenter, clusterer, and
+SpeechBrain installed can still exercise the segmenter, clusterer, and
 store.
 
-Resemblyzer's `VoiceEncoder.embed_utterance` accepts a float32 numpy array
-sampled at 16kHz, returns a 256-dim L2-normalized embedding. The wrapper
-handles the int16 -> float32 conversion + sample rate resampling using our
-existing audio.resample helpers (no librosa just for that step).
+ECAPA-TDNN (Emphasized Channel Attention, Propagation and Aggregation
+Time-Delay Neural Network) is a stronger speaker-embedding model than
+the LSTM-based encoder this module previously used: roughly seven times
+lower equal-error-rate on VoxCeleb1-E. Same-gender separation
+specifically gets meaningfully better, which is the failure mode that
+shows up as "two real speakers getting merged into one cluster."
 
-A short minimum-duration guard avoids feeding tiny snippets to the encoder
-where the embedding would be unreliable.
+The pretrained model is `speechbrain/spkrec-ecapa-voxceleb`. License is
+Apache-2.0; no Hugging Face token or user license-accept required. The
+first call downloads ~22 MB into `app_data_dir() / "models" / "ecapa"`
+and caches it there for offline runs.
+
+SpeechBrain's `EncoderClassifier.encode_batch` accepts a float32 torch
+tensor sampled at 16 kHz, returns a 192-dim L2-normalizable embedding.
+The wrapper handles the int16 -> float32 conversion + sample rate
+resampling using our existing audio.resample helpers (no librosa just
+for that step).
+
+A short minimum-duration guard avoids feeding tiny snippets to the
+encoder where the embedding would be unreliable.
 """
 from __future__ import annotations
 
@@ -21,39 +34,56 @@ from typing import Optional
 
 import numpy as np
 
-from ..audio.resample import to_mono_int16, resample_linear_int16
+from ..audio.resample import resample_linear_int16, to_mono_int16
+from ..utils.paths import app_data_dir
 
 
 log = logging.getLogger(__name__)
 
-EMBEDDING_DIM = 256
+
+EMBEDDING_DIM = 192
 TARGET_SAMPLE_RATE = 16000
 MIN_DURATION_SEC = 0.5
 
+# Hugging Face Hub id of the public, Apache-2.0 ECAPA-TDNN checkpoint.
+# Public download; no token required.
+_ECAPA_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
+
 
 class EmbedderUnavailable(RuntimeError):
-    """Raised when Resemblyzer can't be imported (missing dep) or fails to load."""
+    """Raised when SpeechBrain can't be imported (missing dep) or fails to load."""
+
+
+def _model_cache_dir():
+    """Where to cache the ECAPA checkpoint. Sits next to our other models
+    rather than under the HF default ~/.cache/huggingface so end users
+    see all app artifacts in one place."""
+    cache = app_data_dir() / "models" / "ecapa"
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
 
 
 class VoiceEncoder:
-    """Thin wrapper around resemblyzer.VoiceEncoder.
+    """Thin wrapper around speechbrain.inference.speaker.EncoderClassifier.
 
     The underlying model loads on first `embed_*` call so that simply
-    constructing a refiner doesn't drag torch into memory. Subsequent
-    calls reuse the loaded model.
+    constructing a refiner doesn't drag torch + speechbrain into memory.
+    Subsequent calls reuse the loaded model.
     """
 
     def __init__(self) -> None:
-        self._model = None
+        self._classifier = None
+        self._torch = None
         self._load_error: Optional[Exception] = None
 
     @property
     def is_loaded(self) -> bool:
-        return self._model is not None
+        return self._classifier is not None
 
     @property
     def is_available(self) -> bool:
-        """True if Resemblyzer can be imported. Does not load the model."""
+        """True if SpeechBrain + torch can be imported. Does not load
+        the network or download model weights."""
         try:
             self._lazy_import()
             return True
@@ -62,32 +92,56 @@ class VoiceEncoder:
 
     def _lazy_import(self):
         try:
-            from resemblyzer import VoiceEncoder as _Encoder
-            return _Encoder
+            import torch  # noqa: F401
         except ImportError as exc:
             self._load_error = exc
             raise EmbedderUnavailable(
-                f"Resemblyzer is not installed: {exc}. Install with "
-                "`pip install Resemblyzer` (pulls librosa, scipy, torch)."
+                f"torch is not installed: {exc}. Install the project "
+                "requirements (`pip install -r requirements.txt`) before "
+                "running speaker identification."
+            ) from exc
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+            return EncoderClassifier
+        except ImportError as exc:
+            self._load_error = exc
+            raise EmbedderUnavailable(
+                f"SpeechBrain is not installed: {exc}. Install with "
+                "`pip install speechbrain` (already listed in "
+                "requirements.txt)."
             ) from exc
         except Exception as exc:  # pragma: no cover - defensive
             self._load_error = exc
             raise EmbedderUnavailable(
-                f"Resemblyzer failed to import: {exc}"
+                f"SpeechBrain failed to import: {exc}"
             ) from exc
 
     def _load(self) -> None:
-        if self._model is not None:
+        if self._classifier is not None:
             return
         encoder_cls = self._lazy_import()
         try:
-            self._model = encoder_cls(verbose=False)
+            import torch
+            self._torch = torch
+            savedir = str(_model_cache_dir())
+            # `from_hparams` pulls the checkpoint from HF Hub on first call
+            # and caches under `savedir`. Subsequent loads are offline.
+            self._classifier = encoder_cls.from_hparams(
+                source=_ECAPA_SOURCE,
+                savedir=savedir,
+                run_opts={"device": "cpu"},
+            )
         except Exception as exc:
             self._load_error = exc
             raise EmbedderUnavailable(
-                f"Resemblyzer model failed to load: {exc}"
+                f"ECAPA-TDNN model failed to load: {exc}. The first run "
+                "downloads ~22 MB from huggingface.co; check network "
+                "reachability if this is a fresh install."
             ) from exc
-        log.info("Resemblyzer VoiceEncoder loaded (dim=%d)", EMBEDDING_DIM)
+        log.info(
+            "SpeechBrain ECAPA-TDNN encoder loaded (dim=%d, source=%s)",
+            EMBEDDING_DIM, _ECAPA_SOURCE,
+        )
 
     # ---- public API ----
 
@@ -98,10 +152,10 @@ class VoiceEncoder:
         *,
         channels: int = 1,
     ) -> np.ndarray:
-        """Return a 256-dim embedding for the given PCM clip.
+        """Return a 192-dim embedding for the given PCM clip.
 
         `pcm` is int16 or float32 (interleaved if `channels > 1`).
-        Silently downmixes to mono + resamples to 16kHz; returns a
+        Silently downmixes to mono + resamples to 16 kHz; returns a
         zero-norm vector if the input is too short to embed.
         """
         if pcm.size == 0:
@@ -122,11 +176,20 @@ class VoiceEncoder:
             return np.zeros(EMBEDDING_DIM, dtype=np.float32)
 
         self._load()
-        # Resemblyzer expects float32 in [-1, 1] at 16kHz.
+        torch = self._torch
+        # ECAPA expects float32 in [-1, 1] at 16 kHz as a (batch, samples)
+        # tensor on the encoder's device.
         float_pcm = resampled.astype(np.float32) / 32768.0
-        # `embed_utterance` returns a normalized 256-dim numpy array.
-        embedding = self._model.embed_utterance(float_pcm)
-        return np.asarray(embedding, dtype=np.float32)
+        tensor = torch.from_numpy(float_pcm).unsqueeze(0)
+        with torch.inference_mode():
+            embedding = self._classifier.encode_batch(tensor)
+        # encode_batch returns shape (batch, 1, dim) -- squeeze to (dim,).
+        # L2-normalize so cosine similarity reduces to a dot product.
+        vec = embedding.squeeze().cpu().numpy().astype(np.float32)
+        norm = float(np.linalg.norm(vec))
+        if norm > 1e-8:
+            vec = vec / norm
+        return vec
 
     def embed_turn(self, turn) -> np.ndarray:
         """Convenience: embed a segmenter.Turn."""

@@ -252,8 +252,10 @@ class SettingsDialog(QDialog):
             "against a stored speaker. Higher = stricter (fewer false "
             "matches but more unknowns surfaced for manual labeling); "
             "lower = looser (more auto-labels but higher risk of "
-            "calling Bob Alice). 75% is a reasonable default for the "
-            "Resemblyzer embedding."
+            "calling Bob Alice). The ECAPA-TDNN encoder used in v0.5 "
+            "puts same-speaker pairs around 0.7-0.9 and different "
+            "speakers around 0.1-0.3, so the workable range is "
+            "roughly 0.5-0.8; 0.75 is a reasonable default."
         )
         speakers_form.addRow("Match threshold:", self._match_threshold_slider)
         speakers_form.addRow("", self._match_threshold_label)
@@ -280,7 +282,9 @@ class SettingsDialog(QDialog):
             "merges). Distinct from Match threshold above, which only "
             "controls auto-labeling from the speaker library. Raise "
             "this knob first when you see two real people getting "
-            "munged into one cluster."
+            "munged into one cluster. With the v0.5 ECAPA-TDNN encoder "
+            "the workable range is roughly 0.5-0.8; try 0.78-0.82 if "
+            "75% still merges similar voices."
         )
         speakers_form.addRow("Merge threshold:", self._merge_threshold_slider)
         speakers_form.addRow("", self._merge_threshold_label)

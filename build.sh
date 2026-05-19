@@ -17,10 +17,6 @@ source "$VENV/bin/activate"
 
 pip install --upgrade pip
 pip install -r requirements-dev.txt
-# Resemblyzer is installed with --no-deps to skip its hard `webrtcvad`
-# dependency (no Windows wheel for Python 3.10+). Its actual runtime
-# deps are in requirements.txt; see the long comment there.
-pip install --no-deps "Resemblyzer>=0.1.4"
 
 rm -rf build dist
 pyinstaller --noconfirm --clean meeting_notetaker.spec
