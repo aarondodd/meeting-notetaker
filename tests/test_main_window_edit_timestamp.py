@@ -78,3 +78,43 @@ def test_edit_timestamp_dialog_result_round_trips_through_utc(qt_app):
     assert parsed.tzinfo == timezone.utc
     back_to_local = parsed.astimezone().replace(tzinfo=None)
     assert back_to_local == seed
+
+
+def test_session_list_column_renders_local_time(monkeypatch):
+    """The list's date column converts the stored UTC timestamp into the
+    user's local timezone. Aaron flagged this after seeing 21:00 in the
+    list for a session he had edited to 11:00 (HST = UTC-10)."""
+    import time
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset not available on this platform")
+    monkeypatch.setenv("TZ", "Pacific/Honolulu")
+    time.tzset()
+
+    from meeting_notetaker.models.session import Session
+    from meeting_notetaker.ui.main_window import _session_date_and_title
+
+    s = Session(id="x", title="Test", created_at="2026-05-19T21:00:00Z")
+    when, _title = _session_date_and_title(s)
+    # 21:00 UTC -> 11:00 HST (UTC-10).
+    assert when == "2026-05-19 11:00"
+
+
+def test_session_list_column_round_trip_with_edit_dialog(qt_app, monkeypatch):
+    """End-to-end TZ consistency: what the edit dialog writes for a local
+    'YYYY-MM-DD HH:MM' moment is exactly what the list column then renders
+    for that same session."""
+    import time
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset not available on this platform")
+    monkeypatch.setenv("TZ", "Pacific/Honolulu")
+    time.tzset()
+
+    from meeting_notetaker.models.session import Session
+    from meeting_notetaker.ui.main_window import _session_date_and_title
+
+    seed = datetime(2026, 5, 19, 11, 0, 0)
+    dialog = _EditTimestampDialog(initial=seed)
+    stored_iso = dialog.result_utc_iso()
+    s = Session(id="x", title="t", created_at=stored_iso)
+    when, _title = _session_date_and_title(s)
+    assert when == "2026-05-19 11:00"

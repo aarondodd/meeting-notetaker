@@ -336,9 +336,11 @@ class MainApp(QObject):
         self.window.session_view.flush_pending_live_notes()
         live_notes = store.read_live_notes()
         try:
-            when = datetime.fromisoformat(session.created_at.replace("Z", "+00:00"))
+            when = datetime.fromisoformat(
+                session.created_at.replace("Z", "+00:00")
+            ).astimezone()
         except ValueError:
-            when = datetime.now(timezone.utc)
+            when = datetime.now().astimezone()
         dialog = GeneratePromptDialog(
             session_title=session.title,
             session_date=when,

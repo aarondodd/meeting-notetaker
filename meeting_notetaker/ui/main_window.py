@@ -389,10 +389,15 @@ class MainWindow(QMainWindow):
 
 
 def _session_date_and_title(s: Session) -> tuple[str, str]:
-    """Return ('YYYY-MM-DD HH:MM', title) for the list's two main columns."""
+    """Return ('YYYY-MM-DD HH:MM' in local time, title) for the list's two
+    main columns. Timestamps are stored as UTC ISO; the list shows them in
+    the user's local timezone so the column matches what they'd see in any
+    other calendar UI."""
     try:
-        when = datetime.fromisoformat(s.created_at.replace("Z", "+00:00")).strftime(
-            "%Y-%m-%d %H:%M"
+        when = (
+            datetime.fromisoformat(s.created_at.replace("Z", "+00:00"))
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M")
         )
     except ValueError:
         when = s.created_at
