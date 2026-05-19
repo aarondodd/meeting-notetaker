@@ -20,7 +20,7 @@ from .diarization.persistence import (
 )
 from .diarization import user_voiceprint
 from .diarization.encoder_prewarm import EncoderPrewarmThread
-from .diarization.refiner import RefinementResult, apply_labels_to_segments
+from .diarization.refiner import RefinementResult
 from .diarization.store import open_speaker_store
 from .integrations import audio_session_monitor, outlook_calendar
 from .integrations.audio_session_monitor import MeetingAudioInfo
@@ -49,7 +49,6 @@ from .ui.speaker_walker_dialog import (
 )
 from .ui.speaker_walker_helpers import (
     entries_from_persistence,
-    entries_from_refinement,
     gather_suggestions,
 )
 from .ui.tray import TrayIcon
@@ -436,62 +435,28 @@ class MainApp(QObject):
         # Only flip the Review button on if we're still on this session.
         if sv._session is not None and sv._session.id == session_id:
             sv.set_has_diarization(True)
-        # Surface tagged clusters before deciding whether to skip the
-        # walker. In trust mode the tagged ones auto-apply silently; in
-        # default mode they're shown for one-click confirmation alongside
-        # any genuinely unknown clusters.
-        has_unknown = result.has_unknown()
-        has_tagged = any(getattr(c, "was_user_tagged", False) for c in result.clusters)
-        if not has_unknown and not has_tagged:
-            count = len(result.clusters)
-            if count > 0:
-                self.window.status(
-                    f"Identified {count} speaker(s); all matched the store.",
-                    timeout_ms=8000,
-                )
-            return
-        try:
-            self._launch_label_dialog(session_id, result)
-        except Exception:
-            log.exception("label dialog failed; users can still use Review Speakers")
-
-    def _launch_label_dialog(self, session_id: str, result: RefinementResult) -> None:
-        suggestions = self._suggestion_pool_for(session_id)
-        transcript_segments = self._read_transcript_segments(session_id)
-        trust_tags = self.config.speakers.trust_session_tags
-        entries = entries_from_refinement(
-            result,
-            transcript_segments,
-            suggestions=suggestions,
-            only_unknown=True,
-            # In default (not-yet-confident) mode, surface tagged clusters
-            # in the walker so the user can confirm each one before the
-            # name lands. In trust mode, skip them entirely -- the
-            # SpeakerStore self-improvement step has already absorbed
-            # those centroids.
-            include_tagged_for_confirmation=not trust_tags,
+        # Surface what landed via the status bar; the Label Unknown
+        # Speakers dialog no longer auto-pops -- the user clicks the
+        # session view's Review Speakers button when they're ready to
+        # label / correct. Tagged-cluster centroids were already fed to
+        # the SpeakerStore inside the controller's _on_refinement_done
+        # via _self_improve_store_from_tagged_clusters, so no follow-up
+        # write is needed here for those.
+        cluster_count = len(result.clusters)
+        unknown_count = len(result.unknown_cluster_ids)
+        tagged_count = sum(
+            1 for c in result.clusters if getattr(c, "was_user_tagged", False)
         )
-        if not entries:
-            # Trust mode + only tagged clusters: surface a brief status so
-            # the user knows the refinement actually happened.
-            if trust_tags:
-                tagged_count = sum(
-                    1 for c in result.clusters
-                    if getattr(c, "was_user_tagged", False)
-                )
-                if tagged_count:
-                    self.window.status(
-                        f"Auto-applied {tagged_count} in-meeting tag(s); "
-                        f"no further confirmation needed.",
-                        timeout_ms=8000,
-                    )
+        if cluster_count == 0:
             return
-        session = self.store.get_session(session_id)
-        title = session.title if session else ""
-        dialog = SpeakerWalkerDialog(entries, mode="label", session_title=title, parent=self.window)
-        if dialog.exec() != SpeakerWalkerDialog.DialogCode.Accepted:
-            return
-        self._apply_walker_decisions(session_id, dialog.decisions(), transcript_segments)
+        msg_parts = [f"Identified {cluster_count} speaker(s)"]
+        if tagged_count:
+            msg_parts.append(f"{tagged_count} from in-meeting tags")
+        if unknown_count:
+            msg_parts.append(
+                f"{unknown_count} unlabeled -- click Review Speakers to label"
+            )
+        self.window.status("; ".join(msg_parts) + ".", timeout_ms=10000)
 
     def _on_review_speakers(self, session_id: str) -> None:
         """Manual review walker. Reads diarization.json for the session."""
