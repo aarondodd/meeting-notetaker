@@ -126,11 +126,27 @@ class VoiceEncoder:
             savedir = str(_model_cache_dir())
             # `from_hparams` pulls the checkpoint from HF Hub on first call
             # and caches under `savedir`. Subsequent loads are offline.
-            self._classifier = encoder_cls.from_hparams(
-                source=_ECAPA_SOURCE,
-                savedir=savedir,
-                run_opts={"device": "cpu"},
-            )
+            #
+            # `local_strategy=COPY` matters on Windows: SpeechBrain's
+            # default is SYMLINK, which downloads to ~/.cache/huggingface
+            # and then symlinks the files into savedir. Creating symlinks
+            # on Windows requires admin or Developer Mode (WinError 1314
+            # otherwise), neither of which a corporate user typically has.
+            # COPY uses `shutil.copy` instead -- ~22 MB of duplication on
+            # disk in exchange for working on every Windows config. The
+            # parameter has been part of SpeechBrain since 1.0; for older
+            # builds we silently fall back to whatever the default is.
+            kwargs = {
+                "source": _ECAPA_SOURCE,
+                "savedir": savedir,
+                "run_opts": {"device": "cpu"},
+            }
+            try:
+                from speechbrain.utils.fetching import LocalStrategy
+                kwargs["local_strategy"] = LocalStrategy.COPY
+            except ImportError:
+                pass
+            self._classifier = encoder_cls.from_hparams(**kwargs)
         except Exception as exc:
             self._load_error = exc
             raise EmbedderUnavailable(
