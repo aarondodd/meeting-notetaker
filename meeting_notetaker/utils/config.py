@@ -89,13 +89,6 @@ class SpeakersConfig:
     enabled: bool = True
     match_threshold: float = 0.75
     merge_threshold: float = 0.75
-    # When True, clusters named by in-meeting click-to-tag are auto-applied
-    # at refinement (their centroids land in the SpeakerStore, the transcript
-    # picks up the names) without going through the speaker walker. When
-    # False (default), the walker still shows tagged clusters as pre-filled
-    # entries so the user can confirm. Skipping the walker speeds up close,
-    # but only saves clicks -- the diarization quality is identical.
-    trust_session_tags: bool = False
 
 
 @dataclass

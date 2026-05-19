@@ -68,9 +68,11 @@ def test_speaker_card_shows_tagged_badge_for_user_tagged_entry(qt_app):
     assert "5:42" in badge_text and "6:41" in badge_text
 
 
-def test_entries_from_refinement_includes_tagged_when_requested():
-    """Tagged clusters propagate into the walker entries with name + badge
-    when `include_tagged_for_confirmation=True`, and stay out when False."""
+def test_entries_from_refinement_carries_tag_metadata_to_walker_entry():
+    """Tagged clusters that survive the only_unknown filter (i.e. Review
+    mode, where named clusters are kept) propagate was_user_tagged +
+    tag_times_seconds onto the walker entry so the card can render the
+    'tagged during meeting at ...' badge."""
     centroid = _unit(1.0, 0.0)
     summary = ClusterSummary(
         cluster_id=0,
@@ -88,45 +90,37 @@ def test_entries_from_refinement_includes_tagged_when_requested():
         ],
     )
     segs = [_make_segment(0, text="hi from Pat")]
-
-    # Default mode: tagged clusters shown for confirmation.
-    entries = entries_from_refinement(
-        result, segs, only_unknown=True,
-        include_tagged_for_confirmation=True,
-    )
+    entries = entries_from_refinement(result, segs, only_unknown=False)
     assert len(entries) == 1
     assert entries[0].was_user_tagged is True
     assert entries[0].tag_times_seconds == [5.0, 12.0]
-    assert entries[0].current_name == "Pat"
-
-    # Trust mode: tagged clusters excluded from the walker.
-    entries_trust = entries_from_refinement(
-        result, segs, only_unknown=True,
-        include_tagged_for_confirmation=False,
-    )
-    assert entries_trust == []
 
 
-def test_entries_from_refinement_still_includes_genuinely_unknown_in_trust_mode():
-    """Even with trust on, unknown clusters (no anchor name) must still
-    surface in the walker -- the user has to label them."""
+def test_entries_from_refinement_only_unknown_drops_named_clusters():
+    """only_unknown=True excludes any cluster whose name is set, whether
+    the name came from a store match or an in-meeting tag. The auto-popup
+    walker is gone; this filter just preserves the simple original
+    semantics for any future caller that asks for unknowns only."""
     centroid = _unit(1.0, 0.0)
-    unknown_summary = ClusterSummary(
-        cluster_id=0,
-        centroid=centroid,
-        turn_indices=[0],
-        name=None,
-        was_user_tagged=False,
+    tagged = ClusterSummary(
+        cluster_id=0, centroid=centroid, turn_indices=[0],
+        name="Pat", was_user_tagged=True,
+    )
+    unknown = ClusterSummary(
+        cluster_id=1, centroid=centroid, turn_indices=[1],
+        name=None, was_user_tagged=False,
     )
     result = RefinementResult(
-        turns=[], clusters=[unknown_summary],
+        turns=[], clusters=[tagged, unknown],
         segment_labels=[
-            SegmentLabel(segment_index=0, cluster_id=0, name=None, confidence=None),
+            SegmentLabel(segment_index=0, cluster_id=0, name="Pat", confidence=None),
+            SegmentLabel(segment_index=1, cluster_id=1, name=None, confidence=None),
         ],
     )
     entries = entries_from_refinement(
-        result, [_make_segment(0)], only_unknown=True,
-        include_tagged_for_confirmation=False,
+        result, [_make_segment(0), _make_segment(1)], only_unknown=True,
     )
+    # Only the genuinely unknown cluster lands; the tagged one (now
+    # named) is filtered out.
     assert len(entries) == 1
     assert entries[0].current_name is None

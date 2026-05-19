@@ -289,24 +289,6 @@ class SettingsDialog(QDialog):
         speakers_form.addRow("Merge threshold:", self._merge_threshold_slider)
         speakers_form.addRow("", self._merge_threshold_label)
 
-        self._trust_session_tags = QCheckBox(
-            "Trust in-meeting speaker tags (skip walker confirmation)", self
-        )
-        self._trust_session_tags.setChecked(config.speakers.trust_session_tags)
-        self._trust_session_tags.setToolTip(
-            "When you click an attendee in the right sidebar during a "
-            "meeting, that click constrains the post-meeting speaker "
-            "clustering regardless of this setting. This toggle only "
-            "controls whether the Label Unknown Speakers walker still "
-            "shows tagged clusters for confirmation at the end. Off "
-            "(default) is safer: tagged clusters pre-fill the walker so "
-            "you can OK each one. On skips the walker for tagged "
-            "clusters and applies them silently -- saves clicks once "
-            "you trust your tagging accuracy. Diarization quality is "
-            "identical either way."
-        )
-        speakers_form.addRow(self._trust_session_tags)
-
         self._manage_speakers_btn = QPushButton("Manage Speakers...", self)
         self._manage_speakers_btn.setToolTip(
             "Open the stored speakers list to rename or remove entries."
@@ -506,7 +488,6 @@ class SettingsDialog(QDialog):
         self._config.speakers.enabled = self._speakers_enabled.isChecked()
         self._config.speakers.match_threshold = self._match_threshold_slider.value() / 100.0
         self._config.speakers.merge_threshold = self._merge_threshold_slider.value() / 100.0
-        self._config.speakers.trust_session_tags = self._trust_session_tags.isChecked()
         self._config.detection.enabled = self._detect_enabled.isChecked()
         self._config.detection.min_duration_sec = int(self._detect_duration_slider.value())
         self._config.detection.cooldown_minutes = int(self._detect_cooldown_slider.value())
