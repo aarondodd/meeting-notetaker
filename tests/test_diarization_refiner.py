@@ -479,3 +479,166 @@ def test_apply_labels_works_on_simplenamespace_doubles():
     labels = [SegmentLabel(segment_index=0, cluster_id=0, name="Alice", confidence=0.9)]
     rewritten = apply_labels_to_segments(segments, labels)
     assert rewritten[0].speaker_name == "Alice"
+
+
+# ---- Speaker tags (constrained clustering + skip-store-match) -----------
+
+
+def test_refiner_uses_speaker_tags_to_name_clusters(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """A tag landing inside voice A's turn names that cluster directly,
+    without needing a SpeakerStore match."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    # No prior speakers in the store -- without tags both clusters would
+    # be unknown. The tag inside voice A's window (0.6 - 2.6s) names it.
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[SpeakerTag(name="Pat", t_seconds=1.5)],
+    )
+    pat_clusters = [c for c in result.clusters if c.name == "Pat"]
+    assert len(pat_clusters) == 1
+    assert pat_clusters[0].was_user_tagged is True
+    assert pat_clusters[0].match_similarity is None
+    # The other cluster has no name (no tag, no store match) -> unknown.
+    assert sorted(result.unknown_cluster_ids) == [
+        c.cluster_id for c in result.clusters if c.name is None
+    ]
+
+
+def test_tag_in_silence_is_dropped(two_voice_wav, two_voice_segments, tmp_path):
+    """A tag whose timestamp is far from any turn (silence between voices)
+    does not name any cluster."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    # Silence between voice A (ends 2.6) and voice B (starts 3.4) -- the
+    # tag at 3.0s is 0.4s from each, which is within tolerance, so it
+    # WILL snap. To verify the silence-drop behavior we need a tag that
+    # is genuinely far (> tolerance) from any turn -- use a custom narrow
+    # tolerance.
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[SpeakerTag(name="Ghost", t_seconds=3.0)],
+        tag_match_tolerance_sec=0.1,
+    )
+    assert not any(c.was_user_tagged for c in result.clusters)
+    assert not any(c.name == "Ghost" for c in result.clusters)
+
+
+def test_tag_overrides_store_match(two_voice_wav, two_voice_segments, tmp_path):
+    """If the store would have matched voice A as Alice but the user
+    tagged the segment as Pat, Pat wins."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    store.upsert("Alice", _unit_vec(0.0, 1.0, 0.0))  # would match voice A
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[SpeakerTag(name="Pat", t_seconds=1.5)],
+    )
+    pat_cluster = next(c for c in result.clusters if c.name == "Pat")
+    assert pat_cluster.was_user_tagged is True
+    assert all(c.name != "Alice" for c in result.clusters)
+
+
+def test_tag_propagates_to_segment_labels(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """A user-tagged cluster's name shows up on transcript segments that
+    overlap it -- same plumbing as the store-match path."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[SpeakerTag(name="Pat", t_seconds=1.5)],
+    )
+    # Segments 0 + 3 are both voice A -> tagged "Pat".
+    label_a_first = next(lbl for lbl in result.segment_labels if lbl.segment_index == 0)
+    label_a_second = next(lbl for lbl in result.segment_labels if lbl.segment_index == 3)
+    assert label_a_first.name == "Pat"
+    assert label_a_second.name == "Pat"
+
+
+def test_must_link_keeps_same_name_tags_in_one_cluster(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """Two tags with the same name on different voices (typically a
+    misclick on one) collapse into one cluster -- the must-link
+    constraint wins over the cosine distance signal. Documenting the
+    behavior so the consequence of a misclick is captured: trust the
+    user, but the user is responsible for clicking the right name."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[
+            SpeakerTag(name="Pat", t_seconds=1.5),  # voice A
+            SpeakerTag(name="Pat", t_seconds=4.5),  # voice B
+        ],
+    )
+    pat_clusters = [c for c in result.clusters if c.name == "Pat"]
+    assert len(pat_clusters) == 1
+
+
+def test_cannot_link_keeps_two_names_apart(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """Two tags with different names on different voices keep both
+    clusters intact even if their embeddings drift close together."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[
+            SpeakerTag(name="Pat", t_seconds=1.5),
+            SpeakerTag(name="Sam", t_seconds=4.5),
+        ],
+    )
+    names = sorted(c.name for c in result.clusters if c.name is not None)
+    assert names == ["Pat", "Sam"]
+
+
+def test_tag_times_seconds_captured_for_badge(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """Tag timestamps land on the cluster summary so the walker can
+    show 'tagged at HH:MM, HH:MM' badges."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[
+            SpeakerTag(name="Pat", t_seconds=1.5),
+            SpeakerTag(name="Pat", t_seconds=7.0),  # voice A appears again
+        ],
+    )
+    pat_cluster = next(c for c in result.clusters if c.name == "Pat")
+    assert pat_cluster.tag_times_seconds == [1.5, 7.0]

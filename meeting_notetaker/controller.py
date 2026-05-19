@@ -54,12 +54,13 @@ from .models.session import (
     SessionStore,
     utc_now_iso,
 )
+from .models.speaker_tags import SpeakerTag, SpeakerTagStore
 from .models.transcript import MIC, SYS, TranscriptSegment, TranscriptStore
 from .transcription import model_manager
 from .transcription.worker import LiveTranscriptionWorker, batch_transcribe, interleave
 from .utils.config import Config
 from .utils.live_notes import extract_section, parse_attendees
-from .utils.paths import app_data_dir, session_audio_dir
+from .utils.paths import app_data_dir, session_audio_dir, session_dir
 from .utils.vocabulary import derive_session_hotwords, join_hotwords, load_vocabulary
 
 
@@ -197,6 +198,7 @@ class _SpeakerRefinementThread(QThread):
         merge_threshold: float,
         mic_wav: Optional[Path] = None,
         user_voiceprint=None,
+        speaker_tags: Optional[list] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -206,6 +208,7 @@ class _SpeakerRefinementThread(QThread):
         self.match_threshold = match_threshold
         self.merge_threshold = merge_threshold
         self.user_voiceprint = user_voiceprint
+        self.speaker_tags = speaker_tags or []
 
     def run(self) -> None:
         try:
@@ -236,6 +239,7 @@ class _SpeakerRefinementThread(QThread):
                     user_voiceprint=self.user_voiceprint,
                     match_threshold=self.match_threshold,
                     merge_threshold=self.merge_threshold,
+                    speaker_tags=self.speaker_tags,
                 )
             finally:
                 speaker_store.close()
@@ -262,6 +266,7 @@ class _ProcessingState:
     mic_wav: Optional[Path]
     sys_wav: Optional[Path]
     live_segments: list[TranscriptSegment]
+    speaker_tags: list[SpeakerTag] = field(default_factory=list)
     batch_thread: Optional["_BatchTranscribeThread"] = None
     refinement_thread: Optional["_SpeakerRefinementThread"] = None
 
@@ -278,6 +283,10 @@ class SessionController(QObject):
     speaker_refinement_starting = pyqtSignal(str)              # session_id
     speaker_refinement_done = pyqtSignal(str, object)          # session_id, RefinementResult
     speaker_refinement_skipped = pyqtSignal(str, str)          # session_id, reason
+    # Emitted after a speaker tag is captured or removed during recording.
+    # Carries the up-to-date `{name: count}` snapshot so the right-sidebar
+    # widget can refresh its badge counters without re-reading the file.
+    speaker_tags_changed = pyqtSignal(str, dict)               # session_id, counts
     error = pyqtSignal(str)
     status = pyqtSignal(str)
 
@@ -293,10 +302,21 @@ class SessionController(QObject):
         self._chunk_buffer: Optional[ChunkBuffer] = None
         self._workers: list[LiveTranscriptionWorker] = []
         self._t_start_wall: Optional[float] = None
+        # Recording-active elapsed-time accounting. The live recorders drop
+        # frames while paused, so the WAV time is shorter than wall-clock
+        # by the cumulative pause duration. Speaker tags need WAV time so
+        # they snap to the right turn at refinement; we track active time
+        # via these two fields (sum of completed active spans + the
+        # current span's monotonic start).
+        self._active_elapsed_accumulated_sec: float = 0.0
+        self._active_span_start_monotonic: Optional[float] = None
         self._live_segments: list[TranscriptSegment] = []
         self._mic_wav: Optional[Path] = None
         self._sys_wav: Optional[Path] = None
         self._session_hotwords: str = ""
+        # Per-session speaker tag stores. Keyed by session_id; instantiated
+        # at start_session and consulted by tag_speaker / refinement.
+        self._tag_stores: dict[str, "SpeakerTagStore"] = {}
         # Per-session post-processing entries, keyed by session_id. Survives
         # the live-engine teardown so a follow-on recording can start while
         # this session's batch + speaker passes run in the background.
@@ -411,7 +431,12 @@ class SessionController(QObject):
                 self.status.emit("PyAudioWPatch not installed; recording mic only.")
 
             self._t_start_wall = time.monotonic()
+            self._active_elapsed_accumulated_sec = 0.0
+            self._active_span_start_monotonic = self._t_start_wall
             self._session_hotwords = hotwords
+            # Per-session speaker tag store, lazily initialized so a session
+            # that never gets tagged doesn't write any file.
+            self._tag_stores[session.id] = SpeakerTagStore(session_dir(session.id))
             self.store.update_session(
                 session.id,
                 state=STATE_RECORDING,
@@ -470,6 +495,13 @@ class SessionController(QObject):
             self._mic_recorder.pause()
         if self._loopback_recorder is not None:
             self._loopback_recorder.pause()
+        # Roll the current active span into the accumulator so future tag
+        # timestamps stay aligned with WAV time across the pause.
+        if self._active_span_start_monotonic is not None:
+            self._active_elapsed_accumulated_sec += (
+                time.monotonic() - self._active_span_start_monotonic
+            )
+            self._active_span_start_monotonic = None
         self.store.update_session(self._active_recording_session.id, state=STATE_PAUSED)
         self._active_recording_session.state = STATE_PAUSED
         self.state_changed.emit(self._active_recording_session.id, STATE_PAUSED)
@@ -481,9 +513,63 @@ class SessionController(QObject):
             self._mic_recorder.resume()
         if self._loopback_recorder is not None:
             self._loopback_recorder.resume()
+        # Start a fresh active span. Accumulator already holds the
+        # pre-pause time.
+        self._active_span_start_monotonic = time.monotonic()
         self.store.update_session(self._active_recording_session.id, state=STATE_RECORDING)
         self._active_recording_session.state = STATE_RECORDING
         self.state_changed.emit(self._active_recording_session.id, STATE_RECORDING)
+
+    def _recording_active_elapsed_sec(self) -> float:
+        """Wall-clock seconds the session has actually been recording
+        (i.e. WAV-aligned: pause time excluded). Returns 0.0 if no
+        session is recording."""
+        if self._active_recording_session is None:
+            return 0.0
+        total = self._active_elapsed_accumulated_sec
+        if self._active_span_start_monotonic is not None:
+            total += time.monotonic() - self._active_span_start_monotonic
+        return max(0.0, total)
+
+    # ---- speaker tags (Step 4 of issue #11 -- click-to-tag during recording)
+
+    def tag_speaker(self, name: str) -> None:
+        """Capture a click-to-tag anchor for the active recording session.
+
+        No-op when no session is currently in STATE_RECORDING or
+        STATE_PAUSED -- the user can still tag while paused, since the
+        WAV-aligned time is what matters and pause doesn't advance it.
+        """
+        if self._active_recording_session is None:
+            return
+        session = self._active_recording_session
+        if session.state not in (STATE_RECORDING, STATE_PAUSED):
+            return
+        clean = (name or "").strip()
+        if not clean:
+            return
+        store = self._tag_stores.get(session.id)
+        if store is None:
+            log.warning("tag_speaker called without an open tag store; ignoring")
+            return
+        t_seconds = self._recording_active_elapsed_sec()
+        try:
+            store.append(SpeakerTag(name=clean, t_seconds=t_seconds))
+        except (OSError, ValueError):
+            log.exception("failed to persist speaker tag %r at %.2fs", clean, t_seconds)
+            return
+        self.speaker_tags_changed.emit(session.id, store.counts())
+
+    def remove_last_speaker_tag(self, name: str) -> None:
+        """Undo the most recent tag for a given name on the active session."""
+        if self._active_recording_session is None:
+            return
+        session = self._active_recording_session
+        store = self._tag_stores.get(session.id)
+        if store is None:
+            return
+        if store.remove_last_for(name):
+            self.speaker_tags_changed.emit(session.id, store.counts())
 
     def stop_session(self) -> None:
         if self._active_recording_session is None:
@@ -528,11 +614,18 @@ class SessionController(QObject):
         # down the live engine. The batch + refinement threads will read
         # the WAV paths off this dataclass instead of self._mic_wav etc.,
         # so the live engine is free to start a new recording immediately.
+        # Snapshot any speaker tags captured during recording. The tag
+        # store stays alive in self._tag_stores until _finalize_session;
+        # post-stop tag-removal isn't supported (recording is over) so
+        # we copy the list once here.
+        tag_store = self._tag_stores.get(session.id)
+        tags_snapshot = tag_store.load() if tag_store is not None else []
         proc_state = _ProcessingState(
             session=session,
             mic_wav=self._mic_wav,
             sys_wav=self._sys_wav,
             live_segments=list(self._live_segments),
+            speaker_tags=tags_snapshot,
         )
         self._processing_sessions[session.id] = proc_state
         hotwords = self._session_hotwords
@@ -610,6 +703,10 @@ class SessionController(QObject):
         session.state = STATE_COMPLETE
         self.state_changed.emit(session.id, STATE_COMPLETE)
         self._processing_sessions.pop(session_id, None)
+        # The tag store stayed in self._tag_stores so the sidebar widget
+        # could keep showing live counts during processing. Drop it now
+        # that the session is done.
+        self._tag_stores.pop(session_id, None)
         self.status.emit("Transcription complete.")
 
     def _on_batch_done(
@@ -660,6 +757,7 @@ class SessionController(QObject):
             merge_threshold=self.config.speakers.merge_threshold,
             mic_wav=proc_state.mic_wav,
             user_voiceprint=voiceprint,
+            speaker_tags=proc_state.speaker_tags,
         )
         refinement_thread.progress.connect(self.status.emit)
         refinement_thread.done.connect(
@@ -694,6 +792,7 @@ class SessionController(QObject):
                 refinement_result=result,
                 transcript_segments=labeled,
             )
+            self._self_improve_store_from_tagged_clusters(result)
         except Exception:
             log.exception("post-refinement write failed; transcript unchanged")
         # Surface the result so the UI can pop the Label Unknown Speakers
@@ -706,6 +805,37 @@ class SessionController(QObject):
         log.info("speaker refinement skipped for %s: %s", session_id, reason)
         self.speaker_refinement_skipped.emit(session_id, reason)
         self._finalize_session(session_id, batch_segments=None)
+
+    def _self_improve_store_from_tagged_clusters(self, result: RefinementResult) -> None:
+        """Feed user-tagged cluster centroids into the cross-meeting
+        SpeakerStore. The tag turns each cluster into a labelled
+        sample that updates the speaker's running-average centroid
+        (creating a new entry if the name was previously unknown).
+        Untagged clusters are left alone -- they go through the walker
+        and are persisted there via _apply_walker_decisions.
+        """
+        tagged = [
+            c for c in result.clusters
+            if c.was_user_tagged and c.name and c.centroid is not None
+        ]
+        if not tagged:
+            return
+        try:
+            store = open_speaker_store()
+        except Exception:
+            log.exception("could not open speaker store for self-improvement")
+            return
+        try:
+            for cluster in tagged:
+                try:
+                    store.add_sample(cluster.name, cluster.centroid)
+                except Exception:
+                    log.exception(
+                        "failed to add tagged-cluster sample for %r",
+                        cluster.name,
+                    )
+        finally:
+            store.close()
 
     def _on_refinement_failed(self, session_id: str, msg: str) -> None:
         log.warning("speaker refinement failed for %s: %s", session_id, msg)

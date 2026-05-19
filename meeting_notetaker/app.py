@@ -175,6 +175,15 @@ class MainApp(QObject):
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
         sv.review_speakers_clicked.connect(self._on_review_speakers)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
+        # Click-to-tag attendee sidebar. The session-view passes its own
+        # session_id; we forward to controller.tag_speaker which captures
+        # the WAV-aligned timestamp and persists.
+        sv.tag_speaker_clicked.connect(
+            lambda _sid, name: self.controller.tag_speaker(name)
+        )
+        sv.remove_last_tag_clicked.connect(
+            lambda _sid, name: self.controller.remove_last_speaker_tag(name)
+        )
 
         self.controller.state_changed.connect(self._on_session_state_changed)
         self.controller.segment_arrived.connect(self._on_segment_arrived)
@@ -189,6 +198,7 @@ class MainApp(QObject):
         self.controller.speaker_refinement_skipped.connect(
             self._on_speaker_refinement_skipped
         )
+        self.controller.speaker_tags_changed.connect(self._on_speaker_tags_changed)
         self.controller.error.connect(self._on_controller_error)
         self.controller.status.connect(lambda msg: self.window.status(msg, timeout_ms=5000))
 
@@ -207,13 +217,29 @@ class MainApp(QObject):
         if session is None:
             return
         store = TranscriptStore(session_id)
+        live_notes_body = store.read_live_notes()
         self.window.session_view.set_session(
             session,
             transcript=store.read_transcript(),
             notes=store.read_notes(),
             previous_notes_paths=store.list_previous_notes(),
-            live_notes=store.read_live_notes(),
+            live_notes=live_notes_body,
         )
+        # Seed the click-to-tag sidebar from the live_notes '# Attendees'
+        # section. The sidebar is hidden unless the session is recording,
+        # but seeding now means it shows up populated the moment Start
+        # is clicked.
+        self.window.session_view.set_attendee_names(
+            parse_attendees(live_notes_body)
+        )
+        # If the user reselected a session that's still actively being
+        # recorded (back-to-back-session scenario), surface any tag counts
+        # the controller already collected.
+        active = getattr(self.controller, "active_session", None)
+        if active is not None and active.id == session_id:
+            store = self.controller._tag_stores.get(session_id)
+            if store is not None:
+                self.window.session_view.set_speaker_tag_counts(store.counts())
 
     # ---- session lifecycle handlers ---------------------------------------
 
@@ -357,6 +383,17 @@ class MainApp(QObject):
             TranscriptStore(session_id).save_live_notes(body)
         except OSError:
             log.exception("failed to save live notes for %s", session_id)
+        # Keep the click-to-tag sidebar in sync with whatever the user
+        # currently has under '# Attendees'. The widget only re-renders
+        # when the parsed list actually changes.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            sv.set_attendee_names(parse_attendees(body))
+
+    def _on_speaker_tags_changed(self, session_id: str, counts: dict[str, int]) -> None:
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            sv.set_speaker_tag_counts(counts)
 
     def _on_synthesis_notes_changed(self, session_id: str, body: str) -> None:
         """Persist inline edits to the Synthesis tab.
@@ -399,7 +436,13 @@ class MainApp(QObject):
         # Only flip the Review button on if we're still on this session.
         if sv._session is not None and sv._session.id == session_id:
             sv.set_has_diarization(True)
-        if not result.has_unknown():
+        # Surface tagged clusters before deciding whether to skip the
+        # walker. In trust mode the tagged ones auto-apply silently; in
+        # default mode they're shown for one-click confirmation alongside
+        # any genuinely unknown clusters.
+        has_unknown = result.has_unknown()
+        has_tagged = any(getattr(c, "was_user_tagged", False) for c in result.clusters)
+        if not has_unknown and not has_tagged:
             count = len(result.clusters)
             if count > 0:
                 self.window.status(
@@ -415,13 +458,33 @@ class MainApp(QObject):
     def _launch_label_dialog(self, session_id: str, result: RefinementResult) -> None:
         suggestions = self._suggestion_pool_for(session_id)
         transcript_segments = self._read_transcript_segments(session_id)
+        trust_tags = self.config.speakers.trust_session_tags
         entries = entries_from_refinement(
             result,
             transcript_segments,
             suggestions=suggestions,
             only_unknown=True,
+            # In default (not-yet-confident) mode, surface tagged clusters
+            # in the walker so the user can confirm each one before the
+            # name lands. In trust mode, skip them entirely -- the
+            # SpeakerStore self-improvement step has already absorbed
+            # those centroids.
+            include_tagged_for_confirmation=not trust_tags,
         )
         if not entries:
+            # Trust mode + only tagged clusters: surface a brief status so
+            # the user knows the refinement actually happened.
+            if trust_tags:
+                tagged_count = sum(
+                    1 for c in result.clusters
+                    if getattr(c, "was_user_tagged", False)
+                )
+                if tagged_count:
+                    self.window.status(
+                        f"Auto-applied {tagged_count} in-meeting tag(s); "
+                        f"no further confirmation needed.",
+                        timeout_ms=8000,
+                    )
             return
         session = self.store.get_session(session_id)
         title = session.title if session else ""

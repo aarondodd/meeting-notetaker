@@ -98,3 +98,100 @@ def test_compute_centroid_simple():
 def test_compute_centroid_empty_raises():
     with pytest.raises(ValueError):
         compute_centroid([])
+
+
+# ---- Constrained clustering (must-link / cannot-link via labels) ----------
+
+
+def test_labels_must_link_same_name_even_when_far_apart():
+    """Two embeddings tagged with the same name end up in one cluster
+    regardless of cosine distance."""
+    a = _unit_vec(1.0, 0.0, 0.0)
+    b = _unit_vec(0.0, 1.0, 0.0)  # would normally stay separate
+    result = cluster_segments(
+        [a, b],
+        merge_threshold=0.75,
+        labels={0: "Pat", 1: "Pat"},
+    )
+    assert result.cluster_count() == 1
+    assert result.labels == [0, 0]
+    assert result.name_for(0) == "Pat"
+
+
+def test_labels_cannot_link_different_names_even_when_close():
+    """Two near-identical embeddings tagged with different names stay
+    in separate clusters."""
+    a = _unit_vec(1.0, 0.0, 0.0)
+    b = _unit_vec(0.99, 0.1, 0.0)  # would normally merge
+    result = cluster_segments(
+        [a, b],
+        merge_threshold=0.75,
+        labels={0: "Pat", 1: "Sam"},
+    )
+    assert result.cluster_count() == 2
+    assert result.labels == [0, 1]
+    names = {result.name_for(0), result.name_for(1)}
+    assert names == {"Pat", "Sam"}
+
+
+def test_unlabeled_segment_joins_named_cluster_by_similarity():
+    """An unlabeled segment close to a Pat-tagged segment ends up in
+    the Pat cluster and inherits the name."""
+    pat_anchor = _unit_vec(1.0, 0.0, 0.0)
+    pat_like = _unit_vec(0.98, 0.2, 0.0)  # close to anchor
+    sam_anchor = _unit_vec(0.0, 0.0, 1.0)
+    result = cluster_segments(
+        [pat_anchor, pat_like, sam_anchor],
+        merge_threshold=0.75,
+        labels={0: "Pat", 2: "Sam"},
+    )
+    assert result.cluster_count() == 2
+    pat_cluster = result.labels[0]
+    sam_cluster = result.labels[2]
+    assert pat_cluster != sam_cluster
+    assert result.labels[1] == pat_cluster  # the unlabeled one joins Pat
+    assert result.name_for(pat_cluster) == "Pat"
+    assert result.name_for(sam_cluster) == "Sam"
+
+
+def test_unlabeled_segment_blocked_from_named_cluster_when_far():
+    """An unlabeled segment that's far from any named cluster forms its
+    own cluster; the names side channel keeps it None."""
+    pat_anchor = _unit_vec(1.0, 0.0, 0.0)
+    unrelated = _unit_vec(0.0, 1.0, 0.0)
+    result = cluster_segments(
+        [pat_anchor, unrelated],
+        merge_threshold=0.85,
+        labels={0: "Pat"},
+    )
+    assert result.cluster_count() == 2
+    assert result.name_for(result.labels[0]) == "Pat"
+    assert result.name_for(result.labels[1]) is None
+
+
+def test_no_labels_keeps_legacy_behavior():
+    """Passing no labels (or empty) must reproduce the pre-constraint
+    behavior exactly: names side channel is all None, cluster count
+    matches the unsupervised case."""
+    a = _unit_vec(1.0, 0.0)
+    b = _unit_vec(0.99, 0.1)
+    c = _unit_vec(0.0, 1.0)
+    legacy = cluster_segments([a, b, c], merge_threshold=0.75)
+    with_empty = cluster_segments([a, b, c], merge_threshold=0.75, labels={})
+    assert legacy.labels == with_empty.labels
+    assert all(n is None for n in with_empty.names)
+
+
+def test_out_of_range_label_indices_silently_dropped():
+    """Garbage label indices (negative / out of range) don't crash."""
+    a = _unit_vec(1.0, 0.0)
+    b = _unit_vec(0.99, 0.1)
+    result = cluster_segments(
+        [a, b],
+        merge_threshold=0.75,
+        labels={5: "Ghost", -1: "Negative", 0: "Pat"},
+    )
+    # Only the {0: "Pat"} label survived; segments still cluster together
+    # by similarity (no cannot-link conflict).
+    assert result.cluster_count() == 1
+    assert result.name_for(0) == "Pat"

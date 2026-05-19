@@ -30,6 +30,7 @@ import numpy as np
 from .cluster import ClusterAssignment, cluster_segments, compute_centroid, cosine_similarity
 from .segmenter import Turn, find_turns_in_wav
 from .store import MatchResult, SpeakerStore
+from ..models.speaker_tags import SpeakerTag
 
 
 log = logging.getLogger(__name__)
@@ -46,6 +47,13 @@ log = logging.getLogger(__name__)
 # (Them: for sys, Me: for mic), which is the same outcome as having no
 # diarization data for that span.
 MIN_TURN_DURATION_FOR_CLUSTERING_SEC = 1.0
+
+# Max distance (seconds) between a user-supplied speaker tag and the
+# nearest surviving turn for the tag to take effect. Captures the human
+# click-after-hearing latency (people click ~1s after a speaker starts).
+# Tags landing further than this from any turn are dropped silently --
+# typically clicks that fell in silence or on filtered-out short turns.
+DEFAULT_TAG_MATCH_TOLERANCE_SEC = 2.0
 
 
 class Embedder(Protocol):
@@ -64,6 +72,10 @@ class ClusterSummary:
     None if no match exceeded threshold.
     `turn_indices` indexes into the refinement's `turns` list -- handy
     for the UI to pull a sample audio clip from any turn.
+    `was_user_tagged` is True when the cluster's name came from an
+    in-meeting speaker tag (rather than a store match or being unknown).
+    `tag_times_seconds` are the user-tag timestamps that landed in this
+    cluster -- shown in the walker as a "tagged at HH:MM, ..." badge.
     """
 
     cluster_id: int
@@ -71,6 +83,8 @@ class ClusterSummary:
     turn_indices: list[int]
     name: Optional[str] = None
     match_similarity: Optional[float] = None
+    was_user_tagged: bool = False
+    tag_times_seconds: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -116,6 +130,8 @@ def refine_loopback(
     match_threshold: float = 0.75,
     merge_threshold: float = 0.75,
     min_overlap_sec: float = 0.25,
+    speaker_tags: Optional[list[SpeakerTag]] = None,
+    tag_match_tolerance_sec: float = DEFAULT_TAG_MATCH_TOLERANCE_SEC,
 ) -> RefinementResult:
     """Run the full pipeline.
 
@@ -158,8 +174,22 @@ def refine_loopback(
     for t in turns:
         embeddings.append(np.asarray(encoder.embed_turn(t), dtype=np.float32))
 
-    assignment = cluster_segments(embeddings, merge_threshold=merge_threshold)
-    clusters = _summarize_clusters(assignment, turns, speaker_store, match_threshold)
+    # Match user-supplied speaker tags (captured during recording) to the
+    # nearest turn that survived the duration filter. The mapping feeds
+    # the clusterer's must-link / cannot-link constraints AND the
+    # per-cluster summary so the walker can show a "tagged at ..." badge.
+    matched_tags = _match_tags_to_turns(
+        speaker_tags or [], turns, tolerance_sec=tag_match_tolerance_sec
+    )
+    turn_labels = {turn_idx: name for turn_idx, (name, _ts) in matched_tags.items()}
+
+    assignment = cluster_segments(
+        embeddings, merge_threshold=merge_threshold, labels=turn_labels or None,
+    )
+    clusters = _summarize_clusters(
+        assignment, turns, speaker_store, match_threshold,
+        matched_tags=matched_tags,
+    )
 
     mic_bleed_assignments: dict[int, int] = {}
     if (
@@ -309,21 +339,87 @@ def _summarize_clusters(
     turns: list[Turn],
     store: SpeakerStore,
     match_threshold: float,
+    *,
+    matched_tags: Optional[dict[int, tuple[str, float]]] = None,
 ) -> list[ClusterSummary]:
+    """Build per-cluster summaries. Clusters carrying an anchor name (from
+    a user-supplied speaker tag) bypass the cross-meeting store match and
+    use the anchor name directly -- the user's word beats fuzzy cosine
+    matching against the long-term store. Untagged clusters fall back to
+    the store match path.
+    """
+    matched_tags = matched_tags or {}
     summaries: list[ClusterSummary] = []
     for cid in range(assignment.cluster_count()):
         members = assignment.segments_for(cid)
         centroid = assignment.centroids[cid]
-        match = store.match(centroid, threshold=match_threshold)
-        summary = ClusterSummary(
-            cluster_id=cid,
-            centroid=centroid,
-            turn_indices=members,
-            name=match.speaker.name if match else None,
-            match_similarity=match.similarity if match else None,
-        )
+        anchor_name = assignment.name_for(cid)
+        if anchor_name is not None:
+            # Collect every tag time that landed in a turn assigned to
+            # this cluster, for badge rendering.
+            tag_times = sorted(
+                t for turn_idx, (_name, t) in matched_tags.items()
+                if turn_idx in members
+            )
+            summary = ClusterSummary(
+                cluster_id=cid,
+                centroid=centroid,
+                turn_indices=members,
+                name=anchor_name,
+                match_similarity=None,
+                was_user_tagged=True,
+                tag_times_seconds=tag_times,
+            )
+        else:
+            match = store.match(centroid, threshold=match_threshold)
+            summary = ClusterSummary(
+                cluster_id=cid,
+                centroid=centroid,
+                turn_indices=members,
+                name=match.speaker.name if match else None,
+                match_similarity=match.similarity if match else None,
+            )
         summaries.append(summary)
     return summaries
+
+
+def _match_tags_to_turns(
+    tags: list[SpeakerTag],
+    turns: list[Turn],
+    *,
+    tolerance_sec: float,
+) -> dict[int, tuple[str, float]]:
+    """Snap each tag to the nearest turn within `tolerance_sec`.
+
+    Returns a mapping `turn_idx -> (name, tag_t_seconds)`. Tags that
+    don't have any turn within tolerance are dropped silently (typically
+    clicks that landed in silence or in a sub-second turn that got
+    filtered before clustering). If multiple tags target the same turn
+    with different names, the latest tag wins -- the user's most recent
+    intent is the most likely to be correct.
+    """
+    if not tags or not turns:
+        return {}
+    out: dict[int, tuple[str, float]] = {}
+    for tag in tags:
+        name = (tag.name or "").strip()
+        if not name:
+            continue
+        best_idx = -1
+        best_dist = float("inf")
+        for i, turn in enumerate(turns):
+            if tag.t_seconds < turn.t_start:
+                dist = turn.t_start - tag.t_seconds
+            elif tag.t_seconds > turn.t_end:
+                dist = tag.t_seconds - turn.t_end
+            else:
+                dist = 0.0
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        if best_idx >= 0 and best_dist <= tolerance_sec:
+            out[best_idx] = (name, float(tag.t_seconds))
+    return out
 
 
 def _label_transcript_segments(

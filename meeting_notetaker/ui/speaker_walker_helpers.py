@@ -25,6 +25,7 @@ def entries_from_refinement(
     *,
     suggestions: Optional[list[str]] = None,
     only_unknown: bool = True,
+    include_tagged_for_confirmation: bool = False,
 ) -> list[SpeakerWalkerEntry]:
     """Build walker entries from an in-memory refinement result.
 
@@ -36,12 +37,23 @@ def entries_from_refinement(
 
     `only_unknown=True` (the post-meeting auto-pop case) filters to
     clusters where no name was matched. Pass False for Review mode.
+
+    `include_tagged_for_confirmation=True` keeps user-tagged clusters
+    in the result even when `only_unknown=True`, so the walker can
+    show them pre-filled for the user to confirm. Used in the
+    not-yet-confident default mode for click-to-tag.
     """
     suggestions = list(suggestions or [])
     entries: list[SpeakerWalkerEntry] = []
     for summary in result.clusters:
+        # Filter logic: in only_unknown mode we drop named clusters
+        # EXCEPT when include_tagged_for_confirmation is on and the
+        # cluster carries an in-meeting click-to-tag name -- those
+        # land in the walker for a confirm pass.
+        is_tagged = getattr(summary, "was_user_tagged", False)
         if only_unknown and summary.name is not None:
-            continue
+            if not (include_tagged_for_confirmation and is_tagged):
+                continue
         example_lines = _example_lines_for_cluster(
             summary.cluster_id, result, transcript_segments
         )
@@ -56,6 +68,8 @@ def entries_from_refinement(
             centroid=np.asarray(summary.centroid, dtype=np.float32).copy(),
             match_similarity=summary.match_similarity,
             suggestions=suggestions,
+            was_user_tagged=is_tagged,
+            tag_times_seconds=list(getattr(summary, "tag_times_seconds", [])),
         ))
     return entries
 
