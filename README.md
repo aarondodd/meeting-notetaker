@@ -6,8 +6,17 @@ Meet calls), transcribes both streams on-device with faster-whisper, and
 hands the resulting transcript to you for synthesis by any LLM you trust,
 via clipboard. No audio leaves the machine; no API key required.
 
-> **Status:** v0.5 alpha. End-to-end capture, transcription, and synthesis
+> **Status:** v0.6 alpha. End-to-end capture, transcription, and synthesis
 > work. Performance tuning is ongoing.
+>
+> **Diarization (speaker identification) is rough.** The current pass
+> reliably separates two or three distinct voices in clean audio, but a
+> four-person meeting routinely splits into 20+ "speakers" depending on
+> mic, codec, and noise floor. The defaults are a starting point, not a
+> destination -- the merge / match thresholds are tunable in Settings,
+> and live click-to-tag during recording (v0.6) feeds the clustering
+> directly so you can correct in-meeting. Active iteration; the rest of
+> the app does not depend on it being right.
 
 ## Features
 
@@ -431,6 +440,57 @@ across every subsequent meeting with the same colleagues.
   the full list with sample counts and last-seen dates. Forget anyone
   you'll never recognize again -- a smaller library is faster to match
   against and keeps the auto-recognition cleaner.
+
+### Tuning diarization thresholds
+
+The two knobs in Settings (default 75% each) control different stages
+of the pipeline and address opposite symptoms. Touch one at a time and
+re-run a representative recording before moving the other.
+
+**Merge threshold** -- governs clustering *within* a single meeting.
+This is the cosine-similarity floor for two turns to land in the same
+cluster. Symptom-to-action table:
+
+| Symptom | What to do | Try first |
+|---|---|---|
+| Four people show up as 20+ "Speaker N" clusters. Each person fragments into multiple labels. | Lower the merge threshold so similar-but-not-identical turns merge. | **0.60**, then 0.55 if still split |
+| Two distinct people keep merging into one cluster. | Raise the merge threshold so the algorithm holds them apart. | **0.80**, then 0.85 |
+| Looks roughly right but one person fragments while others are clean. | The fragmenting voice probably changed channel mid-meeting (handheld -> headset, mic re-plug). The threshold can't fix that case -- use Review Speakers to merge the strays manually. | -- |
+
+Over-splitting is the more common failure mode (the defaults err on the
+side of keeping speakers distinct), so try **lowering merge first** if
+you don't know which direction to move.
+
+**Match threshold** -- governs *cross-meeting* recall against
+`speakers.db`. This is the cosine-similarity floor for a cluster
+centroid to auto-adopt a stored speaker's name. Symptom-to-action
+table:
+
+| Symptom | What to do | Try first |
+|---|---|---|
+| A colleague you've labeled in prior meetings keeps coming back as "Speaker N" (no auto-match). Different mic, codec, or noise floor between meetings. | Lower the match threshold to widen recall. | **0.70**, then 0.65 |
+| A cluster gets auto-named with the wrong stored speaker. The voices sound vaguely alike to the embedding model. | Raise the match threshold to demand a stricter match. | **0.80**, then 0.85 |
+| Same person showing up under two different names across meetings (e.g. "Alice" in one, "Alice Smith" in another). | This is a naming consistency issue, not a threshold issue. Settings > Manage Speakers, Forget one, relabel the other consistently going forward. | -- |
+
+**The two knobs are independent and apply in order.** Merge happens
+first (within the recording); match happens second (against the
+library). A "4 participants, 56 speakers" report is purely a merge
+problem -- the match threshold can't compensate for fragmented
+clusters because there's no cluster to match. Fix merge first, then
+re-evaluate match.
+
+**Iterating.** Both settings are saved to `config.toml` and take effect
+on the *next* speaker-identification pass. To re-evaluate a past
+recording at new thresholds, open the session and click Review
+Speakers, or delete `diarization.json` and re-Stop (if the WAV files
+were retained). Without the WAV the existing clusters are frozen on
+disk.
+
+**This is the easy knob.** Even with both sliders dialed in, the
+clusters depend on a 192-dim embedding from a small CPU model running
+on imperfect telephony audio. Expect to spend a minute in Review
+Speakers after most meetings until your library is broad enough that
+match recall kicks in.
 
 ### Limits
 
