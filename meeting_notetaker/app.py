@@ -144,6 +144,7 @@ class MainApp(QObject):
         self.window.open_devices_dialog_requested.connect(self._on_devices)
         self.window.open_outlook_diagnostic_requested.connect(self._on_outlook_diagnostic)
         self.window.open_log_viewer_requested.connect(self._on_log_viewer)
+        self.window.open_dependency_check_requested.connect(self._on_dependency_check)
         self.window.check_for_updates_requested.connect(self._on_check_for_updates)
         self.window.upgrade_requested.connect(self._on_upgrade)
         self.window.quit_requested.connect(self.qt_app.quit)
@@ -757,6 +758,17 @@ class MainApp(QObject):
         self._log_viewer.show()
         self._log_viewer.raise_()
         self._log_viewer.activateWindow()
+
+    def _on_dependency_check(self) -> None:
+        from .ui.dependency_check_dialog import DependencyCheckDialog
+        if getattr(self, "_dep_check", None) is None:
+            self._dep_check = DependencyCheckDialog(parent=self.window)
+        else:
+            # Re-run so the report reflects the current venv state.
+            self._dep_check._run()
+        self._dep_check.show()
+        self._dep_check.raise_()
+        self._dep_check.activateWindow()
 
     def _on_settings(self) -> None:
         dialog = SettingsDialog(self.config, parent=self.window)
