@@ -26,7 +26,7 @@ def _find_menu(parent_menu, name: str) -> QMenu | None:
     return None
 
 
-def test_help_menu_has_debug_submenu_with_log_and_dep_check(qt_app):
+def test_help_menu_has_debug_submenu_with_all_diagnostics(qt_app):
     from meeting_notetaker.ui.main_window import MainWindow
     w = MainWindow()
     menubar = w.menuBar()
@@ -41,8 +41,36 @@ def test_help_menu_has_debug_submenu_with_log_and_dep_check(qt_app):
     assert debug_menu is not None, "Debug submenu missing"
 
     debug_items = [a.text().replace("&", "") for a in debug_menu.actions()]
+    assert "Audio Devices..." in debug_items
+    assert "Diagnose Outlook..." in debug_items
     assert "View Log..." in debug_items
     assert "Check Dependencies..." in debug_items
+
+
+def test_help_menu_does_not_carry_diagnostic_actions_at_top_level(qt_app):
+    """All diagnostic surfaces live under Debug; the top-level Help menu
+    should only carry Debug + the update actions, not duplicate the
+    individual diagnostic items."""
+    from meeting_notetaker.ui.main_window import MainWindow
+    w = MainWindow()
+    menubar = w.menuBar()
+    help_menu = None
+    for action in menubar.actions():
+        if action.text().replace("&", "") == "Help":
+            help_menu = action.menu()
+            break
+    assert help_menu is not None
+    top_level_items = [
+        a.text().replace("&", "") for a in help_menu.actions() if not a.isSeparator()
+    ]
+    assert "Audio Devices..." not in top_level_items
+    assert "Diagnose Outlook..." not in top_level_items
+    assert "View Log..." not in top_level_items
+    assert "Check Dependencies..." not in top_level_items
+    # Debug submenu + update actions are what should remain at top level.
+    assert "Debug" in top_level_items
+    assert "Check for Updates..." in top_level_items
+    assert "Upgrade..." in top_level_items
 
 
 def test_main_window_exposes_dependency_check_signal(qt_app):
