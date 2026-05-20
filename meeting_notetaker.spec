@@ -9,7 +9,24 @@ datas = []
 binaries = []
 hiddenimports = []
 
-for pkg in ("PyQt6", "faster_whisper"):
+# SpeechBrain resolves model + module classes from string paths at runtime
+# (yaml-driven hparam loading), so PyInstaller's static analysis misses
+# huge swaths of its tree. Same story for torch/torchaudio backends and
+# silero_vad's bundled ONNX weights. collect_all walks each package
+# top-to-bottom and pulls every submodule + data file + binary, which is
+# heavy but the only reliable way to get speaker-id working in a frozen
+# build. Without this the runtime fails with
+# "speaker-embedding model unavailable (SpeechBrain not installed)".
+for pkg in (
+    "PyQt6",
+    "faster_whisper",
+    "speechbrain",
+    "torch",
+    "torchaudio",
+    "silero_vad",
+    "huggingface_hub",
+    "scipy",
+):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -17,6 +34,25 @@ for pkg in ("PyQt6", "faster_whisper"):
 
 datas += collect_data_files("ctranslate2")
 datas += [("meeting_notetaker/resources/prompts", "meeting_notetaker/resources/prompts")]
+
+# SpeechBrain's hparam yaml constructs classes via `!new:speechbrain...`
+# tags resolved at runtime. PyInstaller cannot see those, so the relevant
+# leaf modules need an explicit hint here.
+hiddenimports += [
+    "speechbrain.inference",
+    "speechbrain.inference.speaker",
+    "speechbrain.utils.fetching",
+    "speechbrain.lobes.features",
+    "speechbrain.lobes.models.ECAPA_TDNN",
+    "speechbrain.processing.features",
+    "speechbrain.nnet.containers",
+    "speechbrain.nnet.normalization",
+    "speechbrain.nnet.linear",
+    "speechbrain.nnet.activations",
+    "speechbrain.nnet.pooling",
+    "speechbrain.nnet.CNN",
+    "sentencepiece",
+]
 
 
 a = Analysis(
