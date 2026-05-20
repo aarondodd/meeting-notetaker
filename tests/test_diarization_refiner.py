@@ -479,3 +479,261 @@ def test_apply_labels_works_on_simplenamespace_doubles():
     labels = [SegmentLabel(segment_index=0, cluster_id=0, name="Alice", confidence=0.9)]
     rewritten = apply_labels_to_segments(segments, labels)
     assert rewritten[0].speaker_name == "Alice"
+
+
+# ---- Speaker tags (constrained clustering + skip-store-match) -----------
+
+
+def test_refiner_uses_speaker_tags_to_name_clusters(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """A tag landing inside voice A's turn names that cluster directly,
+    without needing a SpeakerStore match."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    # No prior speakers in the store -- without tags both clusters would
+    # be unknown. The tag inside voice A's window (0.6 - 2.6s) names it.
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[SpeakerTag(name="Pat", t_seconds=1.5)],
+    )
+    pat_clusters = [c for c in result.clusters if c.name == "Pat"]
+    assert len(pat_clusters) == 1
+    assert pat_clusters[0].was_user_tagged is True
+    assert pat_clusters[0].match_similarity is None
+    # The other cluster has no name (no tag, no store match) -> unknown.
+    assert sorted(result.unknown_cluster_ids) == [
+        c.cluster_id for c in result.clusters if c.name is None
+    ]
+
+
+def test_tag_in_silence_is_dropped(two_voice_wav, two_voice_segments, tmp_path):
+    """A tag whose timestamp is far from any turn (silence between voices)
+    does not name any cluster."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    # Silence between voice A (ends 2.6) and voice B (starts 3.4) -- the
+    # tag at 3.0s is 0.4s from each, which is within tolerance, so it
+    # WILL snap. To verify the silence-drop behavior we need a tag that
+    # is genuinely far (> tolerance) from any turn -- use a custom narrow
+    # tolerance.
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[SpeakerTag(name="Ghost", t_seconds=3.0)],
+        tag_match_tolerance_sec=0.1,
+    )
+    assert not any(c.was_user_tagged for c in result.clusters)
+    assert not any(c.name == "Ghost" for c in result.clusters)
+
+
+def test_tag_overrides_store_match(two_voice_wav, two_voice_segments, tmp_path):
+    """If the store would have matched voice A as Alice but the user
+    tagged the segment as Pat, Pat wins."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    store.upsert("Alice", _unit_vec(0.0, 1.0, 0.0))  # would match voice A
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[SpeakerTag(name="Pat", t_seconds=1.5)],
+    )
+    pat_cluster = next(c for c in result.clusters if c.name == "Pat")
+    assert pat_cluster.was_user_tagged is True
+    assert all(c.name != "Alice" for c in result.clusters)
+
+
+def test_tag_propagates_to_segment_labels(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """A user-tagged cluster's name shows up on transcript segments that
+    overlap it -- same plumbing as the store-match path."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[SpeakerTag(name="Pat", t_seconds=1.5)],
+    )
+    # Segments 0 + 3 are both voice A -> tagged "Pat".
+    label_a_first = next(lbl for lbl in result.segment_labels if lbl.segment_index == 0)
+    label_a_second = next(lbl for lbl in result.segment_labels if lbl.segment_index == 3)
+    assert label_a_first.name == "Pat"
+    assert label_a_second.name == "Pat"
+
+
+def test_must_link_keeps_same_name_tags_in_one_cluster(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """Two tags with the same name on different voices (typically a
+    misclick on one) collapse into one cluster -- the must-link
+    constraint wins over the cosine distance signal. Documenting the
+    behavior so the consequence of a misclick is captured: trust the
+    user, but the user is responsible for clicking the right name."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[
+            SpeakerTag(name="Pat", t_seconds=1.5),  # voice A
+            SpeakerTag(name="Pat", t_seconds=4.5),  # voice B
+        ],
+    )
+    pat_clusters = [c for c in result.clusters if c.name == "Pat"]
+    assert len(pat_clusters) == 1
+
+
+def test_cannot_link_keeps_two_names_apart(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """Two tags with different names on different voices keep both
+    clusters intact even if their embeddings drift close together."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[
+            SpeakerTag(name="Pat", t_seconds=1.5),
+            SpeakerTag(name="Sam", t_seconds=4.5),
+        ],
+    )
+    names = sorted(c.name for c in result.clusters if c.name is not None)
+    assert names == ["Pat", "Sam"]
+
+
+def test_tag_times_seconds_captured_for_badge(
+    two_voice_wav, two_voice_segments, tmp_path,
+):
+    """Tag timestamps land on the cluster summary so the walker can
+    show 'tagged at HH:MM, HH:MM' badges."""
+    from meeting_notetaker.models.speaker_tags import SpeakerTag
+
+    store = SpeakerStore(tmp_path / "speakers.db")
+    result = refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        speaker_tags=[
+            SpeakerTag(name="Pat", t_seconds=1.5),
+            SpeakerTag(name="Pat", t_seconds=7.0),  # voice A appears again
+        ],
+    )
+    pat_cluster = next(c for c in result.clusters if c.name == "Pat")
+    assert pat_cluster.tag_times_seconds == [1.5, 7.0]
+
+
+# ---- Progress callback bucketing (Phase 2 progress in unified bar) ------
+
+
+def test_refiner_progress_callback_emits_buckets(two_voice_wav, two_voice_segments, tmp_path):
+    """progress_cb fires with monotonically increasing percents that
+    end at exactly 100. The bucket math doesn't have to be precise;
+    the contract is "moves toward 100 and ends at 100 only when done."""
+    store = SpeakerStore(tmp_path / "speakers.db")
+    emitted: list[int] = []
+    refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        progress_cb=emitted.append,
+    )
+    # Monotonic, in range, ends at 100.
+    assert emitted[-1] == 100
+    assert all(0 <= p <= 100 for p in emitted)
+    assert emitted == sorted(emitted)
+    # Saw something other than just (start, 100): the per-turn bucket
+    # in the sys-embedding loop produces intermediate values.
+    intermediates = [p for p in emitted if 5 < p < 100]
+    assert intermediates
+
+
+def test_refiner_progress_callback_throttles_duplicates(two_voice_wav, two_voice_segments, tmp_path):
+    """The emitter must not fire the same percent twice in a row."""
+    store = SpeakerStore(tmp_path / "speakers.db")
+    emitted: list[int] = []
+    refine_loopback(
+        two_voice_wav,
+        two_voice_segments,
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        progress_cb=emitted.append,
+    )
+    # No two adjacent emissions are equal.
+    for prev, curr in zip(emitted, emitted[1:]):
+        assert prev != curr
+
+
+def test_refiner_progress_callback_reaches_100_on_empty_wav(tmp_path):
+    """Even when the WAV has no voiced turns, the callback must land
+    100 so the UI bar clears."""
+    import wave
+
+    # Write a one-second silent WAV.
+    sr = 16000
+    silent = np.zeros(sr, dtype=np.int16)
+    wav_path = tmp_path / "silent.wav"
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(silent.tobytes())
+    store = SpeakerStore(tmp_path / "speakers.db")
+    emitted: list[int] = []
+    refine_loopback(
+        wav_path,
+        [TranscriptSegment(source="sys", text="placeholder", t_start=0.0, t_end=1.0)],
+        speaker_store=store,
+        encoder=FrequencyEmbedder(),
+        progress_cb=emitted.append,
+    )
+    assert emitted[-1] == 100
+
+
+def test_refiner_progress_callback_optional():
+    """Default progress_cb=None must not be invoked, no AttributeError."""
+    # Just verify the kwarg defaults; full no-cb run is covered by
+    # every other refiner test that omits it.
+    import inspect
+    from meeting_notetaker.diarization.refiner import refine_loopback as fn
+    sig = inspect.signature(fn)
+    assert sig.parameters["progress_cb"].default is None
+
+
+def test_progress_emitter_sub_range_scales_to_outer_band():
+    """The sub_range helper feeds inner 0..100 into an outer [lo, hi]
+    slice. Used for mic-bleed progress to slot into the 80-95 band."""
+    from meeting_notetaker.diarization.refiner import _ProgressEmitter
+    outer: list[int] = []
+    emitter = _ProgressEmitter(outer.append)
+    inner = emitter.sub_range(80, 95)
+    assert inner is not None
+    inner(0)
+    inner(50)
+    inner(100)
+    # Map: 0->80, 50->88 (or 87, depending on rounding), 100->95.
+    assert outer[0] == 80
+    assert outer[-1] == 95
+    assert 80 <= outer[1] <= 95

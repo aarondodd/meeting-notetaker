@@ -63,6 +63,11 @@ class SpeakerWalkerEntry:
     # Suggested names for the combo box, typically derived from Outlook
     # attendees + known speakers.
     suggestions: list[str] = field(default_factory=list)
+    # In-meeting click-to-tag provenance. When True, the card renders a
+    # "tagged during meeting at ..." badge so the reviewer knows the
+    # name came from the user's own clicks, not a cosine match.
+    was_user_tagged: bool = False
+    tag_times_seconds: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -108,7 +113,14 @@ class _SpeakerCard(QFrame):
         title_label = QLabel(self._header_text(), self)
         title_label.setFont(title_font)
         header.addWidget(title_label, 1)
-        if entry.match_similarity is not None and entry.current_name:
+        if entry.was_user_tagged and entry.tag_times_seconds:
+            sim_label = QLabel(
+                f"tagged during meeting at {_format_times(entry.tag_times_seconds)}",
+                self,
+            )
+            sim_label.setStyleSheet("color: #4a8;")
+            header.addWidget(sim_label)
+        elif entry.match_similarity is not None and entry.current_name:
             sim_label = QLabel(
                 f"matched at {entry.match_similarity * 100:.0f}% similarity",
                 self,
@@ -294,3 +306,18 @@ class SpeakerWalkerDialog(QDialog):
     def decisions(self) -> list[SpeakerWalkerDecision]:
         """Return the user's choices after the dialog accepts."""
         return [card.decision() for card in self._cards]
+
+
+def _format_times(seconds: list[float]) -> str:
+    """Render a list of WAV-elapsed seconds as a comma-separated HH:MM:SS list."""
+    parts = []
+    for s in seconds:
+        s = max(0.0, float(s))
+        hours = int(s // 3600)
+        minutes = int((s % 3600) // 60)
+        secs = int(s % 60)
+        if hours:
+            parts.append(f"{hours}:{minutes:02d}:{secs:02d}")
+        else:
+            parts.append(f"{minutes}:{secs:02d}")
+    return ", ".join(parts)

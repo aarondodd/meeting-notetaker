@@ -35,6 +35,7 @@ from ..models.transcript import (
 )
 from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
+from .attendee_sidebar import AttendeeSidebar
 from .live_notes_widget import LiveNotesWidget
 
 
@@ -61,6 +62,11 @@ class SessionView(QWidget):
     # rename / forget each one. Feeds corrections back to the speaker
     # store for the self-learning loop.
     review_speakers_clicked = pyqtSignal(str)  # session_id
+    # Click-to-tag for in-meeting speaker anchoring. The sidebar emits
+    # (session_id, name) per click; the controller persists a SpeakerTag
+    # and the post-meeting refiner uses tags to constrain the clusterer.
+    tag_speaker_clicked = pyqtSignal(str, str)            # session_id, name
+    remove_last_tag_clicked = pyqtSignal(str, str)        # session_id, name
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -206,7 +212,24 @@ class SessionView(QWidget):
         self._previous_view.setReadOnly(True)
         self._tabs.addTab(self._previous_view, "Previous Notes")
 
-        layout.addWidget(self._tabs, 1)
+        # Horizontal container holding the tab widget on the left and the
+        # click-to-tag attendee sidebar on the right. The sidebar is
+        # hidden by default; visibility is driven by recording state +
+        # active tab (see `_refresh_sidebar_visibility`). When hidden it
+        # occupies zero width, so the editor pane reclaims the space
+        # without resizing the main window.
+        body_row = QHBoxLayout()
+        body_row.setContentsMargins(0, 0, 0, 0)
+        body_row.setSpacing(0)
+        body_row.addWidget(self._tabs, 1)
+        self._attendee_sidebar = AttendeeSidebar(self)
+        self._attendee_sidebar.setVisible(False)
+        self._attendee_sidebar.tag_clicked.connect(self._on_attendee_tag_clicked)
+        self._attendee_sidebar.remove_last_requested.connect(
+            self._on_attendee_remove_last_clicked
+        )
+        body_row.addWidget(self._attendee_sidebar, 0)
+        layout.addLayout(body_row, 1)
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         self._set_buttons_for_state(STATE_NEW, has_transcript=False, has_notes=False)
@@ -245,6 +268,10 @@ class SessionView(QWidget):
             self._retain_checkbox.setChecked(False)
             self._retain_checkbox.setEnabled(False)
             self._set_buttons_for_state(STATE_NEW, has_transcript=False, has_notes=False)
+            # Clear sidebar state on session deselect; counts will be
+            # re-seeded by the controller on the next select.
+            self._attendee_sidebar.set_counts({})
+            self._attendee_sidebar.setVisible(False)
             return
         self._title_label.setText(session.title)
         self._state_label.setText(_pretty_state(session.state))
@@ -272,6 +299,9 @@ class SessionView(QWidget):
         self._review_speakers_btn.setVisible(
             (sdir / "diarization.json").exists()
         )
+        # The sidebar sits idle (hidden) until the controller seeds the
+        # attendee list and the session enters STATE_RECORDING.
+        self._refresh_sidebar_visibility()
 
     def update_state(self, state: str) -> None:
         if self._session is None:
@@ -283,6 +313,43 @@ class SessionView(QWidget):
             has_transcript=self._session.has_transcript or bool(self._transcript_view.toPlainText().strip()),
             has_notes=self._session.has_notes or bool(self._notes_view.toPlainText().strip()),
         )
+        self._refresh_sidebar_visibility()
+
+    # ---- click-to-tag attendee sidebar -------------------------------------
+
+    def set_attendee_names(self, names: list[str]) -> None:
+        """Refresh the sidebar's attendee list. Called by the controller
+        whenever the live_notes '# Attendees' section changes."""
+        self._attendee_sidebar.set_attendees(names)
+
+    def set_speaker_tag_counts(self, counts: dict[str, int]) -> None:
+        """Refresh the sidebar's per-name tag-count badges."""
+        self._attendee_sidebar.set_counts(counts)
+
+    def _on_attendee_tag_clicked(self, name: str) -> None:
+        if self._session is None:
+            return
+        self.tag_speaker_clicked.emit(self._session.id, name)
+
+    def _on_attendee_remove_last_clicked(self, name: str) -> None:
+        if self._session is None:
+            return
+        self.remove_last_tag_clicked.emit(self._session.id, name)
+
+    def _refresh_sidebar_visibility(self) -> None:
+        """Sidebar shows only while actively recording AND viewing
+        Transcript or My Notes. Hides on Synthesis / Previous Notes
+        even mid-recording -- those tabs are read-only review surfaces."""
+        if self._session is None or self._session.state not in (
+            STATE_RECORDING, STATE_PAUSED,
+        ):
+            self._attendee_sidebar.setVisible(False)
+            return
+        current = self._tabs.currentWidget()
+        on_transcript_or_notes = current in (
+            self._transcript_view, self._live_notes_editor,
+        )
+        self._attendee_sidebar.setVisible(on_transcript_or_notes)
 
     def update_batch_progress(self, pct: int) -> None:
         """Reflect background batch-refinement progress in the state label."""
@@ -333,6 +400,22 @@ class SessionView(QWidget):
             return
         self._session.title = cleaned
         self._title_label.setText(cleaned)
+
+    def set_created_at(self, new_created_at_iso: str) -> None:
+        """Update the bound session's created_at after a timestamp edit.
+
+        No-op when no session is currently bound. Mirrors set_title():
+        keeps the in-memory Session dataclass in sync so the synthesis
+        prompt + print header pick up the new date without a full
+        set_session() round-trip (which would discard in-flight live
+        notes / synthesis edits).
+        """
+        if self._session is None:
+            return
+        cleaned = (new_created_at_iso or "").strip()
+        if not cleaned:
+            return
+        self._session.created_at = cleaned
 
     def set_user_name(self, name: str) -> None:
         """Update the display label for the user's mic and refresh the transcript view."""
@@ -535,6 +618,7 @@ class SessionView(QWidget):
         )
         self._update_copy_button(has_session=has_session)
         self._update_print_button(has_session=has_session, has_notes=has_notes)
+        self._refresh_sidebar_visibility()
 
     def _update_copy_button(self, *, has_session: bool) -> None:
         """Label + enabled state track the active tab."""
@@ -588,7 +672,9 @@ class SessionView(QWidget):
         else:
             return None, ""
 
-        # Parse the session's created_at into a datetime for the header.
+        # Parse the session's created_at into a datetime for the header,
+        # converted from stored UTC to the user's local timezone so the
+        # printed header matches what they see elsewhere in the app.
         # Falls through silently if the stored string is unparseable;
         # the header just renders without the date.
         session_when = None
@@ -597,7 +683,7 @@ class SessionView(QWidget):
             try:
                 session_when = datetime.fromisoformat(
                     self._session.created_at.replace("Z", "+00:00")
-                )
+                ).astimezone()
             except ValueError:
                 session_when = None
 

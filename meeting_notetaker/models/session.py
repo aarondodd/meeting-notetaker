@@ -195,6 +195,7 @@ class SessionStore:
         allowed = {
             "title",
             "folder_id",
+            "created_at",
             "started_at",
             "ended_at",
             "duration_seconds",

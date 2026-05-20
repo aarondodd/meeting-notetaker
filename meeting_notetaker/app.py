@@ -20,7 +20,7 @@ from .diarization.persistence import (
 )
 from .diarization import user_voiceprint
 from .diarization.encoder_prewarm import EncoderPrewarmThread
-from .diarization.refiner import RefinementResult, apply_labels_to_segments
+from .diarization.refiner import RefinementResult
 from .diarization.store import open_speaker_store
 from .integrations import audio_session_monitor, outlook_calendar
 from .integrations.audio_session_monitor import MeetingAudioInfo
@@ -49,7 +49,6 @@ from .ui.speaker_walker_dialog import (
 )
 from .ui.speaker_walker_helpers import (
     entries_from_persistence,
-    entries_from_refinement,
     gather_suggestions,
 )
 from .ui.tray import TrayIcon
@@ -151,6 +150,7 @@ class MainApp(QObject):
         self.window.session_selected.connect(self._on_session_selected)
         self.window.delete_sessions_requested.connect(self._on_delete_sessions)
         self.window.rename_session_requested.connect(self._on_rename_session)
+        self.window.edit_session_timestamp_requested.connect(self._on_edit_session_timestamp)
 
         self.tray.open_main_window.connect(self._foreground_window)
         self.tray.new_session_requested.connect(self._on_new_session)
@@ -174,6 +174,15 @@ class MainApp(QObject):
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
         sv.review_speakers_clicked.connect(self._on_review_speakers)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
+        # Click-to-tag attendee sidebar. The session-view passes its own
+        # session_id; we forward to controller.tag_speaker which captures
+        # the WAV-aligned timestamp and persists.
+        sv.tag_speaker_clicked.connect(
+            lambda _sid, name: self.controller.tag_speaker(name)
+        )
+        sv.remove_last_tag_clicked.connect(
+            lambda _sid, name: self.controller.remove_last_speaker_tag(name)
+        )
 
         self.controller.state_changed.connect(self._on_session_state_changed)
         self.controller.segment_arrived.connect(self._on_segment_arrived)
@@ -188,6 +197,7 @@ class MainApp(QObject):
         self.controller.speaker_refinement_skipped.connect(
             self._on_speaker_refinement_skipped
         )
+        self.controller.speaker_tags_changed.connect(self._on_speaker_tags_changed)
         self.controller.error.connect(self._on_controller_error)
         self.controller.status.connect(lambda msg: self.window.status(msg, timeout_ms=5000))
 
@@ -206,13 +216,29 @@ class MainApp(QObject):
         if session is None:
             return
         store = TranscriptStore(session_id)
+        live_notes_body = store.read_live_notes()
         self.window.session_view.set_session(
             session,
             transcript=store.read_transcript(),
             notes=store.read_notes(),
             previous_notes_paths=store.list_previous_notes(),
-            live_notes=store.read_live_notes(),
+            live_notes=live_notes_body,
         )
+        # Seed the click-to-tag sidebar from the live_notes '# Attendees'
+        # section. The sidebar is hidden unless the session is recording,
+        # but seeding now means it shows up populated the moment Start
+        # is clicked.
+        self.window.session_view.set_attendee_names(
+            parse_attendees(live_notes_body)
+        )
+        # If the user reselected a session that's still actively being
+        # recorded (back-to-back-session scenario), surface any tag counts
+        # the controller already collected.
+        active = getattr(self.controller, "active_session", None)
+        if active is not None and active.id == session_id:
+            store = self.controller._tag_stores.get(session_id)
+            if store is not None:
+                self.window.session_view.set_speaker_tag_counts(store.counts())
 
     # ---- session lifecycle handlers ---------------------------------------
 
@@ -229,6 +255,7 @@ class MainApp(QObject):
             retain_audio=result.retain_audio,
         )
         if result.calendar_meeting is not None:
+            self._align_created_at_to_meeting(session.id, result.calendar_meeting)
             self._seed_live_notes_from_meeting(session.id, result.calendar_meeting)
         self._refresh_session_list(select=session.id)
 
@@ -244,6 +271,26 @@ class MainApp(QObject):
             )
         except OSError:
             log.exception("failed to seed live notes from calendar")
+
+    def _align_created_at_to_meeting(
+        self, session_id: str, info: MeetingInfo
+    ) -> None:
+        """Set the session's created_at to the meeting's start time.
+
+        MeetingInfo.start_time is a naive local datetime (per the Outlook
+        COM converter); the session store keeps timestamps as UTC ISO. Local
+        -> UTC conversion uses the host's current local offset.
+        """
+        try:
+            local_tz = datetime.now().astimezone().tzinfo
+            aware_local = info.start_time.replace(tzinfo=local_tz)
+            iso = aware_local.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        except (AttributeError, ValueError, OSError):
+            log.exception("failed to align created_at to meeting start time")
+            return
+        self.store.update_session(session_id, created_at=iso)
 
     def _on_start_clicked(self, session_id: str) -> None:
         session = self.store.get_session(session_id)
@@ -314,9 +361,11 @@ class MainApp(QObject):
         self.window.session_view.flush_pending_live_notes()
         live_notes = store.read_live_notes()
         try:
-            when = datetime.fromisoformat(session.created_at.replace("Z", "+00:00"))
+            when = datetime.fromisoformat(
+                session.created_at.replace("Z", "+00:00")
+            ).astimezone()
         except ValueError:
-            when = datetime.now(timezone.utc)
+            when = datetime.now().astimezone()
         dialog = GeneratePromptDialog(
             session_title=session.title,
             session_date=when,
@@ -333,6 +382,17 @@ class MainApp(QObject):
             TranscriptStore(session_id).save_live_notes(body)
         except OSError:
             log.exception("failed to save live notes for %s", session_id)
+        # Keep the click-to-tag sidebar in sync with whatever the user
+        # currently has under '# Attendees'. The widget only re-renders
+        # when the parsed list actually changes.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            sv.set_attendee_names(parse_attendees(body))
+
+    def _on_speaker_tags_changed(self, session_id: str, counts: dict[str, int]) -> None:
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            sv.set_speaker_tag_counts(counts)
 
     def _on_synthesis_notes_changed(self, session_id: str, body: str) -> None:
         """Persist inline edits to the Synthesis tab.
@@ -375,36 +435,28 @@ class MainApp(QObject):
         # Only flip the Review button on if we're still on this session.
         if sv._session is not None and sv._session.id == session_id:
             sv.set_has_diarization(True)
-        if not result.has_unknown():
-            count = len(result.clusters)
-            if count > 0:
-                self.window.status(
-                    f"Identified {count} speaker(s); all matched the store.",
-                    timeout_ms=8000,
-                )
-            return
-        try:
-            self._launch_label_dialog(session_id, result)
-        except Exception:
-            log.exception("label dialog failed; users can still use Review Speakers")
-
-    def _launch_label_dialog(self, session_id: str, result: RefinementResult) -> None:
-        suggestions = self._suggestion_pool_for(session_id)
-        transcript_segments = self._read_transcript_segments(session_id)
-        entries = entries_from_refinement(
-            result,
-            transcript_segments,
-            suggestions=suggestions,
-            only_unknown=True,
+        # Surface what landed via the status bar; the Label Unknown
+        # Speakers dialog no longer auto-pops -- the user clicks the
+        # session view's Review Speakers button when they're ready to
+        # label / correct. Tagged-cluster centroids were already fed to
+        # the SpeakerStore inside the controller's _on_refinement_done
+        # via _self_improve_store_from_tagged_clusters, so no follow-up
+        # write is needed here for those.
+        cluster_count = len(result.clusters)
+        unknown_count = len(result.unknown_cluster_ids)
+        tagged_count = sum(
+            1 for c in result.clusters if getattr(c, "was_user_tagged", False)
         )
-        if not entries:
+        if cluster_count == 0:
             return
-        session = self.store.get_session(session_id)
-        title = session.title if session else ""
-        dialog = SpeakerWalkerDialog(entries, mode="label", session_title=title, parent=self.window)
-        if dialog.exec() != SpeakerWalkerDialog.DialogCode.Accepted:
-            return
-        self._apply_walker_decisions(session_id, dialog.decisions(), transcript_segments)
+        msg_parts = [f"Identified {cluster_count} speaker(s)"]
+        if tagged_count:
+            msg_parts.append(f"{tagged_count} from in-meeting tags")
+        if unknown_count:
+            msg_parts.append(
+                f"{unknown_count} unlabeled -- click Review Speakers to label"
+            )
+        self.window.status("; ".join(msg_parts) + ".", timeout_ms=10000)
 
     def _on_review_speakers(self, session_id: str) -> None:
         """Manual review walker. Reads diarization.json for the session."""
@@ -647,6 +699,27 @@ class MainApp(QObject):
         if sv._session is not None and sv._session.id == session_id:
             sv.set_title(new_title)
         self.window.status(f"Renamed to '{new_title}'", timeout_ms=4000)
+
+    # ---- edit timestamp ----------------------------------------------------
+
+    def _on_edit_session_timestamp(
+        self, session_id: str, new_created_at_iso: str
+    ) -> None:
+        new_created_at_iso = (new_created_at_iso or "").strip()
+        if not new_created_at_iso:
+            return
+        session = self.store.get_session(session_id)
+        if session is None or session.created_at == new_created_at_iso:
+            return
+        self.store.update_session(session_id, created_at=new_created_at_iso)
+        self._refresh_session_list(select=session_id)
+        # Mirror the rename path: keep the in-memory session.created_at on the
+        # right pane in sync so synthesis prompts + printing pick up the new
+        # date without a full set_session() reload.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            sv.set_created_at(new_created_at_iso)
+        self.window.status("Session timestamp updated.", timeout_ms=4000)
 
     # ---- bulk delete -------------------------------------------------------
 
@@ -927,6 +1000,7 @@ class MainApp(QObject):
             title=result.title, retain_audio=result.retain_audio
         )
         meeting = result.calendar_meeting or info
+        self._align_created_at_to_meeting(session.id, meeting)
         self._seed_live_notes_from_meeting(session.id, meeting)
         self._refresh_session_list(select=session.id)
         self.window.status(
@@ -986,12 +1060,16 @@ class MainApp(QObject):
             self._audio_monitor = None
 
     def _is_session_active(self) -> bool:
-        """True when a session is currently recording or paused -- the
-        monitor uses this to suppress prompts during an existing call."""
+        """True when the live recording engine is in use -- the monitor
+        uses this to suppress prompts during an existing call.
+
+        Sessions in post-Stop processing (STATE_PROCESSING) do not block
+        a new recording, so they do not suppress detection prompts either.
+        """
         active = self.controller.active_session
         if active is None:
             return False
-        return active.state in (STATE_RECORDING, STATE_PAUSED, STATE_PROCESSING)
+        return active.state in (STATE_RECORDING, STATE_PAUSED)
 
     def _on_meeting_audio_detected(self, info: MeetingAudioInfo) -> None:
         self.tray.notify_audio_detected(

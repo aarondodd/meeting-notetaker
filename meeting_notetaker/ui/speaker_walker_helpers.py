@@ -34,8 +34,8 @@ def entries_from_refinement(
     `suggestions` is a deduplicated list of names the combo box should
     offer (Outlook attendees + known speakers).
 
-    `only_unknown=True` (the post-meeting auto-pop case) filters to
-    clusters where no name was matched. Pass False for Review mode.
+    `only_unknown=True` filters to clusters where no name was matched
+    (the auto-popup case from before v0.6). Pass False for Review mode.
     """
     suggestions = list(suggestions or [])
     entries: list[SpeakerWalkerEntry] = []
@@ -56,6 +56,8 @@ def entries_from_refinement(
             centroid=np.asarray(summary.centroid, dtype=np.float32).copy(),
             match_similarity=summary.match_similarity,
             suggestions=suggestions,
+            was_user_tagged=getattr(summary, "was_user_tagged", False),
+            tag_times_seconds=list(getattr(summary, "tag_times_seconds", [])),
         ))
     return entries
 

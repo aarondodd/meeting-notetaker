@@ -53,6 +53,22 @@ def test_rename_session_via_update(isolated_data_dir):
         assert refreshed.title == "New Title"
 
 
+def test_edit_timestamp_via_update(isolated_data_dir):
+    """`update_session(created_at=...)` is the path the calendar-alignment
+    and Edit Timestamp flows use; round-trip must reflect the new value
+    and the sessions list must re-sort by it."""
+    with SessionStore() as store:
+        a = store.create_session("alpha")
+        b = store.create_session("beta")
+        # Bump alpha into the future so it sorts above beta.
+        store.update_session(a.id, created_at="2099-01-01T12:00:00Z")
+        refreshed = store.get_session(a.id)
+        assert refreshed is not None
+        assert refreshed.created_at == "2099-01-01T12:00:00Z"
+        ordered = [s.id for s in store.list_sessions()]
+        assert ordered[0] == a.id and ordered[1] == b.id
+
+
 def test_folder_create_assign_delete_unfiles_sessions(isolated_data_dir):
     with SessionStore() as store:
         folder = store.create_folder("Customers")
