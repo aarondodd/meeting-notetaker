@@ -9,19 +9,36 @@ via clipboard. No audio leaves the machine; no API key required.
 > **Status:** v0.6 alpha. End-to-end capture, transcription, and synthesis
 > work. Performance tuning is ongoing.
 >
+> **What this tool is.** A note-synthesis pipeline, not a verbatim
+> transcription product. The transcript exists to seed an LLM synthesis
+> pass; the LLM smooths the kinds of errors a CPU-only Whisper run
+> produces (homophones like "there" vs "their", mild punctuation
+> drift, occasional dropped articles). If you need legal-grade verbatim
+> transcripts, use Teams' built-in transcription or a hosted service --
+> this app trades raw accuracy for local-only processing, low CPU cost,
+> and an LLM-friendly transcript that synthesizes well.
+>
 > **Diarization (speaker identification) is rough.** The current pass
 > reliably separates two or three distinct voices in clean audio, but a
 > four-person meeting routinely splits into 20+ "speakers" depending on
-> mic, codec, and noise floor. The defaults are a starting point, not a
-> destination -- the merge / match thresholds are tunable in Settings,
-> and live click-to-tag during recording (v0.6) feeds the clustering
-> directly so you can correct in-meeting. Active iteration; the rest of
-> the app does not depend on it being right.
+> mic, codec, and noise floor. The goal is **sufficient speaker context
+> to attribute concepts and discussion threads to the right person** --
+> not perfect labeling. The synthesis prompt sees speaker labels as
+> hints, and the LLM is fully capable of reconciling "Speaker 7 and
+> Speaker 12 are likely the same person" given the surrounding text.
+> The defaults are a starting point, not a destination -- the merge /
+> match thresholds are tunable in Settings, and live click-to-tag
+> during recording (v0.6) feeds the clustering directly so you can
+> correct in-meeting. Active iteration; the rest of the app does not
+> depend on it being right.
 
 ## Features
 
 - **On-device transcription** via faster-whisper (CPU, int8). Runs live
-  during the meeting and refines after Stop.
+  during the meeting and refines after Stop. Quality is tuned for LLM
+  synthesis -- sufficient to capture what was said and who said it,
+  not a verbatim court reporter. The synthesis pass smooths the
+  remaining word-choice errors (homophones, mild punctuation).
 - **Mic + system-audio capture** through WASAPI loopback, so both sides
   of a Teams / Zoom / Meet call are recorded.
 - **Clipboard-mediated synthesis.** Generate a prompt, paste it into any
@@ -114,6 +131,61 @@ the active tab to a physical printer. For a PDF copy use **Export
 PDF...** -- it writes a PDF directly via Qt's PDF backend, which
 preserves images and clickable links. The **Copy** button copies
 whichever tab is currently active.
+
+#### Paste-target coverage for Copy
+
+The Copy button on the **My Notes** and **Synthesis** tabs puts two
+payloads on the clipboard at once: the raw Markdown source (for
+plain-text editors) and a rendered HTML version with each embedded
+image inlined as a `data:image/...;base64` URI (for rich-text paste
+targets). Different destinations pick different sides of that
+clipboard payload and apply their own sanitization on top, which
+means coverage varies:
+
+| Destination | Formatting | Images | Notes |
+|---|---|---|---|
+| Word (desktop) | yes | yes | Best target -- reads CF_HTML, accepts data: URIs natively. |
+| OneNote (desktop) | yes | yes | Same as Word. |
+| Outlook (desktop, compose) | yes | yes | Same as Word. |
+| Notion (web) | yes | yes | Notion re-uploads each data: URI to its own CDN on paste. |
+| Outlook Web (compose) | yes | **no** | Microsoft's web compose sanitizer strips data: URIs by policy. Formatting (headings, bold, lists) survives. |
+| Microsoft Teams (desktop, compose) | yes | **no** | Same sanitizer as Outlook Web. Formatting survives. |
+| Slack | mixed | mixed | Depends on which compose surface (channel post, DM, thread). |
+| Gmail (web compose) | yes | usually no | Browser-paste sanitizer behavior; varies by account / extension state. |
+| VS Code / Obsidian / plain editors | -- | -- | Take the Markdown side unchanged. This is the intended path for tools that natively understand Markdown. |
+| Transcript tab + Previous Notes tab | -- | -- | These tabs hold plain text. Copy puts the text on the clipboard as plain text; no HTML render is attempted because there's nothing markdown-formatted to preserve. |
+
+**The image-loss story specifically.** Microsoft's web-paste pipeline
+(Outlook Web, Teams desktop) strips `<img src="data:...">` references
+from pasted HTML on receipt. This is a deliberate security stance
+against XSS in pasted content; it is not a bug we can patch around
+from the sender side without uploading images to a hosting service,
+which violates the local-only design.
+
+**What does survive in Teams / Outlook Web.** As of v0.6.2 the
+Markdown -> HTML rendering pipeline runs through a sanitizer that
+strips Qt-specific markers (`<meta name="qrichtext">`, `-qt-*` CSS
+properties, Qt's internal head `<style>` block). Without that
+sanitizer pass the receiving app would see the Qt-flavored payload,
+decide it was internal-only content, and fall back to the
+plain-Markdown side -- the symptom Aaron observed before v0.6.2. With
+sanitization, headings + bold + italic + lists + paragraphs all
+preserve.
+
+**Workaround for images into Teams / Outlook Web.** The fastest path
+when an image absolutely has to land in a Teams or OWA message is to
+paste the message text first, then go back to My Notes, right-click
+the image, and use the OS-level *Copy Image* from the preview to put
+just that image on the clipboard as a binary; paste it into the Teams
+/ OWA compose as a second operation. Tedious but reliable.
+
+**Potential future enhancement.** CF_RTF generation (the Rich Text
+Format clipboard variant that Word / Outlook desktop natively prefer)
+would give Word and Outlook desktop a second guaranteed-good path,
+but it would not help Teams or Outlook Web (Electron + browser both
+read HTML, not RTF). The marginal value is low for the engineering
+effort -- skipped for now; revisit if a future paste target turns
+out to read RTF but reject CF_HTML.
 
 ![Main window -- Synthesis tab](docs/screenshots/04-main-synthesis.png)
 
@@ -260,6 +332,22 @@ The packaged build produces a clickable `.exe`:
 The executable bundles the Python runtime, PyQt6, and faster-whisper.
 The Whisper model itself is downloaded on first run into
 `%APPDATA%\MeetingNotetaker\models\`.
+
+**Post-build dependency gate.** `build.ps1` runs the freshly-built
+`.exe` with `--check-deps` immediately after PyInstaller finishes.
+The flag invokes the same self-test as **Help > Debug > Check
+Dependencies...** but in headless mode -- prints a report to stdout
+and exits non-zero if any dependency is MISSING. If PyInstaller's
+static analysis missed a hidden import (a recurring failure mode for
+libraries that resolve classes from yaml strings or plugin entry
+points), the build fails loudly here rather than producing a binary
+that will silently skip features at runtime.
+
+When the gate fails, add the missing module to
+`meeting_notetaker.spec`'s `hiddenimports` list (or its `collect_all()`
+loop if it's a whole package subtree) and rebuild. You can also run
+`.\dist\meeting-notetaker.exe --check-deps` manually any time to
+re-verify a built binary.
 
 ## Quick start
 
@@ -494,6 +582,16 @@ match recall kicks in.
 
 ### Limits
 
+The diarization goal is **enough speaker context for the synthesis
+pass to attribute concepts and discussions to the right people** --
+not a perfect speaker-labeled transcript. An over-split cluster
+("Alice" showing up as Speaker 3, Speaker 8, and Speaker 14 across
+the meeting) is annoying but not fatal: the LLM reading the transcript
+during synthesis can usually reconcile this from the conversational
+context. Spend the click-to-tag effort on the people whose attribution
+actually matters for the notes (the discussion leads, the
+decision-makers); let strangers stay as "Speaker N".
+
 This is a small CPU-only model running on recorded audio. It is good at
 distinguishing two or three clearly-different voices in a quiet
 meeting. It struggles with:
@@ -540,9 +638,11 @@ these are also editable directly in `config.toml`.
 |---|---|---|
 | Your name | (empty -> "Me") | Replaces "Me:" in the transcript display and in the synthesis prompt. When set, the LLM sees your real name and assigns action items by name instead of "TBD". The on-disk transcript is always stored with the neutral "Me:" label and rewritten on display, so changing your name later does not break old sessions. |
 | Model size | `small.en` | Which faster-whisper model to use. See [Choosing a model](#choosing-a-model). |
-| Capture-only mode | off | Skip live transcription; run a single Whisper pass when you click Stop. Lower CPU during the meeting, no live view. |
+| Capture-only mode | off | Skip live transcription; run a single Whisper pass when you click Stop. Lower CPU during the meeting, no live view. Per-session override is available in the New Session dialog so a single recording can flip the toggle without changing the global default. |
 | Skip post-Stop refinement | off | Make the live transcript final. No second Whisper pass after you click Stop. See [Performance](#performance) for the trade-off. |
-| Fast batch mode | off | When the refinement pass runs, use beam_size=1 (greedy decoding) instead of beam_size=5 (beam search). About 3x faster, modest quality drop on English-only models. Ignored when "Skip refinement" is on. |
+| High accuracy mode | off | Off = greedy decoding (beam_size=1, the default; ~3x faster on the refinement pass). On = beam_size=5 (slower, slightly more accurate). For transcripts that feed an LLM synthesis pass, the default is the right call -- the LLM smooths the kinds of errors greedy decoding makes. Turn this on only if you need verbatim transcripts and never use the synthesis path. |
+| CPU threads per worker | 0 (auto) | CTranslate2 `cpu_threads`. 0 derives a value from `cpu_count() / num_workers` with a minimum of 2. Override only if you know your CPU well; total OS threads in flight = `cpu_threads * num_workers`, keep <= physical core count to avoid L3 cache thrash. |
+| Parallel workers | 2 | CTranslate2 `num_workers`. Lets independent transcribe() calls run truly in parallel inside one model instance. 2 is the right call for two-source meetings (mic + sys batch passes run together). Drop to 1 if you only ever record a single source and have spare cores for elsewhere. |
 | Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. Per-session override stays available. |
 | Enable VAD | on | Trim silent stretches before Whisper decodes them. Saves CPU. Disable if it ever clips speech. |
 | VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. 250-2000 ms range. |
@@ -583,17 +683,32 @@ updates live as the refinement runs in the background. Anything you do
 during refinement uses the live transcript; if you re-generate after
 refinement finishes, the better version is used automatically.
 
+As of v0.6.2 the refinement pass defaults are tuned for a multi-core
+laptop: `beam_size=1` (the "fast" path) is on by default, and
+CTranslate2 runs with `num_workers=2` so mic + sys batch passes truly
+run in parallel inside one model instance, plus `cpu_threads` auto-
+derived from `cpu_count() / num_workers`. On a 12-core CPU this lands
+the refinement of a 30-minute two-source meeting in the 3-5 minute
+range. The old defaults (single CT2 worker, beam=5) were closer to
+real-time.
+
 If the refinement wait still bothers you:
 
 - **Skip post-Stop refinement.** Best if you find live quality
   acceptable. Settings -> Skip post-Stop refinement = on. No CPU cost
   after Stop; transcription is "done" immediately.
-- **Fast batch mode.** Cuts the refinement wall-clock by roughly two
-  thirds. Quality drop is modest for English-only models. Settings ->
-  Fast batch mode = on.
 - **Smaller model.** `base.en` is roughly 3x faster than `small.en`
   for both live and batch passes. Quality is a real step down, but
   workable for many meetings.
+- **Capture-only mode (concurrent meetings).** Recording four meetings
+  back to back? Flip Capture-only on (Settings, or per-session via the
+  New Session dialog) so the live transcription workers don't fight
+  the model. The post-Stop refinement still produces a full transcript
+  on each session; only the live pane is skipped.
+- **Tune CT2 manually.** If your CPU isn't 12 cores or you have an
+  unusual workload, the `CPU threads per worker` + `Parallel workers`
+  settings give you direct control. Total OS threads = `threads *
+  workers`; keep <= physical core count.
 - **Retain the audio.** Per-session "Keep audio" toggle keeps the WAV
   files. If you ever want to re-run Whisper with a different model or
   settings, you have the source material to do it.

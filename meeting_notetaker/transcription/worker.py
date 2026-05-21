@@ -52,7 +52,7 @@ if _HAS_QT:  # pragma: no cover -- exercised in the Qt-enabled runtime
             source: str,
             model,
             *,
-            beam_size: int = 5,
+            beam_size: int = 1,
             vad_filter: bool = True,
             vad_min_silence_ms: int = 500,
             language: str = "en",

@@ -45,6 +45,8 @@ log = logging.getLogger(__name__)
 _lock = threading.Lock()
 _current_model = None
 _current_size: Optional[str] = None
+_current_cpu_threads: int = 0
+_current_num_workers: int = 1
 
 
 # Filenames a faster-whisper CTranslate2 snapshot must contain to be usable
@@ -73,17 +75,36 @@ def get_model(
     *,
     device: str = "cpu",
     compute_type: str = "int8",
+    cpu_threads: int = 0,
+    num_workers: int = 1,
     download_root: Optional[Path] = None,
     progress: Optional[Callable[[str], None]] = None,
 ):
     """Return a faster_whisper.WhisperModel instance for `size`.
 
+    `cpu_threads` and `num_workers` map directly onto CTranslate2's
+    same-named knobs. Defaults of 0 / 1 reproduce CT2's own defaults
+    (cpu_threads = min(cores, 4), single inference worker). On a 12-core
+    CPU recording two sources, callers should pass cpu_threads=6,
+    num_workers=2 so each transcribe() can saturate half the cores and
+    parallel mic + sys batch passes run truly in parallel inside one
+    model instance. Total OS threads = cpu_threads * num_workers; keep
+    that <= physical core count to avoid L3 thrash.
+
+    A change in cpu_threads or num_workers forces a model rebuild even
+    when the size matches, because CT2 fixes those at construct time.
+
     Lazily imports faster_whisper so that test environments without it can
     still import this module.
     """
-    global _current_model, _current_size
+    global _current_model, _current_size, _current_cpu_threads, _current_num_workers
     with _lock:
-        if _current_model is not None and _current_size == size:
+        if (
+            _current_model is not None
+            and _current_size == size
+            and _current_cpu_threads == cpu_threads
+            and _current_num_workers == num_workers
+        ):
             return _current_model
         from faster_whisper import WhisperModel  # type: ignore[import-not-found]
 
@@ -109,17 +130,25 @@ def get_model(
                 progress(f"Loading {size} model (compute_type={compute_type})...")
 
         log.info(
-            "Loading faster-whisper size=%s device=%s compute_type=%s local_only=%s",
-            size, device, compute_type, local_only,
+            "Loading faster-whisper size=%s device=%s compute_type=%s "
+            "cpu_threads=%s num_workers=%s local_only=%s",
+            size, device, compute_type, cpu_threads, num_workers, local_only,
         )
+        kwargs: dict = dict(
+            model_size_or_path=model_arg,
+            device=device,
+            compute_type=compute_type,
+            download_root=str(root),
+            local_files_only=local_only,
+        )
+        # Only forward CT2 knobs when explicitly set; 0 means "let CT2
+        # pick its own default" so we don't override on tiny dev VMs.
+        if cpu_threads and cpu_threads > 0:
+            kwargs["cpu_threads"] = cpu_threads
+        if num_workers and num_workers > 1:
+            kwargs["num_workers"] = num_workers
         try:
-            model = WhisperModel(
-                model_size_or_path=model_arg,
-                device=device,
-                compute_type=compute_type,
-                download_root=str(root),
-                local_files_only=local_only,
-            )
+            model = WhisperModel(**kwargs)
         except Exception as exc:
             msg = _friendly_error(exc, size, root)
             log.error("model load failed: %s", msg)
@@ -127,6 +156,8 @@ def get_model(
 
         _current_model = model
         _current_size = size
+        _current_cpu_threads = cpu_threads
+        _current_num_workers = num_workers
         if progress:
             progress("Model ready.")
         return model
@@ -140,10 +171,12 @@ def current_size() -> Optional[str]:
 
 def unload() -> None:
     """Drop the cached model instance. Useful for tests and 'free memory' menus."""
-    global _current_model, _current_size
+    global _current_model, _current_size, _current_cpu_threads, _current_num_workers
     with _lock:
         _current_model = None
         _current_size = None
+        _current_cpu_threads = 0
+        _current_num_workers = 1
 
 
 def _friendly_error(exc: Exception, size: str, root: Path) -> str:
@@ -173,17 +206,3 @@ def _friendly_error(exc: Exception, size: str, root: Path) -> str:
             f"Underlying error: {text}"
         )
     return text
-
-
-def current_size() -> Optional[str]:
-    """The size of the currently loaded model, or None if nothing is loaded."""
-    with _lock:
-        return _current_size
-
-
-def unload() -> None:
-    """Drop the cached model instance. Useful for tests and 'free memory' menus."""
-    global _current_model, _current_size
-    with _lock:
-        _current_model = None
-        _current_size = None

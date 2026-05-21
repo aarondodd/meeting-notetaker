@@ -96,6 +96,10 @@ class MainApp(QObject):
         self._calendar_monitor = None  # set lazily by _apply_calendar_config
         self._audio_monitor = None  # set lazily by _apply_audio_monitor_config
         self._encoder_prewarm: Optional[EncoderPrewarmThread] = None
+        # Per-session capture-only overrides captured from NewSessionDialog.
+        # Consumed at start_session time, then evicted. Sessions absent from
+        # the dict fall back to the global config value.
+        self._capture_only_overrides: dict[str, bool] = {}
 
         self._wire_signals()
         self._apply_user_name()
@@ -144,6 +148,7 @@ class MainApp(QObject):
         self.window.open_devices_dialog_requested.connect(self._on_devices)
         self.window.open_outlook_diagnostic_requested.connect(self._on_outlook_diagnostic)
         self.window.open_log_viewer_requested.connect(self._on_log_viewer)
+        self.window.open_dependency_check_requested.connect(self._on_dependency_check)
         self.window.check_for_updates_requested.connect(self._on_check_for_updates)
         self.window.upgrade_requested.connect(self._on_upgrade)
         self.window.quit_requested.connect(self.qt_app.quit)
@@ -245,6 +250,7 @@ class MainApp(QObject):
     def _on_new_session(self) -> None:
         dialog = NewSessionDialog(
             retain_audio_default=self.config.audio.retain_audio_default,
+            capture_only_default=self.config.transcription.capture_only_mode,
             parent=self.window,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -254,6 +260,8 @@ class MainApp(QObject):
             title=result.title,
             retain_audio=result.retain_audio,
         )
+        if result.capture_only_override is not None:
+            self._capture_only_overrides[session.id] = result.capture_only_override
         if result.calendar_meeting is not None:
             self._align_created_at_to_meeting(session.id, result.calendar_meeting)
             self._seed_live_notes_from_meeting(session.id, result.calendar_meeting)
@@ -301,8 +309,15 @@ class MainApp(QObject):
         # is on, live workers don't load the model -- but the batch pass at
         # stop time still needs it, so we preload either way.
         size = self.config.transcription.model_size
+        cpu_threads = self.config.transcription.resolved_cpu_threads()
+        num_workers = self.config.transcription.num_workers
+        # Pop the per-session override (if any) so the next Start on
+        # this session falls back to the global setting.
+        capture_override = self._capture_only_overrides.pop(session.id, None)
         if model_manager.current_size() == size:
-            self.controller.start_session(session)
+            self.controller.start_session(
+                session, capture_only_override=capture_override
+            )
             return
 
         run_with_progress(
@@ -313,8 +328,14 @@ class MainApp(QObject):
                 "while the weights download). The app will respond again once it's ready."
             ),
             fn=model_manager.get_model,
-            kwargs={"size": size},
-            on_success=lambda _model: self.controller.start_session(session),
+            kwargs={
+                "size": size,
+                "cpu_threads": cpu_threads,
+                "num_workers": num_workers,
+            },
+            on_success=lambda _model: self.controller.start_session(
+                session, capture_only_override=capture_override
+            ),
             on_failure=lambda msg: self._on_controller_error(msg),
         )
 
@@ -650,14 +671,38 @@ class MainApp(QObject):
                 self.window, f"Copy {label}", f"{label} is empty -- nothing to copy."
             )
             return
-        try:
-            pyperclip.copy(text)
-        except Exception as exc:
-            log.exception("clipboard copy failed")
-            QMessageBox.warning(
-                self.window, f"Copy {label}", f"Clipboard copy failed: {exc}"
-            )
-            return
+
+        # Notes + Synthesis tabs are Markdown bodies that may reference
+        # local images. Run them through the multi-format helper so an
+        # HTML-aware paste target (Notion, Word, browsers) gets inline
+        # image bytes via data: URIs. Plain-text targets still receive
+        # the original Markdown. Transcript / Previous tabs are plain
+        # text and skip the markdown render.
+        if tab_id in ("live_notes", "notes"):
+            from .utils.clipboard import copy_markdown_with_images
+            from .models.transcript import TranscriptStore
+            try:
+                store = TranscriptStore(session_id)
+                copy_markdown_with_images(text, store.session_dir)
+            except Exception as exc:
+                log.exception("multi-format clipboard copy failed; falling back to plain text")
+                try:
+                    pyperclip.copy(text)
+                except Exception as exc2:
+                    log.exception("plain-text fallback copy also failed")
+                    QMessageBox.warning(
+                        self.window, f"Copy {label}", f"Clipboard copy failed: {exc2}"
+                    )
+                    return
+        else:
+            try:
+                pyperclip.copy(text)
+            except Exception as exc:
+                log.exception("clipboard copy failed")
+                QMessageBox.warning(
+                    self.window, f"Copy {label}", f"Clipboard copy failed: {exc}"
+                )
+                return
         self.window.status(f"{label} copied to clipboard.", timeout_ms=4000)
 
     def _on_paste_notes(self, session_id: str) -> None:
@@ -757,6 +802,17 @@ class MainApp(QObject):
         self._log_viewer.show()
         self._log_viewer.raise_()
         self._log_viewer.activateWindow()
+
+    def _on_dependency_check(self) -> None:
+        from .ui.dependency_check_dialog import DependencyCheckDialog
+        if getattr(self, "_dep_check", None) is None:
+            self._dep_check = DependencyCheckDialog(parent=self.window)
+        else:
+            # Re-run so the report reflects the current venv state.
+            self._dep_check._run()
+        self._dep_check.show()
+        self._dep_check.raise_()
+        self._dep_check.activateWindow()
 
     def _on_settings(self) -> None:
         dialog = SettingsDialog(self.config, parent=self.window)

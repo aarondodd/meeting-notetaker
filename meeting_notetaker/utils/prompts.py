@@ -37,6 +37,13 @@ _PRIOR_BUNDLED_HASHES: dict[str, set[str]] = {
         "0004ea62bf061e95be43c27326a7fbb7d9bef3d44fc9de71251519918e3f7c98",
         "81ff640c2ea393feb8520d440b340802cb36347aca56f4646c35f4945fe2192e",
         "e98c35805be75f90c36212dd5852164c09ef49d930d28836d32a5077b6aae4bb",
+        # v0.6.2 -- strengthened the image-preservation rule from a
+        # single sentence to an explicit three-part contract (preserve
+        # every one, byte-for-byte, placed contextually with end-of-
+        # section fallback). The prior single-sentence form was being
+        # under-followed by some LLMs, which dropped or mangled
+        # `![alt](path)` references during synthesis.
+        "086f4dd38e0bab29fbbdc4d3cc4a3bbf06719de195ea5d84edbfed05497dee1c",
     },
     "one-on-one.md": {
         "2a140d9fd7d1ae7687bfd5f7fba0d517b6f41135e467a98cdd13abd8e1ca87f5",

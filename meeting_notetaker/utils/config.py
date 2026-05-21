@@ -13,7 +13,9 @@ Schema (config.toml):
     model_size = "small.en"
     capture_only_mode = false
     skip_batch_refinement = false   # if true, no post-Stop full-recording pass -- live transcript is final
-    fast_batch = false              # if true, batch pass uses beam_size=1 (~3x faster, slight quality drop)
+    fast_batch = true               # batch pass uses beam_size=1 (~3x faster). flip off for legal-grade verbatim.
+    cpu_threads = 0                 # 0 = auto (cpu_count // num_workers); else fixed value passed to CT2
+    num_workers = 2                 # CT2 inference workers per model; >1 lets parallel transcribe() calls run truly in parallel
 
     [ui]
     user_name = ""               # how the user's mic is labeled (defaults to "Me" when empty)
@@ -69,7 +71,24 @@ class TranscriptionConfig:
     model_size: str = "small.en"
     capture_only_mode: bool = False
     skip_batch_refinement: bool = False
-    fast_batch: bool = False
+    fast_batch: bool = True
+    cpu_threads: int = 0
+    num_workers: int = 2
+
+    def resolved_cpu_threads(self, cpu_count: int | None = None) -> int:
+        """0 = auto: split available cores across num_workers, minimum 2.
+
+        Non-zero values pass through. The auto formula keeps total OS
+        threads (cpu_threads * num_workers) bounded by the physical
+        core count so independent transcribe() calls don't oversubscribe
+        the CPU and start thrashing L3 cache.
+        """
+        if self.cpu_threads > 0:
+            return self.cpu_threads
+        import os as _os
+        cores = cpu_count if cpu_count is not None else (_os.cpu_count() or 4)
+        workers = max(1, self.num_workers)
+        return max(2, cores // workers)
 
 
 @dataclass
@@ -164,6 +183,16 @@ class Config:
             errors.append(
                 f"audio.vad_min_silence_ms must be between 50 and 5000, "
                 f"got {self.audio.vad_min_silence_ms}"
+            )
+        if not (0 <= self.transcription.cpu_threads <= 128):
+            errors.append(
+                f"transcription.cpu_threads must be between 0 and 128 (0 = auto), "
+                f"got {self.transcription.cpu_threads}"
+            )
+        if not (1 <= self.transcription.num_workers <= 8):
+            errors.append(
+                f"transcription.num_workers must be between 1 and 8, "
+                f"got {self.transcription.num_workers}"
             )
         if not (1 <= self.calendar.window_minutes <= 60):
             errors.append(

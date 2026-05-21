@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -103,18 +104,56 @@ class SettingsDialog(QDialog):
         )
         tx_form.addRow(self._skip_batch)
 
-        self._fast_batch = QCheckBox(
-            "Fast batch mode (beam_size=1, ~3x faster, slight quality drop)", self
+        # Default is beam_size=1 (fast). Checking this box opts INTO
+        # beam_size=5, which is slower but slightly more accurate. The
+        # underlying config field is still `fast_batch` (True = default,
+        # fast); the UI is inverted because we now default to the fast
+        # path and "High accuracy" is the rare opt-in.
+        self._high_accuracy = QCheckBox(
+            "High accuracy mode (beam_size=5, ~3x slower)", self
         )
-        self._fast_batch.setChecked(config.transcription.fast_batch)
-        self._fast_batch.setToolTip(
-            "Only applies when the post-Stop refinement is running. Uses greedy "
-            "decoding instead of beam search 5. For English-only models the "
-            "quality drop is modest -- a handful of incorrect word choices in "
-            "noisy audio. Wall-clock is roughly 1/3 of the default. Ignored if "
-            "Skip refinement is on."
+        self._high_accuracy.setChecked(not config.transcription.fast_batch)
+        self._high_accuracy.setToolTip(
+            "Default is greedy decoding (beam_size=1), which is roughly 3x "
+            "faster on the post-Stop refinement pass with a mild WER cost. "
+            "For meeting transcripts that feed into an LLM synthesis pass, "
+            "the quality drop is usually invisible -- the LLM smooths the "
+            "kinds of errors greedy makes (homophones, mild punctuation). "
+            "Check this box only if you need verbatim transcripts and never "
+            "use the synthesis path."
         )
-        tx_form.addRow(self._fast_batch)
+        tx_form.addRow(self._high_accuracy)
+
+        # CT2 tuning knobs ------------------------------------------------
+        ct2_blurb = QLabel(
+            "CTranslate2 inference threads. Defaults are tuned to "
+            "saturate a multi-core CPU while keeping mic + sys batch "
+            "passes from oversubscribing physical cores. cpu_threads=0 "
+            "auto-derives from cpu_count / num_workers, minimum 2. "
+            "Total OS threads in flight = cpu_threads * num_workers; "
+            "keep <= physical core count to avoid L3 cache thrash.",
+            self,
+        )
+        ct2_blurb.setWordWrap(True)
+        tx_form.addRow(ct2_blurb)
+
+        self._cpu_threads_spin = QSpinBox(self)
+        self._cpu_threads_spin.setRange(0, 128)
+        self._cpu_threads_spin.setValue(config.transcription.cpu_threads)
+        self._cpu_threads_spin.setToolTip(
+            "CT2 cpu_threads: OpenMP threads PER inference call. 0 = auto."
+        )
+        tx_form.addRow("CPU threads per worker:", self._cpu_threads_spin)
+
+        self._num_workers_spin = QSpinBox(self)
+        self._num_workers_spin.setRange(1, 8)
+        self._num_workers_spin.setValue(config.transcription.num_workers)
+        self._num_workers_spin.setToolTip(
+            "CT2 num_workers: number of concurrent transcribe() slots "
+            "inside one model instance. 2 lets a two-source meeting "
+            "(mic + sys) run both batch passes truly in parallel."
+        )
+        tx_form.addRow("Parallel workers:", self._num_workers_spin)
 
         vocab_blurb = QLabel(
             "Custom vocabulary biases the transcriber toward proper nouns and "
@@ -477,7 +516,9 @@ class SettingsDialog(QDialog):
         self._config.transcription.model_size = self._model_picker.currentText()
         self._config.transcription.capture_only_mode = self._capture_only.isChecked()
         self._config.transcription.skip_batch_refinement = self._skip_batch.isChecked()
-        self._config.transcription.fast_batch = self._fast_batch.isChecked()
+        self._config.transcription.fast_batch = not self._high_accuracy.isChecked()
+        self._config.transcription.cpu_threads = self._cpu_threads_spin.value()
+        self._config.transcription.num_workers = self._num_workers_spin.value()
         self._config.audio.retain_audio_default = self._retain_default.isChecked()
         self._config.audio.vad_enabled = self._vad_enabled.isChecked()
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()

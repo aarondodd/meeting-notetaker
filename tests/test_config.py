@@ -155,3 +155,58 @@ def test_detection_validation_rejects_extremes(isolated_data_dir):
     cfg.detection.cooldown_minutes = 999
     errors = cfg.validate()
     assert any("detection.cooldown_minutes" in e for e in errors)
+
+
+def test_fast_batch_defaults_on(isolated_data_dir):
+    """Default beam_size=1 path: fast_batch must be True out of the box.
+
+    Justification lives in PR #12: meeting transcripts feed an LLM
+    synthesis pass that absorbs the kinds of errors greedy decoding
+    makes. Users wanting verbatim transcripts flip 'High accuracy
+    mode' on in Settings."""
+    cfg = Config()
+    assert cfg.transcription.fast_batch is True
+
+
+def test_ct2_defaults_and_round_trip(isolated_data_dir):
+    cfg = Config()
+    assert cfg.transcription.cpu_threads == 0       # 0 = auto
+    assert cfg.transcription.num_workers == 2
+    cfg.transcription.cpu_threads = 6
+    cfg.transcription.num_workers = 4
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.transcription.cpu_threads == 6
+    assert loaded.transcription.num_workers == 4
+
+
+def test_ct2_validation_rejects_extremes(isolated_data_dir):
+    cfg = Config()
+    cfg.transcription.cpu_threads = -1
+    errors = cfg.validate()
+    assert any("cpu_threads" in e for e in errors)
+    cfg.transcription.cpu_threads = 0
+    cfg.transcription.num_workers = 99
+    errors = cfg.validate()
+    assert any("num_workers" in e for e in errors)
+
+
+def test_resolved_cpu_threads_auto_splits_cores():
+    """Auto formula: cpu_count // num_workers, floor 2."""
+    cfg = Config()
+    cfg.transcription.cpu_threads = 0
+    cfg.transcription.num_workers = 2
+    # 12-core target: 12 / 2 = 6
+    assert cfg.transcription.resolved_cpu_threads(cpu_count=12) == 6
+    # 8-core: 8 / 2 = 4
+    assert cfg.transcription.resolved_cpu_threads(cpu_count=8) == 4
+    # Tiny CI runner: 2 / 2 = 1, clamped up to 2
+    assert cfg.transcription.resolved_cpu_threads(cpu_count=2) == 2
+
+
+def test_resolved_cpu_threads_explicit_passes_through():
+    cfg = Config()
+    cfg.transcription.cpu_threads = 4
+    cfg.transcription.num_workers = 2
+    # Explicit non-zero overrides the auto formula entirely.
+    assert cfg.transcription.resolved_cpu_threads(cpu_count=64) == 4
