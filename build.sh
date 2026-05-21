@@ -21,13 +21,17 @@ pip install -r requirements-dev.txt
 rm -rf build dist
 pyinstaller --noconfirm --clean meeting_notetaker.spec
 
-# Post-build gate: invoke the freshly-built binary with --check-deps. If
-# any dependency is MISSING, fail loudly here rather than producing a
-# binary that will silently skip features at runtime.
+# Post-build gate: invoke the freshly-built binary with --check-deps in a
+# clean environment. If we leave the activated venv leaking through
+# (VIRTUAL_ENV, PYTHONPATH, PYTHONHOME), the frozen binary may pick up
+# the dev venv's site-packages and mask a missing-from-bundle dependency.
+# Strip those vars + reduce PATH to the system default before running.
 echo
-echo "==> Running post-build dependency self-test..."
+echo "==> Running post-build dependency self-test (in clean env)..."
 EXE="$(pwd)/dist/meeting-notetaker"
-if ! "$EXE" --check-deps; then
+if ! env -u VIRTUAL_ENV -u PYTHONHOME -u PYTHONPATH \
+       PATH="/usr/local/bin:/usr/bin:/bin" \
+       "$EXE" --check-deps; then
     echo
     echo "ERROR: Build produced a binary with MISSING dependencies." >&2
     echo "See report above; add the missing module(s) to meeting_notetaker.spec hiddenimports or collect_all() and rebuild." >&2

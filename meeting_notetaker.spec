@@ -54,6 +54,17 @@ hiddenimports += [
     "sentencepiece",
 ]
 
+# Modules only reached via dynamic importlib lookups (dependency_check.py
+# probes them via importlib.import_module to verify the bundle is intact;
+# without a static import here, PyInstaller never sees them and drops
+# them from the bundle, so the runtime check reports MISSING even though
+# the package is in the venv). Add to this list whenever a new entry in
+# dependency_check._GROUPS doesn't have a matching static import path in
+# production code.
+hiddenimports += [
+    "sounddevice",
+]
+
 
 a = Analysis(
     ["main.py"],

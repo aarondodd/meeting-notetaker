@@ -81,6 +81,38 @@ def test_check_deps_does_not_launch_ui():
     # probes, etc.); just confirm we got the structured report.
 
 
+def test_check_deps_in_clean_env_still_reports_dev_venv_deps():
+    """The build gate must run --check-deps in an environment that does
+    NOT see the dev venv's site-packages, so the report reflects what
+    the frozen .exe will actually find at runtime on a user machine.
+
+    Reproduces the 2026-05-22 incident: sounddevice was missing from the
+    PyInstaller bundle (dynamic importlib lookup is invisible to static
+    analysis), but the build.ps1 gate said OK because the activated venv
+    was leaking through. This test confirms we can run --check-deps with
+    a sanitized env and still get an honest report.
+    """
+    if not _has_all_required_for_clean_run():
+        pytest.skip(
+            "dev venv is incomplete; the env-isolation contract can't "
+            "be exercised without a baseline OK run"
+        )
+    # Run with VIRTUAL_ENV/PYTHONHOME/PYTHONPATH cleared. The subprocess
+    # inherits sys.executable's site-packages (since we use the same
+    # python binary), so this is a smoke that the flag works under env
+    # sanitization rather than a true frozen-bundle replay. Catches
+    # accidental reliance on env vars in the check itself.
+    result = _run(
+        ["--check-deps"],
+        env_extra={"VIRTUAL_ENV": "", "PYTHONHOME": "", "PYTHONPATH": ""},
+    )
+    assert "Summary:" in result.stdout
+    # Either OK or MISSING is acceptable here (it depends on whether the
+    # dev venv site-packages still resolves under the cleared env). The
+    # assertion is just that the report ran to completion without env-
+    # sanitization breaking it.
+
+
 def test_no_flag_does_not_run_check_deps():
     """Sanity: running main.py with an unrelated arg doesn't trigger the
     check (i.e. we won't accidentally gate a user-facing launch)."""
