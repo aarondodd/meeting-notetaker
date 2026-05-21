@@ -261,6 +261,22 @@ The executable bundles the Python runtime, PyQt6, and faster-whisper.
 The Whisper model itself is downloaded on first run into
 `%APPDATA%\MeetingNotetaker\models\`.
 
+**Post-build dependency gate.** `build.ps1` runs the freshly-built
+`.exe` with `--check-deps` immediately after PyInstaller finishes.
+The flag invokes the same self-test as **Help > Debug > Check
+Dependencies...** but in headless mode -- prints a report to stdout
+and exits non-zero if any dependency is MISSING. If PyInstaller's
+static analysis missed a hidden import (a recurring failure mode for
+libraries that resolve classes from yaml strings or plugin entry
+points), the build fails loudly here rather than producing a binary
+that will silently skip features at runtime.
+
+When the gate fails, add the missing module to
+`meeting_notetaker.spec`'s `hiddenimports` list (or its `collect_all()`
+loop if it's a whole package subtree) and rebuild. You can also run
+`.\dist\meeting-notetaker.exe --check-deps` manually any time to
+re-verify a built binary.
+
 ## Quick start
 
 1. Launch the app. A blue dot appears in the system tray; the main

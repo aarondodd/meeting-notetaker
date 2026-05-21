@@ -21,5 +21,18 @@ pip install -r requirements-dev.txt
 rm -rf build dist
 pyinstaller --noconfirm --clean meeting_notetaker.spec
 
+# Post-build gate: invoke the freshly-built binary with --check-deps. If
+# any dependency is MISSING, fail loudly here rather than producing a
+# binary that will silently skip features at runtime.
 echo
-echo "Built: $(pwd)/dist/meeting-notetaker"
+echo "==> Running post-build dependency self-test..."
+EXE="$(pwd)/dist/meeting-notetaker"
+if ! "$EXE" --check-deps; then
+    echo
+    echo "ERROR: Build produced a binary with MISSING dependencies." >&2
+    echo "See report above; add the missing module(s) to meeting_notetaker.spec hiddenimports or collect_all() and rebuild." >&2
+    exit 1
+fi
+
+echo
+echo "Built: $EXE"

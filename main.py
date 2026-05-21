@@ -25,8 +25,29 @@ def _inject_truststore() -> None:
 
 _inject_truststore()
 
-from meeting_notetaker.app import main   # noqa: E402  -- import after truststore inject
+
+def _run_check_deps() -> int:
+    """Build-gate self-test. Runs every dependency check, prints a
+    plain-text report, exits 0 if all OK and 1 if any MISSING.
+
+    Imports the check module locally so this path doesn't drag the UI
+    layer in -- the whole point is for a frozen .exe to surface a bundling
+    miss before the UI ever tries to load.
+    """
+    from meeting_notetaker.utils.dependency_check import (
+        Status,
+        format_report,
+        run_checks,
+        summary,
+    )
+    grouped = run_checks()
+    print(format_report(grouped))
+    counts = summary(grouped)
+    return 1 if counts[Status.MISSING] > 0 else 0
 
 
 if __name__ == "__main__":
+    if "--check-deps" in sys.argv[1:]:
+        sys.exit(_run_check_deps())
+    from meeting_notetaker.app import main   # noqa: E402  -- import after truststore inject
     sys.exit(main())
