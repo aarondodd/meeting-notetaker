@@ -92,8 +92,10 @@ class _BatchTranscribeThread(QThread):
         *,
         vad_filter: bool,
         vad_min_silence_ms: int,
-        beam_size: int = 5,
+        beam_size: int = 1,
         hotwords: str = "",
+        cpu_threads: int = 0,
+        num_workers: int = 1,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -104,10 +106,17 @@ class _BatchTranscribeThread(QThread):
         self.vad_min_silence_ms = vad_min_silence_ms
         self.beam_size = beam_size
         self.hotwords = hotwords
+        self.cpu_threads = cpu_threads
+        self.num_workers = num_workers
 
     def run(self) -> None:
         try:
-            model = model_manager.get_model(self.model_size, progress=self.progress.emit)
+            model = model_manager.get_model(
+                self.model_size,
+                cpu_threads=self.cpu_threads,
+                num_workers=self.num_workers,
+                progress=self.progress.emit,
+            )
             tasks: list[tuple[str, Path]] = []
             if self.mic_wav and self.mic_wav.exists() and self.mic_wav.stat().st_size > 44:
                 tasks.append((MIC, self.mic_wav))
@@ -377,7 +386,12 @@ class SessionController(QObject):
 
     # ---- session lifecycle -------------------------------------------------
 
-    def start_session(self, session: Session) -> None:
+    def start_session(
+        self,
+        session: Session,
+        *,
+        capture_only_override: Optional[bool] = None,
+    ) -> None:
         # Only the live-recording slot blocks a new session; sessions in
         # post-Stop batch / refinement processing run independently and
         # do not gate the next recording.
@@ -387,6 +401,11 @@ class SessionController(QObject):
         self._active_recording_session = session
         self._live_segments = []
         hotwords = self._collect_hotwords(session)
+        capture_only_effective = (
+            capture_only_override
+            if capture_only_override is not None
+            else self.config.transcription.capture_only_mode
+        )
         try:
             audio_dir = session_audio_dir(session.id)
             self._mic_wav = audio_dir / "mic.wav"
@@ -397,9 +416,11 @@ class SessionController(QObject):
             # expected to be already cached -- the app layer preloads it via a
             # progress dialog before calling us, so this get_model() is a
             # near-instant cache hit on the second-and-subsequent runs.
-            if not self.config.transcription.capture_only_mode:
+            if not capture_only_effective:
                 model = model_manager.get_model(
                     self.config.transcription.model_size,
+                    cpu_threads=self.config.transcription.resolved_cpu_threads(),
+                    num_workers=self.config.transcription.num_workers,
                     progress=self.status.emit,
                 )
                 for source in (MIC, SYS):
@@ -685,6 +706,8 @@ class SessionController(QObject):
             vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
             beam_size=beam_size,
             hotwords=hotwords,
+            cpu_threads=self.config.transcription.resolved_cpu_threads(),
+            num_workers=self.config.transcription.num_workers,
         )
         batch_thread.progress.connect(self.status.emit)
         batch_thread.progress_pct.connect(

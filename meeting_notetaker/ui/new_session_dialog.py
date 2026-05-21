@@ -29,6 +29,10 @@ from ..integrations import outlook_calendar
 class NewSessionResult:
     title: str
     retain_audio: bool
+    # Per-session override of transcription.capture_only_mode. None means
+    # use the global Settings value; True/False forces it for this session
+    # only. The override doesn't persist past Stop.
+    capture_only_override: Optional[bool] = None
     # When the user picked an Outlook meeting (either via the tray notification
     # imminent-meeting flow or via the Pick from Calendar... button), this
     # carries it so the caller can seed live_notes.md from the invite.
@@ -40,6 +44,7 @@ class NewSessionDialog(QDialog):
         self,
         *,
         retain_audio_default: bool = False,
+        capture_only_default: bool = False,
         title_prefill: str = "",
         prefill_note: str = "",
         calendar_meeting: Optional["outlook_calendar.MeetingInfo"] = None,
@@ -93,6 +98,26 @@ class NewSessionDialog(QDialog):
         )
         layout.addWidget(self._retain_checkbox)
 
+        # Per-session override of capture-only mode. Defaults to the
+        # global Settings value; flipping it for this session only is the
+        # supported way to capture quietly when concurrent meetings are
+        # competing for the Whisper model.
+        self._capture_only_checkbox = QCheckBox(
+            "Capture-only (skip live transcript for this session)", self
+        )
+        self._capture_only_checkbox.setChecked(capture_only_default)
+        self._capture_only_checkbox.setToolTip(
+            "When on, no live transcription runs during recording. The "
+            "WAV is still captured and the post-Stop refinement still "
+            "produces a full transcript. Useful when other sessions are "
+            "already processing and you don't need a live pane."
+        )
+        layout.addWidget(self._capture_only_checkbox)
+        # Remember the global default so we can report None when the user
+        # didn't actually deviate from it; that lets the caller keep the
+        # config-driven path for sessions that weren't overridden.
+        self._capture_only_default = capture_only_default
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self
         )
@@ -114,9 +139,14 @@ class NewSessionDialog(QDialog):
             self.accept()
 
     def result_value(self) -> NewSessionResult:
+        capture_checked = self._capture_only_checkbox.isChecked()
+        capture_override: Optional[bool] = (
+            None if capture_checked == self._capture_only_default else capture_checked
+        )
         return NewSessionResult(
             title=self._title_edit.text().strip(),
             retain_audio=self._retain_checkbox.isChecked(),
+            capture_only_override=capture_override,
             calendar_meeting=self._selected_meeting,
         )
 

@@ -556,9 +556,11 @@ these are also editable directly in `config.toml`.
 |---|---|---|
 | Your name | (empty -> "Me") | Replaces "Me:" in the transcript display and in the synthesis prompt. When set, the LLM sees your real name and assigns action items by name instead of "TBD". The on-disk transcript is always stored with the neutral "Me:" label and rewritten on display, so changing your name later does not break old sessions. |
 | Model size | `small.en` | Which faster-whisper model to use. See [Choosing a model](#choosing-a-model). |
-| Capture-only mode | off | Skip live transcription; run a single Whisper pass when you click Stop. Lower CPU during the meeting, no live view. |
+| Capture-only mode | off | Skip live transcription; run a single Whisper pass when you click Stop. Lower CPU during the meeting, no live view. Per-session override is available in the New Session dialog so a single recording can flip the toggle without changing the global default. |
 | Skip post-Stop refinement | off | Make the live transcript final. No second Whisper pass after you click Stop. See [Performance](#performance) for the trade-off. |
-| Fast batch mode | off | When the refinement pass runs, use beam_size=1 (greedy decoding) instead of beam_size=5 (beam search). About 3x faster, modest quality drop on English-only models. Ignored when "Skip refinement" is on. |
+| High accuracy mode | off | Off = greedy decoding (beam_size=1, the default; ~3x faster on the refinement pass). On = beam_size=5 (slower, slightly more accurate). For transcripts that feed an LLM synthesis pass, the default is the right call -- the LLM smooths the kinds of errors greedy decoding makes. Turn this on only if you need verbatim transcripts and never use the synthesis path. |
+| CPU threads per worker | 0 (auto) | CTranslate2 `cpu_threads`. 0 derives a value from `cpu_count() / num_workers` with a minimum of 2. Override only if you know your CPU well; total OS threads in flight = `cpu_threads * num_workers`, keep <= physical core count to avoid L3 cache thrash. |
+| Parallel workers | 2 | CTranslate2 `num_workers`. Lets independent transcribe() calls run truly in parallel inside one model instance. 2 is the right call for two-source meetings (mic + sys batch passes run together). Drop to 1 if you only ever record a single source and have spare cores for elsewhere. |
 | Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. Per-session override stays available. |
 | Enable VAD | on | Trim silent stretches before Whisper decodes them. Saves CPU. Disable if it ever clips speech. |
 | VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. 250-2000 ms range. |
@@ -599,17 +601,32 @@ updates live as the refinement runs in the background. Anything you do
 during refinement uses the live transcript; if you re-generate after
 refinement finishes, the better version is used automatically.
 
+As of v0.6.2 the refinement pass defaults are tuned for a multi-core
+laptop: `beam_size=1` (the "fast" path) is on by default, and
+CTranslate2 runs with `num_workers=2` so mic + sys batch passes truly
+run in parallel inside one model instance, plus `cpu_threads` auto-
+derived from `cpu_count() / num_workers`. On a 12-core CPU this lands
+the refinement of a 30-minute two-source meeting in the 3-5 minute
+range. The old defaults (single CT2 worker, beam=5) were closer to
+real-time.
+
 If the refinement wait still bothers you:
 
 - **Skip post-Stop refinement.** Best if you find live quality
   acceptable. Settings -> Skip post-Stop refinement = on. No CPU cost
   after Stop; transcription is "done" immediately.
-- **Fast batch mode.** Cuts the refinement wall-clock by roughly two
-  thirds. Quality drop is modest for English-only models. Settings ->
-  Fast batch mode = on.
 - **Smaller model.** `base.en` is roughly 3x faster than `small.en`
   for both live and batch passes. Quality is a real step down, but
   workable for many meetings.
+- **Capture-only mode (concurrent meetings).** Recording four meetings
+  back to back? Flip Capture-only on (Settings, or per-session via the
+  New Session dialog) so the live transcription workers don't fight
+  the model. The post-Stop refinement still produces a full transcript
+  on each session; only the live pane is skipped.
+- **Tune CT2 manually.** If your CPU isn't 12 cores or you have an
+  unusual workload, the `CPU threads per worker` + `Parallel workers`
+  settings give you direct control. Total OS threads = `threads *
+  workers`; keep <= physical core count.
 - **Retain the audio.** Per-session "Keep audio" toggle keeps the WAV
   files. If you ever want to re-run Whisper with a different model or
   settings, you have the source material to do it.
