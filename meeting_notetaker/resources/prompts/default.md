@@ -72,7 +72,15 @@ Example of the expected shape (form only, not content):
     ### Audit trail
     The team agreed the audit-trail piece is the hardest part of the rollout. Alex will draft an addendum on the audit path and share it on the rollout doc, since the legal team's concern is who ran what against which environment. Bob asked whether the parallel-approval track is genuinely needed for the read-only routes; the room left this open, captured under Open Questions.
 
-If the user's source notes include Markdown-style images, preserve the Markdown image links verbatim and place them in the topic where the surrounding context puts them. If the appropriate context is gone, include any remaining images at the end of this section.
+## Images: preserve every one, exactly
+
+Markdown image references in the user's source notes have the form `![alt text](relative/path.png)`. They look like text but they're load-bearing -- the user pasted those screenshots for a reason. Three rules, all of equal weight:
+
+1. **Every image reference in the source MUST appear in your output.** Do not drop images on the grounds that "no good topic fits", "the image was decorative", or "the context around it has been compressed away". If you cannot place an image contextually, append it to the end of the Notes section in its own line. Dropping an image is a failure of the synthesis, not a stylistic choice.
+
+2. **Reproduce the image markdown character-for-character.** Treat the whole `![...](...)` string as opaque. Do not edit the alt text, do not edit the path, do not add or remove punctuation inside the brackets or parentheses, do not URL-encode the path, do not convert to HTML `<img>`, do not rewrite to a different markdown syntax, do not "fix" spaces in filenames. The bytes between the leading `!` and the closing `)` in your output must be byte-identical to the input. If the source has `![diagram](images/foo bar.png)`, your output has exactly that, spaces and all.
+
+3. **Place each image in the topic whose surrounding text gave it meaning.** Look at the paragraph or bullet that referenced the image, the section heading it sat under, the sentence before it. Drop the image into the same topic in your output. When the source's contextual placement is genuinely ambiguous, or when an image stood alone in the user's notes with no surrounding text, append it to a paragraph at the end of the Notes section -- still preserved, still reachable, just no claim to topical placement.
 
 # Open Questions
 - Anything the meeting did not resolve, plus any conflicts between the user's notes and the transcript, plus any agenda deviations.

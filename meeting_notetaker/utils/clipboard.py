@@ -14,7 +14,19 @@ Paste targets pick whichever format they prefer. HTML-aware apps inline
 the image bytes directly; plain-text editors get the original Markdown
 unchanged.
 
-Two layers here so the bytes path is testable without Qt:
+Three layers, ordered so the bytes path is testable without Qt:
+
+  - sanitize_qt_html() : pure-Python pass that strips Qt-specific noise
+    from QTextDocument.toHtml() output. Qt emits `<meta name="qrichtext"
+    content="1">` and a head `<style>` block with `::marker` unicode
+    escapes -- some paste targets (Microsoft Teams desktop, Outlook on
+    the Web) see those, decide the content is Qt-internal, and fall
+    back to the text/plain side. Inline `-qt-*` CSS properties are
+    non-standard and trip strict CSS sanitizers. Stripping all three
+    gives Teams/OWA a clean enough HTML payload that they keep the
+    formatting (data: URI images still strip there by Microsoft's
+    web-paste sanitizer; that's a fundamental limit, not an HTML
+    quality issue).
 
   - rewrite_img_srcs_to_data_uris() : pure-Python HTML rewrite. Resolves
     each <img src="relative/path"> against base_dir, base64-encodes the
@@ -23,7 +35,7 @@ Two layers here so the bytes path is testable without Qt:
     no exception escapes a copy operation.
 
   - copy_markdown_with_images() : Qt-dependent. Renders Markdown -> HTML
-    via QTextDocument.toHtml(), feeds the result through the rewriter,
+    via QTextDocument.toHtml(), runs the sanitizer + image rewrite,
     sets text/plain + text/html on a QMimeData, hands it to the
     clipboard.
 """
@@ -61,6 +73,51 @@ _MIME_BY_EXT: dict[str, str] = {
 _IMG_TAG_RE = re.compile(
     r"""(<img\b[^>]*?\bsrc\s*=\s*)(['"])(?P<src>[^'"]+)\2""",
     re.IGNORECASE,
+)
+
+
+# Qt-specific noise that trips Teams/OWA paste sanitizers. These run
+# in order against the toHtml() output; the result still validates as
+# a well-formed HTML document but no longer signals "Qt internal."
+_QRICHTEXT_META_RE = re.compile(
+    r"""<meta\b[^>]*\bname\s*=\s*["']qrichtext["'][^>]*/?>""",
+    re.IGNORECASE,
+)
+# Qt's <head><style> block has hardcoded `\2610` / `\2612` marker
+# escapes for checkbox glyphs that no other renderer understands.
+# Strip the whole element rather than trying to surgically patch it.
+_HEAD_STYLE_BLOCK_RE = re.compile(
+    r"""<style\b[^>]*>.*?</style>""",
+    re.IGNORECASE | re.DOTALL,
+)
+# Match every style="..." attribute. We walk the captured CSS payload
+# and remove Qt-specific properties; the cleaned-up attribute is
+# rebuilt without them. Standard CSS (font-weight, font-style, etc.)
+# survives so bold + italic still render in target apps.
+_STYLE_ATTR_RE = re.compile(
+    r"""\bstyle\s*=\s*"([^"]*)"|\bstyle\s*=\s*'([^']*)'""",
+    re.IGNORECASE,
+)
+# CSS properties that exist purely for Qt's own rendering and that
+# either (a) are non-standard (`-qt-*`) or (b) tend to fight the
+# destination app's layout for no semantic reason.
+_QT_STYLE_PROPS_TO_DROP: tuple[str, ...] = (
+    "-qt-block-indent",
+    "-qt-list-indent",
+    "-qt-paragraph-type",
+    "-qt-user-state",
+    # Qt's verbose per-element margins/padding are tautological with
+    # the default block-layout that any rich-text receiver applies
+    # itself, but they confuse some paste pipelines into thinking the
+    # content carries authored styling. Drop them.
+    "margin-top",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "text-indent",
+    # Qt emits a body-wide font-family ("Sans Serif") that overrides
+    # whatever font the destination uses; let the destination decide.
+    "font-family",
 )
 
 
@@ -123,6 +180,64 @@ def _encode_as_data_uri(path: Path) -> Optional[str]:
     return f"data:{_content_type_for(path)};base64,{encoded}"
 
 
+def _clean_style_payload(payload: str) -> str:
+    """Drop Qt-specific properties from a single `style="..."` value."""
+    out_parts: list[str] = []
+    for raw in payload.split(";"):
+        chunk = raw.strip()
+        if not chunk:
+            continue
+        prop, sep, _value = chunk.partition(":")
+        if not sep:
+            # Malformed CSS chunk -- drop rather than re-emit broken syntax.
+            continue
+        prop_name = prop.strip().lower()
+        if prop_name in _QT_STYLE_PROPS_TO_DROP:
+            continue
+        out_parts.append(chunk)
+    return "; ".join(out_parts)
+
+
+def sanitize_qt_html(html: str) -> str:
+    """Strip Qt-specific markers + non-standard CSS from QTextDocument output.
+
+    Run before clipboard.setHtml(). Removes:
+
+    - the `<meta name="qrichtext">` declaration that signals Qt-internal
+      content (Microsoft Teams + Outlook Web fall back to text/plain
+      when they detect this),
+    - the `<head><style>` block that ships Qt's own list-marker
+      definitions (apps that don't understand `::marker` unicode
+      escapes occasionally choke parsing it),
+    - `-qt-*` and overly-verbose tautological CSS properties from
+      every inline `style=""` attribute.
+
+    Leaves semantic markup (`<h1>`, `<p>`, `<ul>`, `<strong>`,
+    `<img>`, etc.) and content-bearing styles (font-weight,
+    font-style, font-size when set) untouched, so bold / italic /
+    headings still render correctly after sanitization.
+    """
+    if not html:
+        return html
+
+    cleaned = _QRICHTEXT_META_RE.sub("", html)
+    cleaned = _HEAD_STYLE_BLOCK_RE.sub("", cleaned)
+
+    def _rewrite_style(match: re.Match[str]) -> str:
+        payload = match.group(1) if match.group(1) is not None else match.group(2)
+        new_payload = _clean_style_payload(payload)
+        if not new_payload:
+            return ""  # drop the whole attribute when nothing survives
+        return f'style="{new_payload}"'
+
+    cleaned = _STYLE_ATTR_RE.sub(_rewrite_style, cleaned)
+    # Collapse the run of whitespace that the attribute-strip leaves
+    # behind, e.g. `<p  >`. Cosmetic; trims a few bytes off the payload.
+    cleaned = re.sub(r"\s+>", ">", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned
+
+
 def rewrite_img_srcs_to_data_uris(html: str, base_dir: Path) -> str:
     """Rewrite <img src="relative/path"> -> data: URIs against base_dir.
 
@@ -154,9 +269,9 @@ def rewrite_img_srcs_to_data_uris(html: str, base_dir: Path) -> str:
 def markdown_to_html_with_images(markdown_text: str, base_dir: Path) -> str:
     """Render Markdown to HTML and inline local image refs as data: URIs.
 
-    Qt-dependent. Returns the rewritten HTML; raises ImportError if
-    PyQt6 is not available (the helper is only useful in the running
-    Qt app).
+    Qt-dependent. Returns the rewritten + sanitized HTML; raises
+    ImportError if PyQt6 is not available (the helper is only useful
+    in the running Qt app).
     """
     from PyQt6.QtCore import QUrl
     from PyQt6.QtGui import QTextDocument
@@ -168,6 +283,7 @@ def markdown_to_html_with_images(markdown_text: str, base_dir: Path) -> str:
     doc.setBaseUrl(QUrl.fromLocalFile(str(base_dir) + "/"))
     doc.setMarkdown(markdown_text)
     html = doc.toHtml()
+    html = sanitize_qt_html(html)
     return rewrite_img_srcs_to_data_uris(html, base_dir)
 
 

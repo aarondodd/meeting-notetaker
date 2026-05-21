@@ -15,8 +15,41 @@ import pytest
 
 from meeting_notetaker.utils.clipboard import (
     rewrite_img_srcs_to_data_uris,
+    sanitize_qt_html,
     _content_type_for,
     _is_absolute_url,
+    _clean_style_payload,
+)
+
+
+# Verbatim QTextDocument.toHtml() output for a 'hello world' markdown
+# doc with bold + italic + a heading + a list + a local image. Captured
+# from a real Qt 6.5 run; used as the regression fixture for the
+# sanitizer so we don't need PyQt6 in the test env. Updated whenever Qt
+# meaningfully changes its output shape.
+_QT_TOHTML_FIXTURE = (
+    '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN" "http://www.w3.org/TR/REC-html40/strict.dtd">'
+    '<html><head>'
+    '<meta name="qrichtext" content="1" />'
+    '<meta charset="utf-8" />'
+    '<style type="text/css">\n'
+    'p, li { white-space: pre-wrap; }\n'
+    'hr { height: 1px; border-width: 0; }\n'
+    'li.unchecked::marker { content: "\\2610"; }\n'
+    'li.checked::marker { content: "\\2612"; }\n'
+    '</style></head>'
+    '<body style=" font-family:\'Sans Serif\'; font-size:9pt; font-weight:400; font-style:normal;">'
+    '<h1 style=" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;">'
+    '<span style=" font-size:xx-large; font-weight:700;">Hello</span></h1>'
+    '<ul style="margin-top: 0px; margin-bottom: 0px; margin-left: 0px; margin-right: 0px; -qt-list-indent: 1;">'
+    '<li style=" margin-top:6px; margin-bottom:6px; -qt-block-indent:0;">one</li>'
+    '<li style=" margin-top:6px; margin-bottom:6px; -qt-block-indent:0;">two</li></ul>'
+    '<p style=" margin-top:6px; margin-bottom:6px;">'
+    'Some <span style=" font-weight:700;">bold</span> and '
+    '<span style=" font-style:italic;">italic</span>.</p>'
+    '<p style=" margin-top:6px; margin-bottom:6px;">'
+    '<img src="images/x.png" alt="cat" title="" /></p>'
+    '</body></html>'
 )
 
 
@@ -135,3 +168,138 @@ def test_absolute_url_detection():
 
 def test_empty_input_returns_empty(tmp_path: Path):
     assert rewrite_img_srcs_to_data_uris("", tmp_path) == ""
+
+
+# ---- HTML sanitizer ---------------------------------------------------
+
+
+def test_sanitizer_removes_qrichtext_meta():
+    """The qrichtext meta is the Microsoft-side tell that flips Teams +
+    OWA to text/plain. Must be gone after sanitization."""
+    out = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    assert "qrichtext" not in out
+
+
+def test_sanitizer_removes_head_style_block():
+    """The head <style> block ships Qt's `::marker` unicode escapes
+    that some sanitizers can't parse. Drop the whole block."""
+    out = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    assert "::marker" not in out
+    assert "white-space: pre-wrap" not in out
+    # The body tag survives (it's not inside the head style block).
+    assert "<body" in out
+
+
+def test_sanitizer_strips_qt_specific_css_properties():
+    out = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    assert "-qt-block-indent" not in out
+    assert "-qt-list-indent" not in out
+    assert "-qt-paragraph-type" not in out
+
+
+def test_sanitizer_preserves_semantic_tags():
+    """h1, ul, li, p, img, span -- all must survive so formatting renders."""
+    out = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    assert "<h1" in out
+    assert "<ul" in out
+    assert "<li" in out
+    assert "<p" in out
+    assert "<img" in out
+    assert "<span" in out
+
+
+def test_sanitizer_preserves_bold_and_italic_styles():
+    """Qt encodes bold + italic as `font-weight:700` / `font-style:italic`
+    inline styles, not via <strong>/<em>. The sanitizer must NOT strip
+    these properties or the paste loses all emphasis."""
+    out = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    assert "font-weight:700" in out or "font-weight: 700" in out
+    assert "font-style:italic" in out or "font-style: italic" in out
+
+
+def test_sanitizer_strips_tautological_margins():
+    """Qt emits `margin-top:0px; margin-bottom:0px` on every block. They
+    fight the destination app's layout for no semantic reason; drop them."""
+    out = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    assert "margin-top:0px" not in out
+    assert "margin-top: 0px" not in out
+
+
+def test_sanitizer_preserves_img_src():
+    """Image refs in the body must survive intact -- they go through the
+    data: URI rewriter on the next step."""
+    out = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    assert 'src="images/x.png"' in out
+
+
+def test_sanitizer_significantly_reduces_size():
+    """Sanity check that the strip actually does work -- Qt's verbose
+    output is 1500+ chars; the sanitized version should land near 500."""
+    out = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    assert len(out) < len(_QT_TOHTML_FIXTURE) / 2
+
+
+def test_sanitizer_handles_empty_string():
+    assert sanitize_qt_html("") == ""
+
+
+def test_sanitizer_handles_html_without_qt_markers():
+    """A hand-written HTML payload should pass through with minimal change
+    (just whitespace normalization). No qrichtext + no -qt-* + no head
+    style block to strip."""
+    html = '<p>hello <strong>world</strong></p>'
+    out = sanitize_qt_html(html)
+    assert "<strong>world</strong>" in out
+    assert "hello" in out
+
+
+def test_clean_style_payload_drops_qt_only_keeps_real_css():
+    cleaned = _clean_style_payload(
+        " font-weight:700; -qt-block-indent:0; margin-top:0px; font-style:italic"
+    )
+    assert "font-weight:700" in cleaned
+    assert "font-style:italic" in cleaned
+    assert "-qt-block-indent" not in cleaned
+    assert "margin-top" not in cleaned
+
+
+def test_clean_style_payload_empty_returns_empty():
+    assert _clean_style_payload("") == ""
+    assert _clean_style_payload("   ") == ""
+    assert _clean_style_payload("-qt-block-indent:0; margin-top:0px") == ""
+
+
+def test_sanitizer_drops_style_attr_when_only_qt_props_present():
+    """If a `style=""` becomes empty after stripping Qt props, drop the
+    attribute entirely rather than leaving `style=""` noise."""
+    html = '<li style="-qt-block-indent:0; margin-top:6px;">x</li>'
+    out = sanitize_qt_html(html)
+    assert 'style=""' not in out
+    assert "<li>x</li>" in out
+
+
+def test_sanitizer_preserves_data_uri_unchanged():
+    """data: URIs already in the input must survive sanitization
+    untouched -- the rewriter runs after sanitize and depends on the
+    src attribute being intact."""
+    html = '<p><img src="data:image/png;base64,iVBOR=" alt="x" /></p>'
+    out = sanitize_qt_html(html)
+    assert 'src="data:image/png;base64,iVBOR="' in out
+
+
+def test_rewrite_after_sanitize_still_inlines_images(tmp_path: Path):
+    """End-to-end: sanitizer then image rewriter on the same fixture."""
+    # Write the PNG the fixture references so the rewriter finds it.
+    (tmp_path / "images").mkdir()
+    (tmp_path / "images" / "x.png").write_bytes(
+        base64.b64decode(
+            b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        )
+    )
+    sanitized = sanitize_qt_html(_QT_TOHTML_FIXTURE)
+    final = rewrite_img_srcs_to_data_uris(sanitized, tmp_path)
+    assert "data:image/png;base64," in final
+    # qrichtext is gone, image is inline, semantic HTML preserved.
+    assert "qrichtext" not in final
+    assert "<h1" in final
+    assert "<ul" in final

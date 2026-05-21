@@ -132,6 +132,61 @@ PDF...** -- it writes a PDF directly via Qt's PDF backend, which
 preserves images and clickable links. The **Copy** button copies
 whichever tab is currently active.
 
+#### Paste-target coverage for Copy
+
+The Copy button on the **My Notes** and **Synthesis** tabs puts two
+payloads on the clipboard at once: the raw Markdown source (for
+plain-text editors) and a rendered HTML version with each embedded
+image inlined as a `data:image/...;base64` URI (for rich-text paste
+targets). Different destinations pick different sides of that
+clipboard payload and apply their own sanitization on top, which
+means coverage varies:
+
+| Destination | Formatting | Images | Notes |
+|---|---|---|---|
+| Word (desktop) | yes | yes | Best target -- reads CF_HTML, accepts data: URIs natively. |
+| OneNote (desktop) | yes | yes | Same as Word. |
+| Outlook (desktop, compose) | yes | yes | Same as Word. |
+| Notion (web) | yes | yes | Notion re-uploads each data: URI to its own CDN on paste. |
+| Outlook Web (compose) | yes | **no** | Microsoft's web compose sanitizer strips data: URIs by policy. Formatting (headings, bold, lists) survives. |
+| Microsoft Teams (desktop, compose) | yes | **no** | Same sanitizer as Outlook Web. Formatting survives. |
+| Slack | mixed | mixed | Depends on which compose surface (channel post, DM, thread). |
+| Gmail (web compose) | yes | usually no | Browser-paste sanitizer behavior; varies by account / extension state. |
+| VS Code / Obsidian / plain editors | -- | -- | Take the Markdown side unchanged. This is the intended path for tools that natively understand Markdown. |
+| Transcript tab + Previous Notes tab | -- | -- | These tabs hold plain text. Copy puts the text on the clipboard as plain text; no HTML render is attempted because there's nothing markdown-formatted to preserve. |
+
+**The image-loss story specifically.** Microsoft's web-paste pipeline
+(Outlook Web, Teams desktop) strips `<img src="data:...">` references
+from pasted HTML on receipt. This is a deliberate security stance
+against XSS in pasted content; it is not a bug we can patch around
+from the sender side without uploading images to a hosting service,
+which violates the local-only design.
+
+**What does survive in Teams / Outlook Web.** As of v0.6.2 the
+Markdown -> HTML rendering pipeline runs through a sanitizer that
+strips Qt-specific markers (`<meta name="qrichtext">`, `-qt-*` CSS
+properties, Qt's internal head `<style>` block). Without that
+sanitizer pass the receiving app would see the Qt-flavored payload,
+decide it was internal-only content, and fall back to the
+plain-Markdown side -- the symptom Aaron observed before v0.6.2. With
+sanitization, headings + bold + italic + lists + paragraphs all
+preserve.
+
+**Workaround for images into Teams / Outlook Web.** The fastest path
+when an image absolutely has to land in a Teams or OWA message is to
+paste the message text first, then go back to My Notes, right-click
+the image, and use the OS-level *Copy Image* from the preview to put
+just that image on the clipboard as a binary; paste it into the Teams
+/ OWA compose as a second operation. Tedious but reliable.
+
+**Potential future enhancement.** CF_RTF generation (the Rich Text
+Format clipboard variant that Word / Outlook desktop natively prefer)
+would give Word and Outlook desktop a second guaranteed-good path,
+but it would not help Teams or Outlook Web (Electron + browser both
+read HTML, not RTF). The marginal value is low for the engineering
+effort -- skipped for now; revisit if a future paste target turns
+out to read RTF but reject CF_HTML.
+
 ![Main window -- Synthesis tab](docs/screenshots/04-main-synthesis.png)
 
 **Previous Notes -- earlier synthesis runs, kept as an audit trail.**
