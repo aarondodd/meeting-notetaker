@@ -9,19 +9,36 @@ via clipboard. No audio leaves the machine; no API key required.
 > **Status:** v0.6 alpha. End-to-end capture, transcription, and synthesis
 > work. Performance tuning is ongoing.
 >
+> **What this tool is.** A note-synthesis pipeline, not a verbatim
+> transcription product. The transcript exists to seed an LLM synthesis
+> pass; the LLM smooths the kinds of errors a CPU-only Whisper run
+> produces (homophones like "there" vs "their", mild punctuation
+> drift, occasional dropped articles). If you need legal-grade verbatim
+> transcripts, use Teams' built-in transcription or a hosted service --
+> this app trades raw accuracy for local-only processing, low CPU cost,
+> and an LLM-friendly transcript that synthesizes well.
+>
 > **Diarization (speaker identification) is rough.** The current pass
 > reliably separates two or three distinct voices in clean audio, but a
 > four-person meeting routinely splits into 20+ "speakers" depending on
-> mic, codec, and noise floor. The defaults are a starting point, not a
-> destination -- the merge / match thresholds are tunable in Settings,
-> and live click-to-tag during recording (v0.6) feeds the clustering
-> directly so you can correct in-meeting. Active iteration; the rest of
-> the app does not depend on it being right.
+> mic, codec, and noise floor. The goal is **sufficient speaker context
+> to attribute concepts and discussion threads to the right person** --
+> not perfect labeling. The synthesis prompt sees speaker labels as
+> hints, and the LLM is fully capable of reconciling "Speaker 7 and
+> Speaker 12 are likely the same person" given the surrounding text.
+> The defaults are a starting point, not a destination -- the merge /
+> match thresholds are tunable in Settings, and live click-to-tag
+> during recording (v0.6) feeds the clustering directly so you can
+> correct in-meeting. Active iteration; the rest of the app does not
+> depend on it being right.
 
 ## Features
 
 - **On-device transcription** via faster-whisper (CPU, int8). Runs live
-  during the meeting and refines after Stop.
+  during the meeting and refines after Stop. Quality is tuned for LLM
+  synthesis -- sufficient to capture what was said and who said it,
+  not a verbatim court reporter. The synthesis pass smooths the
+  remaining word-choice errors (homophones, mild punctuation).
 - **Mic + system-audio capture** through WASAPI loopback, so both sides
   of a Teams / Zoom / Meet call are recorded.
 - **Clipboard-mediated synthesis.** Generate a prompt, paste it into any
@@ -509,6 +526,16 @@ Speakers after most meetings until your library is broad enough that
 match recall kicks in.
 
 ### Limits
+
+The diarization goal is **enough speaker context for the synthesis
+pass to attribute concepts and discussions to the right people** --
+not a perfect speaker-labeled transcript. An over-split cluster
+("Alice" showing up as Speaker 3, Speaker 8, and Speaker 14 across
+the meeting) is annoying but not fatal: the LLM reading the transcript
+during synthesis can usually reconcile this from the conversational
+context. Spend the click-to-tag effort on the people whose attribution
+actually matters for the notes (the discussion leads, the
+decision-makers); let strangers stay as "Speaker N".
 
 This is a small CPU-only model running on recorded audio. It is good at
 distinguishing two or three clearly-different voices in a quiet
