@@ -102,6 +102,14 @@ _NETWORKING: tuple[_Check, ...] = (
 
 _OUTLOOK: tuple[_Check, ...] = (
     _Check("pywin32 (win32com.client)", "Outlook calendar", "win32com.client", windows_only=True),
+    # win32timezone is loaded lazily by win32com.client.dynamic.__getattr__
+    # the first time a COM property returns a typed datetime (e.g.
+    # outlook_calendar reading item.Start / item.End). PyInstaller's static
+    # analysis cannot see that path, so we list it explicitly here AND in
+    # the spec's hiddenimports. The check catches a repeat of the 2026-05-21
+    # frozen-build regression: calendar fetch silently returned "no entries
+    # found" because every parse raised ModuleNotFoundError mid-iteration.
+    _Check("pywin32 (win32timezone)", "Outlook calendar (COM date handling)", "win32timezone", windows_only=True),
 )
 
 

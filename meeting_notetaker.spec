@@ -65,6 +65,19 @@ hiddenimports += [
     "sounddevice",
 ]
 
+# pywin32 submodules that win32com loads lazily via __getattr__ at
+# runtime when a COM property returns a typed value (date, currency,
+# variant). Without an explicit hint, PyInstaller drops them from the
+# bundle and the live app crashes the moment Outlook's calendar items
+# are walked (item.Start triggers win32timezone resolution).
+# See: ModuleNotFoundError reports against outlook_calendar
+# _item_to_info -> win32com.client.dynamic.__getattr__.
+hiddenimports += [
+    "win32timezone",
+    "pywintypes",
+    "pythoncom",
+]
+
 
 a = Analysis(
     ["main.py"],

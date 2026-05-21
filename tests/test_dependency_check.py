@@ -45,11 +45,12 @@ def test_windows_only_checks_skip_on_non_windows():
         for r in results:
             if r.status is Status.SKIP:
                 skipped_features.add(r.name)
-    # All four Windows-only deps should be skipped on Linux/macOS.
+    # All Windows-only deps should be skipped on Linux/macOS.
     expected_skips = {
         "PyAudioWPatch",
         "truststore",
         "pywin32 (win32com.client)",
+        "pywin32 (win32timezone)",
         "pycaw",
         "psutil",
     }
@@ -120,3 +121,14 @@ def test_speaker_id_group_covers_runtime_yaml_targets():
         "torchaudio",
     }
     assert required.issubset(names)
+
+
+def test_outlook_group_covers_lazy_pywin32_submodules():
+    """win32timezone is loaded lazily by win32com.client.dynamic when a
+    COM property returns a datetime (item.Start / item.End on Outlook
+    calendar items). PyInstaller's static analysis can't see that
+    import, so it must appear in dependency_check or the build gate
+    won't catch the bundling miss. Pins the 2026-05-21 incident fix."""
+    grouped = dict(run_checks())
+    names = {r.name for r in grouped["Outlook calendar (Windows)"]}
+    assert "pywin32 (win32timezone)" in names
