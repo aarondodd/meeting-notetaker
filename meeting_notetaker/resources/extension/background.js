@@ -71,9 +71,12 @@ function ensurePort() {
 
 function sendToApp(payload) {
   try {
-    ensurePort().postMessage(payload);
+    const p = ensurePort();
+    p.postMessage(payload);
+    console.log("mn-synth bg: -> native host", payload.type,
+      "rid=" + (payload.request_id || ""));
   } catch (e) {
-    console.warn("sendToApp failed:", e);
+    console.warn("mn-synth bg: sendToApp failed:", e);
     port = null;
   }
 }
@@ -247,20 +250,24 @@ function cancelSynthesis(requestId) {
 
 function handleContentMessage(requestId, m, _contentPort) {
   if (!m || typeof m !== "object") return;
+  console.log("mn-synth bg: from content", m.type, "rid=" + requestId,
+    m.type === "RESULT" ? `len=${(m.markdown || "").length}` : "");
   switch (m.type) {
     case "STATUS":
       sendStatus(requestId, m.event, m.detail || "");
       return;
     case "RESULT":
+      console.log("mn-synth bg: forwarding RESULT to app, len=" + (m.markdown || "").length);
       sendResult(requestId, m.target || "claude", m.markdown || "");
       clearInflight(requestId);
       return;
     case "ERROR":
+      console.log("mn-synth bg: forwarding ERROR to app", m.code);
       sendError(requestId, m.code || "unknown", m.detail || "");
       clearInflight(requestId);
       return;
     default:
-      console.warn("unhandled content message:", m);
+      console.warn("mn-synth bg: unhandled content message:", m);
   }
 }
 

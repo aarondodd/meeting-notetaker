@@ -172,72 +172,160 @@
     });
   }
 
-  // Resolve once the page's visible text has been growing (Claude is
-  // actively streaming) AND then stopped for `settleMs`. Designed to
-  // distinguish a single one-shot growth burst (user-message bubble
-  // rendering after submit -- avatar + timestamp + label add a few
-  // dozen chars in one tick) from sustained streaming (Claude
-  // emitting tokens across multiple seconds).
+  // Locate the "stop response" button by attribute or visible-text
+  // match. Aaron confirmed (2026-05-22) that Claude.ai's composer
+  // shows a stop button while generating and a submit button when
+  // idle -- a binary, deterministic state signal that the previous
+  // text-growth heuristics couldn't match.
+  function findGenericStopButton(root) {
+    root = root || document;
+    const buttons = root.querySelectorAll("button");
+    for (const b of buttons) {
+      // aria-label / data-testid / title with "stop" in it.
+      for (const attr of ["aria-label", "data-testid", "title"]) {
+        const v = (b.getAttribute(attr) || "").toLowerCase();
+        if (v && /\bstop\b/.test(v)) return b;
+      }
+      // Visible button text exactly "Stop" or starts with "Stop ".
+      const text = (b.innerText || b.textContent || "").trim().toLowerCase();
+      if (text === "stop" || /^stop\b/.test(text)) return b;
+    }
+    return null;
+  }
+
+  // Wait for the response to complete. Primary signal: the stop
+  // button toggles in/out as Claude generates/finishes. Fallback: if
+  // we never see a stop button at all (selectors / attribute names
+  // have drifted), use the text-growth heuristic with stricter gates.
   //
-  // Gating: settle requires ALL of:
-  //   * total growth >= minGrowthChars (filters out trivial UI noise)
-  //   * growth events recorded in >= minGrowthEvents distinct polls
-  //     (one burst = 1 event; streaming = many events)
-  //   * span between first and last growth event >= minGrowthSpanMs
-  //     (a burst-then-pause looks like 1 event spanning 0ms)
-  //   * no growth for settleMs after the last event
+  // Returns {elapsedMs, growthChars, growthEvents, growthSpanMs,
+  //          signal, sawStopButton} on success; null on timeout.
   //
-  // Resolves with {elapsedMs, growthChars, growthEvents, growthSpanMs}
-  // on settle, null on timeout. onTick(elapsedMs, growthChars,
-  // growthEvents) fires every poll for heartbeat status messages
-  // (keeps the MV3 service worker awake).
+  // ``signal`` describes which path resolved -- helps future
+  // diagnostics distinguish stop-button-toggle from text-growth
+  // fallback.
   function waitForResponseStreaming(opts = {}) {
     return new Promise((resolve) => {
-      const settleMs = opts.settleMs || 3000;
+      const settleMs = opts.settleMs || 2000;
+      const minStreamingDurationMs = opts.minStreamingDurationMs || 1500;
+      // Text-growth fallback gates -- only consulted when the stop
+      // button is never observed during the whole wait.
       const minGrowthChars = opts.minGrowthChars || 200;
       const minGrowthEvents = opts.minGrowthEvents || 3;
-      const minGrowthSpanMs = opts.minGrowthSpanMs || 2000;
+      const minGrowthSpanMs = opts.minGrowthSpanMs || 3000;
+      const fallbackSettleMs = opts.fallbackSettleMs || 5000;
       const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
-      const pollMs = opts.pollMs || 350;
+      const pollMs = opts.pollMs || 300;
       const onTick = opts.onTick || (() => {});
 
       const startLen = (document.body.innerText || "").length;
       const started = Date.now();
       let lastLen = startLen;
-      const growthEventTimes = []; // ms timestamps of polls that saw cur > lastLen
+      const growthEventTimes = [];
+
+      // Stop-button state machine.
+      let stopButtonFirstSeenAt = null;
+      let stopButtonGoneAt = null;
+      let stopButtonGoneStreakStart = null;
 
       const tick = () => {
         const now = Date.now();
         const elapsed = now - started;
+
+        // Text growth tracking (used both for diagnostics + fallback).
         const cur = (document.body.innerText || "").length;
         const growth = cur - startLen;
         if (cur > lastLen) {
           growthEventTimes.push(now);
           lastLen = cur;
         }
-        onTick(elapsed, growth, growthEventTimes.length);
+
+        // Stop button state machine.
+        const stop = findGenericStopButton();
+        if (stop) {
+          if (stopButtonFirstSeenAt === null) {
+            stopButtonFirstSeenAt = now;
+          }
+          stopButtonGoneStreakStart = null;
+          stopButtonGoneAt = null;
+        } else if (stopButtonFirstSeenAt !== null) {
+          // We've seen the stop button before; now it's missing.
+          // Track how long it's been gone -- transient disappearances
+          // during streaming are tolerated; we require a sustained
+          // absence to declare done.
+          if (stopButtonGoneStreakStart === null) {
+            stopButtonGoneStreakStart = now;
+          }
+          stopButtonGoneAt = now;
+        }
+
+        onTick(
+          elapsed,
+          growth,
+          growthEventTimes.length,
+          !!stop,
+          stopButtonFirstSeenAt !== null,
+        );
+
         if (elapsed > timeoutMs) {
           resolve(null);
           return;
         }
+
+        // Primary path: stop button appeared (Claude started) AND has
+        // been gone for >= settleMs (Claude done).
         if (
+          stopButtonFirstSeenAt !== null &&
+          stopButtonGoneStreakStart !== null
+        ) {
+          const goneFor = now - stopButtonGoneStreakStart;
+          const streamedFor = stopButtonGoneStreakStart - stopButtonFirstSeenAt;
+          if (goneFor >= settleMs && streamedFor >= minStreamingDurationMs) {
+            resolve({
+              elapsedMs: elapsed,
+              growthChars: growth,
+              growthEvents: growthEventTimes.length,
+              growthSpanMs:
+                growthEventTimes.length > 1
+                  ? growthEventTimes[growthEventTimes.length - 1] -
+                    growthEventTimes[0]
+                  : 0,
+              signal: `stop-button (streamed ${streamedFor}ms, gone ${goneFor}ms)`,
+              sawStopButton: true,
+            });
+            return;
+          }
+        }
+
+        // Fallback: stop button never seen anywhere on the page even
+        // 8 seconds in -- the selector heuristic isn't matching this
+        // Claude UI version. Fall back to text-growth-based settle
+        // with much stricter gates (5s settle, 200 chars, 3+ events
+        // spanning 3+ seconds).
+        if (
+          stopButtonFirstSeenAt === null &&
+          elapsed > 8000 &&
           growth >= minGrowthChars &&
           growthEventTimes.length >= minGrowthEvents
         ) {
           const span =
-            growthEventTimes[growthEventTimes.length - 1] - growthEventTimes[0];
+            growthEventTimes[growthEventTimes.length - 1] -
+            growthEventTimes[0];
           const sinceLast =
             now - growthEventTimes[growthEventTimes.length - 1];
-          if (span >= minGrowthSpanMs && sinceLast >= settleMs) {
+          if (span >= minGrowthSpanMs && sinceLast >= fallbackSettleMs) {
             resolve({
               elapsedMs: elapsed,
               growthChars: growth,
               growthEvents: growthEventTimes.length,
               growthSpanMs: span,
+              signal: `text-growth fallback (no stop button found)`,
+              sawStopButton: false,
             });
             return;
           }
         }
+
         setTimeout(tick, pollMs);
       };
       tick();
@@ -340,6 +428,7 @@
     waitForSelector,
     waitForStableFalse,
     waitForResponseStreaming,
+    findGenericStopButton,
     pasteIntoComposer,
   };
 })();

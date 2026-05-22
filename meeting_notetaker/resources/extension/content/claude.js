@@ -137,16 +137,21 @@
   }
   function done(markdown) {
     console.log("mn-synth: done; length=", markdown.length);
+    // Diagnostic: a status message right before sending RESULT. If
+    // the app sees this STATUS but not the RESULT, the failure is
+    // between background-postMessage and the app's bridge -- not in
+    // the content script. The status carries the byte count so we
+    // can verify the size end-to-end.
+    status(STATUS.DONE, `pre-send: ${markdown.length} chars about to send`);
+
     if (!connection) {
-      // Worker died during the wait. As a last-ditch retry, open a
-      // fresh port and send. This works because the SYNTHESIZE_START
-      // listener in background.js keeps `inflight` keyed by request
-      // id; even a new worker incarnation can route the late result.
+      console.warn("mn-synth: connection null, opening late-result port");
       try {
         const port = chrome.runtime.connect({
           name: `mn-synth-late-${_requestId}`,
         });
         port.postMessage({ type: "RESULT", target: "claude", markdown });
+        console.log("mn-synth: late RESULT posted");
       } catch (e) {
         console.error("mn-synth: late-result send failed", e);
       }
@@ -154,8 +159,19 @@
     }
     try {
       connection.postMessage({ type: "RESULT", target: "claude", markdown });
+      console.log("mn-synth: RESULT posted on primary port");
     } catch (e) {
       console.error("mn-synth: postMessage RESULT failed", e);
+      // Fall back to a late port if the primary postMessage threw.
+      try {
+        const port = chrome.runtime.connect({
+          name: `mn-synth-late-${_requestId}`,
+        });
+        port.postMessage({ type: "RESULT", target: "claude", markdown });
+        console.log("mn-synth: RESULT fallback posted via late port");
+      } catch (e2) {
+        console.error("mn-synth: fallback late-result send also failed", e2);
+      }
     }
   }
   function fail(code, detail = "") {
@@ -230,40 +246,37 @@
     }
     status(STATUS.AWAITING_RESPONSE);
 
-    // Wait for the response to start streaming AND then stop. We
-    // track visible-text growth on document.body, filtering out the
-    // one-shot user-bubble-rendering burst by requiring multiple
-    // growth events spread over time.
+    // Wait for the response to complete. v5 detector watches Claude's
+    // composer-area stop-button toggle (Aaron's 2026-05-22 obs:
+    // "the prompt textbox changes when it's thinking to a stop
+    // button and disappears to a submit when done"). Binary,
+    // deterministic, attribute-agnostic via inner-text + aria-label
+    // regex match. Falls back to text-growth heuristic if the stop
+    // button never appears (selectors drifted).
     //
-    // History of failures this is guarding against:
-    //   * v1 used selector-based stop-button detection -- failed when
-    //     Claude's DOM didn't match the hard-coded aria-labels.
-    //   * v2 used MutationObserver DOM-settle -- fired during Claude's
-    //     "thinking" pause when no mutations happened, scraped a
-    //     22-char placeholder.
-    //   * v3 used simple text-length-growth -- fired on the user
-    //     message bubble's 58-char render burst, scraped a 40-char
-    //     pre-stream element.
-    //   * v4 (this): require multiple growth events spanning multiple
-    //     seconds before settle is even possible.
-    //
-    // Heartbeat status every 5s keeps the MV3 port active during the
-    // thinking phase. Logged with growth + event counts so future
-    // failures are diagnosable from the console.
+    // Heartbeat status every 4s shows growth + event count + stop
+    // button state so future failures are diagnosable at a glance.
     let lastHeartbeat = Date.now();
-    const HEARTBEAT_MS = 5000;
+    const HEARTBEAT_MS = 4000;
     const result = await waitForResponseStreaming({
-      settleMs: 3000,
+      settleMs: 2000,
+      minStreamingDurationMs: 1500,
       minGrowthChars: 200,
       minGrowthEvents: 3,
-      minGrowthSpanMs: 2000,
+      minGrowthSpanMs: 3000,
+      fallbackSettleMs: 5000,
       timeoutMs: 10 * 60 * 1000,
-      onTick: (ms, growth, events) => {
+      onTick: (ms, growth, events, stopVisible, stopEverSeen) => {
         if (Date.now() - lastHeartbeat >= HEARTBEAT_MS) {
           lastHeartbeat = Date.now();
+          const stopFlag = stopVisible
+            ? "STREAMING"
+            : stopEverSeen
+              ? "POST-STREAM"
+              : "PRE-STREAM";
           status(
             STATUS.RESPONSE_STREAMING,
-            `${Math.floor(ms / 1000)}s, +${growth} chars, ${events} events`,
+            `${Math.floor(ms / 1000)}s ${stopFlag} +${growth}chars ${events}events`,
           );
         }
       },
@@ -274,9 +287,8 @@
     }
     status(
       STATUS.RESPONSE_STREAMING,
-      `settled after ${Math.floor(result.elapsedMs / 1000)}s, ` +
-      `+${result.growthChars} chars, ${result.growthEvents} events, ` +
-      `${result.growthSpanMs}ms span`,
+      `settled (${result.signal}) after ${Math.floor(result.elapsedMs / 1000)}s, ` +
+      `+${result.growthChars} chars, ${result.growthEvents} events`,
     );
 
     // If a stop button is still visible (e.g. the page hasn't yet

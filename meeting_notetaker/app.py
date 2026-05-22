@@ -209,6 +209,12 @@ class MainApp(QObject):
     def _dispatch_bridge_message(self, msg: dict) -> None:
         msg_type = msg.get("type", "")
         request_id = msg.get("request_id", "")
+        log.info(
+            "bridge <- %s rid=%s inflight=%s",
+            msg_type,
+            request_id,
+            list(self._inflight_syntheses.keys()),
+        )
         if msg_type == "status":
             session_id = self._inflight_syntheses.get(request_id, "")
             if session_id:
@@ -219,12 +225,34 @@ class MainApp(QObject):
                     self.window.status(label, timeout_ms=4000)
             return
         if msg_type == "result":
-            session_id = self._inflight_syntheses.pop(request_id, "")
-            if not session_id:
-                log.warning("result for unknown request %s", request_id)
-                return
             markdown = msg.get("markdown", "")
             target = msg.get("target", "")
+            log.info(
+                "bridge result rid=%s len=%d target=%s",
+                request_id,
+                len(markdown),
+                target,
+            )
+            session_id = self._inflight_syntheses.pop(request_id, "")
+            if not session_id:
+                log.warning(
+                    "result for unknown request %s (inflight keys=%s); "
+                    "dropping %d-char synthesis",
+                    request_id,
+                    list(self._inflight_syntheses.keys()),
+                    len(markdown),
+                )
+                # Surface the orphaned result to the user instead of
+                # dropping silently -- they at least see what came
+                # back even if we can't route it to a session. Helps
+                # debug the v0.6.3 result-routing path.
+                self.window.status(
+                    f"Synthesis returned {len(markdown)} chars but "
+                    "the originating session was unrecognized -- "
+                    "see the log.",
+                    timeout_ms=10000,
+                )
+                return
             self._handle_synthesis_result(session_id, markdown, target)
             return
         if msg_type == "error":
