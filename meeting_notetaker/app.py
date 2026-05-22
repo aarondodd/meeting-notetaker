@@ -358,7 +358,31 @@ class MainApp(QObject):
         # showing the error dialog.
         if session_id:
             self.window.session_view.set_synthesis_in_progress(session_id, False)
-        # Map known codes to friendlier messages.
+        # The clipboard-unavailable path is the most common first-run
+        # failure (Chrome shows a per-site permission prompt on the
+        # initial programmatic clipboard read and the user has to
+        # click Allow). Treat it as informational rather than a scary
+        # "Warning" dialog -- the fix is one click and the response
+        # is still visible in the browser tab.
+        if code == automation_messages.ERR_CLIPBOARD_UNAVAILABLE:
+            QMessageBox.information(
+                self.window,
+                "Clipboard permission needed",
+                "Couldn't read Claude's response back from your browser.\n\n"
+                "Chrome requires a one-time permission grant before an "
+                "extension can read the clipboard for a given site. To "
+                "fix this:\n\n"
+                "1. Switch to your Claude.ai tab.\n"
+                "2. Click Claude's own Copy button on the response.\n"
+                "3. When Chrome asks 'Allow claude.ai to see text and "
+                "images copied to the clipboard?', click Allow.\n"
+                "4. Return here and click Send to Claude.ai again.\n\n"
+                "Your response is still in the Claude tab -- nothing is lost. "
+                "You can also copy + paste it manually for this one synthesis "
+                "by switching automation off in Settings.",
+            )
+            return
+        # Map other known codes to friendlier messages.
         friendly = {
             automation_messages.ERR_NO_TAB:
                 "Couldn't open a browser tab. Is Chrome running?",

@@ -104,6 +104,11 @@ ERR_NOT_LOGGED_IN = "not_logged_in"
 ERR_PASTE_FAILED = "paste_failed"
 ERR_TIMEOUT = "timeout"
 ERR_INTERSTITIAL_TIMEOUT = "interstitial_timeout"
+# Clipboard read failed -- typically because the user denied (or
+# never saw) the per-origin clipboard permission prompt. We prefer
+# a hard error here over silently falling back to a DOM-walking
+# converter that produces garbage on non-trivial responses.
+ERR_CLIPBOARD_UNAVAILABLE = "clipboard_unavailable"
 ERR_UNKNOWN = "unknown"
 
 
@@ -113,6 +118,7 @@ VALID_ERROR_CODES = frozenset({
     ERR_PASTE_FAILED,
     ERR_TIMEOUT,
     ERR_INTERSTITIAL_TIMEOUT,
+    ERR_CLIPBOARD_UNAVAILABLE,
     ERR_UNKNOWN,
 })
 

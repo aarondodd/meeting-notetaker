@@ -128,13 +128,19 @@ class AutomationInstallDialog(QDialog):
         self._open_chrome_btn.setEnabled(False)
         self._step2_box.add_action(self._open_chrome_btn)
         self._step2_help = QTextBrowser(self._step2_box)
-        self._step2_help.setMaximumHeight(110)
+        self._step2_help.setMaximumHeight(180)
         self._step2_help.setHtml(
             "<div style='font: 12px sans-serif; color: #4b5563;'>"
             "1. In Chrome, navigate to <code>chrome://extensions</code>.<br>"
             "2. Toggle <b>Developer mode</b> on (top right).<br>"
             "3. Click <b>Load unpacked</b>.<br>"
-            "4. Pick the folder we opened for you in step 1, then come back here."
+            "4. Pick the folder we opened for you in step 1, then come back here.<br><br>"
+            "<b>One-time clipboard permission:</b> on your first Send, "
+            "Chrome will ask <i>\"Allow claude.ai to see text and images "
+            "copied to the clipboard?\"</i> -- click <b>Allow</b>. The "
+            "extension uses Claude's own Copy button to read the response "
+            "back, which requires this permission. If you don't grant it, "
+            "the synthesis will fail with a clear error (no garbage data)."
             "</div>"
         )
         self._step2_box.add_widget(self._step2_help)

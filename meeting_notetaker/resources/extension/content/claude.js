@@ -309,72 +309,60 @@
       return;
     }
 
-    // Extract the response as markdown. Three strategies in order:
-    //
-    //   1. Click Claude's own Copy button + read the clipboard.
-    //      Claude knows how to serialize its response to markdown
-    //      (that's exactly what the user gets clicking Copy manually).
-    //      Requires the clipboardRead permission in manifest.json.
-    //
-    //   2. Walk the rendered DOM with htmlToMarkdown(). Converts
-    //      headings/lists/code-fences/etc back to markdown markup.
-    //      Less precise than Claude's own serializer but doesn't
-    //      depend on locating a Copy button or clipboard access.
-    //
-    //   3. Last-ditch: innerText of the message element. Loses all
-    //      block-level structure but at least returns *something* so
-    //      the user can see what Claude said.
-    //
-    // Each strategy is wrapped in try/catch + logs to console so
-    // future failures can be diagnosed from the Claude tab DevTools.
-    let markdown = "";
-    let extractionMethod = "";
-
-    // Strategy 1: copy button + clipboard.
+    // Extract the response as markdown by clicking Claude's own Copy
+    // button and reading the clipboard. Claude knows how to serialize
+    // its response (exactly what the user gets clicking Copy manually);
+    // this is the only path that produces accurate markdown. The
+    // previous DOM-walking fallback produced mangled output when
+    // clipboard read failed -- duplicated list contents because the
+    // walker's <li> traversal captured the parent list's children
+    // instead of the li's own. Errors are strictly better than
+    // garbage; we fail loudly so the user knows what to fix.
     const copyBtn = findCopyButtonForMessage(messageEl);
-    if (copyBtn) {
-      try {
-        copyBtn.click();
-        // Give Claude a tick to populate the clipboard.
-        await new Promise((r) => setTimeout(r, 250));
-        const clip = await navigator.clipboard.readText();
-        if (clip && clip.trim().length >= 50) {
-          markdown = clip.trim();
-          extractionMethod = "claude-copy-button";
-        } else {
-          console.warn("mn-synth: clipboard returned too little", clip ? clip.length : 0);
-        }
-      } catch (e) {
-        console.warn("mn-synth: copy-button + clipboard read failed", e);
-      }
-    } else {
-      console.warn("mn-synth: no Copy button found near assistant message");
-    }
-
-    // Strategy 2: HTML -> markdown converter.
-    if (!markdown) {
-      try {
-        const md = htmlToMarkdown(messageEl);
-        if (md && md.trim().length >= 20) {
-          markdown = md;
-          extractionMethod = "html-to-markdown";
-        }
-      } catch (e) {
-        console.warn("mn-synth: htmlToMarkdown failed", e);
-      }
-    }
-
-    // Strategy 3: innerText.
-    if (!markdown) {
-      markdown = (messageEl.innerText || messageEl.textContent || "").trim();
-      extractionMethod = "inner-text";
-    }
-
-    if (!markdown) {
-      fail("paste_failed", "Found the assistant container but its text was empty.");
+    if (!copyBtn) {
+      fail(
+        "clipboard_unavailable",
+        "Couldn't find a Copy button on Claude's response. The page " +
+        "structure may have changed; please report this. As a workaround " +
+        "for this synthesis, copy + paste manually from the Claude tab.",
+      );
       return;
     }
-    status(STATUS.DONE, `${markdown.length} chars via ${extractionMethod}`);
+
+    let clip = "";
+    let clipboardErrorDetail = "";
+    try {
+      copyBtn.click();
+      // Give Claude a tick to populate the clipboard.
+      await new Promise((r) => setTimeout(r, 250));
+      clip = await navigator.clipboard.readText();
+    } catch (e) {
+      // Most likely cause: per-origin clipboard permission not
+      // granted. Could also be a non-secure context (shouldn't happen
+      // on claude.ai) or a transient focus issue.
+      clipboardErrorDetail = String(e);
+      console.warn("mn-synth: clipboard read failed", e);
+    }
+
+    if (!clip || clip.trim().length < 20) {
+      const sizeNote =
+        clip != null
+          ? `clipboard returned ${clip.length} chars (expected hundreds)`
+          : "clipboard read threw an exception";
+      fail(
+        "clipboard_unavailable",
+        "Couldn't read Claude's response from the clipboard. The most " +
+        "common cause is that Chrome's per-site clipboard permission " +
+        "hasn't been granted to claude.ai yet. Fix: click Claude's own " +
+        "Copy button once manually -- Chrome will ask you to allow " +
+        "clipboard access. Click Allow, then try Send again. " +
+        `Detail: ${sizeNote}${clipboardErrorDetail ? "; " + clipboardErrorDetail : ""}`,
+      );
+      return;
+    }
+
+    const markdown = clip.trim();
+    status(STATUS.DONE, `${markdown.length} chars via claude-copy-button`);
     done(markdown);
   }
 

@@ -557,8 +557,17 @@
           );
           items.forEach((li, idx) => {
             const marker = tag === "ol" ? `${idx + 1}. ` : "- ";
-            // Inline content first, then nested lists indented.
-            const inner = captureInner({ ...listCtx, inList: tag }).trim();
+            // Walk THIS li's children, not the parent list's. The
+            // outer captureInner() iterates `children` which is bound
+            // to the <ul>/<ol>'s childNodes -- using it here would
+            // emit every <li> for every iteration and produce
+            // N-times-duplicated output (Aaron's 2026-05-22 repro
+            // hit this with 6 decisions rendered 6 times each).
+            const saved = out.length;
+            for (const c of li.childNodes) {
+              walk(c, { ...listCtx, inList: tag });
+            }
+            const inner = out.splice(saved).join("").trim();
             // Naive: prefix each non-empty line with the marker on
             // the first line; subsequent lines (e.g. wrapped text)
             // get a 2-space indent.
