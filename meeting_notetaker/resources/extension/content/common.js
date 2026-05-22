@@ -445,45 +445,87 @@
     return false;
   }
 
-  // Find a "Copy" button scoped to (or near) the given message element.
-  // Claude's response gets a reaction-bar row of small icon buttons
-  // beneath the message once generation is complete -- one of them is
-  // labeled "Copy". Clicking it triggers Claude's own markdown
-  // serializer, which is what we want; reading innerText off the
-  // rendered HTML loses block-level structure (headings, lists, code
-  // fences, etc.).
+  // Find Claude's response-level Copy button. Claude renders two
+  // kinds of Copy affordances:
   //
-  // We search starting from the message element and walking up to
-  // find a containing row, then look for any button whose aria-label,
-  // title, or text starts with "copy". Falls back to "the last Copy
-  // button on the page" if the scoped search misses.
+  //   1. The response-level Copy button in the reaction bar BELOW
+  //      the message. Clicking this copies the full response as
+  //      markdown -- this is what we want.
+  //
+  //   2. Inline "Copy" buttons inside <pre><code>...</code></pre>
+  //      blocks for each code fence in the response. Clicking these
+  //      copies just that code snippet (10-200 chars) -- NOT what we
+  //      want. Synthesis output typically contains code fences, so
+  //      these inline buttons frequently appear in the DOM before
+  //      the response-level button.
+  //
+  // Aaron's 2026-05-22 repro: the original regex matched anything
+  // starting with "Copy" (so "Copy", "Copy code", "Copy link" all
+  // qualified). The inline "Copy code" button appeared first in DOM
+  // order and got clicked instead of the response Copy -- clipboard
+  // came back with a short snippet, failed the >=20 char gate,
+  // surfaced the spurious "permission needed" dialog.
+  //
+  // Fix: exact label match for "copy" / "copy message" / "copy
+  // response" only; reject buttons whose ancestor chain contains
+  // <pre> or <code> (code-fence Copy buttons).
   function findCopyButtonForMessage(messageEl) {
-    const looksLikeCopy = (btn) => {
+    const looksLikeResponseCopy = (btn) => {
+      // Exact-match labels only -- "Copy code" / "Copy link" /
+      // "Copy URL" / "Copy markdown" (anything beyond the bare
+      // word) is excluded.
+      const RESPONSE_LABELS = new Set([
+        "copy",
+        "copy message",
+        "copy response",
+      ]);
       for (const attr of ["aria-label", "data-testid", "title"]) {
-        const v = (btn.getAttribute(attr) || "").toLowerCase();
-        // Match exact "copy" or "copy <something>" but not "copied"
-        // (which the post-click state often shows briefly).
-        if (v && /^copy(\s|$|[^a-z])/i.test(v)) return true;
+        const v = (btn.getAttribute(attr) || "").toLowerCase().trim();
+        if (RESPONSE_LABELS.has(v)) return true;
       }
       const text = (btn.innerText || btn.textContent || "").trim().toLowerCase();
-      if (text === "copy" || /^copy\b/.test(text)) return true;
+      if (text === "copy") return true;
       return false;
     };
 
-    // Walk up from the message to find the row container, then search
-    // its descendants. Limit depth so we don't match an unrelated
-    // Copy button elsewhere on the page.
+    const isInsideCodeBlock = (btn) => {
+      let p = btn.parentElement;
+      while (p && p !== document.body) {
+        const tag = p.tagName.toLowerCase();
+        if (tag === "pre" || tag === "code") return true;
+        p = p.parentElement;
+      }
+      return false;
+    };
+
+    const accept = (btn) => looksLikeResponseCopy(btn) && !isInsideCodeBlock(btn);
+
+    // Strategy 1: search sibling nodes AFTER the message element.
+    // Claude renders the reaction bar as a sibling of the message
+    // bubble (an action row beneath it); searching siblings first
+    // catches that case directly.
+    let sibling = messageEl.nextElementSibling;
+    for (let i = 0; i < 6 && sibling; i += 1) {
+      for (const b of sibling.querySelectorAll("button")) {
+        if (accept(b)) return b;
+      }
+      sibling = sibling.nextElementSibling;
+    }
+
+    // Strategy 2: walk up from the message scope looking for the
+    // reaction bar. The bar might be a parent's child rather than a
+    // direct sibling, depending on the DOM layout.
     let scope = messageEl;
     for (let depth = 0; depth < 6 && scope; depth += 1) {
-      const candidates = scope.querySelectorAll("button");
-      for (const b of candidates) {
-        if (looksLikeCopy(b)) return b;
+      for (const b of scope.querySelectorAll("button")) {
+        if (accept(b)) return b;
       }
       scope = scope.parentElement;
     }
-    // Last-ditch: scan the whole page for Copy buttons; pick the last
-    // (most recent assistant message's reaction bar).
-    const all = Array.from(document.querySelectorAll("button")).filter(looksLikeCopy);
+
+    // Strategy 3 (last-ditch): scan the whole page for response-Copy
+    // buttons and pick the last (most recent assistant turn).
+    const all = Array.from(document.querySelectorAll("button")).filter(accept);
     if (all.length > 0) return all[all.length - 1];
     return null;
   }

@@ -334,52 +334,86 @@
 
     // Extract the response as markdown by clicking Claude's own Copy
     // button and reading the clipboard. Claude knows how to serialize
-    // its response (exactly what the user gets clicking Copy manually);
-    // this is the only path that produces accurate markdown. The
-    // previous DOM-walking fallback produced mangled output when
-    // clipboard read failed -- duplicated list contents because the
-    // walker's <li> traversal captured the parent list's children
-    // instead of the li's own. Errors are strictly better than
-    // garbage; we fail loudly so the user knows what to fix.
+    // its response correctly (what the user gets clicking Copy
+    // manually); innerText off the rendered HTML loses block-level
+    // structure (lists, headings, code fences) which we want.
     const copyBtn = findCopyButtonForMessage(messageEl);
     if (!copyBtn) {
       fail(
         "clipboard_unavailable",
-        "Couldn't find a Copy button on Claude's response. The page " +
-        "structure may have changed; please report this. As a workaround " +
-        "for this synthesis, copy + paste manually from the Claude tab.",
+        "Couldn't find Claude's response Copy button. The page " +
+        "structure may have changed; please report this with a " +
+        "screenshot of the Claude tab. As a workaround for this " +
+        "synthesis, switch automation off in Settings and copy + " +
+        "paste manually.",
       );
       return;
     }
 
+    // Log which button we picked + a few of its attributes so the
+    // Claude tab DevTools console shows whether we hit the response
+    // Copy or an inline code-block Copy (the Aaron 2026-05-22 bug).
+    console.log(
+      "mn-synth: copyBtn picked",
+      {
+        ariaLabel: copyBtn.getAttribute("aria-label"),
+        testId: copyBtn.getAttribute("data-testid"),
+        title: copyBtn.getAttribute("title"),
+        text: (copyBtn.innerText || copyBtn.textContent || "").trim().slice(0, 40),
+      },
+    );
+
+    copyBtn.click();
+
+    // Retry the clipboard read for up to a second. Claude's copy
+    // writes to clipboard asynchronously; a single 250ms wait isn't
+    // always enough on slower machines or when the UI is still
+    // updating. Each retry takes the longest text seen -- if a
+    // stale clipboard value is replaced with the response text
+    // partway through, we'll catch the longer one.
     let clip = "";
     let clipboardErrorDetail = "";
-    try {
-      copyBtn.click();
-      // Give Claude a tick to populate the clipboard.
-      await new Promise((r) => setTimeout(r, 250));
-      clip = await navigator.clipboard.readText();
-    } catch (e) {
-      // Most likely cause: per-origin clipboard permission not
-      // granted. Could also be a non-secure context (shouldn't happen
-      // on claude.ai) or a transient focus issue.
-      clipboardErrorDetail = String(e);
-      console.warn("mn-synth: clipboard read failed", e);
+    const MIN_USEFUL_CHARS = 50;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        const cur = await navigator.clipboard.readText();
+        if (cur && cur.trim().length > clip.trim().length) {
+          clip = cur;
+        }
+        if (clip.trim().length >= MIN_USEFUL_CHARS) break;
+      } catch (e) {
+        clipboardErrorDetail = String(e);
+        // Don't break -- permission may be granted on a later attempt
+        // (rare but cheap to retry).
+      }
     }
+    console.log(
+      "mn-synth: clipboard read result",
+      {
+        chars: clip ? clip.length : 0,
+        preview: clip ? clip.slice(0, 60).replace(/\n/g, "\\n") : "",
+        error: clipboardErrorDetail,
+      },
+    );
 
-    if (!clip || clip.trim().length < 20) {
+    if (!clip || clip.trim().length < MIN_USEFUL_CHARS) {
       const sizeNote =
-        clip != null
-          ? `clipboard returned ${clip.length} chars (expected hundreds)`
-          : "clipboard read threw an exception";
+        clipboardErrorDetail
+          ? `clipboard read threw: ${clipboardErrorDetail}`
+          : `clipboard returned ${clip.length} chars (expected hundreds; got "${clip.slice(0, 30)}...")`;
       fail(
         "clipboard_unavailable",
-        "Couldn't read Claude's response from the clipboard. The most " +
-        "common cause is that Chrome's per-site clipboard permission " +
-        "hasn't been granted to claude.ai yet. Fix: click Claude's own " +
-        "Copy button once manually -- Chrome will ask you to allow " +
-        "clipboard access. Click Allow, then try Send again. " +
-        `Detail: ${sizeNote}${clipboardErrorDetail ? "; " + clipboardErrorDetail : ""}`,
+        "Couldn't read Claude's full response from the clipboard.\n\n" +
+        "If this is the first time on this Claude.ai session, Chrome " +
+        "may need to grant per-site clipboard permission: click " +
+        "Claude's own Copy button once manually -- Chrome will ask " +
+        "you to allow it.\n\n" +
+        "If permission was already granted, the extension may be " +
+        "clicking the wrong button (an inline code-block Copy instead " +
+        "of the response Copy). Check the Claude tab DevTools " +
+        "console for the 'mn-synth: copyBtn picked' line to see " +
+        `which button was chosen.\n\nDetail: ${sizeNote}`,
       );
       return;
     }
