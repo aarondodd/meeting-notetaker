@@ -419,6 +419,226 @@
     return false;
   }
 
+  // Find a "Copy" button scoped to (or near) the given message element.
+  // Claude's response gets a reaction-bar row of small icon buttons
+  // beneath the message once generation is complete -- one of them is
+  // labeled "Copy". Clicking it triggers Claude's own markdown
+  // serializer, which is what we want; reading innerText off the
+  // rendered HTML loses block-level structure (headings, lists, code
+  // fences, etc.).
+  //
+  // We search starting from the message element and walking up to
+  // find a containing row, then look for any button whose aria-label,
+  // title, or text starts with "copy". Falls back to "the last Copy
+  // button on the page" if the scoped search misses.
+  function findCopyButtonForMessage(messageEl) {
+    const looksLikeCopy = (btn) => {
+      for (const attr of ["aria-label", "data-testid", "title"]) {
+        const v = (btn.getAttribute(attr) || "").toLowerCase();
+        // Match exact "copy" or "copy <something>" but not "copied"
+        // (which the post-click state often shows briefly).
+        if (v && /^copy(\s|$|[^a-z])/i.test(v)) return true;
+      }
+      const text = (btn.innerText || btn.textContent || "").trim().toLowerCase();
+      if (text === "copy" || /^copy\b/.test(text)) return true;
+      return false;
+    };
+
+    // Walk up from the message to find the row container, then search
+    // its descendants. Limit depth so we don't match an unrelated
+    // Copy button elsewhere on the page.
+    let scope = messageEl;
+    for (let depth = 0; depth < 6 && scope; depth += 1) {
+      const candidates = scope.querySelectorAll("button");
+      for (const b of candidates) {
+        if (looksLikeCopy(b)) return b;
+      }
+      scope = scope.parentElement;
+    }
+    // Last-ditch: scan the whole page for Copy buttons; pick the last
+    // (most recent assistant message's reaction bar).
+    const all = Array.from(document.querySelectorAll("button")).filter(looksLikeCopy);
+    if (all.length > 0) return all[all.length - 1];
+    return null;
+  }
+
+  // Convert a rendered DOM element to a Markdown approximation.
+  // Used as a fallback when Claude's copy button can't be located /
+  // clicked / read from the clipboard. Covers the structures we
+  // expect in meeting-synthesis output: headings, paragraphs, lists,
+  // code blocks, inline code, bold/italic, blockquotes, links, HR,
+  // basic tables. Unknown elements emit their inner text.
+  function htmlToMarkdown(root) {
+    if (!root) return "";
+
+    const out = [];
+    const walk = (node, listCtx) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        // Collapse whitespace inside text nodes but preserve a single
+        // space if the original had any.
+        out.push(node.textContent);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        return;
+      }
+      const tag = node.tagName.toLowerCase();
+      const children = node.childNodes;
+
+      const emitChildren = (ctx) => {
+        for (const c of children) walk(c, ctx);
+      };
+      const captureInner = (ctx) => {
+        const saved = out.length;
+        emitChildren(ctx);
+        const text = out.splice(saved).join("");
+        return text;
+      };
+
+      switch (tag) {
+        case "p":
+          emitChildren(listCtx);
+          out.push("\n\n");
+          return;
+        case "br":
+          out.push("\n");
+          return;
+        case "strong":
+        case "b": {
+          const inner = captureInner(listCtx).trim();
+          if (inner) out.push("**" + inner + "**");
+          return;
+        }
+        case "em":
+        case "i": {
+          const inner = captureInner(listCtx).trim();
+          if (inner) out.push("*" + inner + "*");
+          return;
+        }
+        case "code": {
+          // Inline code, unless we're inside a <pre> (handled below).
+          if (node.parentElement && node.parentElement.tagName.toLowerCase() === "pre") {
+            emitChildren(listCtx);
+          } else {
+            const inner = captureInner(listCtx);
+            out.push("`" + inner + "`");
+          }
+          return;
+        }
+        case "pre": {
+          // Fenced code block. Try to detect language from a child
+          // <code class="language-foo"> hint.
+          let lang = "";
+          const codeChild = node.querySelector("code");
+          if (codeChild && codeChild.className) {
+            const m = codeChild.className.match(/language-(\w+)/);
+            if (m) lang = m[1];
+          }
+          const text = (codeChild ? codeChild.textContent : node.textContent) || "";
+          out.push("\n```" + lang + "\n" + text.replace(/\n$/, "") + "\n```\n\n");
+          return;
+        }
+        case "h1":
+        case "h2":
+        case "h3":
+        case "h4":
+        case "h5":
+        case "h6": {
+          const level = parseInt(tag.slice(1), 10);
+          const inner = captureInner(listCtx).trim();
+          out.push("\n" + "#".repeat(level) + " " + inner + "\n\n");
+          return;
+        }
+        case "ul":
+        case "ol": {
+          out.push("\n");
+          const items = Array.from(node.children).filter(
+            (c) => c.tagName.toLowerCase() === "li",
+          );
+          items.forEach((li, idx) => {
+            const marker = tag === "ol" ? `${idx + 1}. ` : "- ";
+            // Inline content first, then nested lists indented.
+            const inner = captureInner({ ...listCtx, inList: tag }).trim();
+            // Naive: prefix each non-empty line with the marker on
+            // the first line; subsequent lines (e.g. wrapped text)
+            // get a 2-space indent.
+            const lines = inner.split("\n");
+            const first = lines.shift() || "";
+            out.push(marker + first + "\n");
+            for (const ln of lines) {
+              if (ln.trim()) out.push("  " + ln + "\n");
+            }
+          });
+          out.push("\n");
+          return;
+        }
+        case "li":
+          // Handled by parent ul/ol; emitting bare children covers
+          // edge cases where li appears outside a list (rare).
+          emitChildren(listCtx);
+          return;
+        case "blockquote": {
+          const inner = captureInner(listCtx).trim();
+          out.push("\n");
+          for (const ln of inner.split("\n")) {
+            out.push("> " + ln + "\n");
+          }
+          out.push("\n");
+          return;
+        }
+        case "hr":
+          out.push("\n---\n\n");
+          return;
+        case "a": {
+          const href = node.getAttribute("href") || "";
+          const inner = captureInner(listCtx);
+          if (href && inner && href !== inner) {
+            out.push("[" + inner + "](" + href + ")");
+          } else {
+            out.push(inner);
+          }
+          return;
+        }
+        case "table": {
+          out.push("\n" + tableToMarkdown(node) + "\n\n");
+          return;
+        }
+        case "script":
+        case "style":
+          // Ignore non-content elements.
+          return;
+        default:
+          emitChildren(listCtx);
+          return;
+      }
+    };
+
+    walk(root, {});
+    // Tidy: collapse 3+ blank lines down to 2.
+    return out.join("").replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  function tableToMarkdown(table) {
+    const rows = Array.from(table.querySelectorAll("tr"));
+    if (rows.length === 0) return table.innerText || "";
+    const cellsOf = (row) =>
+      Array.from(row.querySelectorAll("th, td")).map((c) =>
+        (c.innerText || c.textContent || "").trim().replace(/\|/g, "\\|"),
+      );
+    const lines = [];
+    const header = cellsOf(rows[0]);
+    if (header.length === 0) return table.innerText || "";
+    lines.push("| " + header.join(" | ") + " |");
+    lines.push("| " + header.map(() => "---").join(" | ") + " |");
+    for (let i = 1; i < rows.length; i += 1) {
+      const cells = cellsOf(rows[i]);
+      // Pad to header width.
+      while (cells.length < header.length) cells.push("");
+      lines.push("| " + cells.join(" | ") + " |");
+    }
+    return lines.join("\n");
+  }
+
   window.__mnSynth = {
     STATUS,
     looksLikeInterstitial,
@@ -429,6 +649,8 @@
     waitForStableFalse,
     waitForResponseStreaming,
     findGenericStopButton,
+    findCopyButtonForMessage,
+    htmlToMarkdown,
     pasteIntoComposer,
   };
 })();

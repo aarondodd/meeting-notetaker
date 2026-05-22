@@ -191,6 +191,45 @@ class TranscriptStore:
     def list_previous_notes(self) -> list[Path]:
         return sorted(self.session_dir.glob("notes-*.md"), reverse=True)
 
+    def restore_previous_notes(self, archive_path: Path) -> Optional[Path]:
+        """Replace notes.md with the contents of an archived version.
+
+        The current notes.md is archived first (same mechanism as
+        save_notes), so the operation is fully reversible. Raises
+        FileNotFoundError if the archive doesn't exist or isn't in
+        this session's directory.
+        """
+        archive_path = Path(archive_path)
+        if archive_path.parent != self.session_dir:
+            raise ValueError(
+                f"archive path {archive_path} is not in session dir "
+                f"{self.session_dir}"
+            )
+        if not archive_path.exists():
+            raise FileNotFoundError(str(archive_path))
+        body = archive_path.read_text(encoding="utf-8")
+        return self.save_notes(body, archive_existing=True)
+
+    def delete_previous_notes(self, archive_path: Path) -> None:
+        """Remove an archived notes-*.md file. Refuses to delete files
+        outside the session directory or the live notes.md itself.
+
+        Raises FileNotFoundError if the path doesn't exist; ValueError
+        if it points outside the session dir or at notes.md."""
+        archive_path = Path(archive_path)
+        if archive_path.parent != self.session_dir:
+            raise ValueError(
+                f"refusing to delete {archive_path}: not in {self.session_dir}"
+            )
+        if archive_path == self.notes_path:
+            raise ValueError("refusing to delete live notes.md via this API")
+        if not archive_path.name.startswith("notes-") or not archive_path.name.endswith(".md"):
+            raise ValueError(
+                f"refusing to delete {archive_path.name}: doesn't match "
+                "the notes-*.md archive pattern"
+            )
+        archive_path.unlink()
+
     # ---- metadata ----
     def write_metadata(self, meta: dict) -> None:
         self.metadata_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")

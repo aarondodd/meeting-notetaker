@@ -252,6 +252,12 @@ class MainApp(QObject):
                 label = self._format_status_event(event, detail)
                 if label:
                     self.window.status(label, timeout_ms=4000)
+                    # Mirror the status into the synthesis banner so
+                    # the user sees the same progress without having
+                    # to look at the bottom status bar.
+                    self.window.session_view.set_synthesis_in_progress(
+                        session_id, True, status_text=label,
+                    )
             return
         if msg_type == "result":
             markdown = msg.get("markdown", "")
@@ -309,6 +315,9 @@ class MainApp(QObject):
         return labels.get(event, "")
 
     def _handle_synthesis_result(self, session_id: str, markdown: str, target: str) -> None:
+        # Clear the in-progress indicator first so the banner is gone
+        # by the time any modal dialogs surface.
+        self.window.session_view.set_synthesis_in_progress(session_id, False)
         if not markdown.strip():
             QMessageBox.warning(
                 self.window,
@@ -345,6 +354,10 @@ class MainApp(QObject):
             self.window.status("Synthesis received.", timeout_ms=5000)
 
     def _handle_synthesis_error(self, session_id: str, code: str, detail: str) -> None:
+        # Clear the in-progress banner / re-enable Send before
+        # showing the error dialog.
+        if session_id:
+            self.window.session_view.set_synthesis_in_progress(session_id, False)
         # Map known codes to friendlier messages.
         friendly = {
             automation_messages.ERR_NO_TAB:
@@ -454,12 +467,23 @@ class MainApp(QObject):
         )
         if not self._bridge.send(msg):
             self._inflight_syntheses.pop(request_id, None)
+            self.window.session_view.set_synthesis_in_progress(
+                session_id, False
+            )
             QMessageBox.warning(
                 self.window, "Synthesis Automation",
                 "Couldn't reach the extension. Try Reconnect from the "
                 "extension popup, or fall back to manual Generate / Paste.",
             )
             return
+        # Make sure the banner persists across session-switches: if the
+        # user clicks Send, navigates to a different session, and then
+        # comes back, the banner should still be up. SessionView keys
+        # by session id; the call here registers the in-progress state
+        # for the originating session.
+        self.window.session_view.set_synthesis_in_progress(
+            session_id, True, status_text=f"Sent to {target.label}, waiting for response..."
+        )
         self.window.status(
             f"Sent to {target.label}. The response will land in the Synthesis tab.",
             timeout_ms=6000,
@@ -578,6 +602,8 @@ class MainApp(QObject):
         sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
         sv.review_speakers_clicked.connect(self._on_review_speakers)
+        sv.restore_previous_notes_clicked.connect(self._on_restore_previous_notes)
+        sv.delete_previous_notes_clicked.connect(self._on_delete_previous_notes)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
         # Click-to-tag attendee sidebar. The session-view passes its own
         # session_id; we forward to controller.tag_speaker which captures
@@ -1104,6 +1130,51 @@ class MainApp(QObject):
                 )
                 return
         self.window.status(f"{label} copied to clipboard.", timeout_ms=4000)
+
+    def _on_restore_previous_notes(self, session_id: str, archive_path) -> None:
+        """Replace notes.md with a selected archive's contents. The
+        current notes.md gets archived first by ``restore_previous_notes``,
+        so the operation is non-destructive."""
+        from pathlib import Path  # noqa: PLC0415
+
+        store = TranscriptStore(session_id)
+        try:
+            new_archive = store.restore_previous_notes(Path(archive_path))
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            QMessageBox.warning(
+                self.window, "Restore archive",
+                f"Couldn't restore archive: {exc}",
+            )
+            return
+        self.store.update_session(session_id, has_notes=True)
+        self._on_session_selected(session_id)
+        if new_archive:
+            self.window.status(
+                f"Restored. Prior synthesis archived to {new_archive.name}.",
+                timeout_ms=6000,
+            )
+        else:
+            self.window.status("Synthesis restored from archive.", timeout_ms=5000)
+
+    def _on_delete_previous_notes(self, session_id: str, archive_path) -> None:
+        from pathlib import Path  # noqa: PLC0415
+
+        store = TranscriptStore(session_id)
+        try:
+            store.delete_previous_notes(Path(archive_path))
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            QMessageBox.warning(
+                self.window, "Delete archive",
+                f"Couldn't delete archive: {exc}",
+            )
+            return
+        # Refresh the previous-notes list (preserving the synthesis +
+        # live-notes editor state, which set_session_selected would
+        # reset).
+        self.window.session_view.set_previous_notes(store.list_previous_notes())
+        self.window.status(
+            f"Archive deleted: {Path(archive_path).name}", timeout_ms=5000
+        )
 
     def _on_paste_notes(self, session_id: str) -> None:
         session = self.store.get_session(session_id)

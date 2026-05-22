@@ -27,7 +27,8 @@
     return;
   }
   const { STATUS, looksLikeInterstitial, showToast, clearToast, watchForInterstitialClear,
-    waitForSelector, waitForResponseStreaming, pasteIntoComposer } = helpers;
+    waitForSelector, waitForResponseStreaming, pasteIntoComposer,
+    findCopyButtonForMessage, htmlToMarkdown } = helpers;
 
   // Composer probes. We try data-testids and contenteditable in order;
   // the trailing 'div[contenteditable="true"]' is the catch-all that
@@ -307,12 +308,73 @@
       );
       return;
     }
-    const markdown = (messageEl.innerText || messageEl.textContent || "").trim();
+
+    // Extract the response as markdown. Three strategies in order:
+    //
+    //   1. Click Claude's own Copy button + read the clipboard.
+    //      Claude knows how to serialize its response to markdown
+    //      (that's exactly what the user gets clicking Copy manually).
+    //      Requires the clipboardRead permission in manifest.json.
+    //
+    //   2. Walk the rendered DOM with htmlToMarkdown(). Converts
+    //      headings/lists/code-fences/etc back to markdown markup.
+    //      Less precise than Claude's own serializer but doesn't
+    //      depend on locating a Copy button or clipboard access.
+    //
+    //   3. Last-ditch: innerText of the message element. Loses all
+    //      block-level structure but at least returns *something* so
+    //      the user can see what Claude said.
+    //
+    // Each strategy is wrapped in try/catch + logs to console so
+    // future failures can be diagnosed from the Claude tab DevTools.
+    let markdown = "";
+    let extractionMethod = "";
+
+    // Strategy 1: copy button + clipboard.
+    const copyBtn = findCopyButtonForMessage(messageEl);
+    if (copyBtn) {
+      try {
+        copyBtn.click();
+        // Give Claude a tick to populate the clipboard.
+        await new Promise((r) => setTimeout(r, 250));
+        const clip = await navigator.clipboard.readText();
+        if (clip && clip.trim().length >= 50) {
+          markdown = clip.trim();
+          extractionMethod = "claude-copy-button";
+        } else {
+          console.warn("mn-synth: clipboard returned too little", clip ? clip.length : 0);
+        }
+      } catch (e) {
+        console.warn("mn-synth: copy-button + clipboard read failed", e);
+      }
+    } else {
+      console.warn("mn-synth: no Copy button found near assistant message");
+    }
+
+    // Strategy 2: HTML -> markdown converter.
+    if (!markdown) {
+      try {
+        const md = htmlToMarkdown(messageEl);
+        if (md && md.trim().length >= 20) {
+          markdown = md;
+          extractionMethod = "html-to-markdown";
+        }
+      } catch (e) {
+        console.warn("mn-synth: htmlToMarkdown failed", e);
+      }
+    }
+
+    // Strategy 3: innerText.
+    if (!markdown) {
+      markdown = (messageEl.innerText || messageEl.textContent || "").trim();
+      extractionMethod = "inner-text";
+    }
+
     if (!markdown) {
       fail("paste_failed", "Found the assistant container but its text was empty.");
       return;
     }
-    status(STATUS.DONE, `${markdown.length} chars`);
+    status(STATUS.DONE, `${markdown.length} chars via ${extractionMethod}`);
     done(markdown);
   }
 
