@@ -241,7 +241,7 @@ correctness assertions.
 - Hash-gated bundled-prompt upgrade with line-ending normalization so a
   CRLF Windows checkout upgrades cleanly.
 
-### v0.6.3 (current branch)
+### v0.6.3 (current)
 
 Synthesis automation lands behind a per-install Settings toggle. When
 enabled, the Generate Synthesis Prompt + Paste Response Back buttons

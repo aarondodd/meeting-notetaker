@@ -189,11 +189,30 @@ def _grab(widget, name: str, *, autosize: bool = True) -> None:
 
 
 def _seed_session_on_disk() -> Session:
-    """Lay down raw.transcript.md / live_notes.md / notes.md for the demo session."""
+    """Lay down raw.transcript.md / live_notes.md / notes.md for the demo session.
+
+    Also drops a couple of archived synthesis versions so the
+    Previous Notes pane has content to show (the v0.6.3 redesign
+    renders an empty-state pane otherwise, which isn't a useful
+    screenshot)."""
     store = TranscriptStore(SESSION_ID)
     store.transcript_path.write_text(SAMPLE_TRANSCRIPT, encoding="utf-8")
     store.live_notes_path.write_text(SAMPLE_LIVE_NOTES, encoding="utf-8")
     store.notes_path.write_text(SAMPLE_SYNTHESIS, encoding="utf-8")
+    # Seed two archived versions so PreviousNotesWidget has list items.
+    (store.session_dir / "notes-20260520-0900.md").write_text(
+        "# Q3 Platform Sync (v1)\n\n"
+        "## Decisions\n- Migrate the ingest pipeline to a queue-based model.\n\n"
+        "## Action items\n- Alex to draft the queue interface by Friday.\n",
+        encoding="utf-8",
+    )
+    (store.session_dir / "notes-20260521-1430.md").write_text(
+        "# Q3 Platform Sync (v2)\n\n"
+        "## Decisions\n- Queue-based ingest, kicked off Monday.\n"
+        "- Backfill plan tied to the same migration window.\n\n"
+        "## Action items\n- Sam to spec the backfill steps.\n",
+        encoding="utf-8",
+    )
     return Session(
         id=SESSION_ID,
         title=SESSION_TITLE,
@@ -208,28 +227,51 @@ def _seed_session_on_disk() -> Session:
 MAIN_WIN_SIZE = (1280, 760)
 
 
-def _build_main_window() -> MainWindow:
+def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
     session = _seed_session_on_disk()
     win = MainWindow()
     win.resize(*MAIN_WIN_SIZE)
     win.set_sessions([session])
     win.session_view.set_user_name(USER_NAME)
+    store = TranscriptStore(SESSION_ID)
     win.session_view.set_session(
         session,
         transcript=SAMPLE_TRANSCRIPT,
         notes=SAMPLE_SYNTHESIS,
-        previous_notes_paths=[],
+        previous_notes_paths=store.list_previous_notes(),
         live_notes=SAMPLE_LIVE_NOTES,
     )
+    # Seed the per-session prompt-template picker so the dropdown
+    # has realistic content. MainApp does this at runtime; the
+    # screenshot harness has to do it manually.
+    templates = [t.name for t in prompts_mod.list_templates()]
+    win.session_view.set_prompt_templates(templates)
+    if automation_enabled:
+        win.session_view.set_automation_enabled(True, "claude")
+        # And surface the synthesis status in the status bar.
+        win.set_status_indicators(
+            version=__version__,
+            mic_label="Mic: (System default)",
+            loopback_label="System audio: (System default)",
+            calendar_label="Calendar: off",
+            voice_label="Voice: not enrolled",
+            voice_tooltip="No voice sample has been recorded.",
+            synthesis_label="Synthesis: Chrome running, connected",
+            synthesis_tooltip=(
+                "The Meeting Notetaker extension is connected. "
+                "Send is ready to use."
+            ),
+        )
+    else:
+        win.set_status_indicators(
+            version=__version__,
+            mic_label="Mic: (System default)",
+            loopback_label="System audio: (System default)",
+            calendar_label="Calendar: off",
+            voice_label="Voice: not enrolled",
+            voice_tooltip="No voice sample has been recorded.",
+        )
     win.select_session(SESSION_ID)
-    win.set_status_indicators(
-        version=__version__,
-        mic_label="Mic: (System default)",
-        loopback_label="System audio: (System default)",
-        calendar_label="Calendar: off",
-        voice_label="Voice: not enrolled",
-        voice_tooltip="No voice sample has been recorded.",
-    )
     win.show()
     QApplication.processEvents()
     return win
@@ -303,11 +345,20 @@ def shot_new_session() -> None:
 def shot_settings() -> None:
     cfg = Config()
     cfg.ui.user_name = USER_NAME
+    # Pre-enable synthesis automation so the new section's controls
+    # (target picker, Claude project field, install/uninstall) are
+    # all visible in the screenshot. Default (False) would still
+    # show the group but the placeholder text/help reads better
+    # when the picker has its real selected target shown.
+    cfg.synthesis.automation_enabled = True
+    cfg.synthesis.llm_target = "claude"
     dlg = SettingsDialog(cfg)
-    # The dialog has a scroll area; force-resize to a tall window so the
-    # full content is visible in the screenshot (rather than just the
-    # Transcription group at the top).
-    dlg.resize(640, 1200)
+    # The dialog has a scroll area; force-resize to a tall window
+    # so the full content is visible (rather than just the
+    # Transcription group at the top). v0.6.3 added the synthesis
+    # automation + prompts groups at the bottom -- bumped from 1200
+    # to 1600 to accommodate.
+    dlg.resize(680, 1600)
     dlg.show()
     QApplication.processEvents()
     _grab(dlg, "07-dialog-settings.png", autosize=False)
@@ -513,6 +564,35 @@ def shot_manage_dialog() -> None:
 # ---------------------------------------------------------------------------
 
 
+def shot_main_synthesis_automation_enabled() -> None:
+    """v0.6.3: Send-to-Claude button replaces Generate + Paste when
+    synthesis automation is enabled in Settings. Captures the synthesis
+    tab with the new prompt-template picker visible too."""
+    win = _build_main_window(automation_enabled=True)
+    win.session_view._tabs.setCurrentIndex(2)
+    win.session_view._notes_view.set_preview_mode(True)
+    QApplication.processEvents()
+    _grab(win, "15-main-synthesis-automation.png", autosize=False)
+    win.close()
+
+
+def shot_automation_install_dialog() -> None:
+    """v0.6.3: three-step install wizard launched from Settings when
+    the user toggles synthesis automation on for the first time."""
+    from meeting_notetaker.ui.automation_install_dialog import (
+        AutomationInstallDialog,
+    )
+
+    # Minimal stubs -- the wizard's UI shows the three steps + their
+    # current state without needing the install to actually succeed.
+    dlg = AutomationInstallDialog(do_install=lambda: {}, ping_extension=None)
+    dlg.resize(580, 540)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "16-dialog-automation-install.png", autosize=False)
+    dlg.close()
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -530,6 +610,8 @@ def main() -> int:
     shot_label_dialog()
     shot_review_dialog()
     shot_manage_dialog()
+    shot_main_synthesis_automation_enabled()
+    shot_automation_install_dialog()
     print("done.")
     return 0
 
