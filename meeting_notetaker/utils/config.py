@@ -39,6 +39,7 @@ Schema (config.toml):
     [synthesis]
     automation_enabled = false   # if true, swap Generate/Paste buttons for a single Send-to-LLM button (Windows + Chrome extension required)
     llm_target = "claude"        # one of: "claude", "copilot". Copilot is plumbed but not wired in 0.6.3.
+    claude_project_id = ""       # optional Claude project UUID; when set, syntheses land in that project instead of the default chat list
 
 Reads use tomllib (3.11+) or the tomli fallback. Writes are emitted by hand
 since our schema is flat and tomli-w is not a stdlib component.
@@ -142,6 +143,22 @@ _DEFAULT_DETECTION_ALLOWLIST: tuple[str, ...] = (
 class SynthesisConfig:
     automation_enabled: bool = False
     llm_target: str = "claude"
+    # Optional Claude.ai project UUID. When set, the Send-to-Claude
+    # flow opens https://claude.ai/project/<id> instead of /new, so
+    # synthesized notes accumulate inside the named project rather
+    # than flooding the user's default chat list. Empty == no project.
+    claude_project_id: str = ""
+
+    def claude_chat_url(self) -> str:
+        """Build the Claude.ai URL the extension should land on for
+        a fresh synthesis. If a project id is configured, return the
+        project URL; otherwise the canonical /new path. Stripping
+        whitespace so a user pasting with trailing newlines doesn't
+        produce a busted URL."""
+        pid = self.claude_project_id.strip()
+        if pid:
+            return f"https://claude.ai/project/{pid}"
+        return "https://claude.ai/new"
 
 
 @dataclass
@@ -239,6 +256,24 @@ class Config:
                 f"synthesis.llm_target {self.synthesis.llm_target!r} "
                 f"must be one of {VALID_LLM_TARGETS}"
             )
+        if self.synthesis.claude_project_id:
+            # Optional field; if set, must look like a UUID
+            # (8-4-4-4-12 hex). Loose match -- Claude uses UUID-v7
+            # variants whose internal structure differs from v4 but
+            # the outer shape is the same.
+            import re  # noqa: PLC0415
+
+            if not re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                self.synthesis.claude_project_id.strip(),
+            ):
+                errors.append(
+                    "synthesis.claude_project_id must be a UUID-shaped "
+                    "string (e.g. 019e5077-c745-7541-b2c8-08caeb0f3051) "
+                    "or empty to disable. Got: "
+                    f"{self.synthesis.claude_project_id!r}"
+                )
         return errors
 
     def _dump_toml(self) -> str:

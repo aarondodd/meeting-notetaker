@@ -210,10 +210,14 @@ async function startSynthesis(msg) {
   }
 
   sendStatus(requestId, STATUS.OPENING_TAB);
+  // The app can pass a chat_url override (e.g.
+  // claude.ai/project/<id> when the user has configured a Claude
+  // project). Empty == use the target's default URL.
+  const tabUrl = (msg.chat_url && msg.chat_url.trim()) || target.newChatUrl;
   let tab;
   try {
     tab = await chrome.tabs.create({
-      url: target.newChatUrl,
+      url: tabUrl,
       active: true,
     });
   } catch (e) {
@@ -259,6 +263,17 @@ function handleContentMessage(requestId, m, _contentPort) {
     case "RESULT":
       console.log("mn-synth bg: forwarding RESULT to app, len=" + (m.markdown || "").length);
       sendResult(requestId, m.target || "claude", m.markdown || "");
+      // Auto-close the synthesis tab if it's not the only tab in its
+      // window. Avoids piling up an endless trail of Claude tabs
+      // after a series of syntheses. Skips when it's the last tab so
+      // we don't accidentally close Chrome entirely. Best-effort
+      // (kept off the critical path; failure just leaves the tab
+      // open which is the prior behavior). Closes on RESULT only --
+      // leaves the tab open on ERROR so the user can inspect what
+      // Claude actually rendered (especially relevant for the
+      // clipboard-permission-needed path where the response is in
+      // the tab even though we couldn't read it).
+      closeSynthesisTabIfSafe(requestId);
       clearInflight(requestId);
       return;
     case "ERROR":
@@ -268,6 +283,25 @@ function handleContentMessage(requestId, m, _contentPort) {
       return;
     default:
       console.warn("mn-synth bg: unhandled content message:", m);
+  }
+}
+
+async function closeSynthesisTabIfSafe(requestId) {
+  const ctx = await loadInflight(requestId);
+  if (!ctx || ctx.tabId === undefined) return;
+  try {
+    const tab = await chrome.tabs.get(ctx.tabId);
+    if (!tab || tab.windowId === undefined) return;
+    const tabsInWindow = await chrome.tabs.query({ windowId: tab.windowId });
+    if (tabsInWindow.length <= 1) {
+      console.log("mn-synth bg: skipping tab close -- only tab in window");
+      return;
+    }
+    await chrome.tabs.remove(ctx.tabId);
+    console.log("mn-synth bg: closed synthesis tab", ctx.tabId);
+  } catch (e) {
+    // Tab already closed by user, removed, etc. Harmless.
+    console.log("mn-synth bg: tab close skipped:", e && e.message);
   }
 }
 

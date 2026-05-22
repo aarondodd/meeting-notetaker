@@ -106,6 +106,42 @@ def test_delete_previous_notes_refuses_live_file(isolated_data_dir):
         store.delete_previous_notes(store.notes_path)
 
 
+def test_prompt_template_name_round_trip(isolated_data_dir):
+    """Per-session prompt template persists in metadata.json so the
+    user's choice survives app restarts and session reloads."""
+    store = TranscriptStore("s_prompt")
+    # Default is empty (use the bundled default at render time).
+    assert store.read_prompt_template_name() == ""
+
+    store.write_prompt_template_name("standup")
+    assert store.read_prompt_template_name() == "standup"
+
+    # Round-trip through a fresh TranscriptStore instance (simulates
+    # an app restart -- only on-disk state should drive the result).
+    fresh = TranscriptStore("s_prompt")
+    assert fresh.read_prompt_template_name() == "standup"
+
+
+def test_prompt_template_name_clear(isolated_data_dir):
+    """Writing an empty string clears the override (back to default)."""
+    store = TranscriptStore("s_prompt_clear")
+    store.write_prompt_template_name("one-on-one")
+    assert store.read_prompt_template_name() == "one-on-one"
+    store.write_prompt_template_name("")
+    assert store.read_prompt_template_name() == ""
+
+
+def test_prompt_template_name_preserves_other_metadata(isolated_data_dir):
+    """Setting the template must not stomp other metadata fields."""
+    store = TranscriptStore("s_prompt_preserve")
+    store.write_metadata({"title": "Quarterly review", "model": "small.en"})
+    store.write_prompt_template_name("standup")
+    meta = store.read_metadata()
+    assert meta["title"] == "Quarterly review"
+    assert meta["model"] == "small.en"
+    assert meta["prompt_template_name"] == "standup"
+
+
 def test_delete_previous_notes_refuses_non_archive(isolated_data_dir, tmp_path):
     """Refuse to delete files that don't match the notes-*.md pattern,
     even if they're in the session dir."""

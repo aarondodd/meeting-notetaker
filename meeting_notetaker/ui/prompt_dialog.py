@@ -41,6 +41,7 @@ class GeneratePromptDialog(QDialog):
         templates: Iterable[PromptTemplate],
         live_notes: str = "",
         user_name: str = "",
+        initial_template_name: str = "",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -62,6 +63,14 @@ class GeneratePromptDialog(QDialog):
         self._picker = QComboBox(self)
         for tpl in self._templates:
             self._picker.addItem(tpl.display_name, tpl)
+        # Pre-select the session's saved template if it's in the
+        # list -- so the manual Generate flow defaults to the same
+        # template the automation Send flow uses.
+        if initial_template_name:
+            for i, tpl in enumerate(self._templates):
+                if tpl.name == initial_template_name:
+                    self._picker.setCurrentIndex(i)
+                    break
         self._picker.currentIndexChanged.connect(self._refresh_preview)
         picker_row.addWidget(self._picker, 1)
         layout.addLayout(picker_row)

@@ -32,6 +32,11 @@ class SynthesizeRequest:
     ``new_chat=True`` always for v0.6.3 (see Conversation mode decision
     in PR #?? -- always start fresh). The field exists so future
     Conversation-mode setting changes don't require a protocol bump.
+
+    ``chat_url`` lets the app override the URL the extension opens
+    (e.g., claude.ai/project/<id> when the user has configured a
+    Claude project). Empty string means the extension picks the
+    default URL for the target.
     """
 
     type: Literal["synthesize"] = "synthesize"
@@ -39,6 +44,7 @@ class SynthesizeRequest:
     target: str = "claude"  # see VALID_LLM_TARGETS in utils.config
     prompt: str = ""
     new_chat: bool = True
+    chat_url: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

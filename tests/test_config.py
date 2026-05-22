@@ -236,6 +236,59 @@ def test_synthesis_validation_rejects_unknown_target(isolated_data_dir):
     assert any("synthesis.llm_target" in e for e in errors)
 
 
+def test_claude_project_id_defaults_empty(isolated_data_dir):
+    cfg = Config()
+    assert cfg.synthesis.claude_project_id == ""
+    # claude_chat_url with empty project id returns /new.
+    assert cfg.synthesis.claude_chat_url() == "https://claude.ai/new"
+
+
+def test_claude_project_id_round_trip(isolated_data_dir):
+    cfg = Config()
+    cfg.synthesis.claude_project_id = "019e5077-c745-7541-b2c8-08caeb0f3051"
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.synthesis.claude_project_id == "019e5077-c745-7541-b2c8-08caeb0f3051"
+    assert (
+        loaded.synthesis.claude_chat_url()
+        == "https://claude.ai/project/019e5077-c745-7541-b2c8-08caeb0f3051"
+    )
+
+
+def test_claude_project_id_validation_uuid_shape(isolated_data_dir):
+    cfg = Config()
+    cfg.synthesis.claude_project_id = "not-a-uuid"
+    errors = cfg.validate()
+    assert any("claude_project_id" in e for e in errors)
+
+
+def test_claude_project_id_validation_accepts_uuid_v7(isolated_data_dir):
+    """The Claude project ID Aaron provided is UUID v7 (time-based) --
+    different from v4 internally but same 8-4-4-4-12 outer shape.
+    The validator should accept both."""
+    cfg = Config()
+    cfg.synthesis.claude_project_id = "019e5077-c745-7541-b2c8-08caeb0f3051"
+    assert cfg.validate() == []
+
+
+def test_claude_project_id_accepts_empty(isolated_data_dir):
+    """Empty string is the disabled-feature value; must validate."""
+    cfg = Config()
+    cfg.synthesis.claude_project_id = ""
+    assert cfg.validate() == []
+
+
+def test_claude_chat_url_strips_whitespace(isolated_data_dir):
+    """Users pasting from the address bar can accidentally include
+    trailing whitespace or newlines. The URL builder must strip them."""
+    cfg = Config()
+    cfg.synthesis.claude_project_id = " 019e5077-c745-7541-b2c8-08caeb0f3051  \n"
+    assert (
+        cfg.synthesis.claude_chat_url()
+        == "https://claude.ai/project/019e5077-c745-7541-b2c8-08caeb0f3051"
+    )
+
+
 def test_unknown_synthesis_keys_in_toml_drop_cleanly(isolated_data_dir):
     """Forward-compat: a newer config with an unknown key in [synthesis]
     must not crash older releases when loaded."""

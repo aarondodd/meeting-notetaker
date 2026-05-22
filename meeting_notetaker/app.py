@@ -552,24 +552,29 @@ class MainApp(QObject):
         except ValueError:
             when = datetime.now().astimezone()
 
-        # Render with the default template. Users who customize prompts
-        # via the Generate dialog can pick a template there; the
-        # automation flow uses the default to keep the Send path one-
-        # click. (Per-target / per-session prompt picking is a v0.7
-        # candidate.)
+        # Pick the prompt template based on the session's saved
+        # choice (set via the SessionView dropdown), falling back to
+        # the bundled "default" template when the session has no
+        # explicit selection. Per-session choice persists in
+        # metadata.json.
+        chosen_name = store.read_prompt_template_name()
         templates = prompts_mod.list_templates()
-        default = next(
-            (t for t in templates if t.name == "default"),
-            templates[0] if templates else None,
-        )
-        if default is None:
+        chosen = None
+        if chosen_name:
+            chosen = next((t for t in templates if t.name == chosen_name), None)
+        if chosen is None:
+            chosen = next(
+                (t for t in templates if t.name == "default"),
+                templates[0] if templates else None,
+            )
+        if chosen is None:
             QMessageBox.warning(
                 self.window, "Synthesis Automation",
                 "No prompt templates found in the prompts folder.",
             )
             return
         rendered = prompts_mod.render(
-            default,
+            chosen,
             session_title=session.title,
             session_date=when,
             transcript=transcript,
@@ -579,11 +584,19 @@ class MainApp(QObject):
 
         request_id = secrets.token_hex(8)
         self._inflight_syntheses[request_id] = session_id
+        # Build the URL the extension should land on. For Claude this
+        # honors the optional claude_project_id setting -- when set,
+        # syntheses accumulate in that project rather than the user's
+        # default chat list.
+        chat_url = ""
+        if target_key == "claude":
+            chat_url = self.config.synthesis.claude_chat_url()
         msg = automation_messages.SynthesizeRequest(
             request_id=request_id,
             target=target_key,
             prompt=rendered,
             new_chat=True,
+            chat_url=chat_url,
         )
         if not self._bridge.send(msg):
             self._inflight_syntheses.pop(request_id, None)
@@ -633,7 +646,13 @@ class MainApp(QObject):
             True,
             status_text="Starting Chrome...",
         )
-        ok = launch_chrome("https://claude.ai/new")
+        # If a Claude project is configured, launch Chrome directly
+        # at the project URL so the cold-start tab is the right one.
+        # (Without this, Chrome would land on /new and the synthesis
+        # would still work because background.js opens its own tab,
+        # but we'd briefly leave the /new tab as a stray.)
+        cold_url = self.config.synthesis.claude_chat_url()
+        ok = launch_chrome(cold_url)
         if not ok:
             self.window.session_view.set_synthesis_in_progress(session_id, False)
             QMessageBox.warning(
@@ -799,6 +818,7 @@ class MainApp(QObject):
         sv.review_speakers_clicked.connect(self._on_review_speakers)
         sv.restore_previous_notes_clicked.connect(self._on_restore_previous_notes)
         sv.delete_previous_notes_clicked.connect(self._on_delete_previous_notes)
+        sv.prompt_template_changed.connect(self._on_prompt_template_changed)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
         # Click-to-tag attendee sidebar. The session-view passes its own
         # session_id; we forward to controller.tag_speaker which captures
@@ -849,6 +869,13 @@ class MainApp(QObject):
             notes=store.read_notes(),
             previous_notes_paths=store.list_previous_notes(),
             live_notes=live_notes_body,
+        )
+        # Populate the prompt-template picker with the available
+        # templates + restore the session's saved choice.
+        templates = [t.name for t in prompts_mod.list_templates()]
+        self.window.session_view.set_prompt_templates(
+            templates,
+            selected=store.read_prompt_template_name(),
         )
         # Seed the click-to-tag sidebar from the live_notes '# Attendees'
         # section. The sidebar is hidden unless the session is recording,
@@ -1015,6 +1042,10 @@ class MainApp(QObject):
             live_notes=live_notes,
             user_name=self.config.ui.user_name,
             templates=prompts_mod.list_templates(),
+            # Pre-select the session's saved template (set via the
+            # SessionView dropdown). User can still override per-
+            # generation by changing the picker inside this dialog.
+            initial_template_name=store.read_prompt_template_name(),
             parent=self.window,
         )
         dialog.exec()
@@ -1325,6 +1356,13 @@ class MainApp(QObject):
                 )
                 return
         self.window.status(f"{label} copied to clipboard.", timeout_ms=4000)
+
+    def _on_prompt_template_changed(self, session_id: str, name: str) -> None:
+        """Persist the user's per-session prompt template choice."""
+        try:
+            TranscriptStore(session_id).write_prompt_template_name(name)
+        except OSError:
+            log.exception("failed to save prompt template name for %s", session_id)
 
     def _on_restore_previous_notes(self, session_id: str, archive_path) -> None:
         """Replace notes.md with a selected archive's contents. The

@@ -210,6 +210,29 @@ class TranscriptStore:
         body = archive_path.read_text(encoding="utf-8")
         return self.save_notes(body, archive_existing=True)
 
+    # ---- per-session prompt template ----
+    def read_prompt_template_name(self) -> str:
+        """Return the user-selected prompt template name for this
+        session. Empty string means "use the default template" --
+        callers should resolve that to the bundled default at render
+        time rather than persisting the literal name "default" (the
+        default could change between releases).
+        """
+        meta = self.read_metadata()
+        value = meta.get("prompt_template_name", "")
+        return value if isinstance(value, str) else ""
+
+    def write_prompt_template_name(self, name: str) -> None:
+        """Persist the user-selected prompt template name. Set to ""
+        to clear (use default).
+        """
+        meta = self.read_metadata()
+        if name:
+            meta["prompt_template_name"] = name
+        else:
+            meta.pop("prompt_template_name", None)
+        self.write_metadata(meta)
+
     def delete_previous_notes(self, archive_path: Path) -> None:
         """Remove an archived notes-*.md file. Refuses to delete files
         outside the session directory or the live notes.md itself.

@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -72,6 +73,12 @@ class SessionView(QWidget):
     # handled by MainApp (which owns the on-disk store).
     restore_previous_notes_clicked = pyqtSignal(str, Path)   # session_id, archive_path
     delete_previous_notes_clicked = pyqtSignal(str, Path)    # session_id, archive_path
+    # User picked a different synthesis prompt template for this
+    # session. Persisted to the session's metadata.json so the choice
+    # survives reloads, and used by both the automation Send flow and
+    # the manual Generate dialog as the default. Empty string means
+    # "use the bundled default template."
+    prompt_template_changed = pyqtSignal(str, str)            # session_id, template_name
     # Click-to-tag for in-meeting speaker anchoring. The sidebar emits
     # (session_id, name) per click; the controller persists a SpeakerTag
     # and the post-meeting refiner uses tags to constrain the clusterer.
@@ -156,6 +163,27 @@ class SessionView(QWidget):
 
         # Synthesis row
         synthesis = QHBoxLayout()
+        # Per-session prompt template picker. Reflects the bundled +
+        # user-edited template list from the prompts folder; the
+        # selection persists in the session's metadata.json. Both the
+        # automation Send flow and the manual Generate dialog read
+        # this as their default. Population happens via
+        # set_prompt_templates() once the prompts module is loaded.
+        synthesis.addWidget(QLabel("Prompt:", self))
+        self._prompt_template_picker = QComboBox(self)
+        self._prompt_template_picker.setToolTip(
+            "Synthesis prompt template for this session. Each meeting "
+            "can use a different template (e.g. one-on-one vs standup). "
+            "The selection is remembered across app restarts. Edit or "
+            "add templates via Settings > Open Prompts Folder."
+        )
+        self._prompt_template_picker.currentIndexChanged.connect(
+            self._on_prompt_template_changed
+        )
+        # Reasonable cap on width; long template names truncate with
+        # ellipsis but the dropdown shows the full text.
+        self._prompt_template_picker.setMaximumWidth(200)
+        synthesis.addWidget(self._prompt_template_picker)
         self._generate_btn = QPushButton("Generate Synthesis Prompt", self)
         self._generate_btn.clicked.connect(self._on_generate_prompt)
         synthesis.addWidget(self._generate_btn)
@@ -667,6 +695,50 @@ class SessionView(QWidget):
                     has_transcript=bool(self._raw_transcript_text),
                     has_notes=bool(self._session.has_notes),
                 )
+
+    def set_prompt_templates(self, template_names: list[str], selected: str = "") -> None:
+        """Populate the prompt template picker.
+
+        ``template_names`` should be the list of available templates
+        (from prompts module). ``selected`` is the currently-saved
+        choice for this session ("" = use default). Caller is
+        expected to compute that from session metadata before invoking.
+
+        Block signals during population so the currentIndexChanged
+        emit doesn't fire spurious save events at app-startup.
+        """
+        self._prompt_template_picker.blockSignals(True)
+        self._prompt_template_picker.clear()
+        # First entry is always "(default)" -- empty string in data
+        # role -- so leaving the picker untouched on a new session
+        # uses the default template without forcing the user to pick.
+        self._prompt_template_picker.addItem("(default)", "")
+        for name in template_names:
+            if not name or name == "default":
+                # We surface the bundled default via the "(default)"
+                # entry above; skip the literal "default" template
+                # name to avoid the user seeing two entries that
+                # mean the same thing.
+                continue
+            self._prompt_template_picker.addItem(name, name)
+        # Restore selection.
+        target_idx = 0  # (default)
+        for i in range(self._prompt_template_picker.count()):
+            if self._prompt_template_picker.itemData(i) == selected:
+                target_idx = i
+                break
+        self._prompt_template_picker.setCurrentIndex(target_idx)
+        self._prompt_template_picker.blockSignals(False)
+
+    def selected_prompt_template(self) -> str:
+        """The currently-selected template's data value (empty == default)."""
+        return self._prompt_template_picker.currentData() or ""
+
+    def _on_prompt_template_changed(self, _idx: int) -> None:
+        if self._session is None:
+            return
+        name = self._prompt_template_picker.currentData() or ""
+        self.prompt_template_changed.emit(self._session.id, name)
 
     def set_synthesis_connection_state(self, state) -> None:
         """Update the SessionView's view of the synthesis connection

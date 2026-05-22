@@ -531,6 +531,28 @@ class SettingsDialog(QDialog):
         target_row.addWidget(self._auto_target, 1)
         auto_layout.addLayout(target_row)
 
+        # Optional Claude project ID. When set, syntheses land in the
+        # named project on Claude.ai rather than the default chat list.
+        # Aaron's use case: stop flooding the default conversation list
+        # with one chat per meeting; pin them all to a "Meeting Notes"
+        # project he can browse later.
+        proj_row = QHBoxLayout()
+        proj_row.addWidget(QLabel("Claude project ID:", self))
+        self._claude_project_id = QLineEdit(self)
+        self._claude_project_id.setText(config.synthesis.claude_project_id)
+        self._claude_project_id.setPlaceholderText(
+            "Optional UUID (e.g. 019e5077-c745-7541-b2c8-08caeb0f3051)"
+        )
+        self._claude_project_id.setToolTip(
+            "Optional. Paste the UUID portion of a Claude.ai project "
+            "URL. When set, every Send-to-Claude opens that project "
+            "(https://claude.ai/project/<id>) instead of /new, so "
+            "synthesized meeting notes accumulate inside the project. "
+            "Leave blank to land in the default chat list."
+        )
+        proj_row.addWidget(self._claude_project_id, 1)
+        auto_layout.addLayout(proj_row)
+
         # Install / Status row
         self._auto_status = QLabel(self)
         self._auto_status.setWordWrap(True)
@@ -616,6 +638,9 @@ class SettingsDialog(QDialog):
         self._config.synthesis.automation_enabled = self._auto_enabled.isChecked()
         self._config.synthesis.llm_target = (
             self._auto_target.currentData() or "claude"
+        )
+        self._config.synthesis.claude_project_id = (
+            self._claude_project_id.text().strip()
         )
         self.accept()
 
