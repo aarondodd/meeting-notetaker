@@ -148,6 +148,7 @@
       const intervalMs = opts.intervalMs || 250;
       const stableMs = opts.stableMs || 1500;
       const timeoutMs = opts.timeoutMs || 5 * 60 * 1000;
+      const onTick = opts.onTick || (() => {});
       const started = Date.now();
       let firstFalseAt = null;
       const handle = setInterval(() => {
@@ -158,6 +159,7 @@
           return;
         }
         const truthy = !!predicate();
+        onTick(now - started, truthy);
         if (truthy) {
           firstFalseAt = null;
         } else if (firstFalseAt === null) {
@@ -167,6 +169,54 @@
           resolve(now - started);
         }
       }, intervalMs);
+    });
+  }
+
+  // Resolve once the page's DOM has not mutated for `settleMs`
+  // consecutive ms. Selector-agnostic streaming-complete detector --
+  // works even when the chat UI uses class names we can't predict.
+  // Resolves with the elapsed time on settle, null on timeout. The
+  // optional onTick callback fires every poll with the elapsed ms
+  // since start; we use it to send heartbeat status messages back
+  // to the service worker so the port stays active (Chrome may kill
+  // an MV3 service worker after 30s of port inactivity, dropping our
+  // result when we eventually try to send it).
+  function waitForDomSettled(opts = {}) {
+    return new Promise((resolve) => {
+      const settleMs = opts.settleMs || 2500;
+      const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
+      const minWaitMs = opts.minWaitMs || 0;
+      const onTick = opts.onTick || (() => {});
+      const target = opts.target || document.body;
+      const started = Date.now();
+      let lastMutation = started;
+      const observer = new MutationObserver(() => {
+        lastMutation = Date.now();
+      });
+      observer.observe(target, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+      const handle = setInterval(() => {
+        const now = Date.now();
+        const elapsed = now - started;
+        onTick(elapsed);
+        if (elapsed > timeoutMs) {
+          clearInterval(handle);
+          observer.disconnect();
+          resolve(null);
+          return;
+        }
+        if (elapsed < minWaitMs) {
+          return;
+        }
+        if (now - lastMutation >= settleMs) {
+          clearInterval(handle);
+          observer.disconnect();
+          resolve(elapsed);
+        }
+      }, 300);
     });
   }
 
@@ -265,6 +315,7 @@
     watchForInterstitialClear,
     waitForSelector,
     waitForStableFalse,
+    waitForDomSettled,
     pasteIntoComposer,
   };
 })();

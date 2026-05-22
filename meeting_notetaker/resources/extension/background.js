@@ -60,13 +60,11 @@ function ensurePort() {
       console.warn("native host disconnected:", err.message);
     }
     port = null;
-    // Surface in-flight syntheses as errored.
-    for (const [requestId, state] of inflight.entries()) {
-      // Best-effort; the app side has already moved on if it was the
-      // app that closed.
-      console.warn(`in-flight synthesis ${requestId} dropped`);
-      inflight.delete(requestId);
-    }
+    // Do NOT clear inflight here. The native port can drop and
+    // reconnect (worker reboot, app restart) while a synthesis is
+    // still mid-flight in the content script -- when the result
+    // eventually arrives, we want to ferry it through the next
+    // ensurePort() call.
   });
   return port;
 }
@@ -125,6 +123,71 @@ async function handleAppMessage(msg) {
   }
 }
 
+// In-flight synthesis context (request id -> {prompt, target, newChat, ...})
+// is mirrored to chrome.storage.session so a service worker that dies
+// during the streaming wait and respawns can still route a late
+// RESULT message through the module-top onConnect handler.
+async function persistInflight(requestId, ctx) {
+  inflight.set(requestId, ctx);
+  try {
+    await chrome.storage.session.set({ [`inflight:${requestId}`]: ctx });
+  } catch (e) {
+    console.warn("inflight persist failed:", e);
+  }
+}
+
+async function loadInflight(requestId) {
+  const cached = inflight.get(requestId);
+  if (cached) return cached;
+  try {
+    const key = `inflight:${requestId}`;
+    const data = await chrome.storage.session.get(key);
+    if (data && data[key]) {
+      inflight.set(requestId, data[key]);
+      return data[key];
+    }
+  } catch (e) {
+    console.warn("inflight load failed:", e);
+  }
+  return null;
+}
+
+async function clearInflight(requestId) {
+  inflight.delete(requestId);
+  try {
+    await chrome.storage.session.remove(`inflight:${requestId}`);
+  } catch (_) {}
+}
+
+// Module-top onConnect handler. Survives service-worker restarts
+// (the listener re-registers on every worker boot). Routes any port
+// named mn-synth-<rid> or mn-synth-late-<rid> to handleContentMessage.
+// The "late" variant is opened by the content script if its original
+// port disconnected (worker died mid-synthesis); we don't need to
+// send SYNTHESIZE_START on late ports because the synthesis is
+// already running -- we just need to receive the RESULT.
+chrome.runtime.onConnect.addListener(async (port) => {
+  const m = /^mn-synth-(late-)?([a-zA-Z0-9_-]+)$/.exec(port.name);
+  if (!m) return;
+  const isLate = !!m[1];
+  const requestId = m[2];
+  port.onMessage.addListener((msg) => handleContentMessage(requestId, msg, port));
+  if (isLate) return;
+  // Original port: send SYNTHESIZE_START with the captured prompt.
+  const ctx = await loadInflight(requestId);
+  if (!ctx) {
+    console.warn("mn-synth: no inflight ctx for", requestId);
+    return;
+  }
+  port.postMessage({
+    type: "SYNTHESIZE_START",
+    requestId,
+    target: ctx.target,
+    prompt: ctx.prompt || "",
+    newChat: ctx.newChat !== false,
+  });
+});
+
 async function startSynthesis(msg) {
   const requestId = msg.request_id || "";
   const targetKey = msg.target || "claude";
@@ -154,26 +217,19 @@ async function startSynthesis(msg) {
     sendError(requestId, "no_tab", String(e));
     return;
   }
-  inflight.set(requestId, { tabId: tab.id, target: targetKey });
-
-  // Wait for the tab to load, then ask the content script to drive
-  // the chat. We re-send the start message after each navigation
-  // because the proxy interstitial may have caused a redirect.
-  const onMessageFromTab = (port) => {
-    if (port.name !== `mn-synth-${requestId}`) return;
-    port.onMessage.addListener((m) => handleContentMessage(requestId, m, port));
-    port.postMessage({
-      type: "SYNTHESIZE_START",
-      requestId,
-      target: targetKey,
-      prompt: msg.prompt || "",
-      newChat: msg.new_chat !== false,
-    });
-  };
-  chrome.runtime.onConnect.addListener(onMessageFromTab);
+  // Persist the synthesis context. The module-top onConnect handler
+  // reads this when the content script opens its port; storing in
+  // chrome.storage.session means it survives a service-worker restart.
+  await persistInflight(requestId, {
+    tabId: tab.id,
+    target: targetKey,
+    prompt: msg.prompt || "",
+    newChat: msg.new_chat !== false,
+  });
 
   // Inject the start trigger after the tab settles. The content script
-  // opens a port back to us; that's how the connection above gets made.
+  // opens a port back to us; the module-top onConnect handler matches
+  // on the port name and sends SYNTHESIZE_START.
   await waitForTabComplete(tab.id, requestId, targetKey);
 }
 
@@ -189,7 +245,7 @@ function cancelSynthesis(requestId) {
 // ---------------------------------------------------------------------------
 // Content script -> extension
 
-function handleContentMessage(requestId, m, contentPort) {
+function handleContentMessage(requestId, m, _contentPort) {
   if (!m || typeof m !== "object") return;
   switch (m.type) {
     case "STATUS":
@@ -197,11 +253,11 @@ function handleContentMessage(requestId, m, contentPort) {
       return;
     case "RESULT":
       sendResult(requestId, m.target || "claude", m.markdown || "");
-      inflight.delete(requestId);
+      clearInflight(requestId);
       return;
     case "ERROR":
       sendError(requestId, m.code || "unknown", m.detail || "");
-      inflight.delete(requestId);
+      clearInflight(requestId);
       return;
     default:
       console.warn("unhandled content message:", m);

@@ -1,11 +1,24 @@
 // Claude.ai content script.
 //
-// Picks the composer, pastes the prompt, submits, watches for the
-// streaming-complete indicator, scrapes the response. The DOM
-// selectors target Claude's web UI as of 2026-05; they're brittle by
-// nature -- Anthropic owns this page and may restructure it. The
-// content script is designed to fail loudly (ERROR back to background)
-// rather than partial-success.
+// Picks the composer, pastes the prompt, submits, waits for streaming
+// to settle, scrapes the response. Selectors for Claude's chat UI
+// rotate on a roughly-monthly cadence (Anthropic owns the page), so
+// we lean on selector-agnostic heuristics where possible:
+//
+//   * The composer: try a small list of known shapes, but ultimately
+//     fall back to "the first contentEditable on the page".
+//   * Streaming-complete: a MutationObserver-based "DOM hasn't changed
+//     for N seconds" detector. Works regardless of whether the stop
+//     button has any particular class or aria-label.
+//   * Latest assistant message: try several increasingly broad
+//     queries; pick the last match. If nothing matches, fall back
+//     to "the longest direct child of the conversation container".
+//
+// Every checkpoint sends a STATUS message back to the service worker
+// so the app's status bar reflects progress AND the port stays
+// active. Chrome's MV3 service worker kill timer is reset by any
+// port activity; long waits without heartbeats can drop the worker
+// and lose the eventual result.
 
 (function () {
   const helpers = window.__mnSynth;
@@ -14,35 +27,27 @@
     return;
   }
   const { STATUS, looksLikeInterstitial, showToast, clearToast, watchForInterstitialClear,
-    waitForSelector, waitForStableFalse, pasteIntoComposer } = helpers;
+    waitForSelector, waitForDomSettled, pasteIntoComposer } = helpers;
 
-  // Selectors. Each is paired with a fallback so a single DOM rename
-  // doesn't kill the whole flow.
+  // Composer probes. We try data-testids and contenteditable in order;
+  // the trailing 'div[contenteditable="true"]' is the catch-all that
+  // works even if Claude has renamed every other attribute.
   const COMPOSER_SELECTORS = [
     'div[contenteditable="true"][data-testid="chat-input"]',
+    'div[contenteditable="true"][role="textbox"]',
     'div[contenteditable="true"]',
     'textarea[data-testid="chat-input"]',
     'textarea',
   ];
+
+  // Send-button probes. Mostly aria-label-based; the last entry tries
+  // to find a button with an SVG arrow icon near the composer.
   const SEND_BUTTON_SELECTORS = [
     'button[aria-label="Send Message"]',
     'button[aria-label="Send message"]',
+    'button[aria-label="Send"]',
     'button[data-testid="send-button"]',
     'button[type="submit"]',
-  ];
-  // Claude's stop-generation button replaces the send button while
-  // streaming. Its presence == "still generating".
-  const STOP_BUTTON_SELECTORS = [
-    'button[aria-label="Stop Response"]',
-    'button[aria-label="Stop response"]',
-    'button[data-testid="stop-button"]',
-  ];
-  // Response message containers. The latest assistant turn is the
-  // last one matching this selector.
-  const ASSISTANT_MESSAGE_SELECTORS = [
-    'div[data-testid="assistant-message"]',
-    'div[data-message-author-role="assistant"]',
-    'div.assistant-message',
   ];
 
   function findFirst(selectors) {
@@ -53,32 +58,117 @@
     return null;
   }
 
-  function findAll(selectors) {
-    for (const sel of selectors) {
-      const matches = document.querySelectorAll(sel);
-      if (matches.length > 0) return Array.from(matches);
+  // Find a button whose aria-label looks like a stop-generation
+  // affordance. Fall back to a generic SVG-only button with an
+  // adjacent class hint. Returns null if nothing matches -- callers
+  // should treat that as "no stop button found, use DOM-settle
+  // instead".
+  function findStopButton() {
+    const buttons = document.querySelectorAll("button");
+    for (const b of buttons) {
+      const label = (b.getAttribute("aria-label") || "").toLowerCase();
+      if (label && /stop/.test(label)) return b;
+      const testid = (b.getAttribute("data-testid") || "").toLowerCase();
+      if (testid && /stop/.test(testid)) return b;
     }
-    return [];
+    return null;
+  }
+
+  // Broad scrape for the latest assistant message. Strategy stack:
+  //   1. Anything tagged with an explicit assistant role / testid.
+  //   2. Anything in a "font-claude-response" or similar styling
+  //      class container (Claude has historically used this).
+  //   3. Look for the conversation container, then return its last
+  //      message child that isn't tagged as the user's.
+  // Each strategy returns either an element or null; we pick the
+  // first non-null and grab its innerText.
+  function findLatestAssistantMessage() {
+    const strategies = [
+      () => Array.from(document.querySelectorAll('[data-message-author-role="assistant"]')),
+      () => Array.from(document.querySelectorAll('[data-testid*="assistant" i]')),
+      () => Array.from(document.querySelectorAll('div[class*="font-claude-response"]')),
+      () => Array.from(document.querySelectorAll('div[class*="assistant"]')),
+      () => {
+        // Heuristic: find every element flagged as a user message,
+        // then walk up to a common ancestor and pick its last child
+        // that isn't a user message. Covers the case where Claude
+        // tags user messages but not assistant ones.
+        const userMsgs = document.querySelectorAll(
+          '[data-message-author-role="user"], [data-testid="user-message"]',
+        );
+        if (userMsgs.length === 0) return [];
+        const lastUser = userMsgs[userMsgs.length - 1];
+        let container = lastUser.parentElement;
+        while (container && container !== document.body) {
+          // Walk up to the conversation container -- expected to
+          // have at least two message-like children.
+          if (container.children.length >= 2) {
+            const after = [];
+            let seenLastUser = false;
+            for (const child of container.children) {
+              if (child === lastUser) {
+                seenLastUser = true;
+                continue;
+              }
+              if (seenLastUser) after.push(child);
+            }
+            if (after.length > 0) return [after[after.length - 1]];
+          }
+          container = container.parentElement;
+        }
+        return [];
+      },
+    ];
+    for (const strat of strategies) {
+      const matches = strat();
+      if (matches && matches.length > 0) {
+        return matches[matches.length - 1];
+      }
+    }
+    return null;
   }
 
   let connection = null;
 
   function status(event, detail = "") {
+    console.log("mn-synth:", event, detail);
     if (!connection) return;
     try { connection.postMessage({ type: "STATUS", event, detail }); } catch (_) {}
   }
   function done(markdown) {
-    if (!connection) return;
-    try { connection.postMessage({ type: "RESULT", target: "claude", markdown }); } catch (_) {}
+    console.log("mn-synth: done; length=", markdown.length);
+    if (!connection) {
+      // Worker died during the wait. As a last-ditch retry, open a
+      // fresh port and send. This works because the SYNTHESIZE_START
+      // listener in background.js keeps `inflight` keyed by request
+      // id; even a new worker incarnation can route the late result.
+      try {
+        const port = chrome.runtime.connect({
+          name: `mn-synth-late-${_requestId}`,
+        });
+        port.postMessage({ type: "RESULT", target: "claude", markdown });
+      } catch (e) {
+        console.error("mn-synth: late-result send failed", e);
+      }
+      return;
+    }
+    try {
+      connection.postMessage({ type: "RESULT", target: "claude", markdown });
+    } catch (e) {
+      console.error("mn-synth: postMessage RESULT failed", e);
+    }
   }
   function fail(code, detail = "") {
+    console.error("mn-synth: fail", code, detail);
     if (!connection) return;
     try { connection.postMessage({ type: "ERROR", code, detail }); } catch (_) {}
   }
 
+  let _requestId = "";
+
   async function runSynthesis(requestId, prompt) {
-    // If the proxy interstitial is in the way, surface a toast and
-    // wait it out. The user does the human-in-the-loop click.
+    _requestId = requestId;
+
     if (looksLikeInterstitial()) {
       status(STATUS.PROXY_ACK_NEEDED);
       showToast("Click PROCEED to acknowledge AI use, then synthesis continues automatically.");
@@ -96,8 +186,6 @@
       }
       clearToast();
       status(STATUS.PROXY_ACK_CLEARED);
-      // After ack, the page typically navigates. Wait for the
-      // composer to (re)appear before continuing.
     }
 
     status(STATUS.PASTING);
@@ -114,9 +202,8 @@
       return;
     }
 
-    // Give Lexical/React a tick to register the paste, then poll for
-    // the send button to enable. Some installs see the composer take
-    // 200-500ms to recompute enabled-state after a multi-line paste.
+    // Poll for the send button to enable post-paste. Lexical takes a
+    // tick to recompute disabled-state after a multi-line insert.
     let submitted = false;
     const submitDeadline = Date.now() + 4000;
     while (Date.now() < submitDeadline) {
@@ -129,10 +216,6 @@
       await new Promise((r) => setTimeout(r, 100));
     }
     if (!submitted) {
-      // Fall back to keyboard submit. Lexical listens for the full
-      // keydown/keypress/keyup sequence; dispatch all three with the
-      // event flags it expects (bubbles + cancelable, key + code,
-      // keyCode for legacy handlers).
       const enterInit = {
         key: "Enter",
         code: "Enter",
@@ -147,45 +230,64 @@
     }
     status(STATUS.AWAITING_RESPONSE);
 
-    // Wait for the stop button to appear (means generation started),
-    // then for it to disappear (means generation ended).
-    await waitForSelector(STOP_BUTTON_SELECTORS.join(","), { timeoutMs: 30000 });
-    status(STATUS.RESPONSE_STREAMING);
-    const elapsed = await waitForStableFalse(
-      () => !!findFirst(STOP_BUTTON_SELECTORS),
-      { intervalMs: 300, stableMs: 1500, timeoutMs: 10 * 60 * 1000 },
-    );
+    // Wait for streaming to settle. Selector-agnostic via
+    // MutationObserver: detect that the DOM has stopped changing for
+    // 2.5 seconds. minWaitMs=4000 protects against scraping while
+    // Claude is still spinning up the response (the first few
+    // hundred ms after submit can look quiet because the composer
+    // clear + assistant-bubble-create is two discrete bursts).
+    //
+    // Heartbeat status every ~10s keeps the port active so Chrome's
+    // service-worker kill timer doesn't drop the result.
+    let lastHeartbeat = Date.now();
+    const HEARTBEAT_MS = 10000;
+    const elapsed = await waitForDomSettled({
+      settleMs: 2500,
+      timeoutMs: 10 * 60 * 1000,
+      minWaitMs: 4000,
+      onTick: (ms) => {
+        if (Date.now() - lastHeartbeat >= HEARTBEAT_MS) {
+          lastHeartbeat = Date.now();
+          status(STATUS.RESPONSE_STREAMING, `~${Math.floor(ms / 1000)}s elapsed`);
+        }
+      },
+    });
     if (elapsed === null) {
-      fail("timeout", "Claude response didn't finish within 10 minutes.");
+      fail("timeout", "Claude response didn't settle within 10 minutes.");
       return;
+    }
+    status(STATUS.RESPONSE_STREAMING, `settled after ${Math.floor(elapsed / 1000)}s`);
+
+    // Scrape. If the stop button is still visible at this point,
+    // give it another 5 seconds to finish; some chat UIs replace
+    // the stop button with the send button before the final tokens
+    // render.
+    if (findStopButton()) {
+      await new Promise((r) => setTimeout(r, 5000));
     }
 
-    // Scrape the latest assistant message. We grab innerText rather
-    // than the rendered HTML; Claude's response is markdown-rendered
-    // and the source text is preserved in the inner DOM. innerText
-    // gives us the visible-character form which is what the user
-    // would have copied manually.
-    const messages = findAll(ASSISTANT_MESSAGE_SELECTORS);
-    if (messages.length === 0) {
-      fail("paste_failed", "Couldn't locate assistant response in the DOM.");
+    const messageEl = findLatestAssistantMessage();
+    if (!messageEl) {
+      fail(
+        "paste_failed",
+        "Claude responded but I couldn't locate the assistant message in the DOM. " +
+        "The page's structure may have changed; please report this with a screenshot of " +
+        "the chat. Falling back to manual copy/paste.",
+      );
       return;
     }
-    const latest = messages[messages.length - 1];
-    const markdown = (latest.innerText || latest.textContent || "").trim();
+    const markdown = (messageEl.innerText || messageEl.textContent || "").trim();
     if (!markdown) {
-      fail("paste_failed", "Assistant response is empty.");
+      fail("paste_failed", "Found the assistant container but its text was empty.");
       return;
     }
-    status(STATUS.DONE);
+    status(STATUS.DONE, `${markdown.length} chars`);
     done(markdown);
   }
 
-  // Entry point: init.js executes when the tab finishes loading; it
-  // opens a port back to the service worker named by request id, and
-  // the worker pushes SYNTHESIZE_START down it.
+  // Entry point: background's executeScript -> __mnStartSynthesis(rid).
   window.__mnStartSynthesis = function (requestId) {
     if (connection) {
-      // Already running; ignore re-trigger.
       return;
     }
     connection = chrome.runtime.connect({ name: `mn-synth-${requestId}` });
@@ -197,6 +299,9 @@
       }
     });
     connection.onDisconnect.addListener(() => {
+      // Service worker may have died. runSynthesis() will route the
+      // eventual result through a fresh port if `connection` is null
+      // by then.
       connection = null;
     });
   };
