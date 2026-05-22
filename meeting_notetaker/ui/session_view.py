@@ -97,6 +97,13 @@ class SessionView(QWidget):
         # so re-entering a session while its synthesis is still
         # running keeps the indicator on.
         self._synth_in_progress_session_id: Optional[str] = None
+        # Current (chrome_running, bridge_connected) combined state.
+        # Set by MainApp via set_synthesis_connection_state on each
+        # 5-second poll tick + on bridge connect/disconnect. Defaults
+        # to NOT_RUNNING so the Send button enables until proven
+        # otherwise -- the launch-on-Send path handles the case
+        # where Chrome really isn't up.
+        self._synth_connection_state = None  # SynthesisConnectionState, set by app
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -661,6 +668,19 @@ class SessionView(QWidget):
                     has_notes=bool(self._session.has_notes),
                 )
 
+    def set_synthesis_connection_state(self, state) -> None:
+        """Update the SessionView's view of the synthesis connection
+        state. MainApp's poll loop calls this every 5 seconds plus on
+        bridge connect/disconnect transitions. Re-evaluates the Send
+        button enable state immediately."""
+        self._synth_connection_state = state
+        if self._session is not None:
+            self._set_buttons_for_state(
+                self._session.state,
+                has_transcript=bool(self._raw_transcript_text),
+                has_notes=bool(self._session.has_notes),
+            )
+
     def set_automation_enabled(self, enabled: bool, target_key: str = "claude") -> None:
         """Swap between manual (Generate + Paste) and automated (Send)
         synthesis buttons. Copy / Print / Export PDF stay visible
@@ -796,14 +816,18 @@ class SessionView(QWidget):
         can_synthesize = has_session and has_transcript and not is_recording
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
-        # Send button mirrors Generate's gating; the bridge connectivity
-        # gating happens at the controller layer (it surfaces a dialog
-        # if the extension isn't reachable, rather than silently
-        # disabling the button -- the user might have just not loaded
-        # the extension yet and they're more likely to investigate via
-        # a click + error message than via a greyed-out button). The
-        # synthesis-in-progress flag adds a final gate so a mid-flight
-        # request can't be re-fired by a double-click.
+        # Send button: gated by FOUR conditions. All must be true.
+        #
+        #   1. There's a transcript to synthesize (can_synthesize).
+        #   2. The target LLM has a working content-script adapter
+        #      (Copilot is stub-only in v0.6.3 so its target.implemented
+        #      is False; Claude is True).
+        #   3. There's no synthesis already in flight for THIS session
+        #      (prevents double-click → two tabs).
+        #   4. The connection state allows it: NOT_RUNNING (we'll
+        #      launch Chrome on click) or RUNNING_CONNECTED (normal
+        #      flow). RUNNING_DISCONNECTED disables because the
+        #      extension is broken and a click would just fail.
         if self._automation_enabled and self._automation_target:
             from ..automation.targets import get_target
 
@@ -816,8 +840,15 @@ class SessionView(QWidget):
                 self._synth_in_progress_session_id is not None
                 and self._synth_in_progress_session_id == self_id
             )
+            connection_ok = (
+                self._synth_connection_state is None
+                or self._synth_connection_state.send_button_enabled()
+            )
             self._send_btn.setEnabled(
-                can_synthesize and implemented and not in_progress_here
+                can_synthesize
+                and implemented
+                and not in_progress_here
+                and connection_ok
             )
         self._update_copy_button(has_session=has_session)
         self._update_print_button(has_session=has_session, has_notes=has_notes)

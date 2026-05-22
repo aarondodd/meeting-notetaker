@@ -34,6 +34,32 @@
     /by clicking proceed/i,
   ];
 
+  // Detect that the current page is asking the user to sign in,
+  // rather than showing a chat composer. Heuristic: URL contains
+  // /login or /sign-in, OR the page body has "Sign in" / "Continue
+  // with Google" buttons + no composer in sight. The background
+  // script's tabs.onUpdated listener will re-fire __mnStartSynthesis
+  // when navigation lands on a non-login URL.
+  function looksLikeLoginPage() {
+    const url = location.href.toLowerCase();
+    if (/\/(login|sign[_-]?in|signin|auth)\b/.test(url)) return true;
+    // Look for sign-in CTA buttons that aren't typical of a logged-in chat UI.
+    const buttons = document.querySelectorAll("button, a");
+    let signinHits = 0;
+    for (const b of buttons) {
+      const text = (b.innerText || b.textContent || "").trim().toLowerCase();
+      if (
+        text === "log in" ||
+        text === "sign in" ||
+        /^continue with (google|apple|email)/.test(text) ||
+        /^sign in with /.test(text)
+      ) {
+        signinHits += 1;
+      }
+    }
+    return signinHits >= 2;
+  }
+
   function looksLikeInterstitial() {
     // Heuristic 1: page is not on the expected target domain.
     // (per-target content scripts pass their expected hostname.)
@@ -651,6 +677,7 @@
   window.__mnSynth = {
     STATUS,
     looksLikeInterstitial,
+    looksLikeLoginPage,
     showToast,
     clearToast,
     watchForInterstitialClear,

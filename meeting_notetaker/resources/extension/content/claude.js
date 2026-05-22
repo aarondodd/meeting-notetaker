@@ -26,7 +26,8 @@
     console.error("mn-synth: common.js not loaded");
     return;
   }
-  const { STATUS, looksLikeInterstitial, showToast, clearToast, watchForInterstitialClear,
+  const { STATUS, looksLikeInterstitial, looksLikeLoginPage,
+    showToast, clearToast, watchForInterstitialClear,
     waitForSelector, waitForResponseStreaming, pasteIntoComposer,
     findCopyButtonForMessage, htmlToMarkdown } = helpers;
 
@@ -186,6 +187,22 @@
   async function runSynthesis(requestId, prompt) {
     _requestId = requestId;
 
+    // Login detection. If the current page is the Claude sign-in
+    // page (likely a redirect from /new because the user isn't
+    // authenticated), surface a toast and bail out WITHOUT failing.
+    // The background script's tabs.onUpdated listener will re-fire
+    // __mnStartSynthesis when navigation lands on a chat URL after
+    // the user signs in. Failing here would tell the user "not
+    // logged in" then leave them stuck even after they log in --
+    // bailing politely lets the next page fire pick up automatically.
+    if (looksLikeLoginPage()) {
+      status(STATUS.AWAITING_LOGIN, "Sign in to Claude.ai");
+      showToast("Sign in to Claude.ai. Synthesis will resume automatically.");
+      // Don't close the connection -- the next page-load's content
+      // script will open its own port. Just return without failing.
+      return;
+    }
+
     if (looksLikeInterstitial()) {
       status(STATUS.PROXY_ACK_NEEDED);
       showToast("Click PROCEED to acknowledge AI use, then synthesis continues automatically.");
@@ -206,8 +223,14 @@
     }
 
     status(STATUS.PASTING);
+    // 5-minute composer wait accommodates the cold-start case
+    // (Chrome restoring tabs slowly) and the rare scenario where the
+    // user is still mid-login on a tab that just refreshed but
+    // hasn't shown the chat composer yet. The tabs.onUpdated re-fire
+    // path is the primary recovery; this is a backup for cases where
+    // the URL stays the same but the composer takes time to render.
     const composer = await waitForSelector(COMPOSER_SELECTORS.join(","), {
-      timeoutMs: 30000,
+      timeoutMs: 5 * 60 * 1000,
     });
     if (!composer) {
       fail("not_logged_in", "Couldn't find Claude composer. Are you signed in?");

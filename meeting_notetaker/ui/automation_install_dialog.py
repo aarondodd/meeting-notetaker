@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..automation import installer
+from ..utils.chrome_process import locate_chrome_exe
 from ..utils.paths import extension_dir
 
 
@@ -211,7 +212,7 @@ class AutomationInstallDialog(QDialog):
         # Locate chrome.exe directly and launch it with the URL as an
         # argument -- the in-app Chrome instance accepts chrome:// URLs
         # on the command line.
-        chrome_exe = _locate_chrome_exe()
+        chrome_exe = locate_chrome_exe()
         if chrome_exe is not None:
             try:
                 import subprocess  # noqa: PLC0415
@@ -308,66 +309,6 @@ class AutomationInstallDialog(QDialog):
             self._step1_status.setTextFormat(Qt.TextFormat.RichText)
             self._open_chrome_btn.setEnabled(True)
             self._verify_btn.setEnabled(True)
-
-
-def _locate_chrome_exe() -> Path | None:
-    """Best-effort lookup for the Chrome executable. Tries (in order):
-
-      1. The App Paths registry key
-         (HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe).
-         This is the canonical Windows mechanism for finding installed
-         apps -- if Chrome is on the box, the key is set even when the
-         binary isn't on PATH.
-      2. The default per-machine install path under Program Files.
-      3. The per-user install path under %LOCALAPPDATA%.
-      4. ``shutil.which("chrome")`` as a last-ditch PATH lookup.
-
-    Returns None if none of the above resolves. On non-Windows the
-    function still works against PATH-based ``chrome`` (or
-    ``google-chrome``); dev hosts rarely need this code path.
-    """
-    if sys.platform.startswith("win"):
-        try:
-            import winreg  # type: ignore[import-not-found]  # noqa: PLC0415
-
-            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-                try:
-                    with winreg.OpenKey(
-                        hive,
-                        r"Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
-                    ) as k:
-                        value, _ = winreg.QueryValueEx(k, None)
-                        if value:
-                            p = Path(value)
-                            if p.exists():
-                                return p
-                except FileNotFoundError:
-                    continue
-        except ImportError:
-            pass
-
-        candidates = [
-            Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-        ]
-        local_app = sys.platform.startswith("win") and __import__("os").environ.get(
-            "LOCALAPPDATA"
-        )
-        if local_app:
-            candidates.append(
-                Path(local_app) / "Google" / "Chrome" / "Application" / "chrome.exe"
-            )
-        for c in candidates:
-            if c.exists():
-                return c
-
-    import shutil  # noqa: PLC0415
-
-    for name in ("chrome", "google-chrome", "chromium"):
-        found = shutil.which(name)
-        if found:
-            return Path(found)
-    return None
 
 
 class _StepFrame(QFrame):

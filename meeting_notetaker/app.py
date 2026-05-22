@@ -17,6 +17,11 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from .automation import messages as automation_messages
 from .automation.bridge import Bridge, HandshakeState
 from .automation.targets import get_target
+from .utils.chrome_process import (
+    SynthesisConnectionState,
+    is_chrome_running,
+    launch_chrome,
+)
 from .controller import SessionController
 from .diarization.persistence import (
     load_diarization,
@@ -68,6 +73,7 @@ from .utils.paths import (
     bridge_handshake_path,
     calendar_state_path,
     log_path,
+    rotate_log_on_launch,
 )
 from .utils.single_instance import acquire as acquire_lock, release as release_lock
 from .utils.vocabulary import seed_vocabulary_file
@@ -99,6 +105,10 @@ class MainApp(QObject):
     # event loop) and never fired (Aaron's 2026-05-22 repro: bridge
     # received messages but the result never reached the app).
     bridge_message_received = pyqtSignal(dict)
+    # Same thread-safety concern for connect/disconnect callbacks --
+    # they fire on the bridge's accept/reader threads and need to
+    # bounce to the main thread before touching UI / triggering a poll.
+    bridge_state_changed = pyqtSignal()
 
     def __init__(self, qt_app: QApplication) -> None:
         super().__init__()
@@ -139,14 +149,32 @@ class MainApp(QObject):
             self._bridge.start()
         except OSError:
             log.exception("synthesis bridge failed to bind a loopback port")
-        # Bridge worker thread emits this signal; the connect below
-        # auto-promotes to QueuedConnection so the slot runs on the
+        # Three-state synthesis connection: Chrome-running x bridge-
+        # connected. The poll runs every 5s, the keep-alive ping runs
+        # every 25s but only when state==RUNNING_CONNECTED. Both timers
+        # start in _wire_signals so they exist before any UI shows.
+        self._synth_state = SynthesisConnectionState.NOT_RUNNING
+        self._synth_poll_timer = QTimer(self)
+        self._synth_poll_timer.setInterval(5000)
+        self._synth_poll_timer.timeout.connect(self._poll_synthesis_state)
+        self._synth_keepalive_timer = QTimer(self)
+        self._synth_keepalive_timer.setInterval(25000)
+        self._synth_keepalive_timer.timeout.connect(self._send_keepalive_ping)
+        # Bridge worker thread emits these signals; the connects below
+        # auto-promote to QueuedConnection so the slots run on the
         # main thread regardless of which thread emitted.
         self.bridge_message_received.connect(self._dispatch_bridge_message)
+        self.bridge_state_changed.connect(self._poll_synthesis_state)
 
         self._wire_signals()
         self._apply_user_name()
         self._apply_synthesis_automation()
+        # Kick off the state poll immediately so the status bar shows
+        # the right indicator on first paint, then settle into the
+        # 5-second cadence.
+        self._poll_synthesis_state()
+        self._synth_poll_timer.start()
+        self._synth_keepalive_timer.start()
         self._refresh_session_list()
         self._handle_crash_recovery()
         self._warn_if_store_python()
@@ -193,6 +221,53 @@ class MainApp(QObject):
             self.config.synthesis.llm_target,
         )
 
+    # ---- synthesis automation: connection state polling --------------------
+
+    def _poll_synthesis_state(self) -> None:
+        """Re-compute the three-state synthesis-connection value and
+        propagate to the status bar + SessionView Send-button gating.
+
+        Runs every 5 seconds via _synth_poll_timer. Cheap: one psutil
+        process_iter pass + a property read on the bridge."""
+        new_state = SynthesisConnectionState.derive(
+            chrome_running=is_chrome_running(),
+            bridge_connected=self._bridge_ready_state,
+        )
+        if new_state == self._synth_state:
+            return
+        old_state = self._synth_state
+        self._synth_state = new_state
+        log.info(
+            "synthesis state: %s -> %s",
+            old_state.value,
+            new_state.value,
+        )
+        self._refresh_status_indicators()
+        # Push the gating into SessionView so the Send button reflects
+        # the new state without waiting for the next session-state event.
+        self.window.session_view.set_synthesis_connection_state(new_state)
+        # On just-became-connected transitions, fire a keepalive ping
+        # right away rather than waiting up to 25s for the next tick --
+        # the bridge is fresh and a quick pong confirms end-to-end.
+        if (
+            new_state == SynthesisConnectionState.RUNNING_CONNECTED
+            and old_state != SynthesisConnectionState.RUNNING_CONNECTED
+        ):
+            self._send_keepalive_ping()
+
+    def _send_keepalive_ping(self) -> None:
+        """Fire a ping to keep the MV3 service worker awake.
+
+        Only runs when state is RUNNING_CONNECTED -- a ping into a
+        nonexistent peer is wasted work, and we don't want to log
+        warnings every 25s when Chrome is closed."""
+        if self._synth_state != SynthesisConnectionState.RUNNING_CONNECTED:
+            return
+        ping_id = f"keepalive-{secrets.token_hex(4)}"
+        ping = automation_messages.PingRequest(request_id=ping_id)
+        if not self._bridge.send(ping):
+            log.debug("keepalive ping send failed (peer dropped)")
+
     # ---- synthesis automation: bridge callbacks ----------------------------
 
     def _on_bridge_connect(self, state: HandshakeState) -> None:
@@ -202,10 +277,14 @@ class MainApp(QObject):
             state.host_version,
         )
         self._bridge_ready_state = True
+        # Bounce the re-poll to the main thread via signal (these
+        # callbacks fire on the bridge's accept/reader thread).
+        self.bridge_state_changed.emit()
 
     def _on_bridge_disconnect(self) -> None:
         log.info("bridge: extension disconnected")
         self._bridge_ready_state = False
+        self.bridge_state_changed.emit()
 
     def _on_bridge_message(self, msg: dict) -> None:
         """Inbound from the extension. Runs on the bridge's reader
@@ -407,18 +486,35 @@ class MainApp(QObject):
         session = self.store.get_session(session_id)
         if session is None:
             return
-        if not self._bridge_ready_state:
-            ans = QMessageBox.warning(
+        # Three-state-aware preflight. If Chrome isn't running, launch
+        # it and wait for the bridge to connect. The Send button is
+        # disabled in RUNNING_DISCONNECTED so we shouldn't see that
+        # path here, but guard for the race where the state poll
+        # missed a transition.
+        if self._synth_state == SynthesisConnectionState.NOT_RUNNING:
+            if not self._launch_chrome_and_wait_for_connection(session_id):
+                return
+        elif self._synth_state == SynthesisConnectionState.RUNNING_DISCONNECTED:
+            QMessageBox.warning(
                 self.window,
                 "Synthesis Automation",
-                "The Chrome extension is not connected to the app. "
-                "Open the extension in Chrome (chrome://extensions) and "
-                "ensure it's enabled, then try again.\n\nFall back to "
-                "the manual Generate / Paste flow instead?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                "Chrome is running but the extension hasn't connected "
+                "back to the app. The extension service worker may be "
+                "asleep -- it should reconnect within ~60s. If it "
+                "persists, open the Meeting Notetaker extension popup "
+                "in Chrome and click 'Reconnect to app', or reload the "
+                "extension at chrome://extensions.",
             )
-            if ans == QMessageBox.StandardButton.Yes:
-                self._on_generate_prompt(session_id)
+            return
+        elif not self._bridge_ready_state:
+            # Defensive: state thinks connected but bridge says no.
+            # Rare race; surface a clear error.
+            QMessageBox.warning(
+                self.window,
+                "Synthesis Automation",
+                "Lost connection to the extension while preparing to "
+                "send. Try again in a moment.",
+            )
             return
         try:
             target = get_target(target_key)
@@ -512,6 +608,81 @@ class MainApp(QObject):
             f"Sent to {target.label}. The response will land in the Synthesis tab.",
             timeout_ms=6000,
         )
+
+    def _launch_chrome_and_wait_for_connection(self, session_id: str) -> bool:
+        """When the user clicks Send and Chrome isn't running, launch
+        chrome.exe (passing claude.ai/new as the URL so it opens
+        directly to the synthesis target), then wait up to 60s for
+        the bridge to report a connected peer.
+
+        Returns True if Chrome launched AND the bridge connected
+        within the timeout; False otherwise (with an error dialog
+        already shown).
+
+        Cold start can be slow: the user might be waking the machine,
+        Chrome has to load + restore tabs + spin up the extension
+        service worker + native messaging host + TCP connection. 60s
+        is generous; we use a QEventLoop so the UI stays responsive.
+        """
+        from PyQt6.QtCore import QEventLoop  # noqa: PLC0415
+
+        # Show the in-progress banner so the user sees something
+        # happening immediately. Updated as the launch progresses.
+        self.window.session_view.set_synthesis_in_progress(
+            session_id,
+            True,
+            status_text="Starting Chrome...",
+        )
+        ok = launch_chrome("https://claude.ai/new")
+        if not ok:
+            self.window.session_view.set_synthesis_in_progress(session_id, False)
+            QMessageBox.warning(
+                self.window,
+                "Synthesis Automation",
+                "Couldn't find or launch Chrome on this machine. "
+                "Install Chrome from https://www.google.com/chrome/ "
+                "or open it manually before clicking Send.",
+            )
+            return False
+
+        # Wait for the bridge to report connected. 60-second budget.
+        self.window.session_view.set_synthesis_in_progress(
+            session_id,
+            True,
+            status_text="Waiting for Chrome to load extension...",
+        )
+        loop = QEventLoop()
+        connect_poll = QTimer()
+        connect_poll.setInterval(200)
+        connect_poll.timeout.connect(
+            lambda: self._bridge.is_connected and loop.quit()
+        )
+        deadline = QTimer()
+        deadline.setSingleShot(True)
+        deadline.setInterval(60_000)
+        deadline.timeout.connect(loop.quit)
+        connect_poll.start()
+        deadline.start()
+        loop.exec()
+        connect_poll.stop()
+        deadline.stop()
+
+        if not self._bridge.is_connected:
+            self.window.session_view.set_synthesis_in_progress(session_id, False)
+            QMessageBox.warning(
+                self.window,
+                "Synthesis Automation",
+                "Chrome started but the Meeting Notetaker extension "
+                "didn't connect back within 60 seconds.\n\n"
+                "Check that the extension is enabled at chrome://"
+                "extensions and that it shows 'Connected' in its "
+                "popup. Then try Send again.",
+            )
+            return False
+        # Force one fresh state-poll so the indicator + button reflect
+        # the connection before we proceed.
+        self._poll_synthesis_state()
+        return True
 
     def _ping_extension(self, timeout_sec: float) -> bool:
         """Used by the Settings install wizard's Verify step. Returns
@@ -1380,6 +1551,7 @@ class MainApp(QObject):
         speakers_label, speakers_tooltip = self._speakers_indicator()
         voice_label, voice_tooltip = self._voice_indicator()
         detect_label, detect_tooltip = self._detection_indicator()
+        synthesis_label, synthesis_tooltip = self._synthesis_indicator()
         self.window.set_status_indicators(
             version=__version__,
             mic_label=f"Mic: {_short_device_label(mic)}",
@@ -1394,7 +1566,20 @@ class MainApp(QObject):
             voice_tooltip=voice_tooltip,
             detect_label=detect_label,
             detect_tooltip=detect_tooltip,
+            synthesis_label=synthesis_label,
+            synthesis_tooltip=synthesis_tooltip,
         )
+
+    def _synthesis_indicator(self) -> tuple[str, str]:
+        """Status-bar label + tooltip for synthesis automation.
+
+        Empty when automation is disabled in Settings -- the indicator
+        would be noise for users who don't use the feature. Otherwise
+        shows one of three values based on Chrome process + bridge
+        connection state."""
+        if not self.config.synthesis.automation_enabled:
+            return "", ""
+        return self._synth_state.status_label(), self._synth_state.status_tooltip()
 
     def _speakers_indicator(self) -> tuple[str, str]:
         """Return (label, tooltip) for the status-bar speakers segment.
@@ -1943,6 +2128,12 @@ def _set_windows_app_user_model_id() -> None:
 
 def main() -> int:
     _set_windows_app_user_model_id()
+
+    # Rotate the previous run's log out of the way and prune ancient
+    # archives. The current launch gets a fresh meeting_notetaker.log
+    # so a problem in this session doesn't get buried under prior
+    # noise. See utils.paths.rotate_log_on_launch.
+    rotate_log_on_launch()
 
     logging.basicConfig(
         level=logging.INFO,

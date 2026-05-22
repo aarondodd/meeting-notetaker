@@ -274,39 +274,85 @@ function handleContentMessage(requestId, m, _contentPort) {
 // ---------------------------------------------------------------------------
 // Tab plumbing
 
-function waitForTabComplete(tabId, requestId, targetKey) {
+// Module-top tabs.onUpdated listener. Re-triggers __mnStartSynthesis
+// on every status=complete event for a tab that's still associated
+// with an inflight synthesis. This handles two cases Aaron hit:
+//
+//   1. Cold-start: the user clicks Send while Chrome wasn't running,
+//      Chrome launches, content scripts take a moment to load. The
+//      first executeScript can fire before window.__mnStartSynthesis
+//      is defined; the polling fallback inside the injected func
+//      handles that, and this listener re-fires on later completes.
+//
+//   2. Login redirect: claude.ai/new redirects to /login when the
+//      user isn't signed in. Our first __mnStartSynthesis call runs
+//      on the login page (no composer found), then the user signs
+//      in, navigates back to a chat URL. That's a fresh page context;
+//      this listener catches the new status=complete event and
+//      re-fires __mnStartSynthesis on the fresh page. The content
+//      script's __mnStartSynthesis is idempotent for cases where a
+//      synthesis is already running.
+chrome.tabs.onUpdated.addListener((updatedTabId, info, tab) => {
+  if (info.status !== "complete") return;
+  // Find an inflight context that owns this tab.
+  let requestId = "";
+  for (const [rid, ctx] of inflight.entries()) {
+    if (ctx.tabId === updatedTabId) {
+      requestId = rid;
+      break;
+    }
+  }
+  if (!requestId) return;
+  console.log("mn-synth bg: tab complete for inflight rid=" + requestId + " url=" + (tab && tab.url));
+  triggerSynthesisOnTab(updatedTabId, requestId);
+});
+
+function triggerSynthesisOnTab(tabId, requestId) {
+  // Inject a function that polls for window.__mnStartSynthesis to
+  // appear (cold-start: content scripts may not have loaded yet),
+  // then calls it. The content script's __mnStartSynthesis is
+  // idempotent -- a duplicate call while already running is a no-op.
+  chrome.scripting
+    .executeScript({
+      target: { tabId },
+      args: [requestId],
+      func: async (rid) => {
+        // Poll up to 10 seconds for the helper to register. The
+        // content script's manifest-declared run_at is document_idle,
+        // which usually fires before our executeScript -- but cold-
+        // start tabs and login pages can be different.
+        const deadline = Date.now() + 10000;
+        while (Date.now() < deadline) {
+          if (typeof window.__mnStartSynthesis === "function") {
+            window.__mnStartSynthesis(rid);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        console.warn(
+          "mn-synth: __mnStartSynthesis never appeared after 10s -- " +
+          "content script may not have loaded for this URL",
+        );
+      },
+    })
+    .catch((e) => {
+      console.warn("mn-synth bg: executeScript failed for tab " + tabId, e);
+    });
+}
+
+function waitForTabComplete(tabId, requestId, _targetKey) {
+  // Light wrapper around the tabs.onUpdated listener above. Resolves
+  // on first complete event so the caller knows the initial load
+  // landed; subsequent re-triggers (login navigation, redirects) are
+  // handled by the same listener and don't need to block startSynthesis.
   return new Promise((resolve) => {
-    const listener = (updatedTabId, info, _tab) => {
+    const handler = (updatedTabId, info, _tab) => {
       if (updatedTabId !== tabId) return;
-      if (info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
-        // Kick the per-target content script. The content script
-        // registers window.__mnStartSynthesis; we inject a tiny
-        // function that calls it with the request id. Going through
-        // executeScript means we don't have to encode the request id
-        // in the URL where Claude might strip it.
-        chrome.scripting
-          .executeScript({
-            target: { tabId },
-            args: [requestId],
-            func: (rid) => {
-              if (typeof window.__mnStartSynthesis === "function") {
-                window.__mnStartSynthesis(rid);
-              } else {
-                // Content script never loaded -- the chat domain
-                // mismatched the manifest matches, most likely.
-                console.warn("mn-synth: __mnStartSynthesis missing");
-              }
-            },
-          })
-          .catch((e) => {
-            sendError(requestId, "paste_failed", `executeScript failed: ${e}`);
-            inflight.delete(requestId);
-          });
-        resolve();
-      }
+      if (info.status !== "complete") return;
+      chrome.tabs.onUpdated.removeListener(handler);
+      resolve();
     };
-    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.onUpdated.addListener(handler);
   });
 }
 
@@ -358,7 +404,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 //     for the Chrome-just-launched / extension-just-loaded paths.
 ensurePort();
 try {
-  chrome.alarms.create("bridge-retry", { periodInMinutes: 1 });
+  // 0.5 minutes = 30 seconds; Chrome's minimum periodInMinutes for
+  // a recurring alarm. Tightened from 1.0 in v0.6.3 because Chrome's
+  // service-worker idle-kill timer is ~30s, so an alarm firing every
+  // 30s+ couldn't keep the worker continuously alive. Combined with
+  // the app-side 25s ping (sent only when Chrome is running), the
+  // port stays up indefinitely while both processes are alive.
+  chrome.alarms.create("bridge-retry", { periodInMinutes: 0.5 });
 } catch (_e) {
   // alarms permission may be missing in a stale install; harmless.
 }

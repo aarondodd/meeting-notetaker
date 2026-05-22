@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from meeting_notetaker.ui.automation_install_dialog import _locate_chrome_exe
+from meeting_notetaker.utils.chrome_process import locate_chrome_exe as _locate_chrome_exe
 
 
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="dev hosts only")
