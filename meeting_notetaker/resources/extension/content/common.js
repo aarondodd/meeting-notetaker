@@ -170,20 +170,80 @@
     });
   }
 
-  // Convert plain text to HTML for the chat textarea. Most LLM web
-  // UIs strip pasted formatting from a plain string anyway, but
-  // dispatch as a paste event so React-based composers register the
-  // change properly (setting .value alone is silently ignored).
+  // Push text into the chat composer. The composer flavor matters:
+  //
+  // - <textarea> (Copilot, simple chat UIs): set .value via the native
+  //   prototype setter so the React framework's onChange registers
+  //   correctly.
+  //
+  // - ContentEditable Lexical/ProseMirror editor (Claude.ai): we cannot
+  //   use document.execCommand("insertText", ...) on the whole string
+  //   because Lexical treats it as a single text-node insertion and
+  //   strips newlines, leaving only the first line. The reliable path
+  //   is to dispatch a synthetic paste event with a DataTransfer
+  //   carrying text/plain -- Lexical (and ProseMirror, and most modern
+  //   rich-text editors) listens for paste and runs its own multi-line
+  //   parser on the clipboard data.
+  //
+  // If the paste event is canceled by the editor (it will be if
+  // handled), we trust the editor. If nothing observable changes after
+  // the dispatch, we fall back to execCommand line-by-line with
+  // insertLineBreak between -- a slower but always-works path.
   function pasteIntoComposer(composer, text) {
     if (!composer) return false;
     composer.focus();
-    // ContentEditable (Claude.ai) vs <textarea>. Try both.
+
+    // Branch on contentEditable. textarea path stays unchanged.
     if (composer.isContentEditable) {
-      // execCommand is deprecated but still the only way to programmatically
-      // dispatch an actual input event that React/Lexical editors observe.
-      document.execCommand("insertText", false, text);
+      const before = (composer.innerText || composer.textContent || "").length;
+
+      // Path 1: synthetic paste with DataTransfer (Lexical / ProseMirror).
+      let pasteHandled = false;
+      try {
+        const dt = new DataTransfer();
+        dt.setData("text/plain", text);
+        const evt = new ClipboardEvent("paste", {
+          clipboardData: dt,
+          bubbles: true,
+          cancelable: true,
+        });
+        // Lexical's paste handler cancels the event when it processes
+        // the clipboard data. defaultPrevented==true == editor handled.
+        composer.dispatchEvent(evt);
+        pasteHandled = evt.defaultPrevented;
+      } catch (_e) {
+        // DataTransfer / ClipboardEvent constructors may throw in
+        // older Chromium; fall through to the line-by-line path.
+      }
+
+      if (pasteHandled) {
+        return true;
+      }
+
+      // Path 2: did the composer text grow at all?
+      const after = (composer.innerText || composer.textContent || "").length;
+      if (after > before) {
+        return true;
+      }
+
+      // Path 3: insertText line-by-line. Some editors silently drop
+      // the synthetic paste; we still owe them a multi-line insert.
+      const lines = text.split("\n");
+      for (let i = 0; i < lines.length; i += 1) {
+        if (i > 0) {
+          // Lexical respects insertLineBreak as a soft return; some
+          // chat UIs prefer a hard paragraph (insertParagraph). We
+          // pick insertLineBreak because chat composers typically
+          // treat Enter as Submit, and a soft-return survives that.
+          document.execCommand("insertLineBreak", false, null);
+        }
+        if (lines[i]) {
+          document.execCommand("insertText", false, lines[i]);
+        }
+      }
       return true;
     }
+
     if ("value" in composer) {
       const nativeSetter = Object.getOwnPropertyDescriptor(
         Object.getPrototypeOf(composer),

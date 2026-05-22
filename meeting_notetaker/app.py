@@ -409,8 +409,22 @@ class MainApp(QObject):
         )
 
     def _ping_extension(self, timeout_sec: float) -> bool:
-        """Used by the Settings install wizard's Verify step. Sends a
-        ping; returns True if a pong arrives within the timeout.
+        """Used by the Settings install wizard's Verify step. Returns
+        True if the extension is reachable within the timeout.
+
+        Two phases:
+
+        1. Wait for the bridge to report a connected peer. The
+           extension's connectNative() doesn't fire until either Chrome
+           starts the extension, the alarm-based retry ticks (every
+           minute), or the user clicks Reconnect in the extension
+           popup. If the user clicked Verify before the extension's
+           service worker had time to reconnect, we sit here until
+           one of those events lands a peer.
+
+        2. Once connected, send a ping and wait for a pong. Catches
+           the case where the bridge has a peer but the per-host
+           protocol is broken (mismatched extension ID, etc.).
 
         Runs on the Qt main thread. Uses a QEventLoop with a polling
         QTimer so paints and other event-loop work continue during
@@ -418,6 +432,28 @@ class MainApp(QObject):
         freeze the install wizard window."""
         from PyQt6.QtCore import QEventLoop  # noqa: PLC0415
 
+        # Phase 1: wait for peer.
+        deadline_ms = int(timeout_sec * 1000)
+        if not self._bridge.is_connected:
+            loop = QEventLoop()
+            connect_poll = QTimer()
+            connect_poll.setInterval(100)
+            connect_poll.timeout.connect(
+                lambda: self._bridge.is_connected and loop.quit()
+            )
+            deadline = QTimer()
+            deadline.setSingleShot(True)
+            deadline.setInterval(deadline_ms)
+            deadline.timeout.connect(loop.quit)
+            connect_poll.start()
+            deadline.start()
+            loop.exec()
+            connect_poll.stop()
+            deadline.stop()
+        if not self._bridge.is_connected:
+            return False
+
+        # Phase 2: ping/pong probe.
         request_id = f"ping-{secrets.token_hex(4)}"
         evt = threading.Event()
         self._pending_pings[request_id] = evt
@@ -426,19 +462,22 @@ class MainApp(QObject):
             self._pending_pings.pop(request_id, None)
             return False
 
+        # Use a short window for the actual pong (the connection is
+        # already established, so a pong should come back in well
+        # under a second).
         loop = QEventLoop()
         poll = QTimer()
         poll.setInterval(50)
         poll.timeout.connect(lambda: evt.is_set() and loop.quit())
-        deadline = QTimer()
-        deadline.setSingleShot(True)
-        deadline.setInterval(int(timeout_sec * 1000))
-        deadline.timeout.connect(loop.quit)
+        pong_deadline = QTimer()
+        pong_deadline.setSingleShot(True)
+        pong_deadline.setInterval(5000)
+        pong_deadline.timeout.connect(loop.quit)
         poll.start()
-        deadline.start()
+        pong_deadline.start()
         loop.exec()
         poll.stop()
-        deadline.stop()
+        pong_deadline.stop()
 
         self._pending_pings.pop(request_id, None)
         return evt.is_set()

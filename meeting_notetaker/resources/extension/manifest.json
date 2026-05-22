@@ -27,7 +27,8 @@
     "nativeMessaging",
     "scripting",
     "tabs",
-    "storage"
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
     "*://claude.ai/*",

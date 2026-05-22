@@ -114,16 +114,36 @@
       return;
     }
 
-    // Submit. Try the send button first; fall back to Enter.
-    const sendBtn = findFirst(SEND_BUTTON_SELECTORS);
-    if (sendBtn && !sendBtn.disabled) {
-      sendBtn.click();
-    } else {
-      composer.dispatchEvent(new KeyboardEvent("keydown", {
+    // Give Lexical/React a tick to register the paste, then poll for
+    // the send button to enable. Some installs see the composer take
+    // 200-500ms to recompute enabled-state after a multi-line paste.
+    let submitted = false;
+    const submitDeadline = Date.now() + 4000;
+    while (Date.now() < submitDeadline) {
+      const sendBtn = findFirst(SEND_BUTTON_SELECTORS);
+      if (sendBtn && !sendBtn.disabled) {
+        sendBtn.click();
+        submitted = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!submitted) {
+      // Fall back to keyboard submit. Lexical listens for the full
+      // keydown/keypress/keyup sequence; dispatch all three with the
+      // event flags it expects (bubbles + cancelable, key + code,
+      // keyCode for legacy handlers).
+      const enterInit = {
         key: "Enter",
         code: "Enter",
+        keyCode: 13,
+        which: 13,
         bubbles: true,
-      }));
+        cancelable: true,
+      };
+      composer.dispatchEvent(new KeyboardEvent("keydown", enterInit));
+      composer.dispatchEvent(new KeyboardEvent("keypress", enterInit));
+      composer.dispatchEvent(new KeyboardEvent("keyup", enterInit));
     }
     status(STATUS.AWAITING_RESPONSE);
 

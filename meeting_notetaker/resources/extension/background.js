@@ -276,6 +276,37 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 // Try to attach to the host at startup so the popup shows the right
-// status on first open. If the app isn't running, this is harmless;
-// onDisconnect fires and we'll retry on the next outbound message.
+// status on first open. If the app isn't running OR the user hasn't
+// clicked Verify yet (native-messaging-host manifest + HKCU key absent),
+// connectNative fails silently; onDisconnect fires and we're left
+// without a port until something wakes us.
+//
+// Two scheduled retry paths catch the install-before-verify case Aaron
+// hit:
+//
+//   * chrome.alarms.create("bridge-retry", {periodInMinutes: 1}) -- the
+//     alarms API wakes the service worker even after Chrome has
+//     suspended it for inactivity. Every minute we re-check whether
+//     the port is up; if not, ensurePort() runs again. As soon as the
+//     user clicks Verify on the app side, the next alarm tick
+//     connects.
+//
+//   * chrome.runtime.onStartup / onInstalled -- belt-and-suspenders
+//     for the Chrome-just-launched / extension-just-loaded paths.
 ensurePort();
+try {
+  chrome.alarms.create("bridge-retry", { periodInMinutes: 1 });
+} catch (_e) {
+  // alarms permission may be missing in a stale install; harmless.
+}
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "bridge-retry" && port === null) {
+    ensurePort();
+  }
+});
+chrome.runtime.onStartup.addListener(() => {
+  ensurePort();
+});
+chrome.runtime.onInstalled.addListener(() => {
+  ensurePort();
+});

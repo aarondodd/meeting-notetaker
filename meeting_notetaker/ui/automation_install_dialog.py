@@ -199,19 +199,38 @@ class AutomationInstallDialog(QDialog):
         self._verify_btn.setEnabled(True)
 
     def _on_open_chrome_clicked(self) -> None:
-        # ``chrome://extensions`` doesn't resolve via QDesktopServices on
-        # most platforms because the chrome:// scheme isn't registered
-        # in the OS URL-handler table. Best-effort: launch the default
-        # browser at it; if that fails, fall back to a clipboard hint.
-        opened = QDesktopServices.openUrl(QUrl("chrome://extensions"))
-        if not opened:
-            self._step2_help.setHtml(
-                "<div style='font: 12px sans-serif; color: #b91c1c;'>"
-                "Couldn't open chrome://extensions automatically. Open "
-                "Chrome, then paste this in the address bar:<br>"
-                "<code>chrome://extensions</code>"
-                "</div>"
-            )
+        # The chrome:// scheme isn't a registered URL handler in Windows
+        # (or most OSes), so QDesktopServices.openUrl("chrome://...")
+        # surfaces the OS "We can't open this 'chrome' link" dialog.
+        # Locate chrome.exe directly and launch it with the URL as an
+        # argument -- the in-app Chrome instance accepts chrome:// URLs
+        # on the command line.
+        chrome_exe = _locate_chrome_exe()
+        if chrome_exe is not None:
+            try:
+                import subprocess  # noqa: PLC0415
+
+                subprocess.Popen(  # noqa: S603 -- argv is a list, no shell
+                    [str(chrome_exe), "chrome://extensions"],
+                    close_fds=True,
+                )
+                return
+            except OSError as exc:
+                log.warning("chrome launch failed: %s", exc)
+        # Fallback: copy the URL to the clipboard and surface a hint.
+        try:
+            from PyQt6.QtWidgets import QApplication  # noqa: PLC0415
+
+            QApplication.clipboard().setText("chrome://extensions")
+        except Exception:  # noqa: BLE001 -- defensive
+            pass
+        self._step2_help.setHtml(
+            "<div style='font: 12px sans-serif; color: #b91c1c;'>"
+            "Couldn't launch Chrome automatically. The URL has been "
+            "copied to your clipboard -- open Chrome and paste into "
+            "the address bar:<br><code>chrome://extensions</code>"
+            "</div>"
+        )
 
     def _on_verify_clicked(self) -> None:
         self._verify_btn.setEnabled(False)
@@ -283,6 +302,66 @@ class AutomationInstallDialog(QDialog):
             self._step1_status.setTextFormat(Qt.TextFormat.RichText)
             self._open_chrome_btn.setEnabled(True)
             self._verify_btn.setEnabled(True)
+
+
+def _locate_chrome_exe() -> Path | None:
+    """Best-effort lookup for the Chrome executable. Tries (in order):
+
+      1. The App Paths registry key
+         (HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe).
+         This is the canonical Windows mechanism for finding installed
+         apps -- if Chrome is on the box, the key is set even when the
+         binary isn't on PATH.
+      2. The default per-machine install path under Program Files.
+      3. The per-user install path under %LOCALAPPDATA%.
+      4. ``shutil.which("chrome")`` as a last-ditch PATH lookup.
+
+    Returns None if none of the above resolves. On non-Windows the
+    function still works against PATH-based ``chrome`` (or
+    ``google-chrome``); dev hosts rarely need this code path.
+    """
+    if sys.platform.startswith("win"):
+        try:
+            import winreg  # type: ignore[import-not-found]  # noqa: PLC0415
+
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(
+                        hive,
+                        r"Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+                    ) as k:
+                        value, _ = winreg.QueryValueEx(k, None)
+                        if value:
+                            p = Path(value)
+                            if p.exists():
+                                return p
+                except FileNotFoundError:
+                    continue
+        except ImportError:
+            pass
+
+        candidates = [
+            Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        ]
+        local_app = sys.platform.startswith("win") and __import__("os").environ.get(
+            "LOCALAPPDATA"
+        )
+        if local_app:
+            candidates.append(
+                Path(local_app) / "Google" / "Chrome" / "Application" / "chrome.exe"
+            )
+        for c in candidates:
+            if c.exists():
+                return c
+
+    import shutil  # noqa: PLC0415
+
+    for name in ("chrome", "google-chrome", "chromium"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
 
 
 class _StepFrame(QFrame):
