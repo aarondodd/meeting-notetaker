@@ -99,3 +99,28 @@ def package_root() -> Path:
 
 def resource_path(*parts: str) -> Path:
     return package_root() / "resources" / Path(*parts)
+
+
+def automation_dir() -> Path:
+    """Where the unpacked Chrome extension + native-host manifest live."""
+    path = app_data_dir() / "automation"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def extension_dir() -> Path:
+    """The unpacked extension folder the user loads via chrome://extensions."""
+    path = automation_dir() / "extension"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def native_host_manifest_path() -> Path:
+    """The native-messaging-host manifest JSON Chrome reads."""
+    return automation_dir() / "com.meeting_notetaker.bridge.json"
+
+
+def bridge_handshake_path() -> Path:
+    """Loopback port + auth token, written by the running app for the host
+    to read. JSON: {"port": int, "token": str, "pid": int}."""
+    return automation_dir() / "bridge.json"

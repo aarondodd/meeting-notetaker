@@ -48,6 +48,10 @@ class SessionView(QWidget):
     stop_clicked = pyqtSignal(str)
     generate_prompt_clicked = pyqtSignal(str)
     paste_notes_clicked = pyqtSignal(str)
+    # Synthesis Automation: emitted instead of the Generate/Paste pair
+    # when the user has the feature enabled in Settings. Carries the
+    # session id and the LLM target key ("claude" / "copilot").
+    send_to_llm_clicked = pyqtSignal(str, str)      # session_id, target
     copy_tab_clicked = pyqtSignal(str, str)        # session_id, tab_id
     retain_audio_toggled = pyqtSignal(str, bool)   # session_id, value
     live_notes_changed = pyqtSignal(str, str)      # session_id, body
@@ -75,6 +79,12 @@ class SessionView(QWidget):
         # Maps (source, t_start) -> line index in the transcript view.
         self._user_name = ""
         self._raw_transcript_text = ""
+        # Synthesis Automation state. set_automation_enabled() flips
+        # both at construction (via main_window) and when Settings is
+        # closed; the click handler reads _automation_target to know
+        # which LLM to route to.
+        self._automation_enabled = False
+        self._automation_target = ""
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -133,6 +143,21 @@ class SessionView(QWidget):
         self._paste_btn = QPushButton("Paste Response Back...", self)
         self._paste_btn.clicked.connect(self._on_paste_notes)
         synthesis.addWidget(self._paste_btn)
+        # Synthesis Automation: single Send button that replaces the
+        # Generate + Paste pair when settings.synthesis.automation_enabled
+        # is on. Toggled via set_automation_enabled() at construction +
+        # whenever Settings is closed. Copy button stays visible
+        # regardless of the toggle (Aaron's call -- the manual copy
+        # path is still useful when the extension isn't reachable).
+        self._send_btn = QPushButton("Send to Claude.ai", self)
+        self._send_btn.setToolTip(
+            "Send the synthesis prompt to the configured web LLM via "
+            "the Meeting Notetaker browser extension. The response "
+            "lands in the Synthesis tab automatically."
+        )
+        self._send_btn.clicked.connect(self._on_send_to_llm)
+        self._send_btn.setVisible(False)
+        synthesis.addWidget(self._send_btn)
         self._copy_btn = QPushButton("Copy", self)
         self._copy_btn.setToolTip(
             "Copy the active tab's contents to the clipboard. The button "
@@ -527,6 +552,53 @@ class SessionView(QWidget):
         if self._session:
             self.paste_notes_clicked.emit(self._session.id)
 
+    def _on_send_to_llm(self) -> None:
+        if self._session and self._automation_target:
+            self.send_to_llm_clicked.emit(
+                self._session.id, self._automation_target
+            )
+
+    def set_automation_enabled(self, enabled: bool, target_key: str = "claude") -> None:
+        """Swap between manual (Generate + Paste) and automated (Send)
+        synthesis buttons. Copy / Print / Export PDF stay visible
+        regardless -- the user keeps the manual escape hatches.
+
+        target_key drives the Send button label so the user knows
+        where they're sending without opening Settings."""
+        self._automation_enabled = enabled
+        self._automation_target = target_key if enabled else ""
+        self._generate_btn.setVisible(not enabled)
+        self._paste_btn.setVisible(not enabled)
+        self._send_btn.setVisible(enabled)
+        # Label reflects the configured target.
+        if enabled:
+            try:
+                from ..automation.targets import get_target
+
+                target = get_target(target_key)
+                self._send_btn.setText(f"Send to {target.label}")
+                if not target.implemented:
+                    self._send_btn.setEnabled(False)
+                    self._send_btn.setToolTip(
+                        f"{target.label} automation is not yet "
+                        "implemented. Pick a different target in "
+                        "Settings, or toggle automation off to use the "
+                        "manual Generate / Paste flow."
+                    )
+            except ValueError:
+                self._send_btn.setText("Send to LLM")
+        # Visibility change alone is enough; the next state update
+        # from the controller will refresh enabled-state via the
+        # _set_buttons_for_state path. If we're already in a state
+        # where the transcript is ready, force a refresh now so the
+        # button enables without waiting for the next state event.
+        if self._session is not None:
+            self._set_buttons_for_state(
+                self._session.state,
+                has_transcript=bool(self._raw_transcript_text),
+                has_notes=bool(self._session.has_notes if self._session else False),
+            )
+
     def _on_copy_active_tab(self) -> None:
         if not self._session:
             return
@@ -608,6 +680,20 @@ class SessionView(QWidget):
         can_synthesize = has_session and has_transcript and not is_recording
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
+        # Send button mirrors Generate's gating; the bridge connectivity
+        # gating happens at the controller layer (it surfaces a dialog
+        # if the extension isn't reachable, rather than silently
+        # disabling the button -- the user might have just not loaded
+        # the extension yet and they're more likely to investigate via
+        # a click + error message than via a greyed-out button).
+        if self._automation_enabled and self._automation_target:
+            from ..automation.targets import get_target
+
+            try:
+                implemented = get_target(self._automation_target).implemented
+            except ValueError:
+                implemented = False
+            self._send_btn.setEnabled(can_synthesize and implemented)
         self._update_copy_button(has_session=has_session)
         self._update_print_button(has_session=has_session, has_notes=has_notes)
 

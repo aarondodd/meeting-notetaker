@@ -210,3 +210,42 @@ def test_resolved_cpu_threads_explicit_passes_through():
     cfg.transcription.num_workers = 2
     # Explicit non-zero overrides the auto formula entirely.
     assert cfg.transcription.resolved_cpu_threads(cpu_count=64) == 4
+
+
+def test_synthesis_defaults(isolated_data_dir):
+    """Automation feature must default OFF; target must default to claude."""
+    cfg = Config()
+    assert cfg.synthesis.automation_enabled is False
+    assert cfg.synthesis.llm_target == "claude"
+
+
+def test_synthesis_round_trip(isolated_data_dir):
+    cfg = Config()
+    cfg.synthesis.automation_enabled = True
+    cfg.synthesis.llm_target = "copilot"
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.synthesis.automation_enabled is True
+    assert loaded.synthesis.llm_target == "copilot"
+
+
+def test_synthesis_validation_rejects_unknown_target(isolated_data_dir):
+    cfg = Config()
+    cfg.synthesis.llm_target = "gemini"
+    errors = cfg.validate()
+    assert any("synthesis.llm_target" in e for e in errors)
+
+
+def test_unknown_synthesis_keys_in_toml_drop_cleanly(isolated_data_dir):
+    """Forward-compat: a newer config with an unknown key in [synthesis]
+    must not crash older releases when loaded."""
+    config_path().write_text(
+        "[synthesis]\n"
+        "automation_enabled = true\n"
+        'llm_target = "claude"\n'
+        'future_field = "ignore_me"\n',
+        encoding="utf-8",
+    )
+    loaded = Config.load()
+    assert loaded.synthesis.automation_enabled is True
+    assert loaded.synthesis.llm_target == "claude"

@@ -1,0 +1,281 @@
+// Service worker.
+//
+// Lifecycle:
+//   1. App side starts; bridge.json is up to date.
+//   2. User clicks Send in the Meeting Notetaker app.
+//   3. App writes a `synthesize` message to the bridge socket.
+//   4. We receive the message via the native-messaging port, find or
+//      open the target's chat tab, send a SYNTHESIZE_START message to
+//      the content script with the prompt, wait for status/result
+//      messages back, forward them to the app.
+//   5. On result, app writes notes.md and refreshes the synthesis tab.
+//
+// Native messaging port is created lazily on the first outbound app
+// message AND maintained while there's an in-flight synthesis. The
+// service worker can be killed by Chrome between syntheses; we don't
+// rely on keeping the port hot.
+
+const NATIVE_HOST_NAME = "com.meeting_notetaker.bridge";
+
+const STATUS = {
+  OPENING_TAB: "opening_tab",
+  AWAITING_LOGIN: "awaiting_login",
+  PROXY_ACK_NEEDED: "proxy_ack_needed",
+  PROXY_ACK_CLEARED: "proxy_ack_cleared",
+  PASTING: "pasting",
+  AWAITING_RESPONSE: "awaiting_response",
+  RESPONSE_STREAMING: "response_streaming",
+  DONE: "done",
+};
+
+const TARGETS = {
+  claude: {
+    newChatUrl: "https://claude.ai/new",
+    matches: /^https:\/\/(?:[a-z0-9-]+\.)?claude\.ai\//i,
+  },
+  copilot: {
+    newChatUrl: "https://m365.cloud.microsoft/chat",
+    matches: /^https:\/\/(?:m365\.cloud\.microsoft|copilot\.microsoft\.com)\//i,
+  },
+};
+
+const EXTENSION_VERSION = chrome.runtime.getManifest().version;
+
+// Active synthesis state. Keyed by request_id so concurrent sends are
+// at least addressable, even if the UI only allows one at a time.
+const inflight = new Map(); // request_id -> {tabId, target, port}
+
+let port = null;
+
+function ensurePort() {
+  if (port) {
+    return port;
+  }
+  port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+  port.onMessage.addListener(handleAppMessage);
+  port.onDisconnect.addListener(() => {
+    const err = chrome.runtime.lastError;
+    if (err) {
+      // Most common: app not running, bridge.json missing.
+      console.warn("native host disconnected:", err.message);
+    }
+    port = null;
+    // Surface in-flight syntheses as errored.
+    for (const [requestId, state] of inflight.entries()) {
+      // Best-effort; the app side has already moved on if it was the
+      // app that closed.
+      console.warn(`in-flight synthesis ${requestId} dropped`);
+      inflight.delete(requestId);
+    }
+  });
+  return port;
+}
+
+function sendToApp(payload) {
+  try {
+    ensurePort().postMessage(payload);
+  } catch (e) {
+    console.warn("sendToApp failed:", e);
+    port = null;
+  }
+}
+
+function sendStatus(requestId, event, detail = "") {
+  sendToApp({ type: "status", request_id: requestId, event, detail });
+}
+
+function sendResult(requestId, target, markdown) {
+  sendToApp({ type: "result", request_id: requestId, target, markdown });
+}
+
+function sendError(requestId, code, detail = "") {
+  sendToApp({ type: "error", request_id: requestId, code, detail });
+}
+
+// ---------------------------------------------------------------------------
+// App -> extension routing
+
+async function handleAppMessage(msg) {
+  if (!msg || typeof msg !== "object") return;
+  switch (msg.type) {
+    case "bridge_ready":
+      // Just informational; the app version may be useful in the popup.
+      chrome.storage.session.set({ appVersion: msg.app_version || "" });
+      return;
+    case "ping":
+      sendToApp({
+        type: "pong",
+        request_id: msg.request_id || "",
+        extension_version: EXTENSION_VERSION,
+      });
+      return;
+    case "synthesize":
+      await startSynthesis(msg);
+      return;
+    case "cancel":
+      cancelSynthesis(msg.request_id);
+      return;
+    case "error":
+      // Bridge unavailable, etc. Nothing we can do except surface in
+      // the popup; the app already knows.
+      console.warn("app side reports error:", msg);
+      return;
+    default:
+      console.warn("unhandled app message type:", msg.type);
+  }
+}
+
+async function startSynthesis(msg) {
+  const requestId = msg.request_id || "";
+  const targetKey = msg.target || "claude";
+  const target = TARGETS[targetKey];
+  if (!target) {
+    sendError(requestId, "unknown", `unknown target: ${targetKey}`);
+    return;
+  }
+  if (targetKey === "copilot") {
+    // Stub in v0.6.3. The Copilot content script is a placeholder.
+    sendError(
+      requestId,
+      "unknown",
+      "Copilot automation is not implemented in this build. Use Claude as the target, or fall back to manual copy/paste.",
+    );
+    return;
+  }
+
+  sendStatus(requestId, STATUS.OPENING_TAB);
+  let tab;
+  try {
+    tab = await chrome.tabs.create({
+      url: target.newChatUrl,
+      active: true,
+    });
+  } catch (e) {
+    sendError(requestId, "no_tab", String(e));
+    return;
+  }
+  inflight.set(requestId, { tabId: tab.id, target: targetKey });
+
+  // Wait for the tab to load, then ask the content script to drive
+  // the chat. We re-send the start message after each navigation
+  // because the proxy interstitial may have caused a redirect.
+  const onMessageFromTab = (port) => {
+    if (port.name !== `mn-synth-${requestId}`) return;
+    port.onMessage.addListener((m) => handleContentMessage(requestId, m, port));
+    port.postMessage({
+      type: "SYNTHESIZE_START",
+      requestId,
+      target: targetKey,
+      prompt: msg.prompt || "",
+      newChat: msg.new_chat !== false,
+    });
+  };
+  chrome.runtime.onConnect.addListener(onMessageFromTab);
+
+  // Inject the start trigger after the tab settles. The content script
+  // opens a port back to us; that's how the connection above gets made.
+  await waitForTabComplete(tab.id, requestId, targetKey);
+}
+
+function cancelSynthesis(requestId) {
+  const state = inflight.get(requestId);
+  if (!state) return;
+  if (state.tabId !== undefined) {
+    chrome.tabs.remove(state.tabId).catch(() => {});
+  }
+  inflight.delete(requestId);
+}
+
+// ---------------------------------------------------------------------------
+// Content script -> extension
+
+function handleContentMessage(requestId, m, contentPort) {
+  if (!m || typeof m !== "object") return;
+  switch (m.type) {
+    case "STATUS":
+      sendStatus(requestId, m.event, m.detail || "");
+      return;
+    case "RESULT":
+      sendResult(requestId, m.target || "claude", m.markdown || "");
+      inflight.delete(requestId);
+      return;
+    case "ERROR":
+      sendError(requestId, m.code || "unknown", m.detail || "");
+      inflight.delete(requestId);
+      return;
+    default:
+      console.warn("unhandled content message:", m);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tab plumbing
+
+function waitForTabComplete(tabId, requestId, targetKey) {
+  return new Promise((resolve) => {
+    const listener = (updatedTabId, info, _tab) => {
+      if (updatedTabId !== tabId) return;
+      if (info.status === "complete") {
+        chrome.tabs.onUpdated.removeListener(listener);
+        // Kick the per-target content script. The content script
+        // registers window.__mnStartSynthesis; we inject a tiny
+        // function that calls it with the request id. Going through
+        // executeScript means we don't have to encode the request id
+        // in the URL where Claude might strip it.
+        chrome.scripting
+          .executeScript({
+            target: { tabId },
+            args: [requestId],
+            func: (rid) => {
+              if (typeof window.__mnStartSynthesis === "function") {
+                window.__mnStartSynthesis(rid);
+              } else {
+                // Content script never loaded -- the chat domain
+                // mismatched the manifest matches, most likely.
+                console.warn("mn-synth: __mnStartSynthesis missing");
+              }
+            },
+          })
+          .catch((e) => {
+            sendError(requestId, "paste_failed", `executeScript failed: ${e}`);
+            inflight.delete(requestId);
+          });
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Popup helpers (read by popup.js via chrome.runtime.sendMessage)
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.type === "POPUP_STATUS") {
+    chrome.storage.session.get(["appVersion"], (data) => {
+      sendResponse({
+        connected: port !== null,
+        appVersion: data.appVersion || "",
+        extensionVersion: EXTENSION_VERSION,
+        inflightCount: inflight.size,
+      });
+    });
+    return true; // async response
+  }
+  if (msg && msg.type === "POPUP_RECONNECT") {
+    if (port) {
+      try { port.disconnect(); } catch (_) { /* ignore */ }
+      port = null;
+    }
+    // Force a probe so the popup gets fresh connection state.
+    ensurePort();
+    sendToApp({ type: "ping", request_id: "popup-probe" });
+    sendResponse({ ok: true });
+    return false;
+  }
+});
+
+// Try to attach to the host at startup so the popup shows the right
+// status on first open. If the app isn't running, this is harmless;
+// onDisconnect fires and we'll retry on the next outbound message.
+ensurePort();

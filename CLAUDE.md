@@ -7,11 +7,18 @@ note synthesis routes through an approved chatbot via clipboard, not API.
 ## Project Structure
 
 ```
-main.py                          # 3-line entry: delegates to meeting_notetaker.app.main
+main.py                          # entry: --check-deps + --native-host + GUI default
 meeting_notetaker/
-  app.py                         # MainApp -- wires UI + controller + tray + store
+  app.py                         # MainApp -- wires UI + controller + tray + store + bridge
   controller.py                  # SessionController -- session lifecycle, recorders, workers
   version.py
+  automation/                    # synthesis automation bridge (v0.6.3+)
+    messages.py                  # typed request/response/status messages
+    protocol.py                  # length-prefixed JSON framing (Chrome native messaging)
+    bridge.py                    # in-app TCP loopback server; one peer at a time
+    native_host.py               # --native-host mode: stdio <-> TCP bridge
+    targets.py                   # LLMTarget catalog (Claude, Copilot stub)
+    installer.py                 # extension extract + native-host manifest + HKCU keys
   models/
     session.py                   # Session, Folder dataclasses + SessionStore (SQLite WAL)
     transcript.py                # TranscriptSegment + TranscriptStore (transcript + live_notes + notes)
@@ -33,7 +40,8 @@ meeting_notetaker/
     live_notes_widget.py         # Markdown editor + formatting toolbar + Preview/Edit toggle
     new_session_dialog.py        # title + per-session "Keep recording" toggle
     prompt_dialog.py             # Generate Synthesis Prompt + Paste Response Back
-    settings_dialog.py           # model, VAD, batch toggles, retain default, name, prompts-folder
+    settings_dialog.py           # model, VAD, batch toggles, retain default, name, prompts-folder, automation toggle
+    automation_install_dialog.py # three-step wizard for Path-3 unpacked-extension install
     tray.py                      # QSystemTrayIcon wrapper with state coloring
   utils/
     paths.py                     # %APPDATA% / XDG resolution; MEETING_NOTETAKER_DATA_DIR override
@@ -47,6 +55,15 @@ meeting_notetaker/
       default.md                 # generic meeting template
       one-on-one.md
       standup.md
+    extension/                   # bundled Chrome MV3 extension (v0.6.3+); installer copies to %LOCALAPPDATA%
+      manifest.json              # deterministic key + extension id (see installer.EXTENSION_ID)
+      background.js              # service worker; native messaging port; tab orchestration
+      popup.html / popup.js
+      content/
+        common.js                # shared helpers: interstitial detection, paste, streaming watch
+        claude.js                # Claude.ai composer + response scraper
+        copilot.js               # M365 Copilot stub (returns 'not implemented' in 0.6.3)
+      icons/icon{16,48,128}.png
 tests/                           # pure-Python (no Qt, no audio); 42 tests
 build.ps1                        # Windows production build
 build.sh                         # Linux/macOS smoke build
@@ -224,7 +241,52 @@ correctness assertions.
 - Hash-gated bundled-prompt upgrade with line-ending normalization so a
   CRLF Windows checkout upgrades cleanly.
 
-### v0.3 (current)
+### v0.6.3 (current branch)
+
+Synthesis automation lands behind a per-install Settings toggle. When
+enabled, the Generate Synthesis Prompt + Paste Response Back buttons
+are replaced by a single **Send to Claude.ai** button; the Copy
+button stays visible regardless. The flow goes:
+
+```
+SessionView "Send" click
+  -> MainApp._on_send_to_llm renders default prompt template
+  -> Bridge (TCP loopback)
+  -> Native host (main.py --native-host)
+  -> Chrome native-messaging port
+  -> background.js service worker
+  -> chrome.tabs.create(claude.ai/new) + content/claude.js
+  -> paste, watch streaming, scrape response
+  -> back up the chain
+  -> TranscriptStore.save_notes(..., archive_existing=True)
+  -> SessionView reloads Synthesis tab
+```
+
+Key design choices:
+
+- **Path 3 install only.** Chrome blocks silent unpacked-extension
+  installs. The wizard guides the user through chrome://extensions +
+  Load unpacked, then writes the native-host manifest + HKCU keys
+  on Verify.
+- **Deterministic extension ID.** manifest.json carries a `key` field
+  with a base64-encoded SPKI public key; the derived ID
+  (`gmnecenhibfigbpldhacjhgmooopeelo`) is hard-coded as
+  `installer.EXTENSION_ID` so the native-host's allowed_origins is
+  stable across machines. Regenerate both together if the key ever
+  changes.
+- **Proxy interstitial = browser toast + auto-resume.** The content
+  script detects the FHB outbound-proxy "PROCEED" page, shows a toast,
+  and polls for the URL to change. No automation clicks PROCEED -- the
+  human-in-the-loop ack stays intact.
+- **One bridge peer.** A second concurrent native-host connection is
+  rejected. The token in `%LOCALAPPDATA%\MeetingNotetaker\automation\bridge.json`
+  rotates per app launch so a stale handshake file from a crashed
+  prior run can't authenticate.
+- **Copilot is plumbed but not wired.** Settings dropdown lists it;
+  selecting it surfaces "not yet implemented" instead of running the
+  synthesis. The Copilot adapter is the next thing to ship.
+
+### v0.3
 
 - Markdown editor toolbar on the My Notes tab (bold/italic/headings/
   lists/quote/code/link/HR) plus a Preview/Edit toggle that renders the

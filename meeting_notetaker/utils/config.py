@@ -36,6 +36,10 @@ Schema (config.toml):
     cooldown_minutes = 10        # per-app cooldown after a prompt is dismissed
     app_allowlist = ["Teams.exe", "ms-teams.exe", "Zoom.exe", ...]
 
+    [synthesis]
+    automation_enabled = false   # if true, swap Generate/Paste buttons for a single Send-to-LLM button (Windows + Chrome extension required)
+    llm_target = "claude"        # one of: "claude", "copilot". Copilot is plumbed but not wired in 0.6.3.
+
 Reads use tomllib (3.11+) or the tomli fallback. Writes are emitted by hand
 since our schema is flat and tomli-w is not a stdlib component.
 """
@@ -55,6 +59,7 @@ from .paths import config_path
 
 
 VALID_MODEL_SIZES = ("tiny.en", "base.en", "small.en", "medium.en")
+VALID_LLM_TARGETS = ("claude", "copilot")
 
 
 @dataclass
@@ -134,6 +139,12 @@ _DEFAULT_DETECTION_ALLOWLIST: tuple[str, ...] = (
 
 
 @dataclass
+class SynthesisConfig:
+    automation_enabled: bool = False
+    llm_target: str = "claude"
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
@@ -141,6 +152,7 @@ class Config:
     calendar: CalendarConfig = field(default_factory=CalendarConfig)
     speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
+    synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -165,6 +177,9 @@ class Config:
             ),
             detection=DetectionConfig(
                 **_filter_fields(DetectionConfig, data.get("detection", {}))
+            ),
+            synthesis=SynthesisConfig(
+                **_filter_fields(SynthesisConfig, data.get("synthesis", {}))
             ),
         )
 
@@ -219,6 +234,11 @@ class Config:
                 f"detection.cooldown_minutes must be between 1 and 120, "
                 f"got {self.detection.cooldown_minutes}"
             )
+        if self.synthesis.llm_target not in VALID_LLM_TARGETS:
+            errors.append(
+                f"synthesis.llm_target {self.synthesis.llm_target!r} "
+                f"must be one of {VALID_LLM_TARGETS}"
+            )
         return errors
 
     def _dump_toml(self) -> str:
@@ -230,6 +250,7 @@ class Config:
             ("calendar", self.calendar),
             ("speakers", self.speakers),
             ("detection", self.detection),
+            ("synthesis", self.synthesis),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():

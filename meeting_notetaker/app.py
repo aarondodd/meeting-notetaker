@@ -5,13 +5,18 @@ main() is the entry point used by main.py and the pyinstaller spec.
 from __future__ import annotations
 
 import logging
+import secrets
 import sys
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
 from PyQt6.QtCore import QObject, Qt, QTimer
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
+from .automation import messages as automation_messages
+from .automation.bridge import Bridge, HandshakeState
+from .automation.targets import get_target
 from .controller import SessionController
 from .diarization.persistence import (
     load_diarization,
@@ -60,6 +65,7 @@ from .utils.live_notes import extract_section, parse_attendees, seed_body_with_c
 from .utils.paths import (
     app_data_dir,
     audio_session_state_path,
+    bridge_handshake_path,
     calendar_state_path,
     log_path,
 )
@@ -101,8 +107,31 @@ class MainApp(QObject):
         # the dict fall back to the global config value.
         self._capture_only_overrides: dict[str, bool] = {}
 
+        # Synthesis automation bridge. Listens on a loopback port for the
+        # Chrome native-messaging host to connect; route inbound result/
+        # status events to the matching in-flight synthesis. The bridge
+        # runs whether or not the toggle is on -- letting it idle costs
+        # nothing (a single bound TCP port), and starting it lazily
+        # would mean the Verify button in the install wizard wouldn't
+        # have anything to probe against the first time.
+        self._inflight_syntheses: dict[str, str] = {}  # request_id -> session_id
+        self._bridge_ready_state: bool = False
+        self._pending_pings: dict[str, "threading.Event"] = {}
+        self._bridge = Bridge(
+            handshake_file=bridge_handshake_path(),
+            on_message=self._on_bridge_message,
+            on_connect=self._on_bridge_connect,
+            on_disconnect=self._on_bridge_disconnect,
+            app_version=__version__,
+        )
+        try:
+            self._bridge.start()
+        except OSError:
+            log.exception("synthesis bridge failed to bind a loopback port")
+
         self._wire_signals()
         self._apply_user_name()
+        self._apply_synthesis_automation()
         self._refresh_session_list()
         self._handle_crash_recovery()
         self._warn_if_store_python()
@@ -140,6 +169,280 @@ class MainApp(QObject):
     def _apply_user_name(self) -> None:
         self.window.session_view.set_user_name(self.config.ui.user_name)
 
+    def _apply_synthesis_automation(self) -> None:
+        """Push the current setting state into the SessionView, swapping
+        the Generate + Paste buttons for the single Send button or
+        vice-versa. Called at startup and after Settings is closed."""
+        self.window.session_view.set_automation_enabled(
+            self.config.synthesis.automation_enabled,
+            self.config.synthesis.llm_target,
+        )
+
+    # ---- synthesis automation: bridge callbacks ----------------------------
+
+    def _on_bridge_connect(self, state: HandshakeState) -> None:
+        log.info(
+            "bridge: extension connected (id=%s host=%s)",
+            state.extension_id,
+            state.host_version,
+        )
+        self._bridge_ready_state = True
+
+    def _on_bridge_disconnect(self) -> None:
+        log.info("bridge: extension disconnected")
+        self._bridge_ready_state = False
+
+    def _on_bridge_message(self, msg: dict) -> None:
+        """Inbound from the extension. Runs on the bridge's reader
+        thread. Pongs are signaled inline (threading.Event is thread-
+        safe) so a blocking _ping_extension on the main Qt thread
+        doesn't deadlock; everything else bounces to the main thread
+        via QTimer.singleShot."""
+        if msg.get("type") == "pong":
+            request_id = msg.get("request_id", "")
+            evt = self._pending_pings.pop(request_id, None)
+            if evt is not None:
+                evt.set()
+            return
+        QTimer.singleShot(0, lambda: self._dispatch_bridge_message(msg))
+
+    def _dispatch_bridge_message(self, msg: dict) -> None:
+        msg_type = msg.get("type", "")
+        request_id = msg.get("request_id", "")
+        if msg_type == "status":
+            session_id = self._inflight_syntheses.get(request_id, "")
+            if session_id:
+                event = msg.get("event", "")
+                detail = msg.get("detail", "")
+                label = self._format_status_event(event, detail)
+                if label:
+                    self.window.status(label, timeout_ms=4000)
+            return
+        if msg_type == "result":
+            session_id = self._inflight_syntheses.pop(request_id, "")
+            if not session_id:
+                log.warning("result for unknown request %s", request_id)
+                return
+            markdown = msg.get("markdown", "")
+            target = msg.get("target", "")
+            self._handle_synthesis_result(session_id, markdown, target)
+            return
+        if msg_type == "error":
+            session_id = self._inflight_syntheses.pop(request_id, "")
+            code = msg.get("code", "unknown")
+            detail = msg.get("detail", "")
+            self._handle_synthesis_error(session_id, code, detail)
+            return
+        log.debug("ignored bridge message of type %r", msg_type)
+
+    @staticmethod
+    def _format_status_event(event: str, detail: str) -> str:
+        labels = {
+            automation_messages.STATUS_OPENING_TAB: "Synthesis: opening browser tab",
+            automation_messages.STATUS_AWAITING_LOGIN: "Synthesis: waiting for sign-in",
+            automation_messages.STATUS_PROXY_ACK_NEEDED:
+                "Synthesis: click PROCEED in the browser to acknowledge AI use",
+            automation_messages.STATUS_PROXY_ACK_CLEARED:
+                "Synthesis: proxy ack cleared, continuing",
+            automation_messages.STATUS_PASTING: "Synthesis: pasting prompt",
+            automation_messages.STATUS_AWAITING_RESPONSE: "Synthesis: waiting for response",
+            automation_messages.STATUS_RESPONSE_STREAMING: "Synthesis: response streaming",
+            automation_messages.STATUS_DONE: "Synthesis: response received",
+        }
+        return labels.get(event, "")
+
+    def _handle_synthesis_result(self, session_id: str, markdown: str, target: str) -> None:
+        if not markdown.strip():
+            QMessageBox.warning(
+                self.window,
+                "Synthesis Automation",
+                "The extension returned an empty response. Try again, or "
+                "fall back to the manual Generate / Paste flow by disabling "
+                "automation in Settings.",
+            )
+            return
+        try:
+            archive_path = TranscriptStore(session_id).save_notes(
+                markdown, archive_existing=True
+            )
+            self.store.update_session(session_id, has_notes=True)
+        except OSError:
+            log.exception("save_notes failed for %s", session_id)
+            QMessageBox.critical(
+                self.window,
+                "Synthesis Automation",
+                "Couldn't save the synthesis to disk; see the log for "
+                "details.",
+            )
+            return
+        # Reload the SessionView so the Synthesis tab shows the new body.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            self._on_session_selected(session_id)
+        if archive_path:
+            self.window.status(
+                f"Synthesis received. Prior notes archived to {archive_path.name}",
+                timeout_ms=8000,
+            )
+        else:
+            self.window.status("Synthesis received.", timeout_ms=5000)
+
+    def _handle_synthesis_error(self, session_id: str, code: str, detail: str) -> None:
+        # Map known codes to friendlier messages.
+        friendly = {
+            automation_messages.ERR_NO_TAB:
+                "Couldn't open a browser tab. Is Chrome running?",
+            automation_messages.ERR_NOT_LOGGED_IN:
+                "Couldn't find the chat composer. Are you signed in to the target LLM?",
+            automation_messages.ERR_PASTE_FAILED:
+                "Couldn't paste into the chat. The LLM page may have changed; "
+                "fall back to manual Generate / Paste for this session.",
+            automation_messages.ERR_TIMEOUT:
+                "The response didn't finish in time. Check the browser tab "
+                "to see if it's still streaming.",
+            automation_messages.ERR_INTERSTITIAL_TIMEOUT:
+                "The proxy interstitial didn't clear within the time window. "
+                "Click PROCEED in the browser and try Send again.",
+        }
+        message = friendly.get(code, detail or "Unknown error")
+        QMessageBox.warning(self.window, "Synthesis Automation", message)
+
+    # ---- synthesis automation: send + ping ---------------------------------
+
+    def _on_send_to_llm(self, session_id: str, target_key: str) -> None:
+        session = self.store.get_session(session_id)
+        if session is None:
+            return
+        if not self._bridge_ready_state:
+            ans = QMessageBox.warning(
+                self.window,
+                "Synthesis Automation",
+                "The Chrome extension is not connected to the app. "
+                "Open the extension in Chrome (chrome://extensions) and "
+                "ensure it's enabled, then try again.\n\nFall back to "
+                "the manual Generate / Paste flow instead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans == QMessageBox.StandardButton.Yes:
+                self._on_generate_prompt(session_id)
+            return
+        try:
+            target = get_target(target_key)
+        except ValueError:
+            QMessageBox.warning(
+                self.window,
+                "Synthesis Automation",
+                f"Unknown LLM target {target_key!r}. Pick a valid target in Settings.",
+            )
+            return
+        if not target.implemented:
+            QMessageBox.information(
+                self.window,
+                "Synthesis Automation",
+                f"{target.label} automation isn't implemented in this "
+                "build. Switch the target to Claude.ai in Settings, or "
+                "disable automation to use the manual flow.",
+            )
+            return
+
+        store = TranscriptStore(session_id)
+        transcript = store.read_transcript()
+        if not transcript.strip():
+            QMessageBox.information(
+                self.window, "Synthesis Automation",
+                "This session has no transcript yet.",
+            )
+            return
+        self.window.session_view.flush_pending_live_notes()
+        live_notes = store.read_live_notes()
+        try:
+            when = datetime.fromisoformat(
+                session.created_at.replace("Z", "+00:00")
+            ).astimezone()
+        except ValueError:
+            when = datetime.now().astimezone()
+
+        # Render with the default template. Users who customize prompts
+        # via the Generate dialog can pick a template there; the
+        # automation flow uses the default to keep the Send path one-
+        # click. (Per-target / per-session prompt picking is a v0.7
+        # candidate.)
+        templates = prompts_mod.list_templates()
+        default = next(
+            (t for t in templates if t.name == "default"),
+            templates[0] if templates else None,
+        )
+        if default is None:
+            QMessageBox.warning(
+                self.window, "Synthesis Automation",
+                "No prompt templates found in the prompts folder.",
+            )
+            return
+        rendered = prompts_mod.render(
+            default,
+            session_title=session.title,
+            session_date=when,
+            transcript=transcript,
+            live_notes=live_notes,
+            user_name=self.config.ui.user_name,
+        )
+
+        request_id = secrets.token_hex(8)
+        self._inflight_syntheses[request_id] = session_id
+        msg = automation_messages.SynthesizeRequest(
+            request_id=request_id,
+            target=target_key,
+            prompt=rendered,
+            new_chat=True,
+        )
+        if not self._bridge.send(msg):
+            self._inflight_syntheses.pop(request_id, None)
+            QMessageBox.warning(
+                self.window, "Synthesis Automation",
+                "Couldn't reach the extension. Try Reconnect from the "
+                "extension popup, or fall back to manual Generate / Paste.",
+            )
+            return
+        self.window.status(
+            f"Sent to {target.label}. The response will land in the Synthesis tab.",
+            timeout_ms=6000,
+        )
+
+    def _ping_extension(self, timeout_sec: float) -> bool:
+        """Used by the Settings install wizard's Verify step. Sends a
+        ping; returns True if a pong arrives within the timeout.
+
+        Runs on the Qt main thread. Uses a QEventLoop with a polling
+        QTimer so paints and other event-loop work continue during
+        the wait -- a 60-second ``threading.Event.wait()`` would
+        freeze the install wizard window."""
+        from PyQt6.QtCore import QEventLoop  # noqa: PLC0415
+
+        request_id = f"ping-{secrets.token_hex(4)}"
+        evt = threading.Event()
+        self._pending_pings[request_id] = evt
+        ping = automation_messages.PingRequest(request_id=request_id)
+        if not self._bridge.send(ping):
+            self._pending_pings.pop(request_id, None)
+            return False
+
+        loop = QEventLoop()
+        poll = QTimer()
+        poll.setInterval(50)
+        poll.timeout.connect(lambda: evt.is_set() and loop.quit())
+        deadline = QTimer()
+        deadline.setSingleShot(True)
+        deadline.setInterval(int(timeout_sec * 1000))
+        deadline.timeout.connect(loop.quit)
+        poll.start()
+        deadline.start()
+        loop.exec()
+        poll.stop()
+        deadline.stop()
+
+        self._pending_pings.pop(request_id, None)
+        return evt.is_set()
+
     # ---- wiring ------------------------------------------------------------
 
     def _wire_signals(self) -> None:
@@ -174,6 +477,7 @@ class MainApp(QObject):
         sv.stop_clicked.connect(lambda _sid: self.controller.stop_session())
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
+        sv.send_to_llm_clicked.connect(self._on_send_to_llm)
         sv.copy_tab_clicked.connect(self._on_copy_tab)
         sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
@@ -815,7 +1119,11 @@ class MainApp(QObject):
         self._dep_check.activateWindow()
 
     def _on_settings(self) -> None:
-        dialog = SettingsDialog(self.config, parent=self.window)
+        dialog = SettingsDialog(
+            self.config,
+            parent=self.window,
+            ping_extension=self._ping_extension,
+        )
         accepted = dialog.exec() == dialog.DialogCode.Accepted
         # The Manage Speakers sub-dialog can mutate the store regardless
         # of whether the parent Settings dialog is accepted or canceled,
@@ -831,6 +1139,7 @@ class MainApp(QObject):
         self._apply_user_name()
         self._apply_calendar_config()
         self._apply_audio_monitor_config()
+        self._apply_synthesis_automation()
         self._refresh_status_indicators()
         self.window.status("Settings saved.", timeout_ms=4000)
 

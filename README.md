@@ -41,9 +41,13 @@ via clipboard. No audio leaves the machine; no API key required.
   remaining word-choice errors (homophones, mild punctuation).
 - **Mic + system-audio capture** through WASAPI loopback, so both sides
   of a Teams / Zoom / Meet call are recorded.
-- **Clipboard-mediated synthesis.** Generate a prompt, paste it into any
-  approved chatbot (Claude.ai, Copilot, ChatGPT, ...), then paste the
-  reply back. The audio and transcript never touch a third-party API.
+- **Clipboard-mediated synthesis** (default) **or one-click automation**
+  (opt-in, v0.6.3+). Generate a prompt and paste it into any approved
+  chatbot, then paste the reply back -- or install the bundled Chrome
+  extension and let it drive a Claude.ai tab on a single button press.
+  Either way, the browser stays the LLM intermediary; no audio or
+  transcript ever touches a third-party API. See **Synthesis automation
+  (optional)** below.
 - **Speaker identification.** SpeechBrain ECAPA-TDNN embeddings cluster
   the loopback channel into per-speaker turns and match them against a
   local library that grows as you label voices.
@@ -253,6 +257,66 @@ Manage Speakers...; Rename / Forget per row, with a Forget All
 escape hatch:
 
 ![Manage Speakers dialog](docs/screenshots/14-dialog-manage-speakers.png)
+
+## Synthesis automation (optional)
+
+By default the app uses a **manual** synthesis flow: click **Generate
+Synthesis Prompt**, paste the prompt into your approved chatbot, then
+**Paste Response Back** to land the reply in the Synthesis tab.
+
+Starting in v0.6.3, **Settings > Synthesis Automation** can replace the
+Generate + Paste buttons with a single **Send to Claude.ai** button. A
+bundled Chrome extension drives the chat tab for you: it opens a fresh
+conversation, pastes the prompt, watches for the response to stream in,
+and writes the result back to `notes.md`. The Copy button stays
+visible regardless of the toggle.
+
+### What stays the same
+
+- **No API calls.** The extension uses your existing Claude.ai (or, in
+  a future build, M365 Copilot) browser session -- exactly what
+  approved chatbot use looks like today.
+- **The browser remains the intermediary.** The extension types into
+  the chat composer and reads the rendered response; it does not
+  bypass the LLM's web interface.
+- **The proxy interstitial still gates traffic.** If your outbound
+  proxy shows a "PROCEED" page on the first AI request, the extension
+  detects it, shows a toast, and waits for you to click PROCEED. The
+  human-in-the-loop ack stays intact.
+
+### One-time install (Path 3: guided manual)
+
+Chrome does not permit silent install of unpacked extensions, so the
+install flow is a three-step wizard launched from
+**Settings > Synthesis Automation > Install / Verify...**:
+
+1. **Extract the extension files.** Click *Extract and open folder*;
+   the app drops the unpacked extension into
+   `%LOCALAPPDATA%\MeetingNotetaker\automation\extension` and opens
+   the folder in Explorer.
+2. **Load in Chrome.** Open `chrome://extensions`, toggle Developer
+   mode on, click **Load unpacked**, and select the folder from step 1.
+3. **Verify.** Back in the wizard, click *Verify*. The app registers
+   the native-messaging bridge in HKCU (per-user, no admin needed)
+   and waits up to a minute for the extension to connect. Green
+   indicator means done.
+
+To remove later: **Uninstall bridge** in Settings tears down the
+registry registration; to also remove the extension from Chrome,
+delete it from `chrome://extensions`.
+
+### Trade-offs
+
+- **Brittle to LLM UI changes.** The content script targets Claude.ai
+  selectors as of late 2026. If Anthropic restructures the chat DOM,
+  the extension may fail loudly; falling back is one toggle in
+  Settings.
+- **Claude.ai only in v0.6.3.** The settings dropdown lists Microsoft
+  365 Copilot but its content script is a stub that surfaces "not yet
+  implemented"; the plumbing is in place so the next release can drop
+  in the Copilot adapter without an architectural change.
+- **Browser must be Chrome.** The bridge is also registered for Edge
+  in HKCU, but the extension hasn't been smoke-tested there.
 
 ## Why this exists
 

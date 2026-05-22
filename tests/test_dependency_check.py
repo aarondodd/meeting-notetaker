@@ -23,9 +23,11 @@ def test_run_checks_returns_one_entry_per_group():
     assert "Core" in group_names
     assert "Transcription" in group_names
     assert "Speaker identification" in group_names
-    # Order is stable -- Core first, Ad-hoc detect last.
+    # Order is stable -- Core first, Synthesis automation last (added
+    # in v0.6.3 -- prior to that, the last group was Ad-hoc detection).
     assert group_names[0] == "Core"
-    assert group_names[-1] == "Ad-hoc meeting detection (Windows)"
+    assert group_names[-1] == "Synthesis automation"
+    assert "Ad-hoc meeting detection (Windows)" in group_names
 
 
 def test_every_result_has_status_and_feature_string():
