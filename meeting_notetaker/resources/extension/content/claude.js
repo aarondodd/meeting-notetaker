@@ -184,6 +184,36 @@
 
   let _requestId = "";
 
+  // Bring the Claude tab into focus so navigator.clipboard.readText
+  // works. Chrome requires document focus for clipboard reads -- if
+  // the user has switched back to Meeting Notetaker during the long
+  // streaming wait, the tab is in the background and the read fails
+  // with NotAllowedError. We delegate the actual focus call to the
+  // background script (content scripts can't call chrome.tabs.update
+  // or chrome.windows.update), then poll document.hasFocus() for the
+  // change to land. Returns true on focus, false on timeout.
+  async function ensureDocumentFocused(timeoutMs = 3000) {
+    if (document.hasFocus()) return true;
+    console.log("mn-synth: requesting tab focus");
+    if (connection) {
+      try {
+        connection.postMessage({ type: "REQUEST_FOCUS" });
+      } catch (e) {
+        console.warn("mn-synth: REQUEST_FOCUS post failed", e);
+      }
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (document.hasFocus()) {
+        console.log("mn-synth: document focus acquired");
+        return true;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    console.warn("mn-synth: document never focused within", timeoutMs, "ms");
+    return false;
+  }
+
   async function runSynthesis(requestId, prompt) {
     _requestId = requestId;
 
@@ -363,6 +393,14 @@
       },
     );
 
+    // navigator.clipboard.readText() requires the document to have
+    // focus. Synthesis routinely takes 30-60+ seconds during which
+    // the user typically switches back to Meeting Notetaker; when
+    // we reach this point the Claude tab is in the background and
+    // Chrome rejects the read with NotAllowedError. Ask the
+    // background to refocus the tab/window, then poll
+    // document.hasFocus() until it's true (or 3s elapses).
+    await ensureDocumentFocused();
     copyBtn.click();
 
     // Retry the clipboard read for up to a second. Claude's copy
@@ -402,18 +440,42 @@
         clipboardErrorDetail
           ? `clipboard read threw: ${clipboardErrorDetail}`
           : `clipboard returned ${clip.length} chars (expected hundreds; got "${clip.slice(0, 30)}...")`;
+      // Distinguish the three known failure modes so the dialog
+      // gives actionable advice rather than a generic catch-all.
+      const isFocusError = /not focused|Document is not focused/i.test(
+        clipboardErrorDetail
+      );
+      const isPermError = /denied|NotAllowedError(?!.*not focused)/i.test(
+        clipboardErrorDetail
+      );
+      let advice;
+      if (isFocusError) {
+        advice =
+          "Chrome refused the clipboard read because the Claude tab " +
+          "wasn't focused. The extension tries to refocus it before " +
+          "reading; that didn't succeed in time. Try Send again -- " +
+          "if it keeps happening, click into the Claude tab once " +
+          "manually right after Send so it's clearly focused, then " +
+          "let the synthesis run.";
+      } else if (isPermError) {
+        advice =
+          "Chrome's per-site clipboard permission for claude.ai " +
+          "hasn't been granted. Click Claude's own Copy button on " +
+          "any response manually -- Chrome will prompt; click Allow. " +
+          "Then try Send again.";
+      } else {
+        advice =
+          "If permission was already granted, the extension may be " +
+          "clicking the wrong button (an inline code-block Copy " +
+          "instead of the response Copy). Check the Claude tab " +
+          "DevTools console for the 'mn-synth: copyBtn picked' line " +
+          "to see which button was chosen.";
+      }
       fail(
         "clipboard_unavailable",
         "Couldn't read Claude's full response from the clipboard.\n\n" +
-        "If this is the first time on this Claude.ai session, Chrome " +
-        "may need to grant per-site clipboard permission: click " +
-        "Claude's own Copy button once manually -- Chrome will ask " +
-        "you to allow it.\n\n" +
-        "If permission was already granted, the extension may be " +
-        "clicking the wrong button (an inline code-block Copy instead " +
-        "of the response Copy). Check the Claude tab DevTools " +
-        "console for the 'mn-synth: copyBtn picked' line to see " +
-        `which button was chosen.\n\nDetail: ${sizeNote}`,
+        advice +
+        `\n\nDetail: ${sizeNote}`,
       );
       return;
     }

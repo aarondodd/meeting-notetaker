@@ -260,6 +260,15 @@ function handleContentMessage(requestId, m, _contentPort) {
     case "STATUS":
       sendStatus(requestId, m.event, m.detail || "");
       return;
+    case "REQUEST_FOCUS":
+      // Content script needs the tab focused for
+      // navigator.clipboard.readText. Content scripts can't call
+      // chrome.tabs.update or chrome.windows.update themselves, so
+      // they delegate to us. Best-effort + asynchronous; the
+      // content script polls document.hasFocus() and proceeds when
+      // it lands (or times out).
+      focusInflightTab(requestId);
+      return;
     case "RESULT":
       console.log("mn-synth bg: forwarding RESULT to app, len=" + (m.markdown || "").length);
       sendResult(requestId, m.target || "claude", m.markdown || "");
@@ -283,6 +292,29 @@ function handleContentMessage(requestId, m, _contentPort) {
       return;
     default:
       console.warn("mn-synth bg: unhandled content message:", m);
+  }
+}
+
+async function focusInflightTab(requestId) {
+  const ctx = await loadInflight(requestId);
+  if (!ctx || ctx.tabId === undefined) {
+    console.warn("mn-synth bg: focus request for unknown rid", requestId);
+    return;
+  }
+  try {
+    const tab = await chrome.tabs.get(ctx.tabId);
+    if (!tab) return;
+    // Make the tab active within its window.
+    await chrome.tabs.update(ctx.tabId, { active: true });
+    // Bring the window to the foreground. Content script's
+    // document.hasFocus() will start returning true once the OS
+    // honors this; the content script polls for that change.
+    if (tab.windowId !== undefined) {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+    console.log("mn-synth bg: focused tab", ctx.tabId, "window", tab.windowId);
+  } catch (e) {
+    console.warn("mn-synth bg: focus failed", e && e.message);
   }
 }
 
