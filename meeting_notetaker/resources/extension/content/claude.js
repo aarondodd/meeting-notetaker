@@ -27,7 +27,7 @@
     return;
   }
   const { STATUS, looksLikeInterstitial, showToast, clearToast, watchForInterstitialClear,
-    waitForSelector, waitForDomSettled, pasteIntoComposer } = helpers;
+    waitForSelector, waitForResponseStreaming, pasteIntoComposer } = helpers;
 
   // Composer probes. We try data-testids and contenteditable in order;
   // the trailing 'div[contenteditable="true"]' is the catch-all that
@@ -230,40 +230,48 @@
     }
     status(STATUS.AWAITING_RESPONSE);
 
-    // Wait for streaming to settle. Selector-agnostic via
-    // MutationObserver: detect that the DOM has stopped changing for
-    // 2.5 seconds. minWaitMs=4000 protects against scraping while
-    // Claude is still spinning up the response (the first few
-    // hundred ms after submit can look quiet because the composer
-    // clear + assistant-bubble-create is two discrete bursts).
+    // Wait for the response to start streaming AND then stop. We
+    // track visible-text growth on document.body rather than DOM
+    // mutations because Claude's "thinking" pause between submit and
+    // first token can run 5-15 seconds with no mutations -- a
+    // mutation-based detector settles during that pause and scrapes
+    // a 22-char placeholder bubble (Aaron's 2026-05-22 repro).
     //
-    // Heartbeat status every ~10s keeps the port active so Chrome's
-    // service-worker kill timer doesn't drop the result.
+    // The growth-based detector requires the text to grow by at
+    // least minGrowthChars before it can settle, so the thinking
+    // pause holds us in "still waiting" until tokens actually arrive.
+    //
+    // Heartbeat status every ~10s keeps the MV3 port active so the
+    // service worker isn't killed during long responses.
     let lastHeartbeat = Date.now();
     const HEARTBEAT_MS = 10000;
-    const elapsed = await waitForDomSettled({
-      settleMs: 2500,
+    const result = await waitForResponseStreaming({
+      settleMs: 3000,
+      minGrowthChars: 30,
       timeoutMs: 10 * 60 * 1000,
-      minWaitMs: 4000,
-      onTick: (ms) => {
+      onTick: (ms, growth) => {
         if (Date.now() - lastHeartbeat >= HEARTBEAT_MS) {
           lastHeartbeat = Date.now();
-          status(STATUS.RESPONSE_STREAMING, `~${Math.floor(ms / 1000)}s elapsed`);
+          status(
+            STATUS.RESPONSE_STREAMING,
+            `${Math.floor(ms / 1000)}s elapsed, ${growth} chars grown`,
+          );
         }
       },
     });
-    if (elapsed === null) {
+    if (result === null) {
       fail("timeout", "Claude response didn't settle within 10 minutes.");
       return;
     }
-    status(STATUS.RESPONSE_STREAMING, `settled after ${Math.floor(elapsed / 1000)}s`);
+    status(
+      STATUS.RESPONSE_STREAMING,
+      `settled after ${Math.floor(result.elapsedMs / 1000)}s, ${result.growthChars} chars grown`,
+    );
 
-    // Scrape. If the stop button is still visible at this point,
-    // give it another 5 seconds to finish; some chat UIs replace
-    // the stop button with the send button before the final tokens
-    // render.
+    // If a stop button is still visible (e.g. the page hasn't yet
+    // swapped it back to send), give it another moment to finish.
     if (findStopButton()) {
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, 3000));
     }
 
     const messageEl = findLatestAssistantMessage();

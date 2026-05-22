@@ -172,51 +172,59 @@
     });
   }
 
-  // Resolve once the page's DOM has not mutated for `settleMs`
-  // consecutive ms. Selector-agnostic streaming-complete detector --
-  // works even when the chat UI uses class names we can't predict.
-  // Resolves with the elapsed time on settle, null on timeout. The
-  // optional onTick callback fires every poll with the elapsed ms
-  // since start; we use it to send heartbeat status messages back
-  // to the service worker so the port stays active (Chrome may kill
-  // an MV3 service worker after 30s of port inactivity, dropping our
-  // result when we eventually try to send it).
-  function waitForDomSettled(opts = {}) {
+  // Resolve once the page's visible text has grown (Claude started
+  // responding) AND then stopped growing for `settleMs` consecutive
+  // ms (Claude finished). The DOM-mutation-based predecessor settled
+  // too early when Claude's "thinking" pause between submit and first
+  // token was longer than the min-wait: no mutations during the pause
+  // looks identical to "no mutations because done."
+  //
+  // Tracking visible text length sidesteps this: during the thinking
+  // pause, length doesn't grow, so we don't satisfy the
+  // "sawGrowth" gate and don't settle. Once tokens start streaming,
+  // length grows; settle fires after streaming stops.
+  //
+  // Resolves with {elapsedMs, growthChars} on settle, null on timeout.
+  // onTick(elapsedMs, growthChars) fires every poll for heartbeat
+  // status messages (keeps the MV3 service worker awake).
+  function waitForResponseStreaming(opts = {}) {
     return new Promise((resolve) => {
-      const settleMs = opts.settleMs || 2500;
+      const settleMs = opts.settleMs || 3000;
+      const minGrowthChars = opts.minGrowthChars || 20;
       const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
-      const minWaitMs = opts.minWaitMs || 0;
+      const pollMs = opts.pollMs || 500;
       const onTick = opts.onTick || (() => {});
-      const target = opts.target || document.body;
+
+      const startLen = (document.body.innerText || "").length;
       const started = Date.now();
-      let lastMutation = started;
-      const observer = new MutationObserver(() => {
-        lastMutation = Date.now();
-      });
-      observer.observe(target, {
-        childList: true,
-        subtree: true,
-        characterData: true,
-      });
-      const handle = setInterval(() => {
+      let lastLen = startLen;
+      let lastChangeAt = started;
+      let sawGrowth = false;
+
+      const tick = () => {
         const now = Date.now();
         const elapsed = now - started;
-        onTick(elapsed);
+        const cur = (document.body.innerText || "").length;
+        const growth = cur - startLen;
+        if (cur !== lastLen) {
+          lastChangeAt = now;
+          lastLen = cur;
+          if (growth >= minGrowthChars) {
+            sawGrowth = true;
+          }
+        }
+        onTick(elapsed, growth);
         if (elapsed > timeoutMs) {
-          clearInterval(handle);
-          observer.disconnect();
           resolve(null);
           return;
         }
-        if (elapsed < minWaitMs) {
+        if (sawGrowth && now - lastChangeAt >= settleMs) {
+          resolve({ elapsedMs: elapsed, growthChars: growth });
           return;
         }
-        if (now - lastMutation >= settleMs) {
-          clearInterval(handle);
-          observer.disconnect();
-          resolve(elapsed);
-        }
-      }, 300);
+        setTimeout(tick, pollMs);
+      };
+      tick();
     });
   }
 
@@ -315,7 +323,7 @@
     watchForInterstitialClear,
     waitForSelector,
     waitForStableFalse,
-    waitForDomSettled,
+    waitForResponseStreaming,
     pasteIntoComposer,
   };
 })();
