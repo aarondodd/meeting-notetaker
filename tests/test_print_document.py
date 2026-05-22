@@ -101,6 +101,54 @@ def test_cache_returns_same_object_for_repeated_calls(qt_app, session_with_image
     assert a is b
 
 
+def test_clamp_images_to_printer_pins_oversized(qt_app, tmp_path):
+    """An image wider than the printer's paint-rect clamps down to fit.
+
+    The natural image width has to exceed the printer's pixel paint
+    width to trigger a clamp -- so the test image is sized comfortably
+    over a high-resolution Letter page's printable area (~9500px at
+    1200dpi minus margins).
+    """
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    img = QImage(20000, 200, QImage.Format.Format_RGB32)
+    img.fill(QColor(20, 80, 200))
+    img.save(str(images_dir / "huge.png"), "PNG")
+
+    doc = PrintTextDocument(tmp_path)
+    doc.setMarkdown("![huge](images/huge.png)\n")
+
+    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+    out_pdf = tmp_path / "clamped.pdf"
+    printer.setOutputFileName(str(out_pdf))
+    paint_w = printer.pageLayout().paintRectPixels(printer.resolution()).width()
+    assert paint_w < 20000, (
+        "test premise: image must be wider than the printer's paint rect"
+    )
+
+    adjustments = doc.clamp_images_to_printer(printer)
+    assert adjustments == 1
+
+    # Walk for the image fragment and confirm width was pinned to the
+    # printer's paint-rect width (or less).
+    block = doc.begin()
+    found_width = None
+    while block.isValid() and found_width is None:
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid() and frag.charFormat().isImageFormat():
+                found_width = frag.charFormat().toImageFormat().width()
+                break
+            it += 1
+        block = block.next()
+    assert found_width is not None
+    assert 0 < found_width <= paint_w
+    # And it's strictly less than the natural 20000.
+    assert found_width < 20000
+
+
 def test_pdf_actually_embeds_image(qt_app, session_with_image, tmp_path):
     """End-to-end: render a Markdown doc to PDF and verify the rendered
     page has the colored pixels somewhere on it.

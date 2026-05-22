@@ -27,7 +27,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QStackedWidget,
-    QTextBrowser,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -42,6 +41,7 @@ from ..utils.images import (
     save_qimage,
 )
 from .image_metadata_dialog import ImageMetadataDialog
+from .markdown_preview import MarkdownPreview
 
 
 class _MarkdownEditor(QPlainTextEdit):
@@ -87,8 +87,7 @@ class LiveNotesWidget(QWidget):
         self._editor.textChanged.connect(self.textChanged.emit)
         self._editor.image_pasted.connect(self._on_image_pasted)
 
-        self._preview = QTextBrowser(self)
-        self._preview.setOpenExternalLinks(True)
+        self._preview = MarkdownPreview(self)
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self._editor)   # index 0
