@@ -41,9 +41,13 @@ via clipboard. No audio leaves the machine; no API key required.
   remaining word-choice errors (homophones, mild punctuation).
 - **Mic + system-audio capture** through WASAPI loopback, so both sides
   of a Teams / Zoom / Meet call are recorded.
-- **Clipboard-mediated synthesis.** Generate a prompt, paste it into any
-  approved chatbot (Claude.ai, Copilot, ChatGPT, ...), then paste the
-  reply back. The audio and transcript never touch a third-party API.
+- **Clipboard-mediated synthesis** (default) **or one-click automation**
+  (opt-in, v0.6.3+). Generate a prompt and paste it into any approved
+  chatbot, then paste the reply back -- or install the bundled Chrome
+  extension and let it drive a Claude.ai tab on a single button press.
+  Either way, the browser stays the LLM intermediary; no audio or
+  transcript ever touches a third-party API. See **Synthesis automation
+  (optional)** below.
 - **Speaker identification.** SpeechBrain ECAPA-TDNN embeddings cluster
   the loopback channel into per-speaker turns and match them against a
   local library that grows as you label voices.
@@ -254,6 +258,135 @@ escape hatch:
 
 ![Manage Speakers dialog](docs/screenshots/14-dialog-manage-speakers.png)
 
+## Synthesis automation (optional)
+
+By default the app uses a **manual** synthesis flow: click **Generate
+Synthesis Prompt**, paste the prompt into your approved chatbot, then
+**Paste Response Back** to land the reply in the Synthesis tab.
+
+Starting in v0.6.3, **Settings > Synthesis Automation** can replace the
+Generate + Paste buttons with a single **Send to Claude.ai** button. A
+bundled Chrome extension drives the chat tab for you: opens the
+conversation, pastes the prompt, watches for the response to stream in,
+clicks Claude's Copy button to read it back as proper markdown, then
+closes the tab. The Copy button stays visible regardless of the toggle.
+
+![Synthesis tab with automation enabled](docs/screenshots/15-main-synthesis-automation.png)
+
+### What stays the same
+
+- **No API calls.** The extension uses your existing Claude.ai (or,
+  in a future build, M365 Copilot) browser session -- exactly what
+  approved chatbot use looks like today.
+- **The browser remains the intermediary.** The extension types into
+  the chat composer and reads Claude's rendered response via its own
+  Copy button; it does not bypass the LLM's web interface.
+- **The proxy interstitial still gates traffic.** If your outbound
+  proxy shows a "PROCEED" page on the first AI request, the extension
+  detects it, shows a toast, and waits for you to click PROCEED. The
+  human-in-the-loop ack stays intact.
+
+### Hard dependencies
+
+- **Google Chrome** (or Chromium / Edge) installed on the same
+  machine as Meeting Notetaker. The extension is Manifest V3 and
+  loads as an unpacked extension; no other browser is supported in
+  v0.6.3.
+- **Windows.** The native-messaging bridge registers itself in HKCU
+  on the user side; macOS and Linux paths are scaffolded but not
+  packaged in this release.
+- **A signed-in Claude.ai account.** First-time use also prompts
+  Chrome for one-time per-site permissions; see below.
+
+### One-time install (Path 3: guided manual)
+
+Chrome does not permit silent install of unpacked extensions, so the
+install flow is a three-step wizard launched from
+**Settings > Synthesis Automation > Install / Verify...**:
+
+![Install wizard](docs/screenshots/16-dialog-automation-install.png)
+
+1. **Extract the extension files.** Click *Extract and open folder*;
+   the app drops the unpacked extension into
+   `%LOCALAPPDATA%\MeetingNotetaker\automation\extension` and opens
+   the folder in Explorer.
+2. **Load in Chrome.** Open `chrome://extensions`, toggle Developer
+   mode on, click **Load unpacked**, and select the folder from step 1.
+3. **Verify.** Back in the wizard, click *Verify*. The app registers
+   the native-messaging bridge in HKCU (per-user, no admin needed)
+   and waits up to a minute for the extension to connect. Green
+   indicator means done.
+
+To remove later: **Uninstall bridge** in Settings tears down the
+registry registration; to also remove the extension from Chrome,
+delete it from `chrome://extensions`.
+
+### Chrome permissions you'll be asked to grant
+
+On the first synthesis, Chrome shows **one-time per-site prompts**:
+
+- **"Allow claude.ai to see text and images copied to the clipboard?"**
+  Click **Allow**. The extension uses Claude's own Copy button + the
+  Clipboard API to read the response back as markdown; without this
+  permission, the synthesis fails with a clear "permission needed"
+  dialog (no garbage data lands in the Synthesis tab).
+
+Both prompts persist per Claude.ai origin; you only see them once.
+
+### Optional: route into a Claude project
+
+Synthesis output piles up in your default Claude.ai chat list by
+default. To send everything into a named **Claude project** instead
+(e.g. a "Meeting Notes" project), paste the project's UUID into
+**Settings > Synthesis Automation > Claude project ID**. Every Send
+then opens `https://claude.ai/project/<id>` rather than `/new`.
+
+The project ID is the UUID portion of a Claude project URL --
+something like `019e5077-c745-7541-b2c8-08caeb0f3051`. Leave the
+field blank to disable.
+
+### Per-session prompt template
+
+The synthesis tab now has a **Prompt** dropdown that picks which
+template to use for that session. Selection persists across app
+restarts. Each meeting can use a different template (e.g.
+`one-on-one` vs `standup`) without changing global settings; both
+the automation Send flow and the manual Generate dialog honor the
+selection. Edit or add templates via *Settings > Open Prompts
+Folder*.
+
+### Status bar connection state
+
+The status bar shows one of three values when synthesis automation
+is enabled in Settings:
+
+- **`Synthesis: Chrome not running`** -- Send is enabled and clicking
+  it launches Chrome at the synthesis URL automatically.
+- **`Synthesis: Chrome running, connected`** -- Send is ready.
+- **`Synthesis: Chrome running, disconnected`** -- Send is **disabled**.
+  The extension's service worker has been killed by Chrome's MV3
+  idle timer; it auto-reconnects within ~60 seconds via the
+  combined app-side ping + extension chrome.alarms retry. If it
+  persists, open the extension popup and click **Reconnect to app**.
+
+### Trade-offs
+
+- **Brittle to LLM UI changes.** The content script targets Claude.ai
+  selectors as of late 2026. The detector uses Claude's stop-button
+  toggle (resilient to class-name churn) and Claude's own Copy
+  button (works against Claude's serialization, not ours), but
+  significant DOM restructuring would still require a patch.
+- **Claude.ai only in v0.6.3.** The settings dropdown lists Microsoft
+  365 Copilot but its content script is a stub that surfaces "not
+  yet implemented"; the plumbing is in place so the next release
+  can drop in the Copilot adapter without an architectural change.
+- **Chrome only.** The bridge is also registered for Edge in HKCU
+  but the extension hasn't been smoke-tested there.
+- **Cold-start adds a few seconds.** If Chrome isn't running when you
+  click Send, the app launches it and waits up to 60 seconds for
+  the extension to connect before proceeding. Warm Chrome is
+  instant.
+
 ## Why this exists
 
 Many workstations forbid:
@@ -278,6 +411,11 @@ a human hand-off.
 - A working microphone and a default speaker / output device.
 - ~500 MB of disk for the default `small.en` Whisper model. The model
   downloads on first run.
+- **For optional synthesis automation (v0.6.3+):** Google Chrome on
+  the same machine. The automation feature opens a Claude.ai tab in
+  your existing Chrome session and reads the response back via
+  Chrome's clipboard API; no other browser is supported. See
+  [Synthesis automation (optional)](#synthesis-automation-optional).
 
 The dev environment installs PyAudio's PortAudio binding. On Windows the
 pip wheel ships PortAudio binaries; no extra system install is needed.

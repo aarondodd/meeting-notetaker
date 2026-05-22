@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -37,6 +38,7 @@ from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
 from .attendee_sidebar import AttendeeSidebar
 from .live_notes_widget import LiveNotesWidget
+from .previous_notes_widget import PreviousNotesWidget
 
 
 class SessionView(QWidget):
@@ -48,6 +50,10 @@ class SessionView(QWidget):
     stop_clicked = pyqtSignal(str)
     generate_prompt_clicked = pyqtSignal(str)
     paste_notes_clicked = pyqtSignal(str)
+    # Synthesis Automation: emitted instead of the Generate/Paste pair
+    # when the user has the feature enabled in Settings. Carries the
+    # session id and the LLM target key ("claude" / "copilot").
+    send_to_llm_clicked = pyqtSignal(str, str)      # session_id, target
     copy_tab_clicked = pyqtSignal(str, str)        # session_id, tab_id
     retain_audio_toggled = pyqtSignal(str, bool)   # session_id, value
     live_notes_changed = pyqtSignal(str, str)      # session_id, body
@@ -62,6 +68,17 @@ class SessionView(QWidget):
     # rename / forget each one. Feeds corrections back to the speaker
     # store for the self-learning loop.
     review_speakers_clicked = pyqtSignal(str)  # session_id
+    # Previous-notes pane actions. Restore swaps an archive into the
+    # current notes.md; Delete removes the archive file. Both are
+    # handled by MainApp (which owns the on-disk store).
+    restore_previous_notes_clicked = pyqtSignal(str, Path)   # session_id, archive_path
+    delete_previous_notes_clicked = pyqtSignal(str, Path)    # session_id, archive_path
+    # User picked a different synthesis prompt template for this
+    # session. Persisted to the session's metadata.json so the choice
+    # survives reloads, and used by both the automation Send flow and
+    # the manual Generate dialog as the default. Empty string means
+    # "use the bundled default template."
+    prompt_template_changed = pyqtSignal(str, str)            # session_id, template_name
     # Click-to-tag for in-meeting speaker anchoring. The sidebar emits
     # (session_id, name) per click; the controller persists a SpeakerTag
     # and the post-meeting refiner uses tags to constrain the clusterer.
@@ -75,6 +92,25 @@ class SessionView(QWidget):
         # Maps (source, t_start) -> line index in the transcript view.
         self._user_name = ""
         self._raw_transcript_text = ""
+        # Synthesis Automation state. set_automation_enabled() flips
+        # both at construction (via main_window) and when Settings is
+        # closed; the click handler reads _automation_target to know
+        # which LLM to route to.
+        self._automation_enabled = False
+        self._automation_target = ""
+        # Per-session "synthesis automation is mid-flight" state. We
+        # only need a single slot because the SessionView shows one
+        # session at a time; MainApp tracks which session_id owns it
+        # so re-entering a session while its synthesis is still
+        # running keeps the indicator on.
+        self._synth_in_progress_session_id: Optional[str] = None
+        # Current (chrome_running, bridge_connected) combined state.
+        # Set by MainApp via set_synthesis_connection_state on each
+        # 5-second poll tick + on bridge connect/disconnect. Defaults
+        # to NOT_RUNNING so the Send button enables until proven
+        # otherwise -- the launch-on-Send path handles the case
+        # where Chrome really isn't up.
+        self._synth_connection_state = None  # SynthesisConnectionState, set by app
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -127,12 +163,48 @@ class SessionView(QWidget):
 
         # Synthesis row
         synthesis = QHBoxLayout()
+        # Per-session prompt template picker. Reflects the bundled +
+        # user-edited template list from the prompts folder; the
+        # selection persists in the session's metadata.json. Both the
+        # automation Send flow and the manual Generate dialog read
+        # this as their default. Population happens via
+        # set_prompt_templates() once the prompts module is loaded.
+        synthesis.addWidget(QLabel("Prompt:", self))
+        self._prompt_template_picker = QComboBox(self)
+        self._prompt_template_picker.setToolTip(
+            "Synthesis prompt template for this session. Each meeting "
+            "can use a different template (e.g. one-on-one vs standup). "
+            "The selection is remembered across app restarts. Edit or "
+            "add templates via Settings > Open Prompts Folder."
+        )
+        self._prompt_template_picker.currentIndexChanged.connect(
+            self._on_prompt_template_changed
+        )
+        # Reasonable cap on width; long template names truncate with
+        # ellipsis but the dropdown shows the full text.
+        self._prompt_template_picker.setMaximumWidth(200)
+        synthesis.addWidget(self._prompt_template_picker)
         self._generate_btn = QPushButton("Generate Synthesis Prompt", self)
         self._generate_btn.clicked.connect(self._on_generate_prompt)
         synthesis.addWidget(self._generate_btn)
         self._paste_btn = QPushButton("Paste Response Back...", self)
         self._paste_btn.clicked.connect(self._on_paste_notes)
         synthesis.addWidget(self._paste_btn)
+        # Synthesis Automation: single Send button that replaces the
+        # Generate + Paste pair when settings.synthesis.automation_enabled
+        # is on. Toggled via set_automation_enabled() at construction +
+        # whenever Settings is closed. Copy button stays visible
+        # regardless of the toggle (Aaron's call -- the manual copy
+        # path is still useful when the extension isn't reachable).
+        self._send_btn = QPushButton("Send to Claude.ai", self)
+        self._send_btn.setToolTip(
+            "Send the synthesis prompt to the configured web LLM via "
+            "the Meeting Notetaker browser extension. The response "
+            "lands in the Synthesis tab automatically."
+        )
+        self._send_btn.clicked.connect(self._on_send_to_llm)
+        self._send_btn.setVisible(False)
+        synthesis.addWidget(self._send_btn)
         self._copy_btn = QPushButton("Copy", self)
         self._copy_btn.setToolTip(
             "Copy the active tab's contents to the clipboard. The button "
@@ -174,6 +246,25 @@ class SessionView(QWidget):
         synthesis.addStretch(1)
         layout.addLayout(synthesis)
 
+        # Synthesis-in-progress banner. Shown only while a Send-to-LLM
+        # call is mid-flight; hidden otherwise. Lives between the button
+        # row and the tabs so it's visible no matter which tab is
+        # active, and the Send button (above) is disabled in lockstep
+        # so a double-click can't launch a second synthesis tab.
+        self._synth_banner = QLabel("", self)
+        self._synth_banner.setVisible(False)
+        self._synth_banner.setStyleSheet(
+            "QLabel { "
+            "background: #fef3c7; "
+            "color: #92400e; "
+            "border: 1px solid #fbbf24; "
+            "border-radius: 4px; "
+            "padding: 6px 10px; "
+            "font-weight: 500; "
+            "}"
+        )
+        layout.addWidget(self._synth_banner)
+
         # Transcript / My Notes / Synthesis / Previous tabs
         self._tabs = QTabWidget(self)
         self._transcript_view = QPlainTextEdit(self)
@@ -208,8 +299,17 @@ class SessionView(QWidget):
         self._notes_view.textChanged.connect(self._on_notes_changed)
         self._tabs.addTab(self._notes_view, "Synthesis")
 
-        self._previous_view = QPlainTextEdit(self)
-        self._previous_view.setReadOnly(True)
+        # Previous Notes: list of archived synthesis versions + a
+        # markdown-rendered preview of the selected one, with
+        # Restore / Delete actions. Replaces the v0.6.2 plaintext
+        # dump of every archive concatenated together.
+        self._previous_view = PreviousNotesWidget(self)
+        self._previous_view.restore_requested.connect(
+            self._on_previous_restore_requested
+        )
+        self._previous_view.delete_requested.connect(
+            self._on_previous_delete_requested
+        )
         self._tabs.addTab(self._previous_view, "Previous Notes")
 
         # Horizontal container holding the tab widget on the left and the
@@ -255,6 +355,16 @@ class SessionView(QWidget):
             self._flush_notes()
         self._session = session
         self._provisional_segments.clear()
+        # Re-evaluate whether the new session has a synthesis still
+        # in flight; if not, hide the banner. (The display state is a
+        # function of session_id + in-progress-id, so swapping sessions
+        # always changes the banner visibility correctly.)
+        if session is None or self._synth_in_progress_session_id != session.id:
+            self._synth_banner.setVisible(False)
+            self._synth_banner.setText("")
+        else:
+            self._synth_banner.setText("⏳  Waiting for Claude.ai response...")
+            self._synth_banner.setVisible(True)
         if session is None:
             self._title_label.setText("(no session)")
             self._state_label.setText("")
@@ -262,7 +372,8 @@ class SessionView(QWidget):
             self._transcript_view.setPlainText("")
             self._notes_view.set_session_dir(None)
             self._set_notes_text("")
-            self._previous_view.setPlainText("")
+            self._previous_view.set_session_id("")
+            self._previous_view.set_archives([])
             self._live_notes_editor.set_session_dir(None)
             self._set_live_notes_text("")
             self._retain_checkbox.setChecked(False)
@@ -290,7 +401,8 @@ class SessionView(QWidget):
         self._retain_checkbox.blockSignals(True)
         self._retain_checkbox.setChecked(session.retain_audio)
         self._retain_checkbox.blockSignals(False)
-        self._previous_view.setPlainText(_summarize_previous(previous_notes_paths))
+        self._previous_view.set_session_id(session.id)
+        self._previous_view.set_archives(previous_notes_paths)
         self._set_buttons_for_state(
             session.state,
             has_transcript=session.has_transcript or bool(transcript.strip()),
@@ -440,7 +552,7 @@ class SessionView(QWidget):
         self._notes_view.set_preview_mode(bool(text.strip()))
 
     def set_previous_notes(self, paths: list) -> None:
-        self._previous_view.setPlainText(_summarize_previous(paths))
+        self._previous_view.set_archives(paths)
 
     def current_live_notes(self) -> str:
         """Return the current live-notes editor body. Flushes pending saves."""
@@ -527,6 +639,161 @@ class SessionView(QWidget):
         if self._session:
             self.paste_notes_clicked.emit(self._session.id)
 
+    def _on_send_to_llm(self) -> None:
+        if self._session and self._automation_target:
+            # Optimistically mark in-progress so a double-click can't
+            # fire two synthesis tabs. The controller will call
+            # set_synthesis_in_progress with the same id; idempotent.
+            self.set_synthesis_in_progress(self._session.id, True, status_text=None)
+            self.send_to_llm_clicked.emit(
+                self._session.id, self._automation_target
+            )
+
+    def set_synthesis_in_progress(
+        self, session_id: str, in_progress: bool, *, status_text: Optional[str] = None
+    ) -> None:
+        """Track + display whether a synthesis-automation call is mid-
+        flight for ``session_id``.
+
+        While in progress: shows the yellow banner above the tabs,
+        disables the Send button (preventing parallel tabs from a
+        double-click), and updates the banner text if ``status_text``
+        is provided (used by the controller to surface "pasting",
+        "response streaming", etc as they come back from the bridge).
+
+        Off: clears the banner + re-enables Send.
+
+        The state is keyed by session_id so switching away to another
+        session and back doesn't lose the indicator -- MainApp keeps
+        the tracking; SessionView only renders for the currently-
+        displayed session.
+        """
+        if in_progress:
+            self._synth_in_progress_session_id = session_id
+        elif self._synth_in_progress_session_id == session_id:
+            self._synth_in_progress_session_id = None
+        # Only render if the in-progress session is the one currently
+        # displayed. Switching to a different session while a synthesis
+        # is mid-flight elsewhere should not show the banner here.
+        showing_this = (
+            self._session is not None and self._session.id == session_id
+        )
+        if showing_this and self._synth_in_progress_session_id == session_id:
+            text = status_text or "Waiting for Claude.ai response..."
+            self._synth_banner.setText(f"⏳  {text}")
+            self._synth_banner.setVisible(True)
+            self._send_btn.setEnabled(False)
+        else:
+            # Either we're not the displayed session, or the synthesis
+            # finished -- hide the banner and let the next state
+            # refresh re-enable the Send button.
+            self._synth_banner.setVisible(False)
+            self._synth_banner.setText("")
+            if self._session is not None:
+                self._set_buttons_for_state(
+                    self._session.state,
+                    has_transcript=bool(self._raw_transcript_text),
+                    has_notes=bool(self._session.has_notes),
+                )
+
+    def set_prompt_templates(self, template_names: list[str], selected: str = "") -> None:
+        """Populate the prompt template picker.
+
+        ``template_names`` should be the list of available templates
+        (from prompts module). ``selected`` is the currently-saved
+        choice for this session ("" = use default). Caller is
+        expected to compute that from session metadata before invoking.
+
+        Block signals during population so the currentIndexChanged
+        emit doesn't fire spurious save events at app-startup.
+        """
+        self._prompt_template_picker.blockSignals(True)
+        self._prompt_template_picker.clear()
+        # First entry is always "(default)" -- empty string in data
+        # role -- so leaving the picker untouched on a new session
+        # uses the default template without forcing the user to pick.
+        self._prompt_template_picker.addItem("(default)", "")
+        for name in template_names:
+            if not name or name == "default":
+                # We surface the bundled default via the "(default)"
+                # entry above; skip the literal "default" template
+                # name to avoid the user seeing two entries that
+                # mean the same thing.
+                continue
+            self._prompt_template_picker.addItem(name, name)
+        # Restore selection.
+        target_idx = 0  # (default)
+        for i in range(self._prompt_template_picker.count()):
+            if self._prompt_template_picker.itemData(i) == selected:
+                target_idx = i
+                break
+        self._prompt_template_picker.setCurrentIndex(target_idx)
+        self._prompt_template_picker.blockSignals(False)
+
+    def selected_prompt_template(self) -> str:
+        """The currently-selected template's data value (empty == default)."""
+        return self._prompt_template_picker.currentData() or ""
+
+    def _on_prompt_template_changed(self, _idx: int) -> None:
+        if self._session is None:
+            return
+        name = self._prompt_template_picker.currentData() or ""
+        self.prompt_template_changed.emit(self._session.id, name)
+
+    def set_synthesis_connection_state(self, state) -> None:
+        """Update the SessionView's view of the synthesis connection
+        state. MainApp's poll loop calls this every 5 seconds plus on
+        bridge connect/disconnect transitions. Re-evaluates the Send
+        button enable state immediately."""
+        self._synth_connection_state = state
+        if self._session is not None:
+            self._set_buttons_for_state(
+                self._session.state,
+                has_transcript=bool(self._raw_transcript_text),
+                has_notes=bool(self._session.has_notes),
+            )
+
+    def set_automation_enabled(self, enabled: bool, target_key: str = "claude") -> None:
+        """Swap between manual (Generate + Paste) and automated (Send)
+        synthesis buttons. Copy / Print / Export PDF stay visible
+        regardless -- the user keeps the manual escape hatches.
+
+        target_key drives the Send button label so the user knows
+        where they're sending without opening Settings."""
+        self._automation_enabled = enabled
+        self._automation_target = target_key if enabled else ""
+        self._generate_btn.setVisible(not enabled)
+        self._paste_btn.setVisible(not enabled)
+        self._send_btn.setVisible(enabled)
+        # Label reflects the configured target.
+        if enabled:
+            try:
+                from ..automation.targets import get_target
+
+                target = get_target(target_key)
+                self._send_btn.setText(f"Send to {target.label}")
+                if not target.implemented:
+                    self._send_btn.setEnabled(False)
+                    self._send_btn.setToolTip(
+                        f"{target.label} automation is not yet "
+                        "implemented. Pick a different target in "
+                        "Settings, or toggle automation off to use the "
+                        "manual Generate / Paste flow."
+                    )
+            except ValueError:
+                self._send_btn.setText("Send to LLM")
+        # Visibility change alone is enough; the next state update
+        # from the controller will refresh enabled-state via the
+        # _set_buttons_for_state path. If we're already in a state
+        # where the transcript is ready, force a refresh now so the
+        # button enables without waiting for the next state event.
+        if self._session is not None:
+            self._set_buttons_for_state(
+                self._session.state,
+                has_transcript=bool(self._raw_transcript_text),
+                has_notes=bool(self._session.has_notes if self._session else False),
+            )
+
     def _on_copy_active_tab(self) -> None:
         if not self._session:
             return
@@ -557,7 +824,14 @@ class SessionView(QWidget):
         if tab_id == "notes":
             return self._notes_view.toPlainText()
         if tab_id == "previous":
-            return self._previous_view.toPlainText()
+            # The new PreviousNotesWidget renders one archive at a time
+            # in a QTextBrowser preview; expose that as the "tab text"
+            # for Copy / Print etc. Returns empty string if no archive
+            # is selected, which is fine -- Copy is a no-op then.
+            try:
+                return self._previous_view._preview.toPlainText()  # noqa: SLF001
+            except AttributeError:
+                return ""
         return ""
 
     def active_tab_label(self) -> str:
@@ -569,6 +843,12 @@ class SessionView(QWidget):
             "notes": "Synthesis",
             "previous": "Previous Notes",
         }.get(tab_id or "", "")
+
+    def _on_previous_restore_requested(self, session_id: str, path: Path) -> None:
+        self.restore_previous_notes_clicked.emit(session_id, path)
+
+    def _on_previous_delete_requested(self, session_id: str, path: Path) -> None:
+        self.delete_previous_notes_clicked.emit(session_id, path)
 
     def _on_review_speakers(self) -> None:
         if self._session:
@@ -608,6 +888,40 @@ class SessionView(QWidget):
         can_synthesize = has_session and has_transcript and not is_recording
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
+        # Send button: gated by FOUR conditions. All must be true.
+        #
+        #   1. There's a transcript to synthesize (can_synthesize).
+        #   2. The target LLM has a working content-script adapter
+        #      (Copilot is stub-only in v0.6.3 so its target.implemented
+        #      is False; Claude is True).
+        #   3. There's no synthesis already in flight for THIS session
+        #      (prevents double-click → two tabs).
+        #   4. The connection state allows it: NOT_RUNNING (we'll
+        #      launch Chrome on click) or RUNNING_CONNECTED (normal
+        #      flow). RUNNING_DISCONNECTED disables because the
+        #      extension is broken and a click would just fail.
+        if self._automation_enabled and self._automation_target:
+            from ..automation.targets import get_target
+
+            try:
+                implemented = get_target(self._automation_target).implemented
+            except ValueError:
+                implemented = False
+            self_id = self._session.id if self._session else ""
+            in_progress_here = (
+                self._synth_in_progress_session_id is not None
+                and self._synth_in_progress_session_id == self_id
+            )
+            connection_ok = (
+                self._synth_connection_state is None
+                or self._synth_connection_state.send_button_enabled()
+            )
+            self._send_btn.setEnabled(
+                can_synthesize
+                and implemented
+                and not in_progress_here
+                and connection_ok
+            )
         self._update_copy_button(has_session=has_session)
         self._update_print_button(has_session=has_session, has_notes=has_notes)
 
@@ -770,16 +1084,3 @@ def _pretty_state(state: str) -> str:
     return pretty.get(state, state.title())
 
 
-def _summarize_previous(paths: list) -> str:
-    if not paths:
-        return "(no archived notes for this session)"
-    lines = ["Archived notes for this session:", ""]
-    for p in paths:
-        try:
-            body = p.read_text(encoding="utf-8")
-        except OSError:
-            body = "(unreadable)"
-        lines.append(f"=== {p.name} ===")
-        lines.append(body.strip())
-        lines.append("")
-    return "\n".join(lines).rstrip()

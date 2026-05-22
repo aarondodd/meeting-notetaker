@@ -87,8 +87,9 @@ def test_main_window_exposes_dependency_check_signal(qt_app):
 def test_dependency_check_dialog_populates_without_crashing(qt_app):
     from meeting_notetaker.ui.dependency_check_dialog import DependencyCheckDialog
     dlg = DependencyCheckDialog()
-    # Eight feature groups defined in dependency_check._GROUPS
-    assert dlg._tree.topLevelItemCount() == 8
+    # Nine feature groups defined in dependency_check._GROUPS
+    # (v0.6.3 added Synthesis automation as the ninth).
+    assert dlg._tree.topLevelItemCount() == 9
     # Summary label is populated with three counts
     text = dlg._summary_label.text()
     assert "OK" in text

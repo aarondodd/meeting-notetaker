@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Meeting Notetaker</title>
+  <style>
+    body {
+      width: 260px;
+      margin: 0;
+      padding: 12px 14px;
+      font: 13px/1.4 -apple-system, system-ui, sans-serif;
+      color: #111827;
+      background: #ffffff;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #9ca3af;
+    }
+    .dot.connected { background: #10b981; }
+    .dot.disconnected { background: #ef4444; }
+    .meta {
+      color: #6b7280;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .meta div { margin-bottom: 2px; }
+    button {
+      width: 100%;
+      padding: 6px 10px;
+      font: inherit;
+      border: 1px solid #d1d5db;
+      background: #f9fafb;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover { background: #f3f4f6; }
+  </style>
+</head>
+<body>
+  <h1>Meeting Notetaker</h1>
+  <div class="status-row">
+    <span id="dot" class="dot"></span>
+    <span id="status-text">Checking...</span>
+  </div>
+  <div class="meta">
+    <div>Extension: <span id="ext-version">-</span></div>
+    <div>App: <span id="app-version">-</span></div>
+    <div id="inflight-row" style="display: none;">In-flight: <span id="inflight-count">0</span></div>
+  </div>
+  <button id="reconnect">Reconnect to app</button>
+  <script src="popup.js"></script>
+</body>
+</html>

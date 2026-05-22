@@ -36,6 +36,11 @@ Schema (config.toml):
     cooldown_minutes = 10        # per-app cooldown after a prompt is dismissed
     app_allowlist = ["Teams.exe", "ms-teams.exe", "Zoom.exe", ...]
 
+    [synthesis]
+    automation_enabled = false   # if true, swap Generate/Paste buttons for a single Send-to-LLM button (Windows + Chrome extension required)
+    llm_target = "claude"        # one of: "claude", "copilot". Copilot is plumbed but not wired in 0.6.3.
+    claude_project_id = ""       # optional Claude project UUID; when set, syntheses land in that project instead of the default chat list
+
 Reads use tomllib (3.11+) or the tomli fallback. Writes are emitted by hand
 since our schema is flat and tomli-w is not a stdlib component.
 """
@@ -55,6 +60,7 @@ from .paths import config_path
 
 
 VALID_MODEL_SIZES = ("tiny.en", "base.en", "small.en", "medium.en")
+VALID_LLM_TARGETS = ("claude", "copilot")
 
 
 @dataclass
@@ -134,6 +140,28 @@ _DEFAULT_DETECTION_ALLOWLIST: tuple[str, ...] = (
 
 
 @dataclass
+class SynthesisConfig:
+    automation_enabled: bool = False
+    llm_target: str = "claude"
+    # Optional Claude.ai project UUID. When set, the Send-to-Claude
+    # flow opens https://claude.ai/project/<id> instead of /new, so
+    # synthesized notes accumulate inside the named project rather
+    # than flooding the user's default chat list. Empty == no project.
+    claude_project_id: str = ""
+
+    def claude_chat_url(self) -> str:
+        """Build the Claude.ai URL the extension should land on for
+        a fresh synthesis. If a project id is configured, return the
+        project URL; otherwise the canonical /new path. Stripping
+        whitespace so a user pasting with trailing newlines doesn't
+        produce a busted URL."""
+        pid = self.claude_project_id.strip()
+        if pid:
+            return f"https://claude.ai/project/{pid}"
+        return "https://claude.ai/new"
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
@@ -141,6 +169,7 @@ class Config:
     calendar: CalendarConfig = field(default_factory=CalendarConfig)
     speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
+    synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -165,6 +194,9 @@ class Config:
             ),
             detection=DetectionConfig(
                 **_filter_fields(DetectionConfig, data.get("detection", {}))
+            ),
+            synthesis=SynthesisConfig(
+                **_filter_fields(SynthesisConfig, data.get("synthesis", {}))
             ),
         )
 
@@ -219,6 +251,29 @@ class Config:
                 f"detection.cooldown_minutes must be between 1 and 120, "
                 f"got {self.detection.cooldown_minutes}"
             )
+        if self.synthesis.llm_target not in VALID_LLM_TARGETS:
+            errors.append(
+                f"synthesis.llm_target {self.synthesis.llm_target!r} "
+                f"must be one of {VALID_LLM_TARGETS}"
+            )
+        if self.synthesis.claude_project_id:
+            # Optional field; if set, must look like a UUID
+            # (8-4-4-4-12 hex). Loose match -- Claude uses UUID-v7
+            # variants whose internal structure differs from v4 but
+            # the outer shape is the same.
+            import re  # noqa: PLC0415
+
+            if not re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                self.synthesis.claude_project_id.strip(),
+            ):
+                errors.append(
+                    "synthesis.claude_project_id must be a UUID-shaped "
+                    "string (e.g. 019e5077-c745-7541-b2c8-08caeb0f3051) "
+                    "or empty to disable. Got: "
+                    f"{self.synthesis.claude_project_id!r}"
+                )
         return errors
 
     def _dump_toml(self) -> str:
@@ -230,6 +285,7 @@ class Config:
             ("calendar", self.calendar),
             ("speakers", self.speakers),
             ("detection", self.detection),
+            ("synthesis", self.synthesis),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():

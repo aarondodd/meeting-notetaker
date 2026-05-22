@@ -92,6 +92,60 @@ def log_path() -> Path:
     return app_data_dir() / "meeting_notetaker.log"
 
 
+# How many historical log files to keep alongside the current one.
+# Total on disk = LOG_HISTORY_KEEP + the live meeting_notetaker.log
+# (so 5 historical + 1 current = 6 files max).
+LOG_HISTORY_KEEP = 5
+
+
+def rotate_log_on_launch(now: object | None = None) -> Path | None:
+    """Move the existing meeting_notetaker.log aside before the new
+    session opens its file handler, so each launch gets a fresh log.
+
+    Returns the archived path (or None if there was nothing to rotate
+    -- first launch on a fresh install). Also prunes the historical
+    list down to LOG_HISTORY_KEEP entries, oldest first.
+
+    ``now`` is overridable for tests; in production it's datetime.now().
+    """
+    import datetime as _dt  # noqa: PLC0415
+
+    if now is None:
+        now = _dt.datetime.now()
+    current = log_path()
+    archived: Path | None = None
+    if current.exists() and current.stat().st_size > 0:
+        stamp = now.strftime("%Y%m%d-%H%M%S")
+        candidate = current.parent / f"meeting_notetaker-{stamp}.log"
+        # Highly unlikely but guard against collision (two launches in
+        # the same second -- e.g. supervisor restart loops).
+        counter = 1
+        while candidate.exists():
+            candidate = current.parent / f"meeting_notetaker-{stamp}-{counter}.log"
+            counter += 1
+        try:
+            current.rename(candidate)
+            archived = candidate
+        except OSError:
+            # If the rename fails (Windows handles, AV scanner, etc),
+            # we'd rather have appended logs than a missing log. Leave
+            # the existing file in place; basicConfig will append.
+            archived = None
+    # Prune historical files. Sort by mtime descending; keep the first
+    # LOG_HISTORY_KEEP, delete the rest.
+    history = sorted(
+        current.parent.glob("meeting_notetaker-*.log"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in history[LOG_HISTORY_KEEP:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    return archived
+
+
 def package_root() -> Path:
     """Root of the meeting_notetaker package (for bundled resources)."""
     return Path(__file__).resolve().parent.parent
@@ -99,3 +153,28 @@ def package_root() -> Path:
 
 def resource_path(*parts: str) -> Path:
     return package_root() / "resources" / Path(*parts)
+
+
+def automation_dir() -> Path:
+    """Where the unpacked Chrome extension + native-host manifest live."""
+    path = app_data_dir() / "automation"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def extension_dir() -> Path:
+    """The unpacked extension folder the user loads via chrome://extensions."""
+    path = automation_dir() / "extension"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def native_host_manifest_path() -> Path:
+    """The native-messaging-host manifest JSON Chrome reads."""
+    return automation_dir() / "com.meeting_notetaker.bridge.json"
+
+
+def bridge_handshake_path() -> Path:
+    """Loopback port + auth token, written by the running app for the host
+    to read. JSON: {"port": int, "token": str, "pid": int}."""
+    return automation_dir() / "bridge.json"

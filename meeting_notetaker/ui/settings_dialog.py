@@ -32,22 +32,38 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
 from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
+from ..automation import installer
+from ..automation.targets import ALL_TARGETS, get_target
 from ..diarization import user_voiceprint
 from ..diarization.store import open_speaker_store
 from ..utils.config import Config, VALID_MODEL_SIZES
 from ..utils.paths import prompts_dir, vocabulary_path
 from ..utils.vocabulary import seed_vocabulary_file
+from .automation_install_dialog import AutomationInstallDialog
 from .speakers_manage_dialog import SpeakersManageDialog
 from .voice_enrollment_dialog import VoiceEnrollmentDialog
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, config: Config, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        parent: Optional[QWidget] = None,
+        *,
+        ping_extension: Optional[callable] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
         self.resize(560, 600)
         self._config = config
+        # The install wizard's Verify step probes the live bridge to
+        # confirm the extension is reachable. The Settings dialog
+        # doesn't own a bridge; the controller does. Inject the probe
+        # function here so the wizard can call it without a circular
+        # dependency. ``None`` is fine in tests / off-Windows where the
+        # wizard falls back to "is_fully_installed()".
+        self._ping_extension = ping_extension
 
         # Outer layout: scroll area on top, button bar at the bottom outside
         # the scroll region so OK/Cancel are always reachable. The content
@@ -481,6 +497,87 @@ class SettingsDialog(QDialog):
         ui_form.addRow("Your name:", self._user_name_edit)
         layout.addWidget(ui_group)
 
+        # Synthesis Automation group --------------------------------------
+        auto_group = QGroupBox("Synthesis Automation (optional)", self)
+        auto_layout = QVBoxLayout(auto_group)
+        auto_blurb = QLabel(
+            "When enabled, the Generate Synthesis Prompt + Paste Response "
+            "Back buttons are replaced by a single \"Send to <LLM>\" "
+            "button. The browser stays the intermediary -- the extension "
+            "drives the same chat window you would use manually. "
+            "Requires a one-time install (unpacked Chrome extension).",
+            self,
+        )
+        auto_blurb.setWordWrap(True)
+        auto_layout.addWidget(auto_blurb)
+
+        self._auto_enabled = QCheckBox("Enable synthesis automation", self)
+        self._auto_enabled.setChecked(config.synthesis.automation_enabled)
+        auto_layout.addWidget(self._auto_enabled)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Send to:", self))
+        self._auto_target = QComboBox(self)
+        for tgt in ALL_TARGETS:
+            label = tgt.label
+            if not tgt.implemented:
+                label = f"{label} (not yet implemented)"
+            self._auto_target.addItem(label, tgt.key)
+        # Select current.
+        for i in range(self._auto_target.count()):
+            if self._auto_target.itemData(i) == config.synthesis.llm_target:
+                self._auto_target.setCurrentIndex(i)
+                break
+        target_row.addWidget(self._auto_target, 1)
+        auto_layout.addLayout(target_row)
+
+        # Optional Claude project ID. When set, syntheses land in the
+        # named project on Claude.ai rather than the default chat list.
+        # Aaron's use case: stop flooding the default conversation list
+        # with one chat per meeting; pin them all to a "Meeting Notes"
+        # project he can browse later.
+        proj_row = QHBoxLayout()
+        proj_row.addWidget(QLabel("Claude project ID:", self))
+        self._claude_project_id = QLineEdit(self)
+        self._claude_project_id.setText(config.synthesis.claude_project_id)
+        self._claude_project_id.setPlaceholderText(
+            "Optional UUID (e.g. 019e5077-c745-7541-b2c8-08caeb0f3051)"
+        )
+        self._claude_project_id.setToolTip(
+            "Optional. Paste the UUID portion of a Claude.ai project "
+            "URL. When set, every Send-to-Claude opens that project "
+            "(https://claude.ai/project/<id>) instead of /new, so "
+            "synthesized meeting notes accumulate inside the project. "
+            "Leave blank to land in the default chat list."
+        )
+        proj_row.addWidget(self._claude_project_id, 1)
+        auto_layout.addLayout(proj_row)
+
+        # Install / Status row
+        self._auto_status = QLabel(self)
+        self._auto_status.setWordWrap(True)
+        self._auto_status.setTextFormat(Qt.TextFormat.RichText)
+        auto_layout.addWidget(self._auto_status)
+
+        auto_actions = QHBoxLayout()
+        self._auto_install_btn = QPushButton("Install / Verify...", self)
+        self._auto_install_btn.clicked.connect(self._on_install_clicked)
+        auto_actions.addWidget(self._auto_install_btn)
+        self._auto_uninstall_btn = QPushButton("Uninstall bridge", self)
+        self._auto_uninstall_btn.setToolTip(
+            "Removes the native-messaging bridge registration. Leaves "
+            "the extension files on disk so you can re-verify later "
+            "without re-extracting. To fully remove the extension from "
+            "Chrome, also remove it at chrome://extensions."
+        )
+        self._auto_uninstall_btn.clicked.connect(self._on_uninstall_clicked)
+        auto_actions.addWidget(self._auto_uninstall_btn)
+        auto_actions.addStretch(1)
+        auto_layout.addLayout(auto_actions)
+
+        layout.addWidget(auto_group)
+        self._refresh_automation_status()
+
         # Prompts group ----------------------------------------------------
         prompts_group = QGroupBox("Synthesis Prompts", self)
         prompts_layout = QVBoxLayout(prompts_group)
@@ -538,6 +635,13 @@ class SettingsDialog(QDialog):
             if piece.strip()
         ]
         self._config.ui.user_name = self._user_name_edit.text().strip()
+        self._config.synthesis.automation_enabled = self._auto_enabled.isChecked()
+        self._config.synthesis.llm_target = (
+            self._auto_target.currentData() or "claude"
+        )
+        self._config.synthesis.claude_project_id = (
+            self._claude_project_id.text().strip()
+        )
         self.accept()
 
     def _open_prompts_folder(self) -> None:
@@ -581,6 +685,79 @@ class SettingsDialog(QDialog):
     def _clear_voiceprint(self) -> None:
         if user_voiceprint.clear():
             self._refresh_voiceprint_row()
+
+    # ------------------------------------------------------------------
+    # Synthesis automation
+
+    def _refresh_automation_status(self) -> None:
+        state = installer.installation_state()
+        bits: list[str] = []
+        if state["extension_extracted"]:
+            bits.append(
+                f"Extension files: <code>{state['extension_path']}</code>"
+            )
+        else:
+            bits.append("Extension files: not extracted")
+        if state["native_manifest_written"]:
+            bits.append("Bridge manifest: written")
+        else:
+            bits.append("Bridge manifest: not written")
+        if state.get("registry_chrome"):
+            bits.append("Chrome registration: ok")
+        elif state["native_manifest_written"]:
+            bits.append(
+                "<span style='color: #b91c1c;'>Chrome registration: missing</span>"
+                if __import__("sys").platform.startswith("win")
+                else "Chrome registration: (non-Windows)"
+            )
+        if installer.is_fully_installed():
+            bits.insert(0, "<b style='color: #047857;'>Installed.</b>")
+        elif state["extension_extracted"] or state["native_manifest_written"]:
+            bits.insert(0, "<b style='color: #b45309;'>Partially installed.</b>")
+        else:
+            bits.insert(0, "Not installed.")
+        self._auto_status.setText("<br>".join(bits))
+
+    def _on_install_clicked(self) -> None:
+        # The Chrome native-messaging wrapper has to point at a single
+        # executable; CLI args go in the wrapper body, not the manifest.
+        # Frozen build: <app.exe> --native-host. Dev: <python> main.py
+        # --native-host. We resolve the right shape here and hand the
+        # wizard a single zero-arg installer.
+        import sys as _sys
+        from pathlib import Path as _Path
+        from ..utils.paths import package_root
+
+        if getattr(_sys, "frozen", False):
+            host_exe = _Path(_sys.executable)
+            host_args = ["--native-host"]
+        else:
+            host_exe = _Path(_sys.executable)
+            host_args = [
+                str(package_root().parent / "main.py"),
+                "--native-host",
+            ]
+
+        def do_install() -> dict:
+            installer.extract_extension()
+            installer.write_native_host_manifest(
+                host_executable=host_exe,
+                host_args=host_args,
+            )
+            installer.register_native_host()
+            return installer.installation_state()
+
+        wizard = AutomationInstallDialog(
+            do_install=do_install,
+            ping_extension=self._ping_extension,
+            parent=self,
+        )
+        wizard.exec()
+        self._refresh_automation_status()
+
+    def _on_uninstall_clicked(self) -> None:
+        installer.uninstall(keep_extension_files=True)
+        self._refresh_automation_status()
 
 
 def _populate_device_picker(

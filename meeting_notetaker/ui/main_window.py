@@ -205,6 +205,8 @@ class MainWindow(QMainWindow):
         voice_tooltip: str = "",
         detect_label: str = "",
         detect_tooltip: str = "",
+        synthesis_label: str = "",
+        synthesis_tooltip: str = "",
     ) -> None:
         """Update the bottom status bar's right-side indicator string.
 
@@ -238,6 +240,9 @@ class MainWindow(QMainWindow):
         if detect_label:
             parts.append(detect_label)
             tooltip_parts.append(detect_tooltip or detect_label)
+        if synthesis_label:
+            parts.append(synthesis_label)
+            tooltip_parts.append(synthesis_tooltip or synthesis_label)
         self._indicators_label.setText(" | ".join(parts))
         self._indicators_label.setToolTip("\n".join(tooltip_parts))
 
