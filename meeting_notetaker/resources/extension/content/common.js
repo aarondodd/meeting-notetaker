@@ -172,55 +172,71 @@
     });
   }
 
-  // Resolve once the page's visible text has grown (Claude started
-  // responding) AND then stopped growing for `settleMs` consecutive
-  // ms (Claude finished). The DOM-mutation-based predecessor settled
-  // too early when Claude's "thinking" pause between submit and first
-  // token was longer than the min-wait: no mutations during the pause
-  // looks identical to "no mutations because done."
+  // Resolve once the page's visible text has been growing (Claude is
+  // actively streaming) AND then stopped for `settleMs`. Designed to
+  // distinguish a single one-shot growth burst (user-message bubble
+  // rendering after submit -- avatar + timestamp + label add a few
+  // dozen chars in one tick) from sustained streaming (Claude
+  // emitting tokens across multiple seconds).
   //
-  // Tracking visible text length sidesteps this: during the thinking
-  // pause, length doesn't grow, so we don't satisfy the
-  // "sawGrowth" gate and don't settle. Once tokens start streaming,
-  // length grows; settle fires after streaming stops.
+  // Gating: settle requires ALL of:
+  //   * total growth >= minGrowthChars (filters out trivial UI noise)
+  //   * growth events recorded in >= minGrowthEvents distinct polls
+  //     (one burst = 1 event; streaming = many events)
+  //   * span between first and last growth event >= minGrowthSpanMs
+  //     (a burst-then-pause looks like 1 event spanning 0ms)
+  //   * no growth for settleMs after the last event
   //
-  // Resolves with {elapsedMs, growthChars} on settle, null on timeout.
-  // onTick(elapsedMs, growthChars) fires every poll for heartbeat
-  // status messages (keeps the MV3 service worker awake).
+  // Resolves with {elapsedMs, growthChars, growthEvents, growthSpanMs}
+  // on settle, null on timeout. onTick(elapsedMs, growthChars,
+  // growthEvents) fires every poll for heartbeat status messages
+  // (keeps the MV3 service worker awake).
   function waitForResponseStreaming(opts = {}) {
     return new Promise((resolve) => {
       const settleMs = opts.settleMs || 3000;
-      const minGrowthChars = opts.minGrowthChars || 20;
+      const minGrowthChars = opts.minGrowthChars || 200;
+      const minGrowthEvents = opts.minGrowthEvents || 3;
+      const minGrowthSpanMs = opts.minGrowthSpanMs || 2000;
       const timeoutMs = opts.timeoutMs || 10 * 60 * 1000;
-      const pollMs = opts.pollMs || 500;
+      const pollMs = opts.pollMs || 350;
       const onTick = opts.onTick || (() => {});
 
       const startLen = (document.body.innerText || "").length;
       const started = Date.now();
       let lastLen = startLen;
-      let lastChangeAt = started;
-      let sawGrowth = false;
+      const growthEventTimes = []; // ms timestamps of polls that saw cur > lastLen
 
       const tick = () => {
         const now = Date.now();
         const elapsed = now - started;
         const cur = (document.body.innerText || "").length;
         const growth = cur - startLen;
-        if (cur !== lastLen) {
-          lastChangeAt = now;
+        if (cur > lastLen) {
+          growthEventTimes.push(now);
           lastLen = cur;
-          if (growth >= minGrowthChars) {
-            sawGrowth = true;
-          }
         }
-        onTick(elapsed, growth);
+        onTick(elapsed, growth, growthEventTimes.length);
         if (elapsed > timeoutMs) {
           resolve(null);
           return;
         }
-        if (sawGrowth && now - lastChangeAt >= settleMs) {
-          resolve({ elapsedMs: elapsed, growthChars: growth });
-          return;
+        if (
+          growth >= minGrowthChars &&
+          growthEventTimes.length >= minGrowthEvents
+        ) {
+          const span =
+            growthEventTimes[growthEventTimes.length - 1] - growthEventTimes[0];
+          const sinceLast =
+            now - growthEventTimes[growthEventTimes.length - 1];
+          if (span >= minGrowthSpanMs && sinceLast >= settleMs) {
+            resolve({
+              elapsedMs: elapsed,
+              growthChars: growth,
+              growthEvents: growthEventTimes.length,
+              growthSpanMs: span,
+            });
+            return;
+          }
         }
         setTimeout(tick, pollMs);
       };

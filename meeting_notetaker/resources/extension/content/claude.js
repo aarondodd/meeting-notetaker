@@ -231,30 +231,39 @@
     status(STATUS.AWAITING_RESPONSE);
 
     // Wait for the response to start streaming AND then stop. We
-    // track visible-text growth on document.body rather than DOM
-    // mutations because Claude's "thinking" pause between submit and
-    // first token can run 5-15 seconds with no mutations -- a
-    // mutation-based detector settles during that pause and scrapes
-    // a 22-char placeholder bubble (Aaron's 2026-05-22 repro).
+    // track visible-text growth on document.body, filtering out the
+    // one-shot user-bubble-rendering burst by requiring multiple
+    // growth events spread over time.
     //
-    // The growth-based detector requires the text to grow by at
-    // least minGrowthChars before it can settle, so the thinking
-    // pause holds us in "still waiting" until tokens actually arrive.
+    // History of failures this is guarding against:
+    //   * v1 used selector-based stop-button detection -- failed when
+    //     Claude's DOM didn't match the hard-coded aria-labels.
+    //   * v2 used MutationObserver DOM-settle -- fired during Claude's
+    //     "thinking" pause when no mutations happened, scraped a
+    //     22-char placeholder.
+    //   * v3 used simple text-length-growth -- fired on the user
+    //     message bubble's 58-char render burst, scraped a 40-char
+    //     pre-stream element.
+    //   * v4 (this): require multiple growth events spanning multiple
+    //     seconds before settle is even possible.
     //
-    // Heartbeat status every ~10s keeps the MV3 port active so the
-    // service worker isn't killed during long responses.
+    // Heartbeat status every 5s keeps the MV3 port active during the
+    // thinking phase. Logged with growth + event counts so future
+    // failures are diagnosable from the console.
     let lastHeartbeat = Date.now();
-    const HEARTBEAT_MS = 10000;
+    const HEARTBEAT_MS = 5000;
     const result = await waitForResponseStreaming({
       settleMs: 3000,
-      minGrowthChars: 30,
+      minGrowthChars: 200,
+      minGrowthEvents: 3,
+      minGrowthSpanMs: 2000,
       timeoutMs: 10 * 60 * 1000,
-      onTick: (ms, growth) => {
+      onTick: (ms, growth, events) => {
         if (Date.now() - lastHeartbeat >= HEARTBEAT_MS) {
           lastHeartbeat = Date.now();
           status(
             STATUS.RESPONSE_STREAMING,
-            `${Math.floor(ms / 1000)}s elapsed, ${growth} chars grown`,
+            `${Math.floor(ms / 1000)}s, +${growth} chars, ${events} events`,
           );
         }
       },
@@ -265,7 +274,9 @@
     }
     status(
       STATUS.RESPONSE_STREAMING,
-      `settled after ${Math.floor(result.elapsedMs / 1000)}s, ${result.growthChars} chars grown`,
+      `settled after ${Math.floor(result.elapsedMs / 1000)}s, ` +
+      `+${result.growthChars} chars, ${result.growthEvents} events, ` +
+      `${result.growthSpanMs}ms span`,
     );
 
     // If a stop button is still visible (e.g. the page hasn't yet
