@@ -11,7 +11,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from PyQt6.QtCore import QObject, Qt, QTimer
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from .automation import messages as automation_messages
@@ -89,6 +89,17 @@ _TRAY_FOR_STATE = {
 
 
 class MainApp(QObject):
+    # Cross-thread inbound message from the synthesis bridge. The bridge
+    # reader runs on its own worker thread; we emit this signal from
+    # that thread to bounce the message onto the Qt main thread (Qt's
+    # auto-connection promotes a cross-thread emit to QueuedConnection,
+    # which is what we want). Replaces the QTimer.singleShot(0, lambda)
+    # approach used in v1, which silently failed on Windows because
+    # QTimer's slot was registered on the bridge worker thread (no Qt
+    # event loop) and never fired (Aaron's 2026-05-22 repro: bridge
+    # received messages but the result never reached the app).
+    bridge_message_received = pyqtSignal(dict)
+
     def __init__(self, qt_app: QApplication) -> None:
         super().__init__()
         self.qt_app = qt_app
@@ -128,6 +139,10 @@ class MainApp(QObject):
             self._bridge.start()
         except OSError:
             log.exception("synthesis bridge failed to bind a loopback port")
+        # Bridge worker thread emits this signal; the connect below
+        # auto-promotes to QueuedConnection so the slot runs on the
+        # main thread regardless of which thread emitted.
+        self.bridge_message_received.connect(self._dispatch_bridge_message)
 
         self._wire_signals()
         self._apply_user_name()
@@ -194,17 +209,31 @@ class MainApp(QObject):
 
     def _on_bridge_message(self, msg: dict) -> None:
         """Inbound from the extension. Runs on the bridge's reader
-        thread. Pongs are signaled inline (threading.Event is thread-
-        safe) so a blocking _ping_extension on the main Qt thread
-        doesn't deadlock; everything else bounces to the main thread
-        via QTimer.singleShot."""
-        if msg.get("type") == "pong":
-            request_id = msg.get("request_id", "")
+        thread.
+
+        Pongs are signaled inline (threading.Event is thread-safe) so
+        a blocking _ping_extension on the main Qt thread doesn't
+        deadlock waiting for itself; everything else is emitted via
+        pyqtSignal, which Qt auto-routes across threads using
+        QueuedConnection so the slot runs on the main thread.
+
+        We log on the bridge thread BEFORE the emit so future drops
+        can be distinguished: if the bridge-thread log fires but
+        _dispatch_bridge_message doesn't, the cross-thread bounce
+        failed (signal/connection misconfigured). If the bridge-
+        thread log doesn't fire, the message never reached the
+        bridge at all (the failure is upstream in the extension /
+        native host / TCP path).
+        """
+        msg_type = msg.get("type", "")
+        request_id = msg.get("request_id", "")
+        log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
+        if msg_type == "pong":
             evt = self._pending_pings.pop(request_id, None)
             if evt is not None:
                 evt.set()
             return
-        QTimer.singleShot(0, lambda: self._dispatch_bridge_message(msg))
+        self.bridge_message_received.emit(msg)
 
     def _dispatch_bridge_message(self, msg: dict) -> None:
         msg_type = msg.get("type", "")
