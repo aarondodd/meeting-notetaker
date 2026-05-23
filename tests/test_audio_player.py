@@ -54,18 +54,22 @@ def _write_sine_wav(
                 w.writeframes(struct.pack("<" + "h" * channels, *([sample] * channels)))
 
 
-def test_mix_to_max_length_pads_short_side():
-    """Sum + attenuate. Shorter buffer is zero-padded so the long
-    side determines the output length."""
+def test_mix_to_max_length_pads_short_side_at_front():
+    """End-aligned mix: shorter buffer gets LEADING silence so its
+    END aligns with the merged track's end. Reflects the v0.6.5
+    fix where WASAPI loopback (sys) may start producing samples
+    after mic does; both stop simultaneously at controller.stop,
+    so end-alignment is the natural anchor."""
     a = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
     b = np.array([1.0, 1.0], dtype=np.float32)
     mixed = _mix_to_max_length([a, b])
     assert mixed.size == 4
-    # First two samples are (1 + 1) / 2 = 1.0; last two are 1/2 (only a contributes).
-    assert mixed[0] == pytest.approx(1.0)
-    assert mixed[1] == pytest.approx(1.0)
-    assert mixed[2] == pytest.approx(0.5)
-    assert mixed[3] == pytest.approx(0.5)
+    # First two: only a contributes (b's leading silence), so 0.5
+    # each. Last two: both contribute, so 1.0 each.
+    assert mixed[0] == pytest.approx(0.5)
+    assert mixed[1] == pytest.approx(0.5)
+    assert mixed[2] == pytest.approx(1.0)
+    assert mixed[3] == pytest.approx(1.0)
 
 
 def test_mix_to_max_length_single_buffer_passes_through():

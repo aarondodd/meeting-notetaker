@@ -60,8 +60,8 @@ class SessionView(QWidget):
     """Right-hand pane shown when a session is selected."""
 
     start_clicked = pyqtSignal(str)               # session_id
-    pause_clicked = pyqtSignal(str)
-    resume_clicked = pyqtSignal(str)
+    # pause_clicked / resume_clicked dropped in v0.6.5 -- the
+    # session recording is now a fixed Start -> Stop block.
     stop_clicked = pyqtSignal(str)
     generate_prompt_clicked = pyqtSignal(str)
     paste_notes_clicked = pyqtSignal(str)
@@ -184,12 +184,12 @@ class SessionView(QWidget):
         self._start_btn = QPushButton("Start", self)
         self._start_btn.clicked.connect(self._on_start)
         controls.addWidget(self._start_btn)
-        self._pause_btn = QPushButton("Pause", self)
-        self._pause_btn.clicked.connect(self._on_pause)
-        controls.addWidget(self._pause_btn)
-        self._resume_btn = QPushButton("Resume", self)
-        self._resume_btn.clicked.connect(self._on_resume)
-        controls.addWidget(self._resume_btn)
+        # Pause + Resume were removed in v0.6.5 to keep recordings
+        # wall-clock-continuous. With pause, mic.wav and sys.wav
+        # could go out of sync (especially under WASAPI loopback,
+        # which delivers samples idiosyncratically when no audio is
+        # playing). The recording is now a fixed start -> stop block
+        # with all silences / padding preserved.
         self._stop_btn = QPushButton("Stop", self)
         self._stop_btn.clicked.connect(self._on_stop)
         controls.addWidget(self._stop_btn)
@@ -1181,14 +1181,6 @@ class SessionView(QWidget):
         if self._session:
             self.start_clicked.emit(self._session.id)
 
-    def _on_pause(self) -> None:
-        if self._session:
-            self.pause_clicked.emit(self._session.id)
-
-    def _on_resume(self) -> None:
-        if self._session:
-            self.resume_clicked.emit(self._session.id)
-
     def _on_stop(self) -> None:
         if self._session:
             self.stop_clicked.emit(self._session.id)
@@ -1439,8 +1431,6 @@ class SessionView(QWidget):
 
         has_session = self._session is not None
         self._start_btn.setEnabled(has_session and (is_new or is_complete))
-        self._pause_btn.setEnabled(has_session and is_recording)
-        self._resume_btn.setEnabled(has_session and is_paused)
         self._stop_btn.setEnabled(has_session and (is_recording or is_paused))
         self._refresh_screencap_button_enabled()
         # Generate/paste are available as soon as a transcript exists. The

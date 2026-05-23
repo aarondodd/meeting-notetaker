@@ -120,19 +120,25 @@ def _decode_to_mono_float32(src: Path, target_rate: int) -> np.ndarray:
 
 
 def _mix_to_max_length(buffers: list[np.ndarray]) -> np.ndarray:
-    """Sum 2+ mono float32 buffers, padded to the longest, attenuated.
+    """Sum 2+ mono float32 buffers, end-aligned with leading silence.
 
     Divide by len(buffers) so the merged signal stays bounded by
     [-1, 1] when each input is already inside that range. PyAV's
     fltp samples are exactly in that range, so the result is
     clip-free without additional limiting.
+
+    Aligns the END of each buffer (recorders stop simultaneously)
+    via leading-zero padding -- a system-audio segment that began
+    30 s into a 60 s meeting renders at the 30 s mark in the merged
+    output, not the 0 s mark. Pre-v0.6.5 this padded TRAILING zeros
+    and dragged short sys-audio segments to the wrong moment.
     """
     max_len = max(b.size for b in buffers)
     acc = np.zeros(max_len, dtype=np.float32)
     for b in buffers:
         if b.size < max_len:
             pad = np.zeros(max_len, dtype=np.float32)
-            pad[: b.size] = b
+            pad[-b.size:] = b
             acc += pad
         else:
             acc += b

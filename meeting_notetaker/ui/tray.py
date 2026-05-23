@@ -58,15 +58,10 @@ class TrayIcon(QObject):
         self._action_new.triggered.connect(self.new_session_requested.emit)
         self._menu.addAction(self._action_new)
 
-        self._action_pause = QAction("Pause Recording", self)
-        self._action_pause.triggered.connect(self.pause_requested.emit)
-        self._action_pause.setEnabled(False)
-        self._menu.addAction(self._action_pause)
-
-        self._action_resume = QAction("Resume Recording", self)
-        self._action_resume.triggered.connect(self.resume_requested.emit)
-        self._action_resume.setEnabled(False)
-        self._menu.addAction(self._action_resume)
+        # Pause / Resume tray actions removed in v0.6.5 alongside
+        # the SessionView buttons -- the recording is now a fixed
+        # Start -> Stop block (avoids wall-clock / mic / sys
+        # alignment drift). Stop is the only mid-recording action.
 
         self._action_stop = QAction("Stop Recording", self)
         self._action_stop.triggered.connect(self.stop_requested.emit)
@@ -102,11 +97,10 @@ class TrayIcon(QObject):
             self._pulse_timer.start()
         else:
             self._pulse_timer.stop()
-        # Enable/disable transport actions to match.
+        # Stop is the only transport action; enable while recording
+        # or (for legacy sessions) paused.
         recording = state == "recording"
         paused = state == "paused"
-        self._action_pause.setEnabled(recording)
-        self._action_resume.setEnabled(paused)
         self._action_stop.setEnabled(recording or paused)
 
     def _pulse_step(self) -> None:

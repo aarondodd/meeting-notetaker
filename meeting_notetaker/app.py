@@ -825,8 +825,6 @@ class MainApp(QObject):
 
         self.tray.open_main_window.connect(self._foreground_window)
         self.tray.new_session_requested.connect(self._on_new_session)
-        self.tray.pause_requested.connect(self.controller.pause_session)
-        self.tray.resume_requested.connect(self.controller.resume_session)
         self.tray.stop_requested.connect(self.controller.stop_session)
         self.tray.settings_requested.connect(self._on_settings)
         self.tray.quit_requested.connect(self.qt_app.quit)
@@ -835,8 +833,6 @@ class MainApp(QObject):
 
         sv = self.window.session_view
         sv.start_clicked.connect(self._on_start_clicked)
-        sv.pause_clicked.connect(lambda _sid: self.controller.pause_session())
-        sv.resume_clicked.connect(lambda _sid: self.controller.resume_session())
         sv.stop_clicked.connect(lambda _sid: self.controller.stop_session())
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
@@ -1039,6 +1035,17 @@ class MainApp(QObject):
         )
 
     def _on_session_state_changed(self, session_id: str, state: str) -> None:
+        # Invalidate the player's cached load whenever the session
+        # state changes. The audio files on disk may have just been
+        # rewritten (RECORDING -> PROCESSING -> COMPLETE encodes the
+        # WAVs to opus and deletes the WAVs); the cached load is
+        # now stale. _maybe_load_player_for_session, called inside
+        # _on_session_selected, decides whether to reload based on
+        # the new state.
+        if self._player_loaded_session_id == session_id:
+            if self._audio_player is not None:
+                self._audio_player.close()
+            self._player_loaded_session_id = None
         # Update list label + selected view.
         self._refresh_session_list(select=session_id)
         self._on_session_selected(session_id)
@@ -1681,21 +1688,38 @@ class MainApp(QObject):
     def _maybe_load_player_for_session(self, session_id: str) -> None:
         """Load the session's retained audio into the player, if any.
 
-        Called from _on_session_selected. The player bar shows/hides
-        based on whether files actually exist on disk; loading is
-        skipped (with the player closed) when nothing's there.
+        Only loads when the session is in a terminal state
+        (COMPLETE / ERROR). Mid-recording (RECORDING / PAUSED) the
+        WAVs are growing under us, and during PROCESSING the encoder
+        rewrites them to opus -- in both cases any snapshot we take
+        is stale by the time the user clicks Play. (Aaron's bug:
+        loading during RECORDING produced a 92 ms buffer that stayed
+        cached through to COMPLETE; restarting the app fixed it by
+        forcing a fresh load against the final opus files.)
         """
         from .utils.paths import session_audio_files  # noqa: PLC0415
+        # If we're loaded for this session, never reload mid-state-
+        # change unless the state forces an invalidation upstream
+        # (handled in _on_session_state_changed).
+        if self._player_loaded_session_id == session_id:
+            return
+        session = self.store.get_session(session_id)
+        if session is not None and session.state not in (STATE_COMPLETE, STATE_ERROR):
+            # The recording is still in flight (or being encoded).
+            # Keep the player torn down so the bar stays disabled;
+            # the next state transition will trigger a fresh load.
+            if self._audio_player is not None:
+                self._audio_player.close()
+            self._player_loaded_session_id = None
+            self.window.session_view.set_player_enabled(False)
+            return
         files = session_audio_files(session_id)
         if not files:
-            # No audio for this session -- tear down the player bar.
             if self._audio_player is not None and self._player_loaded_session_id:
                 self._audio_player.close()
                 self._player_loaded_session_id = None
             self.window.session_view.set_player_enabled(False)
             return
-        if self._player_loaded_session_id == session_id:
-            return  # Already loaded; the bar is already showing.
         # Separate the mic and sys halves out of the list. The path
         # helper sorts mic-first-then-sys so we can index, but go
         # safer and discriminate by stem.

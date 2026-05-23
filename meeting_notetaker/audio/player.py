@@ -394,7 +394,21 @@ def _decode_to_mono_float32(src: Path, target_rate: int) -> np.ndarray:
 
 
 def _mix_to_max_length(buffers: list[np.ndarray]) -> np.ndarray:
-    """Sum 1+ mono float32 buffers, padded to longest, attenuated."""
+    """Sum 1+ mono float32 buffers, end-aligned with leading silence.
+
+    Recorders stop simultaneously (controller.stop_session synchronously
+    stops both). A shorter buffer therefore means the recorder STARTED
+    later -- typical with WASAPI loopback, which may not deliver
+    samples until something actually plays through the speakers.
+    Leading-zero padding aligns the END of each buffer with the
+    merged track's end, so a system-audio segment that began 30 s
+    into a 60 s meeting plays back at the 30 s mark instead of the
+    0 s mark.
+
+    Pre-v0.6.5 this padded TRAILING zeros, which dragged any short
+    sys-audio segment to the front of the timeline -- the alignment
+    bug Aaron flagged.
+    """
     if len(buffers) == 1:
         return buffers[0]
     max_len = max(b.size for b in buffers)
@@ -402,7 +416,7 @@ def _mix_to_max_length(buffers: list[np.ndarray]) -> np.ndarray:
     for b in buffers:
         if b.size < max_len:
             pad = np.zeros(max_len, dtype=np.float32)
-            pad[: b.size] = b
+            pad[-b.size:] = b
             acc += pad
         else:
             acc += b
