@@ -526,7 +526,7 @@ needs the User Guide above.
 ## Architecture overview
 
 ```mermaid
-flowchart LR
+flowchart TD
     mic[Microphone]
     sys["System audio<br/>(WASAPI loopback)"]
     align["Wall-clock<br/>alignment<br/>(wav_align)"]
@@ -619,7 +619,7 @@ transcription pass commits, the WAVs are re-encoded to the
 configured format (Opus / FLAC / WAV) and the WAVs are deleted.
 
 ```mermaid
-flowchart LR
+flowchart TD
     wav[mic.wav<br/>sys.wav]
     decide{retain_audio<br/>+ format}
     delete[delete WAVs]
@@ -821,7 +821,7 @@ timestamp.
 ## Synthesis automation deep-dive
 
 ```mermaid
-flowchart LR
+flowchart TD
     sv[SessionView<br/>Send to Claude.ai click]
     main[MainApp<br/>render prompt + open bridge]
     bridge["Bridge<br/>(TCP loopback, app side)"]
@@ -868,7 +868,7 @@ class-name churn in Claude's DOM and survives most UI updates.
 ## Audio playback + transcript sync
 
 ```mermaid
-flowchart LR
+flowchart TD
     on_select[Session selected]
     state{State<br/>COMPLETE/ERROR?}
     skip[Don't load player]
