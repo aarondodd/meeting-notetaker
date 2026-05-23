@@ -128,6 +128,12 @@ class MainApp(QObject):
         # Consumed at start_session time, then evicted. Sessions absent from
         # the dict fall back to the global config value.
         self._capture_only_overrides: dict[str, bool] = {}
+        # Per-session screen-capture region in absolute screen coords.
+        # Populated once the user accepts the region picker; cleared on
+        # Stop Screen Capture or when the recording ends. Indexed by
+        # session id so multi-session-in-flight (a v0.6 feature) still
+        # routes captures to the right session.
+        self._screen_capture_regions: dict[str, tuple[int, int, int, int]] = {}
 
         # Synthesis automation bridge. Listens on a loopback port for the
         # Chrome native-messaging host to connect; route inbound result/
@@ -832,6 +838,14 @@ class MainApp(QObject):
         sv.remove_last_tag_clicked.connect(
             lambda _sid, name: self.controller.remove_last_speaker_tag(name)
         )
+        # Screen-capture lifecycle. Start launches the region picker;
+        # Stop tears down. Capture / Insert in the sidebar grab the
+        # currently-armed region.
+        sv.start_screen_capture_clicked.connect(self._on_start_screen_capture)
+        sv.stop_screen_capture_clicked.connect(self._on_stop_screen_capture)
+        sv.screencap_capture_clicked.connect(self._on_screencap_capture)
+        sv.screencap_insert_clicked.connect(self._on_screencap_insert)
+        sv.delete_screenshot_clicked.connect(self._on_delete_screenshot)
 
         self.controller.state_changed.connect(self._on_session_state_changed)
         self.controller.segment_arrived.connect(self._on_segment_arrived)
@@ -995,6 +1009,17 @@ class MainApp(QObject):
         self._refresh_session_list(select=session_id)
         self._on_session_selected(session_id)
         self.tray.set_state(_TRAY_FOR_STATE.get(state, "idle"))
+        # Drop any armed screen-capture region when the recording ends.
+        # The button itself is greyed-out post-recording (the SessionView
+        # gates on RECORDING / PAUSED), but the in-memory region would
+        # otherwise stay until the user re-enters the session.
+        from .models.session import (  # noqa: PLC0415
+            STATE_COMPLETE, STATE_ERROR, STATE_NEW, STATE_PROCESSING,
+        )
+        if state in (STATE_COMPLETE, STATE_ERROR, STATE_NEW, STATE_PROCESSING):
+            if session_id in self._screen_capture_regions:
+                self._screen_capture_regions.pop(session_id, None)
+                self.window.session_view.set_screencap_armed(False)
 
     def _on_segment_arrived(self, session_id: str, segment) -> None:
         sv = self.window.session_view
@@ -1472,6 +1497,97 @@ class MainApp(QObject):
         if sv._session is not None and sv._session.id == session_id:
             sv.set_created_at(new_created_at_iso)
         self.window.status("Session timestamp updated.", timeout_ms=4000)
+
+    # ---- screen capture ---------------------------------------------------
+
+    def _on_start_screen_capture(self, session_id: str) -> None:
+        """First-time popup -> RegionPicker -> store region + arm SessionView."""
+        if not self.config.ui.screen_capture_first_time_seen:
+            QMessageBox.information(
+                self.window,
+                "Screen capture",
+                "Screen capture works by snapshotting a fixed region you "
+                "draw on screen.\n\n"
+                "ANY content that lands in that rectangle while capture is "
+                "active will be saved -- including windows you move into "
+                "frame after starting, popups, and overlays. Position your "
+                "shared-content window before starting capture, and stop "
+                "capture before showing anything you don't want recorded.\n\n"
+                "Screenshots stay on this machine, alongside the rest of "
+                "the session files. They are never sent to the LLM during "
+                "synthesis.\n\n"
+                "This notice only appears once.",
+            )
+            self.config.ui.screen_capture_first_time_seen = True
+            self.config.save()
+
+        from .screencap.region_picker import RegionPicker  # noqa: PLC0415
+        picker = RegionPicker()
+        rect = picker.exec()
+        if rect is None or rect.width() < 8 or rect.height() < 8:
+            return  # User canceled or drew a degenerate rect.
+        self._screen_capture_regions[session_id] = (
+            rect.x(), rect.y(), rect.width(), rect.height(),
+        )
+        self.window.session_view.set_screencap_armed(True)
+
+    def _on_stop_screen_capture(self, session_id: str) -> None:
+        self._screen_capture_regions.pop(session_id, None)
+        self.window.session_view.set_screencap_armed(False)
+
+    def _on_screencap_capture(self, session_id: str) -> None:
+        self._capture_screenshot(session_id, insert=False)
+
+    def _on_screencap_insert(self, session_id: str) -> None:
+        self._capture_screenshot(session_id, insert=True)
+
+    def _capture_screenshot(self, session_id: str, *, insert: bool) -> None:
+        """Shared body for Capture and Insert.
+
+        Both grab the armed region, save a PNG, and refresh the Slides
+        tab; Insert additionally drops a markdown image-ref at the My
+        Notes cursor. The dual-path makes the no-op-on-failure semantics
+        identical regardless of which button the user clicked.
+        """
+        region = self._screen_capture_regions.get(session_id)
+        if region is None:
+            self.window.status(
+                "Screen capture is not armed. Click Start Screen Capture first.",
+                timeout_ms=5000,
+            )
+            return
+        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
+        from .utils.paths import session_screenshots_dir  # noqa: PLC0415
+        dst_dir = session_screenshots_dir(session_id)
+        saved = capture_region_to_file(region, dst_dir)
+        if saved is None:
+            self.window.status(
+                "Screen capture failed (see log).", timeout_ms=5000,
+            )
+            return
+        self.window.session_view.refresh_screenshots()
+        if insert:
+            # Relative path anchored at the session dir so the My Notes
+            # preview's setSearchPaths resolves it.
+            relative = f"screenshots/{saved.name}"
+            self.window.session_view.insert_screenshot_markdown(relative)
+        self.window.status(
+            f"Screenshot saved: {saved.name}", timeout_ms=4000,
+        )
+
+    def _on_delete_screenshot(self, session_id: str, path) -> None:
+        try:
+            path.unlink()
+        except OSError:
+            log.exception("could not delete screenshot %s", path)
+            return
+        # Only the active session's SlidesWidget needs refreshing; if
+        # the user has navigated away, the next set_session will pick
+        # up the new state from disk.
+        self.window.session_view.refresh_screenshots()
+        self.window.status(
+            f"Deleted screenshot: {path.name}", timeout_ms=4000,
+        )
 
     # ---- recording context-menu actions -----------------------------------
 

@@ -39,6 +39,8 @@ from ..utils.paths import session_dir
 from .attendee_sidebar import AttendeeSidebar
 from .live_notes_widget import LiveNotesWidget
 from .previous_notes_widget import PreviousNotesWidget
+from .screencap_sidebar import ScreencapSidebar
+from .slides_widget import SlidesWidget
 
 
 class SessionView(QWidget):
@@ -84,6 +86,18 @@ class SessionView(QWidget):
     # and the post-meeting refiner uses tags to constrain the clusterer.
     tag_speaker_clicked = pyqtSignal(str, str)            # session_id, name
     remove_last_tag_clicked = pyqtSignal(str, str)        # session_id, name
+    # Screen-capture lifecycle. start_screen_capture_clicked carries the
+    # session id; MainApp shows the first-time popup (if needed) and
+    # launches the region picker. stop_screen_capture_clicked tears the
+    # session's capture state down. The two sidebar signals fire from
+    # the My Notes pane's Capture / Insert buttons; both implicitly
+    # operate on the currently-armed region for the active session.
+    start_screen_capture_clicked = pyqtSignal(str)        # session_id
+    stop_screen_capture_clicked = pyqtSignal(str)         # session_id
+    screencap_capture_clicked = pyqtSignal(str)           # session_id
+    screencap_insert_clicked = pyqtSignal(str)            # session_id
+    # Right-click on a Slides thumbnail / full view: delete the file.
+    delete_screenshot_clicked = pyqtSignal(str, Path)     # session_id, path
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -111,6 +125,11 @@ class SessionView(QWidget):
         # otherwise -- the launch-on-Send path handles the case
         # where Chrome really isn't up.
         self._synth_connection_state = None  # SynthesisConnectionState, set by app
+        # Screen-capture armed state. True once the user clicked Start
+        # Screen Capture and drew a region; flipped back when they
+        # click Stop or the recording ends. Drives both the toggle
+        # button text and the My Notes sidebar enablement.
+        self._screencap_armed = False
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -155,6 +174,18 @@ class SessionView(QWidget):
         self._stop_btn = QPushButton("Stop", self)
         self._stop_btn.clicked.connect(self._on_stop)
         controls.addWidget(self._stop_btn)
+        # Screen-capture toggle. Disabled unless the session is in
+        # RECORDING or PAUSED (set_buttons_for_state drives this); the
+        # button text flips between "Start Screen Capture" and "Stop
+        # Screen Capture" as the user toggles.
+        self._screen_capture_btn = QPushButton("Start Screen Capture", self)
+        self._screen_capture_btn.setToolTip(
+            "Draw a region on screen, then Capture / Insert from the "
+            "My Notes sidebar grabs a screenshot of it. Only available "
+            "while recording."
+        )
+        self._screen_capture_btn.clicked.connect(self._on_screen_capture_toggle)
+        controls.addWidget(self._screen_capture_btn)
         controls.addStretch(1)
         self._retain_checkbox = QCheckBox("Keep audio for this session", self)
         self._retain_checkbox.toggled.connect(self._on_retain_toggled)
@@ -295,6 +326,15 @@ class SessionView(QWidget):
         self._notes_view.textChanged.connect(self._on_notes_changed)
         self._tabs.addTab(self._notes_view, "Synthesis")
 
+        # Slides: per-session captured screenshots. Thumbnail grid +
+        # full-view nav with right-click Copy / Delete / Open. Sits
+        # between Synthesis and Previous Notes so reference material
+        # is one tab away from both the notes-in-progress and the
+        # synthesis a user is reviewing.
+        self._slides_view = SlidesWidget(self)
+        self._slides_view.delete_requested.connect(self._on_screenshot_delete_requested)
+        self._tabs.addTab(self._slides_view, "Slides")
+
         # Previous Notes: list of archived synthesis versions + a
         # markdown-rendered preview of the selected one, with
         # Restore / Delete actions. Replaces the v0.6.2 plaintext
@@ -338,13 +378,28 @@ class SessionView(QWidget):
         body_row.setContentsMargins(0, 0, 0, 0)
         body_row.setSpacing(0)
         body_row.addWidget(self._tabs, 1)
-        self._attendee_sidebar = AttendeeSidebar(self)
-        self._attendee_sidebar.setVisible(False)
+        # Right column: screen-capture sidebar stacked above the
+        # attendee-tag sidebar. Both are visible only when My Notes is
+        # the active tab; _refresh_sidebar_visibility flips them as a
+        # group.
+        right_column = QWidget(self)
+        right_column_layout = QVBoxLayout(right_column)
+        right_column_layout.setContentsMargins(0, 0, 0, 0)
+        right_column_layout.setSpacing(0)
+        self._screencap_sidebar = ScreencapSidebar(right_column)
+        self._screencap_sidebar.capture_clicked.connect(self._on_screencap_capture)
+        self._screencap_sidebar.insert_clicked.connect(self._on_screencap_insert)
+        right_column_layout.addWidget(self._screencap_sidebar)
+        self._attendee_sidebar = AttendeeSidebar(right_column)
         self._attendee_sidebar.tag_clicked.connect(self._on_attendee_tag_clicked)
         self._attendee_sidebar.remove_last_requested.connect(
             self._on_attendee_remove_last_clicked
         )
-        body_row.addWidget(self._attendee_sidebar, 0)
+        right_column_layout.addWidget(self._attendee_sidebar)
+        right_column_layout.addStretch(1)
+        self._right_column = right_column
+        self._right_column.setVisible(False)
+        body_row.addWidget(self._right_column, 0)
         layout.addLayout(body_row, 1)
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -398,7 +453,9 @@ class SessionView(QWidget):
             # Clear sidebar state on session deselect; counts will be
             # re-seeded by the controller on the next select.
             self._attendee_sidebar.set_counts({})
-            self._attendee_sidebar.setVisible(False)
+            self._right_column.setVisible(False)
+            self._slides_view.set_screenshots([])
+            self.set_screencap_armed(False)
             return
         self._title_label.setText(session.title)
         self._state_label.setText(_pretty_state(session.state))
@@ -419,6 +476,14 @@ class SessionView(QWidget):
         self._retain_checkbox.blockSignals(False)
         self._previous_view.set_session_id(session.id)
         self._previous_view.set_archives(previous_notes_paths)
+        # Seed the Slides tab. MainApp also pushes updates here after
+        # each successful capture / insert / delete via
+        # refresh_screenshots() so the grid stays current.
+        self.refresh_screenshots()
+        # Switching to a different session drops any armed capture
+        # state; the region the user drew in one meeting doesn't carry
+        # into another.
+        self.set_screencap_armed(False)
         self._set_buttons_for_state(
             session.state,
             has_transcript=session.has_transcript or bool(transcript.strip()),
@@ -466,18 +531,106 @@ class SessionView(QWidget):
 
     def _refresh_sidebar_visibility(self) -> None:
         """Sidebar shows only while actively recording AND viewing
-        Transcript or My Notes. Hides on Synthesis / Previous Notes
-        even mid-recording -- those tabs are read-only review surfaces."""
+        Transcript or My Notes. Hides on Synthesis / Previous Notes /
+        Slides even mid-recording -- those tabs are read-only review
+        surfaces. The right column wraps both the screencap sidebar
+        and the attendee sidebar; they show / hide together so the
+        column doesn't shrink to just one widget mid-recording."""
         if self._session is None or self._session.state not in (
             STATE_RECORDING, STATE_PAUSED,
         ):
-            self._attendee_sidebar.setVisible(False)
+            self._right_column.setVisible(False)
             return
         current = self._tabs.currentWidget()
         on_transcript_or_notes = current in (
             self._transcript_view, self._live_notes_editor,
         )
-        self._attendee_sidebar.setVisible(on_transcript_or_notes)
+        self._right_column.setVisible(on_transcript_or_notes)
+        # The screencap sidebar belongs to My Notes only; hide it on
+        # the Transcript tab even though the column is shown for the
+        # attendee tag controls.
+        self._screencap_sidebar.setVisible(current is self._live_notes_editor)
+
+    # ---- screen-capture API used by MainApp ------------------------------
+
+    def set_screencap_armed(self, armed: bool) -> None:
+        """Flip the toggle button + sidebar enable state.
+
+        MainApp calls this after the user confirms a region (-> True)
+        or clicks Stop Screen Capture / the recording ends (-> False).
+        Keeping the visible state in one place avoids the toggle button
+        and the sidebar drifting out of sync.
+        """
+        self._screencap_armed = armed
+        self._screencap_sidebar.set_armed(armed)
+        self._screen_capture_btn.setText(
+            "Stop Screen Capture" if armed else "Start Screen Capture"
+        )
+        self._refresh_screencap_button_enabled()
+
+    def is_screencap_armed(self) -> bool:
+        return self._screencap_armed
+
+    def refresh_screenshots(self) -> None:
+        """Reload the Slides tab from disk for the current session."""
+        if self._session is None:
+            self._slides_view.set_screenshots([])
+            return
+        from ..utils.paths import list_screenshots  # noqa: PLC0415
+        self._slides_view.set_screenshots(list_screenshots(self._session.id))
+
+    def insert_screenshot_markdown(self, relative_path: str) -> None:
+        """Drop an image-ref into My Notes at the current cursor.
+
+        Called by MainApp after a successful Insert: the screenshot has
+        landed on disk and the editor needs the markdown link so the
+        Preview shows the captured image inline with the surrounding
+        notes. relative_path is anchored at the session dir so it
+        round-trips through the editor's setSearchPaths.
+        """
+        ref = f"![screenshot]({relative_path})\n"
+        # toPlainText() returns the source-mode text; insert via the
+        # editor's QTextCursor so undo/redo work like a typed paste.
+        editor = self._live_notes_editor._editor  # noqa: SLF001
+        cursor = editor.textCursor()
+        cursor.insertText(ref)
+        editor.setTextCursor(cursor)
+
+    def _on_screen_capture_toggle(self) -> None:
+        if self._session is None:
+            return
+        if self._screencap_armed:
+            self.stop_screen_capture_clicked.emit(self._session.id)
+        else:
+            self.start_screen_capture_clicked.emit(self._session.id)
+
+    def _on_screencap_capture(self) -> None:
+        if self._session is None:
+            return
+        self.screencap_capture_clicked.emit(self._session.id)
+
+    def _on_screencap_insert(self) -> None:
+        if self._session is None:
+            return
+        self.screencap_insert_clicked.emit(self._session.id)
+
+    def _on_screenshot_delete_requested(self, path: Path) -> None:
+        if self._session is None:
+            return
+        self.delete_screenshot_clicked.emit(self._session.id, path)
+
+    def _refresh_screencap_button_enabled(self) -> None:
+        """Enabled only while RECORDING or PAUSED, OR while armed.
+
+        The 'OR armed' branch is the Stop-Screen-Capture-after-recording
+        edge case: if the user hit Stop before disarming, the toggle
+        still needs to be clickable so they can disarm it cleanly.
+        """
+        if self._session is None:
+            self._screen_capture_btn.setEnabled(False)
+            return
+        live = self._session.state in (STATE_RECORDING, STATE_PAUSED)
+        self._screen_capture_btn.setEnabled(live or self._screencap_armed)
 
     def update_batch_progress(self, pct: int) -> None:
         """Reflect background batch-refinement progress in the state label."""
@@ -896,6 +1049,7 @@ class SessionView(QWidget):
         self._pause_btn.setEnabled(has_session and is_recording)
         self._resume_btn.setEnabled(has_session and is_paused)
         self._stop_btn.setEnabled(has_session and (is_recording or is_paused))
+        self._refresh_screencap_button_enabled()
         # Generate/paste are available as soon as a transcript exists. The
         # batch-refinement pass after Stop runs in the background and is
         # explicitly NOT a gate on synthesis -- the live transcript is good

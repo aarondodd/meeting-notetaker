@@ -217,6 +217,18 @@ def test_resolved_cpu_threads_explicit_passes_through():
     assert cfg.transcription.resolved_cpu_threads(cpu_count=64) == 4
 
 
+def test_screen_capture_first_time_seen_defaults_false(isolated_data_dir):
+    """Fresh installs have NOT seen the screen-capture notice. The first
+    Start Screen Capture click shows the popup, then flips this to True
+    so future clicks don't interrupt."""
+    cfg = Config()
+    assert cfg.ui.screen_capture_first_time_seen is False
+    cfg.ui.screen_capture_first_time_seen = True
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.ui.screen_capture_first_time_seen is True
+
+
 def test_retain_format_defaults_to_opus(isolated_data_dir):
     """Opus is the default retained-recording format -- best size, near-
     transparent for speech. Pin so a refactor doesn't accidentally

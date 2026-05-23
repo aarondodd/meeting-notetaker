@@ -114,6 +114,11 @@ class TranscriptionConfig:
 class UiConfig:
     user_name: str = ""
     first_run_complete: bool = False
+    # Flipped to True the first time the user clicks Start Screen
+    # Capture and confirms the privacy-notice popup. Suppresses the
+    # popup on subsequent captures so the workflow doesn't get
+    # interrupted every meeting.
+    screen_capture_first_time_seen: bool = False
 
 
 @dataclass

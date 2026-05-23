@@ -88,6 +88,37 @@ def has_retained_audio(session_id: str) -> bool:
     return bool(session_audio_files(session_id))
 
 
+def session_screenshots_dir(session_id: str) -> Path:
+    """Per-session screenshots/ dir. Created on first access.
+
+    Captures from the v0.6.5 screen-capture flow land here as
+    NNNN-YYYYMMDDTHHMMSSZ.png. The Slides tab reads from this dir;
+    so does the Insert path when it embeds a markdown image ref into
+    My Notes (relative path "screenshots/<filename>", resolved via
+    the editor's setSearchPaths pointing at the session dir).
+    """
+    path = session_dir(session_id) / "screenshots"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def list_screenshots(session_id: str) -> list[Path]:
+    """Every PNG in the session's screenshots dir, oldest first.
+
+    The capture path prefixes filenames with a 4-digit sequence so
+    sorting by name is equivalent to sorting by capture time. Files
+    that don't conform to the naming scheme (e.g. one a user dropped
+    in manually) still sort lexically and surface in the Slides tab.
+    """
+    screenshots_dir = session_dir(session_id) / "screenshots"
+    if not screenshots_dir.is_dir():
+        return []
+    return sorted(
+        (p for p in screenshots_dir.iterdir() if p.suffix.lower() == ".png"),
+        key=lambda p: p.name,
+    )
+
+
 def models_dir() -> Path:
     path = app_data_dir() / "models"
     path.mkdir(parents=True, exist_ok=True)
