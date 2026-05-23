@@ -277,10 +277,10 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
 
 
 def shot_main_transcript() -> None:
-    # Transcript moved to the rightmost tab in v0.6.5. Order:
-    # 0 My Notes, 1 Synthesis, 2 Previous Notes, 3 Transcript.
+    # v0.6.5 tab order with the Slides tab landed:
+    # 0 My Notes, 1 Synthesis, 2 Slides, 3 Previous Notes, 4 Transcript.
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(3)
+    win.session_view._tabs.setCurrentIndex(4)
     QApplication.processEvents()
     _grab(win, "01-main-transcript.png", autosize=False)
     win.close()
@@ -318,7 +318,7 @@ def shot_main_synthesis() -> None:
 
 def shot_main_previous_notes() -> None:
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(2)
+    win.session_view._tabs.setCurrentIndex(3)
     QApplication.processEvents()
     _grab(win, "05-main-previous-notes.png", autosize=False)
     win.close()

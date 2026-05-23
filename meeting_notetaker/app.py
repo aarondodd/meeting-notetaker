@@ -139,6 +139,13 @@ class MainApp(QObject):
         # time); _arm_screen_capture_overlay creates it, _disarm tears
         # it down.
         self._armed_region_overlay = None
+        # One AudioPlayer instance, reused across sessions. Lazily
+        # constructed on first use so a workspace without retained
+        # audio never pays the sounddevice / PyAV import cost.
+        self._audio_player = None
+        # Track which session is currently loaded into the player so
+        # we don't reload identical files on every selection.
+        self._player_loaded_session_id: Optional[str] = None
 
         # Synthesis automation bridge. Listens on a loopback port for the
         # Chrome native-messaging host to connect; route inbound result/
@@ -806,6 +813,7 @@ class MainApp(QObject):
         self.window.rename_session_requested.connect(self._on_rename_session)
         self.window.edit_session_timestamp_requested.connect(self._on_edit_session_timestamp)
         self.window.open_recording_requested.connect(self._on_open_recording)
+        self.window.export_recording_requested.connect(self._on_export_recording)
         self.window.delete_recording_requested.connect(self._on_delete_recording)
 
         self.tray.open_main_window.connect(self._foreground_window)
@@ -851,6 +859,11 @@ class MainApp(QObject):
         sv.screencap_capture_clicked.connect(self._on_screencap_capture)
         sv.screencap_insert_clicked.connect(self._on_screencap_insert)
         sv.delete_screenshot_clicked.connect(self._on_delete_screenshot)
+        # Transcript playback wiring. The player bar fires play / pause /
+        # seek; MainApp owns the single AudioPlayer and routes them.
+        sv.transcript_play_clicked.connect(self._on_transcript_play)
+        sv.transcript_pause_clicked.connect(self._on_transcript_pause)
+        sv.transcript_seek_ms_requested.connect(self._on_transcript_seek)
 
         self.controller.state_changed.connect(self._on_session_state_changed)
         self.controller.segment_arrived.connect(self._on_segment_arrived)
@@ -892,6 +905,11 @@ class MainApp(QObject):
             previous_notes_paths=store.list_previous_notes(),
             live_notes=live_notes_body,
         )
+        # Load the session's retained audio into the player (if any).
+        # The player bar in the Transcript pane greys out cleanly when
+        # there's nothing on disk; loading itself is a no-op for
+        # already-loaded sessions.
+        self._maybe_load_player_for_session(session_id)
         # Populate the prompt-template picker with the available
         # templates + restore the session's saved choice.
         templates = [t.name for t in prompts_mod.list_templates()]
@@ -1610,6 +1628,91 @@ class MainApp(QObject):
             f"Deleted screenshot: {path.name}", timeout_ms=4000,
         )
 
+    # ---- transcript playback ----------------------------------------------
+
+    def _ensure_audio_player(self):
+        """Lazy-build the AudioPlayer + wire its signals into the view."""
+        if self._audio_player is not None:
+            return self._audio_player
+        from .audio.player import AudioPlayer  # noqa: PLC0415
+        player = AudioPlayer(self)
+        player.loaded.connect(self._on_player_loaded)
+        player.load_failed.connect(self._on_player_load_failed)
+        player.position_changed.connect(self._on_player_position_changed)
+        player.playback_finished.connect(self._on_player_finished)
+        self._audio_player = player
+        return player
+
+    def _maybe_load_player_for_session(self, session_id: str) -> None:
+        """Load the session's retained audio into the player, if any.
+
+        Called from _on_session_selected. The player bar shows/hides
+        based on whether files actually exist on disk; loading is
+        skipped (with the player closed) when nothing's there.
+        """
+        from .utils.paths import session_audio_files  # noqa: PLC0415
+        files = session_audio_files(session_id)
+        if not files:
+            # No audio for this session -- tear down the player bar.
+            if self._audio_player is not None and self._player_loaded_session_id:
+                self._audio_player.close()
+                self._player_loaded_session_id = None
+            self.window.session_view.set_player_enabled(False)
+            return
+        if self._player_loaded_session_id == session_id:
+            return  # Already loaded; the bar is already showing.
+        # Separate the mic and sys halves out of the list. The path
+        # helper sorts mic-first-then-sys so we can index, but go
+        # safer and discriminate by stem.
+        mic_path = next((p for p in files if p.stem == "mic"), None)
+        sys_path = next((p for p in files if p.stem == "sys"), None)
+        player = self._ensure_audio_player()
+        try:
+            player.load(mic_path, sys_path)
+        except Exception:
+            log.exception("AudioPlayer.load raised")
+            self.window.session_view.set_player_enabled(False)
+            self._player_loaded_session_id = None
+            return
+        self._player_loaded_session_id = session_id
+
+    def _on_player_loaded(self, total_ms: int) -> None:
+        sv = self.window.session_view
+        sv.set_player_total_ms(total_ms)
+        sv.set_player_position_ms(0)
+        sv.set_player_is_playing(False)
+        sv.set_player_enabled(True)
+
+    def _on_player_load_failed(self, message: str) -> None:
+        self.window.status(message, timeout_ms=5000)
+        self.window.session_view.set_player_enabled(False)
+        self._player_loaded_session_id = None
+
+    def _on_player_position_changed(self, ms: int) -> None:
+        self.window.session_view.set_player_position_ms(int(ms))
+
+    def _on_player_finished(self) -> None:
+        sv = self.window.session_view
+        sv.set_player_is_playing(False)
+        sv.set_player_position_ms(0)
+
+    def _on_transcript_play(self, _session_id: str) -> None:
+        if self._audio_player is None:
+            return
+        self._audio_player.play()
+        self.window.session_view.set_player_is_playing(True)
+
+    def _on_transcript_pause(self, _session_id: str) -> None:
+        if self._audio_player is None:
+            return
+        self._audio_player.pause()
+        self.window.session_view.set_player_is_playing(False)
+
+    def _on_transcript_seek(self, _session_id: str, ms: int) -> None:
+        if self._audio_player is None:
+            return
+        self._audio_player.seek_ms(int(ms))
+
     # ---- recording context-menu actions -----------------------------------
 
     def _on_open_recording(self, session_id: str) -> None:
@@ -1632,6 +1735,75 @@ class MainApp(QObject):
                 f"Could not open {files[0].name} (no default player?)",
                 timeout_ms=5000,
             )
+
+    def _on_export_recording(self, session_id: str) -> None:
+        """Prompt for a destination + format, mix mic+sys, write the file.
+
+        QFileDialog's filter list drives which container the exporter
+        uses. The default suggested name embeds the session title and
+        date; the user gets a one-click flow for the common case
+        ("share this meeting's audio with a colleague").
+        """
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox  # noqa: PLC0415
+        from .audio.export import export_mixed, known_extensions  # noqa: PLC0415
+        from .utils.export import default_export_filename  # noqa: PLC0415
+        from .utils.paths import session_audio_files  # noqa: PLC0415
+
+        files = session_audio_files(session_id)
+        if not files:
+            self.window.status(
+                "No recording on disk for this session.", timeout_ms=5000,
+            )
+            return
+        session = self.store.get_session(session_id)
+        title = session.title if session is not None else "session"
+
+        # Build the QFileDialog filter string. .flac is offered first
+        # as the "lossless, plays everywhere" pick.
+        ext_labels = {
+            ".flac": "FLAC -- lossless (*.flac)",
+            ".mp3":  "MP3 -- universal compatibility (*.mp3)",
+            ".m4a":  "AAC -- broad compatibility (*.m4a)",
+            ".opus": "Opus -- smallest (*.opus)",
+            ".wav":  "WAV -- raw PCM (*.wav)",
+        }
+        filters = ";;".join(ext_labels[e] for e in known_extensions())
+
+        suggested = default_export_filename(title, "Audio", ".flac")
+        suggested_path = str(session_audio_files(session_id)[0].parent / suggested)
+        path_str, chosen_filter = QFileDialog.getSaveFileName(
+            self.window,
+            "Export recording",
+            suggested_path,
+            filters,
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        # If the user typed a path without an extension OR with a
+        # different extension than the chosen filter, honor the chosen
+        # filter so the codec lookup picks a working format.
+        ext_for_filter = next(
+            (ext for ext, label in ext_labels.items() if label == chosen_filter),
+            None,
+        )
+        if ext_for_filter and target.suffix.lower() != ext_for_filter:
+            target = target.with_suffix(ext_for_filter)
+
+        mic_path = next((p for p in files if p.stem == "mic"), None)
+        sys_path = next((p for p in files if p.stem == "sys"), None)
+        try:
+            export_mixed(mic_path, sys_path, target)
+        except Exception as exc:
+            log.exception("export_mixed failed for session %s", session_id)
+            QMessageBox.warning(
+                self.window, "Export recording",
+                f"Could not export audio: {exc}",
+            )
+            return
+        self.window.status(
+            f"Exported recording to {target.name}", timeout_ms=5000,
+        )
 
     def _on_delete_recording(self, session_id: str) -> None:
         """Delete the session's audio files; keep transcript + notes."""
@@ -1667,6 +1839,9 @@ class MainApp(QObject):
         removed = self.store.delete_sessions(session_ids)
         self._refresh_session_list()
         self.window.session_view.set_session(None, transcript="", notes="", previous_notes_paths=[])
+        if self._audio_player is not None:
+            self._audio_player.close()
+            self._player_loaded_session_id = None
         self.window.status(f"Deleted {removed} session(s)", timeout_ms=5000)
 
     # ---- settings ---------------------------------------------------------

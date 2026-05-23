@@ -4,8 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import bisect
+import re
+
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -41,6 +44,13 @@ from .live_notes_widget import LiveNotesWidget
 from .previous_notes_widget import PreviousNotesWidget
 from .screencap_sidebar import ScreencapSidebar
 from .slides_widget import SlidesWidget
+from .transcript_player_bar import TranscriptPlayerBar
+
+
+# How many milliseconds before the clicked transcript line to seek to.
+# Aaron asked for "just before that line's timestamp (~10s)" so the
+# listen-back catches the lead-in. Pulled out so it's easy to tune.
+_TRANSCRIPT_SEEK_LEAD_MS = 10_000
 
 
 class SessionView(QWidget):
@@ -98,6 +108,12 @@ class SessionView(QWidget):
     screencap_insert_clicked = pyqtSignal(str)            # session_id
     # Right-click on a Slides thumbnail / full view: delete the file.
     delete_screenshot_clicked = pyqtSignal(str, Path)     # session_id, path
+    # Transcript-pane playback control. The bar fires these for the
+    # session id MainApp tracks; the seek signal also fires when the
+    # user clicks a transcript line (with the line's start - 10s).
+    transcript_play_clicked = pyqtSignal(str)             # session_id
+    transcript_pause_clicked = pyqtSignal(str)            # session_id
+    transcript_seek_ms_requested = pyqtSignal(str, int)   # session_id, ms
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -348,7 +364,13 @@ class SessionView(QWidget):
         )
         self._tabs.addTab(self._previous_view, "Previous Notes")
 
-        self._transcript_view = QPlainTextEdit(self)
+        # Transcript pane: editor + a playback toolbar below. Wrapped
+        # in a QWidget so the QTabWidget treats them as one tab.
+        transcript_page = QWidget(self)
+        transcript_layout = QVBoxLayout(transcript_page)
+        transcript_layout.setContentsMargins(0, 0, 0, 0)
+        transcript_layout.setSpacing(4)
+        self._transcript_view = _ClickableTranscriptView(transcript_page)
         self._transcript_view.setReadOnly(True)
         self._transcript_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         mono = QFont("Consolas")
@@ -366,7 +388,19 @@ class SessionView(QWidget):
             "Settings if you'd rather see lines arrive in real time during "
             "the meeting."
         )
-        self._tabs.addTab(self._transcript_view, "Transcript")
+        self._transcript_view.line_clicked.connect(self._on_transcript_line_clicked)
+        transcript_layout.addWidget(self._transcript_view, 1)
+        self._player_bar = TranscriptPlayerBar(transcript_page)
+        self._player_bar.play_clicked.connect(self._on_player_bar_play_clicked)
+        self._player_bar.pause_clicked.connect(self._on_player_bar_pause_clicked)
+        self._player_bar.seek_ms_requested.connect(self._on_player_bar_seek_requested)
+        transcript_layout.addWidget(self._player_bar, 0)
+        self._tabs.addTab(transcript_page, "Transcript")
+        # Per-line timestamp index. Built each time the transcript text
+        # changes; consumed by the position-driven highlight and the
+        # click-to-seek path. Each tuple is (start_ms, block_number).
+        self._transcript_timestamps: list[tuple[int, int]] = []
+        self._current_highlight_block: Optional[int] = None
 
         # Horizontal container holding the tab widget on the left and the
         # click-to-tag attendee sidebar on the right. The sidebar is
@@ -441,6 +475,8 @@ class SessionView(QWidget):
             self._state_label.setText("")
             self._raw_transcript_text = ""
             self._transcript_view.setPlainText("")
+            self._refresh_transcript_timestamps()
+            self.set_player_enabled(False)
             self._notes_view.set_session_dir(None)
             self._set_notes_text("")
             self._previous_view.set_session_id("")
@@ -461,6 +497,7 @@ class SessionView(QWidget):
         self._state_label.setText(_pretty_state(session.state))
         self._raw_transcript_text = transcript
         self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
+        self._refresh_transcript_timestamps()
         sdir = session_dir(session.id)
         self._notes_view.set_session_dir(sdir)
         self._set_notes_text(notes)
@@ -632,6 +669,105 @@ class SessionView(QWidget):
         live = self._session.state in (STATE_RECORDING, STATE_PAUSED)
         self._screen_capture_btn.setEnabled(live or self._screencap_armed)
 
+    # ---- transcript playback API used by MainApp -------------------------
+
+    def set_player_enabled(self, enabled: bool) -> None:
+        """Master enable for the player bar.
+
+        MainApp calls this with True when the active session has
+        retained audio (the player has something to play) and False
+        otherwise.
+        """
+        self._player_bar.set_enabled_state(enabled)
+        if not enabled:
+            self._clear_transcript_highlight()
+
+    def set_player_total_ms(self, total_ms: int) -> None:
+        self._player_bar.set_total_ms(total_ms)
+
+    def set_player_position_ms(self, ms: int) -> None:
+        self._player_bar.set_position_ms(ms)
+        # Highlight the transcript line that owns this timestamp. We
+        # do this on every position update so the highlight follows
+        # playback in real time. Skip when the user is mid-drag --
+        # otherwise the highlight thrashes around the slider thumb.
+        if self._player_bar.is_user_dragging():
+            return
+        self._refresh_transcript_highlight(ms)
+
+    def set_player_is_playing(self, playing: bool) -> None:
+        self._player_bar.set_is_playing(playing)
+
+    def _on_player_bar_play_clicked(self) -> None:
+        if self._session is None:
+            return
+        self.transcript_play_clicked.emit(self._session.id)
+
+    def _on_player_bar_pause_clicked(self) -> None:
+        if self._session is None:
+            return
+        self.transcript_pause_clicked.emit(self._session.id)
+
+    def _on_player_bar_seek_requested(self, ms: int) -> None:
+        if self._session is None:
+            return
+        self.transcript_seek_ms_requested.emit(self._session.id, int(ms))
+
+    def _on_transcript_line_clicked(self, block_number: int) -> None:
+        if self._session is None:
+            return
+        start_ms = _start_ms_for_block(self._transcript_timestamps, block_number)
+        if start_ms is None:
+            return
+        # Seek a few seconds before the clicked line so the listen-back
+        # catches the lead-in (Aaron's "~10s before that line").
+        target = max(0, int(start_ms) - _TRANSCRIPT_SEEK_LEAD_MS)
+        self.transcript_seek_ms_requested.emit(self._session.id, target)
+
+    def _refresh_transcript_timestamps(self) -> None:
+        """Rebuild the timestamp index from the transcript view text.
+
+        Called whenever set_transcript_text / set_session updates the
+        displayed text. Click-to-seek and position-driven highlight
+        both consume this list.
+        """
+        text = self._transcript_view.toPlainText()
+        self._transcript_timestamps = _parse_transcript_timestamps(text)
+        self._clear_transcript_highlight()
+
+    def _refresh_transcript_highlight(self, position_ms: int) -> None:
+        block_number = _block_for_position_ms(
+            self._transcript_timestamps, position_ms,
+        )
+        if block_number is None:
+            self._clear_transcript_highlight()
+            return
+        if block_number == self._current_highlight_block:
+            return
+        self._current_highlight_block = block_number
+        # Build a single ExtraSelection that highlights the entire
+        # block. The selection's format paints behind the text without
+        # disrupting the cursor (the view is read-only anyway).
+        from PyQt6.QtWidgets import QTextEdit  # noqa: PLC0415
+        sel = QTextEdit.ExtraSelection()
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(255, 240, 160))
+        fmt.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
+        sel.format = fmt
+        cursor = QTextCursor(self._transcript_view.document().findBlockByNumber(block_number))
+        cursor.clearSelection()
+        sel.cursor = cursor
+        self._transcript_view.setExtraSelections([sel])
+        # Scroll the highlight into view if it's offscreen.
+        view_cursor = self._transcript_view.textCursor()
+        view_cursor.setPosition(cursor.position())
+        self._transcript_view.setTextCursor(view_cursor)
+        self._transcript_view.ensureCursorVisible()
+
+    def _clear_transcript_highlight(self) -> None:
+        self._current_highlight_block = None
+        self._transcript_view.setExtraSelections([])
+
     def update_batch_progress(self, pct: int) -> None:
         """Reflect background batch-refinement progress in the state label."""
         if self._session is None:
@@ -654,6 +790,10 @@ class SessionView(QWidget):
         if self._raw_transcript_text:
             self._raw_transcript_text += "\n"
         self._raw_transcript_text += raw_line
+        # New line means a new candidate timestamp for the click-to-
+        # seek index. Cheap to rebuild on every append (the regex is
+        # one match per line); the index is small.
+        self._refresh_transcript_timestamps()
 
     def append_provisional(self, segment: TranscriptSegment) -> None:
         """Append a provisional segment that may be rewritten when the next overlap arrives."""
@@ -665,6 +805,7 @@ class SessionView(QWidget):
         """Replace the transcript view's contents. `text` should be the raw on-disk form."""
         self._raw_transcript_text = text
         self._transcript_view.setPlainText(rewrite_user_label(text, self._user_name))
+        self._refresh_transcript_timestamps()
 
     def set_title(self, new_title: str) -> None:
         """Update the displayed session title in place after a rename.
@@ -707,6 +848,7 @@ class SessionView(QWidget):
         self._transcript_view.setPlainText(
             rewrite_user_label(self._raw_transcript_text, self._user_name)
         )
+        self._refresh_transcript_timestamps()
 
     def set_notes_text(self, text: str) -> None:
         """Replace the Synthesis body. Used by Paste-Response-Back and reload.
@@ -1242,6 +1384,80 @@ class SessionView(QWidget):
         self.window().statusBar().showMessage(
             f"Exported PDF to {target.name}", 5000
         )
+
+
+_TIMESTAMP_RE = re.compile(r"^\[(\d+):(\d{2}):(\d{2})\]")
+
+
+def _parse_transcript_timestamps(text: str) -> list[tuple[int, int]]:
+    """Return [(start_ms, block_number), ...] for every line whose
+    leading bracket is a HH:MM:SS timestamp.
+
+    Lines without a leading timestamp (status messages, blank lines)
+    are silently skipped; they don't contribute a seek anchor. The
+    list is monotonic in start_ms because the transcript writer
+    emits segments in chronological order; we rely on that to do
+    O(log N) bisect lookups.
+    """
+    out: list[tuple[int, int]] = []
+    for block_number, line in enumerate(text.splitlines()):
+        match = _TIMESTAMP_RE.match(line)
+        if match is None:
+            continue
+        hours, minutes, seconds = (int(g) for g in match.groups())
+        start_ms = ((hours * 3600) + (minutes * 60) + seconds) * 1000
+        out.append((start_ms, block_number))
+    return out
+
+
+def _block_for_position_ms(
+    timestamps: list[tuple[int, int]], position_ms: int,
+) -> Optional[int]:
+    """Return the block number whose timestamp the position falls in.
+
+    Bisect for the rightmost segment whose start_ms <= position_ms.
+    Returns None if the timestamps list is empty or the position
+    precedes every segment.
+    """
+    if not timestamps:
+        return None
+    keys = [t[0] for t in timestamps]
+    idx = bisect.bisect_right(keys, position_ms) - 1
+    if idx < 0:
+        return None
+    return timestamps[idx][1]
+
+
+def _start_ms_for_block(
+    timestamps: list[tuple[int, int]], block_number: int,
+) -> Optional[int]:
+    """Inverse: return the timestamp anchored at this block, or None."""
+    for ms, blk in timestamps:
+        if blk == block_number:
+            return ms
+    return None
+
+
+class _ClickableTranscriptView(QPlainTextEdit):
+    """QPlainTextEdit that emits line_clicked(block_number) on click.
+
+    Distinct from a regular cursor selection: the user clicking a
+    line in the transcript pane is a seek action, not text-selection.
+    We let the parent dispatch the click through the normal
+    mousePressEvent first so the cursor still moves; then emit a
+    signal so the SessionView can compute the seek target.
+    """
+
+    line_clicked = pyqtSignal(int)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        super().mousePressEvent(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        cursor = self.cursorForPosition(event.pos())
+        block = cursor.block()
+        if block.isValid():
+            self.line_clicked.emit(block.blockNumber())
 
 
 def _pretty_state(state: str) -> str:

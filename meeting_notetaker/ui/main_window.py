@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
     rename_session_requested = pyqtSignal(str, str)  # session_id, new_title
     edit_session_timestamp_requested = pyqtSignal(str, str)  # session_id, new_created_at_iso (UTC)
     open_recording_requested = pyqtSignal(str)     # session_id
+    export_recording_requested = pyqtSignal(str)   # session_id
     delete_recording_requested = pyqtSignal(str)   # session_id
     session_selected = pyqtSignal(str)             # session_id
 
@@ -320,6 +321,8 @@ class MainWindow(QMainWindow):
         has_audio = bool(single_id) and has_retained_audio(single_id)
         action_open_recording = menu.addAction("Open recording in media player")
         action_open_recording.setEnabled(has_audio)
+        action_export_recording = menu.addAction("Export recording as...")
+        action_export_recording.setEnabled(has_audio)
         action_delete_recording = menu.addAction("Delete recording...")
         action_delete_recording.setEnabled(has_audio)
         menu.addSeparator()
@@ -331,6 +334,8 @@ class MainWindow(QMainWindow):
             self._edit_timestamp_selected()
         elif action is action_open_recording and single_id:
             self.open_recording_requested.emit(single_id)
+        elif action is action_export_recording and single_id:
+            self.export_recording_requested.emit(single_id)
         elif action is action_delete_recording and single_id:
             self._confirm_delete_recording(single_id)
         elif action is action_delete:
