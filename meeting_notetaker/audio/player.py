@@ -108,13 +108,25 @@ class AudioPlayer(QObject):
             log.exception("AudioPlayer.load: decode failed")
             self.load_failed.emit(f"Could not decode audio: {exc}")
             return
-        mixed_float = _mix_to_max_length(decoded)
-        # Convert to int16 once; sounddevice handles int16 natively
-        # and the float32 buffer would be 2x the memory.
-        mixed_int16 = np.clip(mixed_float * 32767, -32768, 32767).astype(np.int16)
-        self._buffer = mixed_int16
-        self._total_frames = int(mixed_int16.size)
+        # Keep the buffer as float32. sounddevice's int16 path is
+        # less reliable on Windows WASAPI than its float32 path
+        # (PortAudio internally converts in either direction; float32
+        # is the "native" PCM type for the modern audio stack).
+        # Memory cost: 2x int16, but a 1-hour mono 16k buffer is
+        # ~230 MB -- the user's machine has headroom.
+        mixed = _mix_to_max_length(decoded).astype(np.float32, copy=False)
+        # Clip in case the unattenuated sum slightly overshot [-1, 1]
+        # (rare but possible for two strongly-correlated channels).
+        np.clip(mixed, -1.0, 1.0, out=mixed)
+        self._buffer = mixed
+        self._total_frames = int(mixed.size)
         self._cursor_frames = 0
+        log.info(
+            "AudioPlayer: loaded %d samples (%.1f s) from %d source(s)",
+            self._total_frames,
+            self._total_frames / _PLAYBACK_RATE if _PLAYBACK_RATE else 0,
+            len(sources),
+        )
         self.loaded.emit(self.total_ms())
 
     def close(self) -> None:
@@ -132,8 +144,11 @@ class AudioPlayer(QObject):
             # Restart from the beginning -- the user hit Play after
             # the stream reached EOF.
             self._cursor_frames = 0
+        log.info(
+            "AudioPlayer: play from frame=%d (pos=%d ms / total=%d ms)",
+            self._cursor_frames, self.position_ms(), self.total_ms(),
+        )
         self._start_stream()
-        self._tick.start()
 
     def pause(self) -> None:
         self._stop_stream()
@@ -148,8 +163,16 @@ class AudioPlayer(QObject):
         if was_playing:
             self._stop_stream()
         target = max(0, min(self._total_frames - 1, int(ms * _PLAYBACK_RATE / 1000)))
+        log.debug(
+            "AudioPlayer: seek to %d ms (frame=%d, was_playing=%s)",
+            ms, target, was_playing,
+        )
         self._cursor_frames = target
         if was_playing:
+            # _start_stream restarts the tick too -- avoids a
+            # regression where seek-during-playback stops position
+            # updates because _stop_stream paired its tick.stop() and
+            # _start_stream didn't restore.
             self._start_stream()
         self._emit_position()
 
@@ -171,18 +194,33 @@ class AudioPlayer(QObject):
     # Internals
 
     def _start_stream(self) -> None:
+        """Construct + start the sounddevice OutputStream and the tick.
+
+        Tick start lives here (not in play()) so any code path that
+        starts a stream -- play(), seek_ms during playback -- restarts
+        position updates. The previous shape paired tick.stop() inside
+        _stop_stream but only put tick.start() in play(); seek_ms
+        cycled the stream and the tick stayed dead.
+        """
         with self._lock:
             if self._stream is not None:
+                self._tick.start()  # be defensive; idempotent if already running
                 return
             import sounddevice as sd  # noqa: PLC0415
-            self._stream = sd.OutputStream(
-                samplerate=_PLAYBACK_RATE,
-                channels=1,
-                dtype="int16",
-                callback=self._audio_callback,
-                finished_callback=self._on_stream_finished,
-            )
-            self._stream.start()
+            try:
+                self._stream = sd.OutputStream(
+                    samplerate=_PLAYBACK_RATE,
+                    channels=1,
+                    dtype="float32",
+                    callback=self._audio_callback,
+                    finished_callback=self._on_stream_finished,
+                )
+                self._stream.start()
+            except Exception:
+                log.exception("AudioPlayer: failed to start sounddevice stream")
+                self._stream = None
+                return
+        self._tick.start()
 
     def _stop_stream(self) -> None:
         with self._lock:
@@ -199,21 +237,25 @@ class AudioPlayer(QObject):
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
         # Called on sounddevice's PortAudio thread. Must NOT do Qt I/O
         # here -- emit only via the QTimer tick on the main thread.
-        if self._buffer is None:
-            outdata[:] = 0
+        if self._buffer is None or self._total_frames == 0:
+            outdata[:] = 0.0
             return
         start = self._cursor_frames
         end = start + frames
         chunk = self._buffer[start:end]
         if chunk.size < frames:
             outdata[: chunk.size, 0] = chunk
-            outdata[chunk.size :, 0] = 0
+            outdata[chunk.size :, 0] = 0.0
             self._cursor_frames = self._total_frames
-            # Don't raise CallbackStop here; let _on_stream_finished
-            # land naturally after the buffer drains.
-        else:
-            outdata[:, 0] = chunk
-            self._cursor_frames = end
+            # Signal end-of-stream to PortAudio. CallbackStop drains
+            # the device and calls finished_callback once cleanly.
+            # Without this, the callback would keep producing silence
+            # forever after the buffer ends; the tick would keep
+            # firing and the UI would stay in "playing" state.
+            import sounddevice as sd  # noqa: PLC0415
+            raise sd.CallbackStop
+        outdata[:, 0] = chunk
+        self._cursor_frames = end
 
     def _on_stream_finished(self) -> None:
         # Called on the PortAudio thread after stop()/close(). Use a
@@ -222,13 +264,33 @@ class AudioPlayer(QObject):
         QTimer.singleShot(0, self._handle_stream_finished_on_main_thread)
 
     def _handle_stream_finished_on_main_thread(self) -> None:
-        # Stream stopped: either user-paused, or playback ran past
-        # the end. We only fire playback_finished in the run-past-end
-        # case so the UI knows to flip Play <-> Pause.
-        if self._cursor_frames >= self._total_frames and self._total_frames > 0:
+        """Tear down the stream after sounddevice signals end-of-stream.
+
+        Fires from two paths:
+        * User-initiated stop via _stop_stream (sounddevice's stop()
+          calls finished_callback).
+        * Buffer drained via CallbackStop in _audio_callback.
+
+        In both cases the stream is dead; clear our reference so a
+        subsequent play() builds a new one. Only emit
+        playback_finished in the drained case (Stop already updated
+        the UI on the way down).
+        """
+        finished_via_drain = (
+            self._cursor_frames >= self._total_frames
+            and self._total_frames > 0
+        )
+        with self._lock:
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    log.exception("AudioPlayer: stream close after finish failed")
+                self._stream = None
+        self._tick.stop()
+        if finished_via_drain:
             self.playback_finished.emit()
-            self._tick.stop()
-            self._emit_position()
+        self._emit_position()
 
     def _emit_position(self) -> None:
         self.position_changed.emit(self.position_ms())

@@ -145,6 +145,33 @@ def test_load_twice_replaces_session(qt_app, tmp_path):
     assert captured[-1] > captured[0]
 
 
+def test_seek_during_playback_restarts_position_tick(qt_app, tmp_path):
+    """Regression: a seek while playing used to leave the position tick
+    stopped (audio kept playing via sounddevice but the UI scrubber
+    froze). Confirm the tick is running after a mid-play seek."""
+    mic = tmp_path / "mic.wav"
+    _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
+    player = AudioPlayer()
+    player.load(mic, None)
+    qt_app.processEvents()
+
+    fake_stream = mock.MagicMock()
+    fake_stream.active = True
+    fake_sd = mock.MagicMock()
+    fake_sd.OutputStream = mock.MagicMock(return_value=fake_stream)
+
+    with mock.patch.dict(sys.modules, {"sounddevice": fake_sd}):
+        player.play()
+        assert player._tick.isActive(), "tick should run while playing"  # noqa: SLF001
+        # Mid-play seek: the old code stopped the tick (in _stop_stream)
+        # and never restarted it (only play() did, not _start_stream).
+        player.seek_ms(100)
+        assert player._tick.isActive(), (  # noqa: SLF001
+            "tick must still run after a seek-during-playback so the "
+            "UI scrubber + transcript highlight keep updating"
+        )
+
+
 def test_play_calls_start_stream(qt_app, tmp_path):
     """play() opens a sounddevice OutputStream. Patch the
     construction so we don't need PortAudio in the test env."""
