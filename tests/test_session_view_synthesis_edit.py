@@ -93,8 +93,8 @@ def test_flush_pending_notes_is_safe_when_no_session(qt_app):
 def test_active_tab_text_returns_notes_source_for_synthesis(qt_app, fake_session):
     view = SessionView()
     view.set_session(fake_session, transcript="", notes="# Hello", previous_notes_paths=[])
-    # Tabs: Transcript=0, My Notes=1, Synthesis=2, Previous=3
-    view._tabs.setCurrentIndex(2)
+    # v0.6.5 tab order: My Notes=0, Synthesis=1, Previous=2, Transcript=3.
+    view._tabs.setCurrentIndex(1)
     assert view.active_tab_text() == "# Hello"
     assert view.active_tab_label() == "Synthesis"
 

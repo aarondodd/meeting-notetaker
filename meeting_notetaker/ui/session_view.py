@@ -265,15 +265,11 @@ class SessionView(QWidget):
         )
         layout.addWidget(self._synth_banner)
 
-        # Transcript / My Notes / Synthesis / Previous tabs
+        # My Notes / Synthesis / Previous Notes / Transcript. Transcript
+        # is the rightmost tab as of v0.6.5: the user-curated and synthesis
+        # tabs are what people read after a meeting; the raw transcript
+        # is a reference rather than a starting point.
         self._tabs = QTabWidget(self)
-        self._transcript_view = QPlainTextEdit(self)
-        self._transcript_view.setReadOnly(True)
-        self._transcript_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.StyleHint.Monospace)
-        self._transcript_view.setFont(mono)
-        self._tabs.addTab(self._transcript_view, "Transcript")
 
         self._live_notes_editor = LiveNotesWidget(self)
         self._live_notes_editor.setPlaceholderText(
@@ -311,6 +307,26 @@ class SessionView(QWidget):
             self._on_previous_delete_requested
         )
         self._tabs.addTab(self._previous_view, "Previous Notes")
+
+        self._transcript_view = QPlainTextEdit(self)
+        self._transcript_view.setReadOnly(True)
+        self._transcript_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        self._transcript_view.setFont(mono)
+        # An empty transcript pane could read as a bug. Set placeholder
+        # text that explains the expected state: the transcript only
+        # populates after the recording is stopped and the batch pass
+        # has finished. With capture-only mode being the v0.6.5 default,
+        # this is the normal state during a recording.
+        self._transcript_view.setPlaceholderText(
+            "Transcription will appear here once the recording is stopped "
+            "and the post-meeting transcription pass has finished.\n\n"
+            "Live transcription is off by default in v0.6.5; toggle it in "
+            "Settings if you'd rather see lines arrive in real time during "
+            "the meeting."
+        )
+        self._tabs.addTab(self._transcript_view, "Transcript")
 
         # Horizontal container holding the tab widget on the left and the
         # click-to-tag attendee sidebar on the right. The sidebar is

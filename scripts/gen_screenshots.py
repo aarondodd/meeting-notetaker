@@ -289,8 +289,10 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
 
 
 def shot_main_transcript() -> None:
+    # Transcript moved to the rightmost tab in v0.6.5. Order:
+    # 0 My Notes, 1 Synthesis, 2 Previous Notes, 3 Transcript.
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(0)
+    win.session_view._tabs.setCurrentIndex(3)
     QApplication.processEvents()
     _grab(win, "01-main-transcript.png", autosize=False)
     win.close()
@@ -298,7 +300,7 @@ def shot_main_transcript() -> None:
 
 def shot_main_my_notes_edit() -> None:
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(1)
+    win.session_view._tabs.setCurrentIndex(0)
     # Force edit mode (template-seeded notes default to preview when populated).
     win.session_view._live_notes_editor.set_preview_mode(False)
     QApplication.processEvents()
@@ -308,7 +310,7 @@ def shot_main_my_notes_edit() -> None:
 
 def shot_main_my_notes_preview() -> None:
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(1)
+    win.session_view._tabs.setCurrentIndex(0)
     win.session_view._live_notes_editor.set_preview_mode(True)
     QApplication.processEvents()
     _grab(win, "03-main-my-notes-preview.png", autosize=False)
@@ -317,7 +319,7 @@ def shot_main_my_notes_preview() -> None:
 
 def shot_main_synthesis() -> None:
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(2)
+    win.session_view._tabs.setCurrentIndex(1)
     # Synthesis defaults to preview mode in set_session; explicit set is a no-op
     # but keeps the assumption in the script obvious.
     win.session_view._notes_view.set_preview_mode(True)
@@ -328,7 +330,7 @@ def shot_main_synthesis() -> None:
 
 def shot_main_previous_notes() -> None:
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(3)
+    win.session_view._tabs.setCurrentIndex(2)
     QApplication.processEvents()
     _grab(win, "05-main-previous-notes.png", autosize=False)
     win.close()

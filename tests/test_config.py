@@ -36,6 +36,11 @@ def test_load_with_missing_file_returns_defaults(isolated_data_dir):
     cfg = Config.load()
     assert cfg.transcription.model_size == "small.en"
     assert cfg.audio.retain_audio_default is False
+    # v0.6.5: fresh installs default to capture-only (no live
+    # transcription pass). The post-Stop batch pass is what populates
+    # the Transcript tab. Pin so a future refactor doesn't silently
+    # flip live transcription back on.
+    assert cfg.transcription.capture_only_mode is True
 
 
 def test_validate_rejects_bad_values(isolated_data_dir):

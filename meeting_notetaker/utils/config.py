@@ -4,6 +4,7 @@ Schema (config.toml):
 
     [audio]
     retain_audio_default = false
+    retain_format = "opus"             # opus / flac / wav; format used when retain_audio is True
     vad_enabled = true
     vad_min_silence_ms = 500
     mic_device_name = ""               # empty -> system default; substring match
@@ -11,7 +12,7 @@ Schema (config.toml):
 
     [transcription]
     model_size = "small.en"
-    capture_only_mode = false
+    capture_only_mode = true          # default off for live transcription as of v0.6.5
     skip_batch_refinement = false   # if true, no post-Stop full-recording pass -- live transcript is final
     fast_batch = true               # batch pass uses beam_size=1 (~3x faster). flip off for legal-grade verbatim.
     cpu_threads = 0                 # 0 = auto (cpu_count // num_workers); else fixed value passed to CT2
@@ -82,7 +83,12 @@ class AudioConfig:
 @dataclass
 class TranscriptionConfig:
     model_size: str = "small.en"
-    capture_only_mode: bool = False
+    # v0.6.5+: default is capture-only (no live transcription pass).
+    # The post-meeting batch transcription on Stop still runs and is
+    # what populates the Transcript tab. Users who want lines arriving
+    # mid-meeting can flip this off in Settings. Existing configs keep
+    # the explicit value they had saved.
+    capture_only_mode: bool = True
     skip_batch_refinement: bool = False
     fast_batch: bool = True
     cpu_threads: int = 0
