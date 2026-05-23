@@ -20,7 +20,9 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QImage, QTextDocument
+from PyQt6.QtGui import QImage, QPageLayout, QTextDocument
+
+from .markdown_preview import clamp_image_widths
 
 
 class PrintTextDocument(QTextDocument):
@@ -57,6 +59,29 @@ class PrintTextDocument(QTextDocument):
                     self._image_cache[key] = img
                     return img
         return super().loadResource(resource_type, name)
+
+    def clamp_images_to_printer(self, printer) -> int:
+        """Pin every image's rendered width to fit the printer's page.
+
+        Without this step, an image whose natural pixel size exceeds the
+        printable page width spills off the right margin in the rendered
+        PDF (and gets clipped by the print engine in hard-copy output).
+        Call this after setMarkdown() and before doc.print(printer).
+
+        Uses the same walk as the in-app preview. The clamp value is the
+        printer's paint rect width in *points* (1/72 inch). That matches
+        the unit QTextDocument::print() picks for the page size when the
+        document's own pageSize is left unset -- which is the case here.
+        Touching pageSize directly skews the print engine's scale ratio
+        (printerPageRect / pageSize) and shrinks all the body text to
+        match; this path leaves pagination alone and only adjusts the
+        per-image format width.
+        """
+        layout = printer.pageLayout()
+        paint_rect = layout.paintRect(QPageLayout.Unit.Point)
+        if paint_rect.width() <= 0 or paint_rect.height() <= 0:
+            return 0
+        return clamp_image_widths(self, float(paint_rect.width()))
 
     def _resolve_image_path(self, name) -> Optional[Path]:
         """Resolve a QUrl (or string-coercible) to an absolute Path on disk.

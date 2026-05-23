@@ -31,10 +31,11 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
-    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
+
+from .markdown_preview import MarkdownPreview
 
 
 class PreviousNotesWidget(QWidget):
@@ -98,8 +99,7 @@ class PreviousNotesWidget(QWidget):
         self._preview_heading = QLabel("Preview", right)
         self._preview_heading.setStyleSheet("font-weight: 600;")
         right_layout.addWidget(self._preview_heading)
-        self._preview = QTextBrowser(right)
-        self._preview.setOpenExternalLinks(True)
+        self._preview = MarkdownPreview(right)
         right_layout.addWidget(self._preview, 1)
         splitter.addWidget(right)
 

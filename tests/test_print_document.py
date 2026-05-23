@@ -101,6 +101,86 @@ def test_cache_returns_same_object_for_repeated_calls(qt_app, session_with_image
     assert a is b
 
 
+def test_clamp_images_to_printer_pins_oversized(qt_app, tmp_path):
+    """An image wider than the printer's paint-rect in points clamps to fit.
+
+    QTextDocument::print uses point units when pageSize is unset; the
+    clamp likewise targets the paint rect in points. A Letter page's
+    paint rect runs ~540 points wide, so even a modest 2000px image
+    has to be pinned to fit.
+    """
+    from PyQt6.QtGui import QPageLayout  # noqa: PLC0415
+
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    img = QImage(2000, 200, QImage.Format.Format_RGB32)
+    img.fill(QColor(20, 80, 200))
+    img.save(str(images_dir / "huge.png"), "PNG")
+
+    doc = PrintTextDocument(tmp_path)
+    doc.setMarkdown("![huge](images/huge.png)\n")
+
+    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+    out_pdf = tmp_path / "clamped.pdf"
+    printer.setOutputFileName(str(out_pdf))
+    paint_w = printer.pageLayout().paintRect(QPageLayout.Unit.Point).width()
+    assert paint_w < 2000, (
+        "test premise: image natural pixel width must exceed page in points"
+    )
+
+    adjustments = doc.clamp_images_to_printer(printer)
+    assert adjustments == 1
+
+    # Walk for the image fragment and confirm width was pinned to the
+    # printer's paint-rect width (or less).
+    block = doc.begin()
+    found_width = None
+    while block.isValid() and found_width is None:
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid() and frag.charFormat().isImageFormat():
+                found_width = frag.charFormat().toImageFormat().width()
+                break
+            it += 1
+        block = block.next()
+    assert found_width is not None
+    assert 0 < found_width <= paint_w
+    # And it's strictly less than the natural 2000.
+    assert found_width < 2000
+
+
+def test_clamp_images_to_printer_does_not_change_page_size(qt_app, tmp_path):
+    """Regression: an earlier draft set the document's pageSize to the
+    printer's paint rect in *device pixels at the printer's resolution*.
+    QTextDocument::print() then read pageSize and computed
+    `scale = printerPageRect (points) / pageSize (pixels)` -- a tiny
+    ratio -- which shrunk every glyph in the rendered PDF.
+
+    The fix leaves pageSize untouched so doc.print() can pick its own
+    point-based pagination. This test pins that contract.
+    """
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    img = QImage(2000, 200, QImage.Format.Format_RGB32)
+    img.fill(QColor(50, 150, 50))
+    img.save(str(images_dir / "img.png"), "PNG")
+
+    doc = PrintTextDocument(tmp_path)
+    doc.setMarkdown("# Title\n\nParagraph.\n\n![i](images/img.png)\n")
+    page_size_before = doc.pageSize()
+
+    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+    printer.setOutputFileName(str(tmp_path / "out.pdf"))
+    doc.clamp_images_to_printer(printer)
+
+    # pageSize must be unchanged -- either still invalid (Qt sets it
+    # itself in doc.print) or identical to whatever it was before.
+    assert doc.pageSize() == page_size_before
+
+
 def test_pdf_actually_embeds_image(qt_app, session_with_image, tmp_path):
     """End-to-end: render a Markdown doc to PDF and verify the rendered
     page has the colored pixels somewhere on it.

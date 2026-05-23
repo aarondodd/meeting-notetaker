@@ -1026,6 +1026,7 @@ class SessionView(QWidget):
         dialog.setWindowTitle(f"Print -- {self._session.title} -- {tab_label}")
         if dialog.exec() != QPrintDialog.DialogCode.Accepted:
             return
+        doc.clamp_images_to_printer(printer)
         doc.print(printer)
 
     def _on_export_pdf(self) -> None:
@@ -1063,6 +1064,7 @@ class SessionView(QWidget):
         printer.setOutputFileName(str(target))
         printer.setDocName(f"{self._session.title} -- {tab_label}")
         try:
+            doc.clamp_images_to_printer(printer)
             doc.print(printer)
         except Exception as exc:
             QMessageBox.warning(self, "Export PDF", f"Could not write PDF: {exc}")
@@ -1082,5 +1084,3 @@ def _pretty_state(state: str) -> str:
         STATE_ERROR: "Error",
     }
     return pretty.get(state, state.title())
-
-
