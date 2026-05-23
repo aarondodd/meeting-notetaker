@@ -357,17 +357,21 @@ Folder*.
 
 ### Status bar connection state
 
-The status bar shows one of three values when synthesis automation
-is enabled in Settings:
+The status bar's **`Syn`** pill carries the synthesis automation state
+in its dot color (hover for the full description):
 
-- **`Synthesis: Chrome not running`** -- Send is enabled and clicking
-  it launches Chrome at the synthesis URL automatically.
-- **`Synthesis: Chrome running, connected`** -- Send is ready.
-- **`Synthesis: Chrome running, disconnected`** -- Send is **disabled**.
-  The extension's service worker has been killed by Chrome's MV3
-  idle timer; it auto-reconnects within ~60 seconds via the
-  combined app-side ping + extension chrome.alarms retry. If it
-  persists, open the extension popup and click **Reconnect to app**.
+- **green** -- the extension is connected. Send is ready.
+- **yellow** -- Chrome isn't running. Send is enabled and clicking it
+  launches Chrome at the synthesis URL automatically.
+- **red** -- Chrome is running but the extension hasn't reconnected.
+  Send is **disabled**. The MV3 service worker auto-reconnects within
+  ~60 seconds via the combined app-side ping + extension
+  `chrome.alarms` retry. If it persists, open the extension popup
+  and click **Reconnect to app**.
+
+Other status-bar pills follow the same dot convention: green means
+active / OK, yellow means warning or idle, red means error or
+unavailable, gray means informational.
 
 ### Trade-offs
 

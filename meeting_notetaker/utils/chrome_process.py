@@ -91,6 +91,18 @@ class SynthesisConnectionState(enum.Enum):
                 "'Reconnect to app'.",
         }[self]
 
+    def dot_color(self) -> str:
+        """Status-bar dot color name for this state.
+
+        green = ready to send, yellow = Chrome cold (Send will warm it),
+        red = Chrome up but the extension isn't talking to the app.
+        """
+        return {
+            SynthesisConnectionState.NOT_RUNNING: "yellow",
+            SynthesisConnectionState.RUNNING_CONNECTED: "green",
+            SynthesisConnectionState.RUNNING_DISCONNECTED: "red",
+        }[self]
+
     def send_button_enabled(self) -> bool:
         """Whether the Send-to-LLM button should be clickable in this
         state. Only RUNNING_DISCONNECTED disables -- the other two

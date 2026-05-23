@@ -40,6 +40,11 @@ from ..models.session import (
 )
 from ..utils.icons import app_icon
 from .session_view import SessionView
+from .status_indicators import SegmentState, StatusSegment
+
+
+# Status-bar segment keys, in left-to-right display order.
+_STATUS_SEGMENT_KEYS = ("mic", "sys", "cal", "spk", "voice", "det", "syn")
 
 
 # Per-state cell content + tooltip for the transcription-state column.
@@ -180,71 +185,52 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
 
-        # Single right-aligned permanent indicator that joins all sub-items
-        # with " | " explicitly. Using one QLabel rather than multiple
-        # addPermanentWidget() calls avoids Qt's Windows-native style
-        # painting a separator line *after* the last permanent widget
-        # (which read as a trailing pipe).
-        self._indicators_label = QLabel("", self)
-        self._indicators_label.setContentsMargins(8, 0, 8, 0)
-        self.statusBar().addPermanentWidget(self._indicators_label)
+        # Right-side indicators: a row of StatusSegment widgets (each is
+        # a painted colored dot + short label + optional payload) plus a
+        # plain "v0.6.4" version label on the left of the row. Painted
+        # dots dodge the Windows emoji-font sizing inconsistency that an
+        # earlier draft using unicode bullets had to work around.
+        self._status_segments_widget = QWidget(self)
+        seg_layout = QHBoxLayout(self._status_segments_widget)
+        seg_layout.setContentsMargins(8, 0, 8, 0)
+        seg_layout.setSpacing(14)
+        self._version_label = QLabel("", self._status_segments_widget)
+        seg_layout.addWidget(self._version_label)
+        self._status_segments: dict[str, StatusSegment] = {}
+        for key in _STATUS_SEGMENT_KEYS:
+            seg = StatusSegment(self._status_segments_widget)
+            seg.hide()  # Hidden until set_status_indicators makes it visible.
+            seg_layout.addWidget(seg)
+            self._status_segments[key] = seg
+        self.statusBar().addPermanentWidget(self._status_segments_widget)
 
     def set_status_indicators(
         self,
         *,
         version: str = "",
-        mic_label: str,
-        mic_tooltip: str = "",
-        loopback_label: str,
-        loopback_tooltip: str = "",
-        calendar_label: str,
-        calendar_tooltip: str = "",
-        speakers_label: str = "",
-        speakers_tooltip: str = "",
-        voice_label: str = "",
-        voice_tooltip: str = "",
-        detect_label: str = "",
-        detect_tooltip: str = "",
-        synthesis_label: str = "",
-        synthesis_tooltip: str = "",
+        indicators: Optional[dict[str, SegmentState]] = None,
     ) -> None:
-        """Update the bottom status bar's right-side indicator string.
+        """Update the right-side status-bar pills.
 
-        Sub-items are joined with " | "; we explicitly avoid trailing
-        the string with a separator. The full per-sub-item tooltip text
-        is joined into a single multi-line tooltip so the user can still
-        hover the indicator to see the long form (the QLabel doesn't
-        expose per-character tooltips).
-
-        `speakers_label`, `voice_label`, and `detect_label` only render
-        when non-empty -- clean installs and not-applicable states leave
-        them out.
+        `indicators` is a dict keyed by segment id (mic, sys, cal, spk,
+        voice, det, syn). Missing keys are treated as visible=False so
+        callers only have to pass entries for segments that should
+        render this update. The version label is always shown on the
+        left of the row.
         """
-        parts: list[str] = []
-        tooltip_parts: list[str] = []
         if version:
-            parts.append(f"v{version}")
-            tooltip_parts.append(f"Running version: v{version}")
-        parts.append(mic_label)
-        tooltip_parts.append(mic_tooltip or mic_label)
-        parts.append(loopback_label)
-        tooltip_parts.append(loopback_tooltip or loopback_label)
-        parts.append(calendar_label)
-        tooltip_parts.append(calendar_tooltip or calendar_label)
-        if speakers_label:
-            parts.append(speakers_label)
-            tooltip_parts.append(speakers_tooltip or speakers_label)
-        if voice_label:
-            parts.append(voice_label)
-            tooltip_parts.append(voice_tooltip or voice_label)
-        if detect_label:
-            parts.append(detect_label)
-            tooltip_parts.append(detect_tooltip or detect_label)
-        if synthesis_label:
-            parts.append(synthesis_label)
-            tooltip_parts.append(synthesis_tooltip or synthesis_label)
-        self._indicators_label.setText(" | ".join(parts))
-        self._indicators_label.setToolTip("\n".join(tooltip_parts))
+            self._version_label.setText(f"v{version}")
+            self._version_label.setToolTip(f"Running version: v{version}")
+            self._version_label.show()
+        else:
+            self._version_label.hide()
+        indicators = indicators or {}
+        for key, segment in self._status_segments.items():
+            state = indicators.get(key)
+            if state is None:
+                segment.hide()
+            else:
+                segment.apply(state)
 
     def set_sessions(self, sessions: Iterable[Session]) -> None:
         self._list.blockSignals(True)

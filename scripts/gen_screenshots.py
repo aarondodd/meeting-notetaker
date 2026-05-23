@@ -246,31 +246,37 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
     # screenshot harness has to do it manually.
     templates = [t.name for t in prompts_mod.list_templates()]
     win.session_view.set_prompt_templates(templates)
+    from meeting_notetaker.ui.status_indicators import SegmentState
+    base_indicators: dict[str, SegmentState] = {
+        "mic": SegmentState(
+            color="gray",
+            short_label="Mic",
+            payload="(default)",
+            tooltip="Microphone device: (System default)",
+        ),
+        "sys": SegmentState(
+            color="gray",
+            short_label="Sys",
+            payload="(default)",
+            tooltip="System audio capture (loopback): (System default)",
+        ),
+        "voice": SegmentState(
+            color="yellow",
+            short_label="Voice",
+            tooltip="No voice sample has been recorded.",
+        ),
+    }
     if automation_enabled:
         win.session_view.set_automation_enabled(True, "claude")
-        # And surface the synthesis status in the status bar.
-        win.set_status_indicators(
-            version=__version__,
-            mic_label="Mic: (System default)",
-            loopback_label="System audio: (System default)",
-            calendar_label="Calendar: off",
-            voice_label="Voice: not enrolled",
-            voice_tooltip="No voice sample has been recorded.",
-            synthesis_label="Synthesis: Chrome running, connected",
-            synthesis_tooltip=(
+        base_indicators["syn"] = SegmentState(
+            color="green",
+            short_label="Syn",
+            tooltip=(
                 "The Meeting Notetaker extension is connected. "
                 "Send is ready to use."
             ),
         )
-    else:
-        win.set_status_indicators(
-            version=__version__,
-            mic_label="Mic: (System default)",
-            loopback_label="System audio: (System default)",
-            calendar_label="Calendar: off",
-            voice_label="Voice: not enrolled",
-            voice_tooltip="No voice sample has been recorded.",
-        )
+    win.set_status_indicators(version=__version__, indicators=base_indicators)
     win.select_session(SESSION_ID)
     win.show()
     QApplication.processEvents()

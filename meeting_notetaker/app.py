@@ -49,6 +49,7 @@ from .models.transcript import TranscriptSegment, TranscriptStore
 from .transcription import model_manager
 from .ui.devices_dialog import DevicesDialog
 from .ui.main_window import MainWindow
+from .ui.status_indicators import SegmentState
 from .ui.new_session_dialog import NewSessionDialog
 from .ui.progress import run_with_progress
 from .ui.prompt_dialog import GeneratePromptDialog, PasteNotesDialog
@@ -1546,89 +1547,122 @@ class MainApp(QObject):
     # ---- status bar indicators -------------------------------------------
 
     def _refresh_status_indicators(self) -> None:
-        """Repopulate the right-side status bar widgets from current state.
+        """Repopulate the right-side status bar pills from current state.
 
         Pulled out so settings-saved, calendar-config-applied, and startup
-        all share one source of truth.
+        all share one source of truth. Each segment computes its own
+        SegmentState (or None to hide); MainWindow paints the dots.
         """
-        mic = self.config.audio.mic_device_name or "(System default)"
-        loopback = self.config.audio.loopback_device_name or "(System default)"
+        indicators: dict[str, SegmentState] = {}
+        indicators["mic"] = self._mic_segment()
+        indicators["sys"] = self._sys_segment()
+        cal = self._calendar_segment()
+        if cal is not None:
+            indicators["cal"] = cal
+        spk = self._speakers_segment()
+        if spk is not None:
+            indicators["spk"] = spk
+        voice = self._voice_segment()
+        if voice is not None:
+            indicators["voice"] = voice
+        det = self._detection_segment()
+        if det is not None:
+            indicators["det"] = det
+        syn = self._synthesis_segment()
+        if syn is not None:
+            indicators["syn"] = syn
+        self.window.set_status_indicators(
+            version=__version__,
+            indicators=indicators,
+        )
 
-        # Calendar indicator: combines the user's intent (Watch on/off) with
-        # actual Outlook reachability so the user sees whether the feature
-        # is silently disabled.
+    def _mic_segment(self) -> SegmentState:
+        mic = self.config.audio.mic_device_name or "(System default)"
+        return SegmentState(
+            color="gray",
+            short_label="Mic",
+            payload=_short_device_label(mic),
+            tooltip=f"Microphone device: {mic}",
+        )
+
+    def _sys_segment(self) -> SegmentState:
+        loopback = self.config.audio.loopback_device_name or "(System default)"
+        return SegmentState(
+            color="gray",
+            short_label="Sys",
+            payload=_short_device_label(loopback),
+            tooltip=f"System audio capture (loopback): {loopback}",
+        )
+
+    def _calendar_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the calendar pill, or None when hidden.
+
+        Hidden when the user has the feature off (no point telling them
+        about something they aren't using). Otherwise green=watching,
+        yellow=idle, red=Outlook unavailable.
+        """
         if not self.config.calendar.watch_calendar:
-            cal_label = "Calendar: off"
-            cal_tooltip = (
-                "Outlook calendar watching is disabled. Enable it in Settings "
-                "to be notified when a meeting is about to start."
+            return None
+        if outlook_calendar.is_available():
+            running = (
+                self._calendar_monitor is not None
+                and self._calendar_monitor.is_running()
             )
-        elif outlook_calendar.is_available():
-            running = self._calendar_monitor is not None and self._calendar_monitor.is_running()
             if running:
-                cal_label = "Calendar: watching"
-                cal_tooltip = (
-                    f"Watching Outlook calendar; notifying within "
-                    f"+- {self.config.calendar.window_minutes} min of each "
-                    "meeting start."
+                return SegmentState(
+                    color="green",
+                    short_label="Cal",
+                    tooltip=(
+                        f"Watching Outlook calendar; notifying within "
+                        f"+- {self.config.calendar.window_minutes} min of "
+                        "each meeting start."
+                    ),
                 )
-            else:
-                cal_label = "Calendar: idle"
-                cal_tooltip = (
+            return SegmentState(
+                color="yellow",
+                short_label="Cal",
+                tooltip=(
                     "Calendar watching is enabled but the monitor is not "
                     "running. Try toggling it off and on in Settings."
-                )
-        else:
-            cal_label = "Calendar: Outlook unavailable"
-            cal_tooltip = (
+                ),
+            )
+        return SegmentState(
+            color="red",
+            short_label="Cal",
+            tooltip=(
                 "Calendar watching is enabled, but Outlook (or pywin32) is "
                 "not reachable. Help > Diagnose Outlook... reports which "
                 "step in the chain is failing."
-            )
-
-        speakers_label, speakers_tooltip = self._speakers_indicator()
-        voice_label, voice_tooltip = self._voice_indicator()
-        detect_label, detect_tooltip = self._detection_indicator()
-        synthesis_label, synthesis_tooltip = self._synthesis_indicator()
-        self.window.set_status_indicators(
-            version=__version__,
-            mic_label=f"Mic: {_short_device_label(mic)}",
-            mic_tooltip=f"Microphone device: {mic}",
-            loopback_label=f"System audio: {_short_device_label(loopback)}",
-            loopback_tooltip=f"System audio capture (loopback): {loopback}",
-            calendar_label=cal_label,
-            calendar_tooltip=cal_tooltip,
-            speakers_label=speakers_label,
-            speakers_tooltip=speakers_tooltip,
-            voice_label=voice_label,
-            voice_tooltip=voice_tooltip,
-            detect_label=detect_label,
-            detect_tooltip=detect_tooltip,
-            synthesis_label=synthesis_label,
-            synthesis_tooltip=synthesis_tooltip,
+            ),
         )
 
-    def _synthesis_indicator(self) -> tuple[str, str]:
-        """Status-bar label + tooltip for synthesis automation.
+    def _synthesis_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the synthesis-automation pill, or None.
 
-        Empty when automation is disabled in Settings -- the indicator
-        would be noise for users who don't use the feature. Otherwise
-        shows one of three values based on Chrome process + bridge
-        connection state."""
+        Hidden when automation is disabled in Settings. Otherwise the
+        dot color tracks the bridge state: green when the extension is
+        connected, yellow when Chrome is cold (Send will launch it),
+        red when Chrome is up but the extension isn't talking back.
+        """
         if not self.config.synthesis.automation_enabled:
-            return "", ""
-        return self._synth_state.status_label(), self._synth_state.status_tooltip()
+            return None
+        state = self._synth_state
+        return SegmentState(
+            color=state.dot_color(),
+            short_label="Syn",
+            tooltip=state.status_tooltip(),
+        )
 
-    def _speakers_indicator(self) -> tuple[str, str]:
-        """Return (label, tooltip) for the status-bar speakers segment.
+    def _speakers_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the speakers-known pill, or None.
 
-        Hidden (empty label) when speaker ID is disabled or no speakers
-        are stored yet -- "Speakers: 0" would just be noise on a fresh
-        install. The tooltip lists up to 8 stored names so the user can
-        sanity-check the library without opening Settings.
+        Hidden when speaker ID is off or no speakers are stored yet --
+        "Spk 0" would be noise on a fresh install. Tooltip lists up to
+        8 stored names so the user can sanity-check the library without
+        opening Settings.
         """
         if not self.config.speakers.enabled:
-            return "", ""
+            return None
         try:
             store = open_speaker_store()
             try:
@@ -1637,69 +1671,83 @@ class MainApp(QObject):
                 store.close()
         except Exception:
             log.exception("speakers indicator: store unreadable")
-            return "", ""
+            return None
         if not records:
-            return "", ""
+            return None
         names = [r.name for r in records]
         preview = ", ".join(names[:8])
         if len(names) > 8:
             preview += f" (+{len(names) - 8} more)"
-        tooltip = f"Known speakers ({len(names)}): {preview}"
-        return f"Speakers: {len(names)}", tooltip
+        return SegmentState(
+            color="green",
+            short_label="Spk",
+            payload=str(len(names)),
+            tooltip=f"Known speakers ({len(names)}): {preview}",
+        )
 
-    def _detection_indicator(self) -> tuple[str, str]:
-        """Return (label, tooltip) for the ad-hoc-meeting-detect indicator.
+    def _detection_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the ad-hoc-meeting-detect pill, or None.
 
-        Hidden (empty label) when detection is off; surfaces the running /
-        unavailable / idle state to mirror the Calendar indicator pattern.
+        Hidden when detection is off; mirrors the Calendar pill's color
+        encoding for the enabled states.
         """
         if not self.config.detection.enabled:
-            return "", ""
+            return None
         if not audio_session_monitor.is_available():
-            return (
-                "Detect: pycaw unavailable",
-                "Ad-hoc meeting detection is enabled, but pycaw / psutil "
-                "are not importable. Install them in this environment to "
-                "use this feature (Windows wheels)."
+            return SegmentState(
+                color="red",
+                short_label="Det",
+                tooltip=(
+                    "Ad-hoc meeting detection is enabled, but pycaw / "
+                    "psutil are not importable. Install them in this "
+                    "environment to use this feature (Windows wheels)."
+                ),
             )
         running = self._audio_monitor is not None and self._audio_monitor.is_running()
         if running:
             allowlist_size = len(self.config.detection.app_allowlist)
-            return (
-                "Detect: watching",
-                f"Watching system audio for {allowlist_size} known meeting "
-                f"app(s); prompting after audio sustains "
-                f"{self.config.detection.min_duration_sec}s.",
+            return SegmentState(
+                color="green",
+                short_label="Det",
+                tooltip=(
+                    f"Watching system audio for {allowlist_size} known "
+                    f"meeting app(s); prompting after audio sustains "
+                    f"{self.config.detection.min_duration_sec}s."
+                ),
             )
-        return (
-            "Detect: idle",
-            "Ad-hoc meeting detection is enabled but the monitor is not "
-            "running. Try toggling it off and on in Settings.",
+        return SegmentState(
+            color="yellow",
+            short_label="Det",
+            tooltip=(
+                "Ad-hoc meeting detection is enabled but the monitor is "
+                "not running. Try toggling it off and on in Settings."
+            ),
         )
 
-    def _voice_indicator(self) -> tuple[str, str]:
-        """Return (label, tooltip) for the user-voice enrollment indicator.
+    def _voice_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the voiceprint-enrollment pill, or None.
 
         Only surfaces when speaker ID is enabled but no usable voiceprint
-        is on disk -- the goal is to remind the user there's a setup
-        step they haven't completed. A voiceprint recorded under a
-        previous encoder (e.g. Resemblyzer before the v0.5 ECAPA swap)
-        is treated as not enrolled because its dim is incompatible with
-        the current encoder's output; the user must re-record.
+        is on disk. Voiceprints recorded under an older encoder (e.g.
+        Resemblyzer before the v0.5 ECAPA swap) count as not enrolled
+        because their dim is incompatible with the current encoder.
         """
         if not self.config.speakers.enabled:
-            return "", ""
+            return None
         try:
             if user_voiceprint.load() is not None:
-                return "", ""
+                return None
         except Exception:
             log.exception("voice indicator: voiceprint check failed")
-            return "", ""
-        return (
-            "Voice: not enrolled",
-            "No voice sample has been recorded. Settings > Speaker "
-            "Identification > Record voice sample lets the refiner "
-            "tell your microphone from system-audio bleed.",
+            return None
+        return SegmentState(
+            color="yellow",
+            short_label="Voice",
+            tooltip=(
+                "No voice sample has been recorded. Settings > Speaker "
+                "Identification > Record voice sample lets the refiner "
+                "tell your microphone from system-audio bleed."
+            ),
         )
 
     # ---- calendar integration ---------------------------------------------
