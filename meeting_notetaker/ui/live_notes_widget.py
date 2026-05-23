@@ -22,7 +22,6 @@ from typing import Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QImage, QKeySequence, QTextCursor
 from PyQt6.QtWidgets import (
-    QDialog,
     QFileDialog,
     QMessageBox,
     QPlainTextEdit,
@@ -40,7 +39,6 @@ from ..utils.images import (
     markdown_image_ref,
     save_qimage,
 )
-from .image_metadata_dialog import ImageMetadataDialog
 from .markdown_preview import MarkdownPreview
 
 
@@ -365,7 +363,13 @@ class LiveNotesWidget(QWidget):
     # ---- image handlers ----------------------------------------------------
 
     def _on_image_pasted(self, image) -> None:
-        """Handle a QImage payload pasted from the clipboard."""
+        """Handle a QImage payload pasted from the clipboard.
+
+        Saves directly with a default alt of 'image'; the user can edit
+        the markdown afterward. The interactive alt/caption dialog was
+        removed in v0.6.5 as a clarification step that added friction
+        without commensurate value.
+        """
         if not isinstance(image, QImage) or image.isNull():
             return
         if self._session_dir is None:
@@ -376,20 +380,20 @@ class LiveNotesWidget(QWidget):
                 "alongside the notes.",
             )
             return
-        dialog = ImageMetadataDialog(preview_image=image, parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
         try:
             saved = save_qimage(image, self._session_dir / IMAGES_SUBDIR)
         except OSError as exc:
             QMessageBox.warning(self, "Image paste", f"Could not save image: {exc}")
             return
-        self._insert_image_markdown(
-            saved.name, dialog.alt_text() or "image", dialog.caption()
-        )
+        self._insert_image_markdown(saved.name, "image", "")
 
     def _insert_image_action(self) -> None:
-        """Toolbar handler: copy a file from disk into the session images dir."""
+        """Toolbar handler: copy a file from disk into the session images dir.
+
+        Uses the source file's stem as the alt text so the markdown
+        carries something descriptive without prompting the user. Edit
+        in source mode if a different alt is wanted.
+        """
         if self._session_dir is None:
             QMessageBox.information(
                 self,
@@ -413,19 +417,12 @@ class LiveNotesWidget(QWidget):
                 "Unsupported image type or missing file.",
             )
             return
-        dialog = ImageMetadataDialog(
-            preview_path=src, default_alt=src.stem, parent=self
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
         try:
             saved = copy_image_file(src, self._session_dir / IMAGES_SUBDIR)
         except OSError as exc:
             QMessageBox.warning(self, "Insert image", f"Could not copy image: {exc}")
             return
-        self._insert_image_markdown(
-            saved.name, dialog.alt_text() or saved.stem, dialog.caption()
-        )
+        self._insert_image_markdown(saved.name, saved.stem, "")
 
     def _insert_image_markdown(self, filename: str, alt: str, caption: str) -> None:
         """Insert the Markdown image ref on its own line at the cursor."""

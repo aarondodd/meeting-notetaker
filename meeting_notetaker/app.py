@@ -134,6 +134,11 @@ class MainApp(QObject):
         # session id so multi-session-in-flight (a v0.6 feature) still
         # routes captures to the right session.
         self._screen_capture_regions: dict[str, tuple[int, int, int, int]] = {}
+        # Persistent on-screen outline showing the armed region. There
+        # is one overlay at a time (only one session captures at a
+        # time); _arm_screen_capture_overlay creates it, _disarm tears
+        # it down.
+        self._armed_region_overlay = None
 
         # Synthesis automation bridge. Listens on a loopback port for the
         # Chrome native-messaging host to connect; route inbound result/
@@ -1019,6 +1024,7 @@ class MainApp(QObject):
         if state in (STATE_COMPLETE, STATE_ERROR, STATE_NEW, STATE_PROCESSING):
             if session_id in self._screen_capture_regions:
                 self._screen_capture_regions.pop(session_id, None)
+                self._hide_armed_region_overlay()
                 self.window.session_view.set_screencap_armed(False)
 
     def _on_segment_arrived(self, session_id: str, segment) -> None:
@@ -1529,11 +1535,26 @@ class MainApp(QObject):
         self._screen_capture_regions[session_id] = (
             rect.x(), rect.y(), rect.width(), rect.height(),
         )
+        self._show_armed_region_overlay(rect)
         self.window.session_view.set_screencap_armed(True)
 
     def _on_stop_screen_capture(self, session_id: str) -> None:
         self._screen_capture_regions.pop(session_id, None)
+        self._hide_armed_region_overlay()
         self.window.session_view.set_screencap_armed(False)
+
+    def _show_armed_region_overlay(self, rect) -> None:
+        """Build the persistent outline overlay and show it on top."""
+        self._hide_armed_region_overlay()
+        from .screencap.armed_overlay import ArmedRegionOverlay  # noqa: PLC0415
+        overlay = ArmedRegionOverlay(rect)
+        overlay.show()
+        self._armed_region_overlay = overlay
+
+    def _hide_armed_region_overlay(self) -> None:
+        if self._armed_region_overlay is not None:
+            self._armed_region_overlay.close()
+            self._armed_region_overlay = None
 
     def _on_screencap_capture(self, session_id: str) -> None:
         self._capture_screenshot(session_id, insert=False)
@@ -1715,8 +1736,6 @@ class MainApp(QObject):
         SegmentState (or None to hide); MainWindow paints the dots.
         """
         indicators: dict[str, SegmentState] = {}
-        indicators["mic"] = self._mic_segment()
-        indicators["sys"] = self._sys_segment()
         cal = self._calendar_segment()
         if cal is not None:
             indicators["cal"] = cal
@@ -1732,24 +1751,6 @@ class MainApp(QObject):
         self.window.set_status_indicators(
             version=__version__,
             indicators=indicators,
-        )
-
-    def _mic_segment(self) -> SegmentState:
-        mic = self.config.audio.mic_device_name or "(System default)"
-        return SegmentState(
-            color="gray",
-            short_label="Mic",
-            payload=_short_device_label(mic),
-            tooltip=f"Microphone device: {mic}",
-        )
-
-    def _sys_segment(self) -> SegmentState:
-        loopback = self.config.audio.loopback_device_name or "(System default)"
-        return SegmentState(
-            color="gray",
-            short_label="Sys",
-            payload=_short_device_label(loopback),
-            tooltip=f"System audio capture (loopback): {loopback}",
         )
 
     def _calendar_segment(self) -> Optional[SegmentState]:
@@ -2311,16 +2312,6 @@ class MainApp(QObject):
         self.window.showNormal()
         self.window.raise_()
         self.window.activateWindow()
-
-
-_STATUS_DEVICE_TRUNCATE_AT = 36
-
-
-def _short_device_label(name: str) -> str:
-    """Trim long device names so the status bar doesn't overflow."""
-    if len(name) <= _STATUS_DEVICE_TRUNCATE_AT:
-        return name
-    return name[: _STATUS_DEVICE_TRUNCATE_AT - 1].rstrip() + "..."
 
 
 def _set_windows_app_user_model_id() -> None:

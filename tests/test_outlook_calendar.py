@@ -170,11 +170,57 @@ def test_fetch_remaining_today_returns_empty_when_unavailable():
     assert fetch_remaining_today(now=datetime(2026, 5, 17, 14, 30)) == []
 
 
-def test_fetch_remaining_today_clamps_when_now_is_end_of_day(monkeypatch):
-    # If the integration is "available" but the COM dispatch fails (typical
-    # state during testing), fetch_calendar_range still returns []. We use
-    # this to assert that fetch_remaining_today doesn't raise around the
-    # 23:59:59 edge case.
+def test_fetch_remaining_today_looks_back_for_in_progress_meetings(monkeypatch):
+    """v0.6.5: include meetings that started before now but haven't ended.
+
+    The Outlook restrict filter is on Start; we widen the fetch
+    backwards a few hours, then post-filter by end_time > now. Confirm
+    the widening + the filter both work.
+    """
+    from meeting_notetaker.integrations.outlook_calendar import MeetingInfo
+
+    now = datetime(2026, 5, 17, 14, 30)
+    captured: dict = {}
+
+    def fake_range(start, end):
+        captured["start"] = start
+        captured["end"] = end
+        # Three candidates:
+        #   - started 4h ago, ended an hour ago (DONE, must be dropped)
+        #   - started 30m ago, still running (IN-PROGRESS, must surface)
+        #   - starts in 2h (UPCOMING, must surface)
+        return [
+            MeetingInfo(
+                entry_id="done", subject="Done",
+                start_time=datetime(2026, 5, 17, 10, 30),
+                end_time=datetime(2026, 5, 17, 13, 30),
+            ),
+            MeetingInfo(
+                entry_id="now", subject="In Progress",
+                start_time=datetime(2026, 5, 17, 14, 0),
+                end_time=datetime(2026, 5, 17, 15, 0),
+            ),
+            MeetingInfo(
+                entry_id="later", subject="Upcoming",
+                start_time=datetime(2026, 5, 17, 16, 30),
+                end_time=datetime(2026, 5, 17, 17, 30),
+            ),
+        ]
+
+    monkeypatch.setattr(outlook_calendar, "fetch_calendar_range", fake_range)
+    result = fetch_remaining_today(now=now)
+    # The lookback start sits before now; the filter drops the
+    # already-ended meeting.
+    assert captured["start"] < now
+    subjects = [m.subject for m in result]
+    assert "In Progress" in subjects
+    assert "Upcoming" in subjects
+    assert "Done" not in subjects
+
+
+def test_fetch_remaining_today_end_of_day_still_safe(monkeypatch):
+    """The 23:59:59 edge case still doesn't raise and still walks the
+    lookback window."""
     captured: dict = {}
 
     def fake_range(start, end):
@@ -184,6 +230,5 @@ def test_fetch_remaining_today_clamps_when_now_is_end_of_day(monkeypatch):
 
     monkeypatch.setattr(outlook_calendar, "fetch_calendar_range", fake_range)
     fetch_remaining_today(now=datetime(2026, 5, 17, 23, 59, 30))
-    assert captured["start"].hour == 23
     assert captured["end"].hour == 23
     assert captured["end"] >= captured["start"]

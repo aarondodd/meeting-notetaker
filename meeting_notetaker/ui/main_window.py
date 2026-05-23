@@ -44,8 +44,10 @@ from .session_view import SessionView
 from .status_indicators import SegmentState, StatusSegment
 
 
-# Status-bar segment keys, in left-to-right display order.
-_STATUS_SEGMENT_KEYS = ("mic", "sys", "cal", "voice", "det", "syn")
+# Status-bar segment keys, in left-to-right display order. v0.6.5
+# drops the informational Mic / Sys pills (no actionable state to
+# show); device names live in Settings now.
+_STATUS_SEGMENT_KEYS = ("cal", "voice", "det", "syn")
 
 
 # Per-state cell content + tooltip for the transcription-state column.

@@ -248,18 +248,6 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
     win.session_view.set_prompt_templates(templates)
     from meeting_notetaker.ui.status_indicators import SegmentState
     base_indicators: dict[str, SegmentState] = {
-        "mic": SegmentState(
-            color="gray",
-            short_label="Mic",
-            payload="(default)",
-            tooltip="Microphone device: (System default)",
-        ),
-        "sys": SegmentState(
-            color="gray",
-            short_label="Sys",
-            payload="(default)",
-            tooltip="System audio capture (loopback): (System default)",
-        ),
         "voice": SegmentState(
             color="yellow",
             short_label="Voiceprint",
