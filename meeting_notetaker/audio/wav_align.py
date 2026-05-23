@@ -98,6 +98,41 @@ def _write_silence(
         wf.writeframes(b"\x00" * (remaining * bytes_per_frame))
 
 
+def gap_frames_to_fill(
+    *,
+    now_wallclock: float,
+    last_callback_wallclock: float,
+    frame_count: int,
+    sample_rate: int,
+    threshold_ms: int = 100,
+) -> int:
+    """Return the silence-frame count to write before a new callback's data.
+
+    The audio callback fires periodically; for a typical 1024-frame
+    buffer at 48 kHz that's every ~21 ms. When WASAPI puts the audio
+    engine to sleep (no audio playing through the speakers, no other
+    renderer active) the callback can stop firing entirely until the
+    engine wakes up.
+
+    To detect: compare the wall-clock elapsed since the previous
+    callback to the audio time the current chunk represents. If the
+    wall-clock elapsed is significantly larger, the difference is a
+    gap WASAPI didn't deliver -- it needs to be filled with silence
+    in the WAV to keep the file wall-clock-aligned.
+
+    `threshold_ms` is the minimum gap below which we treat the
+    delta as ordinary jitter and don't pad. 100 ms is comfortably
+    above normal PortAudio scheduler variance but well below a real
+    audio-engine sleep.
+    """
+    expected_delta_s = frame_count / sample_rate
+    actual_delta_s = now_wallclock - last_callback_wallclock
+    gap_s = actual_delta_s - expected_delta_s
+    if gap_s * 1000 < threshold_ms:
+        return 0
+    return int(gap_s * sample_rate)
+
+
 def compute_pad_frames(
     *,
     start_wallclock: float,

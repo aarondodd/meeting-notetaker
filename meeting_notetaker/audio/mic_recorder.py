@@ -21,7 +21,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .chunk_buffer import ChunkBuffer
 from .resample import to_mono_16k
-from .wav_align import compute_pad_frames, pad_wav
+from .wav_align import compute_pad_frames, gap_frames_to_fill, pad_wav
 
 
 log = logging.getLogger(__name__)
@@ -61,7 +61,12 @@ class MicRecorder(QObject):
         # silence so the file spans the full [start, stop] window.
         self._start_wallclock: Optional[float] = None
         self._first_sample_wallclock: Optional[float] = None
+        self._last_callback_wallclock: Optional[float] = None
         self._stop_wallclock: Optional[float] = None
+        # Cumulative silence frames the callback inserted to fill
+        # mid-recording WASAPI sleeps. Counted for diagnostics + so
+        # compute_pad_frames's trailing math accounts for them.
+        self._gap_fill_frames_total: int = 0
 
     @property
     def is_recording(self) -> bool:
@@ -88,7 +93,9 @@ class MicRecorder(QObject):
         self._is_recording = True
         self._start_wallclock = time.monotonic()
         self._first_sample_wallclock = None
+        self._last_callback_wallclock = None
         self._stop_wallclock = None
+        self._gap_fill_frames_total = 0
         open_kwargs: dict = dict(
             format=pyaudio.paInt16,
             channels=self._channels,
@@ -115,8 +122,29 @@ class MicRecorder(QObject):
             # Drop the buffer; do not append to WAV. Live view pauses too.
             return (None, pyaudio.paContinue)
         try:
+            now = time.monotonic()
             if self._first_sample_wallclock is None:
-                self._first_sample_wallclock = time.monotonic()
+                self._first_sample_wallclock = now
+            elif self._last_callback_wallclock is not None and self._wf is not None:
+                # Mid-callback gap detection. If PyAudio's input stream
+                # stalled (rare on mic capture but possible under heavy
+                # load), fill the gap with silence so the WAV stays
+                # wall-clock-aligned. Mostly a no-op for mic; load-
+                # bearing for the symmetric LoopbackRecorder path.
+                gap = gap_frames_to_fill(
+                    now_wallclock=now,
+                    last_callback_wallclock=self._last_callback_wallclock,
+                    frame_count=frame_count,
+                    sample_rate=self._native_rate,
+                )
+                if gap > 0:
+                    log.info(
+                        "MicRecorder gap-fill: %d frames (%.0f ms)",
+                        gap, gap * 1000 / self._native_rate,
+                    )
+                    self._write_silence_frames(gap)
+                    self._gap_fill_frames_total += gap
+            self._last_callback_wallclock = now
             if self._wf is not None:
                 self._wf.writeframes(in_data)
             pcm = np.frombuffer(in_data, dtype=np.int16)
@@ -165,6 +193,26 @@ class MicRecorder(QObject):
         self._maybe_pad_wav()
         log.info("MicRecorder stopped")
         self.stopped.emit()
+
+    def _write_silence_frames(self, frame_count: int) -> None:
+        """Append `frame_count` of all-zero PCM to the current WAV.
+
+        Called from the audio callback when a wall-clock gap is
+        detected. Sampwidth is 2 (int16), channels = self._channels.
+        Streams in 64 KB blocks so a very long gap (rare) doesn't
+        materialize a giant byte string.
+        """
+        if self._wf is None or frame_count <= 0:
+            return
+        bytes_per_frame = self._channels * 2
+        BLOCK_FRAMES = 8192
+        block = b"\x00" * (BLOCK_FRAMES * bytes_per_frame)
+        remaining = frame_count
+        while remaining >= BLOCK_FRAMES:
+            self._wf.writeframes(block)
+            remaining -= BLOCK_FRAMES
+        if remaining > 0:
+            self._wf.writeframes(b"\x00" * (remaining * bytes_per_frame))
 
     def _maybe_pad_wav(self) -> None:
         """Rewrite the WAV with leading + trailing silence to span

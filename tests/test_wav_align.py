@@ -17,6 +17,7 @@ import pytest
 
 from meeting_notetaker.audio.wav_align import (
     compute_pad_frames,
+    gap_frames_to_fill,
     pad_wav,
 )
 
@@ -175,6 +176,63 @@ def test_compute_pad_frames_no_callbacks_returns_zero(tmp_path):
     )
     assert leading == 0
     assert trailing == 0
+
+
+def test_gap_frames_to_fill_zero_for_continuous_callbacks():
+    """Continuous-rate callbacks (actual delta ~= frame_time) -> no gap."""
+    rate = 48000
+    frame_count = 1024  # ~21 ms at 48k
+    # The audio thread's normal jitter: actual delta = 25 ms vs expected 21 ms.
+    gap = gap_frames_to_fill(
+        now_wallclock=10.025,
+        last_callback_wallclock=10.000,
+        frame_count=frame_count,
+        sample_rate=rate,
+    )
+    assert gap == 0
+
+
+def test_gap_frames_to_fill_detects_engine_sleep():
+    """WASAPI slept for 5 s between callbacks -> fill 5 s of silence."""
+    rate = 48000
+    frame_count = 1024
+    gap = gap_frames_to_fill(
+        now_wallclock=15.021,  # 5 s + ~21 ms after previous callback
+        last_callback_wallclock=10.000,
+        frame_count=frame_count,
+        sample_rate=rate,
+    )
+    # gap_s = (15.021 - 10.000) - (1024 / 48000) = 5.021 - 0.0213 = 4.999...
+    # at 48k -> ~240000 frames
+    assert 239000 <= gap <= 240500
+
+
+def test_gap_frames_to_fill_threshold_default_100ms():
+    """A 50 ms gap is below the default 100 ms threshold -> no pad."""
+    rate = 48000
+    frame_count = 1024
+    gap = gap_frames_to_fill(
+        now_wallclock=10.071,  # 50 ms + frame_time after previous
+        last_callback_wallclock=10.000,
+        frame_count=frame_count,
+        sample_rate=rate,
+    )
+    assert gap == 0
+
+
+def test_gap_frames_to_fill_threshold_custom():
+    """Callers can tighten the threshold for a stricter test fixture."""
+    rate = 48000
+    frame_count = 1024
+    gap = gap_frames_to_fill(
+        now_wallclock=10.071,  # 50 ms gap
+        last_callback_wallclock=10.000,
+        frame_count=frame_count,
+        sample_rate=rate,
+        threshold_ms=10,  # 10 ms threshold
+    )
+    # gap_s = 0.071 - 0.0213 = ~0.05 s
+    assert gap > 0
 
 
 def test_compute_pad_frames_sub_threshold_returns_zero():

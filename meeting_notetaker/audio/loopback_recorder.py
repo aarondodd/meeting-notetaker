@@ -25,7 +25,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .chunk_buffer import ChunkBuffer
 from .resample import to_mono_16k
-from .wav_align import compute_pad_frames, pad_wav
+from .wav_align import compute_pad_frames, gap_frames_to_fill, pad_wav
 
 
 log = logging.getLogger(__name__)
@@ -71,7 +71,15 @@ class LoopbackRecorder(QObject):
         # wall-clock window as mic.wav.
         self._start_wallclock: Optional[float] = None
         self._first_sample_wallclock: Optional[float] = None
+        self._last_callback_wallclock: Optional[float] = None
         self._stop_wallclock: Optional[float] = None
+        # Cumulative silence frames the callback inserted to fill
+        # mid-recording WASAPI sleeps. WASAPI loopback often goes
+        # idle between audio bursts; without this, two separate
+        # audio clips would land back-to-back in sys.wav with no
+        # silence between them -- the bug Aaron flagged where the
+        # second music clip played at the wrong wall-clock moment.
+        self._gap_fill_frames_total: int = 0
 
     @staticmethod
     def is_available() -> bool:
@@ -151,7 +159,9 @@ class LoopbackRecorder(QObject):
         self._is_recording = True
         self._start_wallclock = time.monotonic()
         self._first_sample_wallclock = None
+        self._last_callback_wallclock = None
         self._stop_wallclock = None
+        self._gap_fill_frames_total = 0
         self._stream = self._pa.open(
             format=pyaudio.paInt16,
             channels=self._channels,
@@ -178,8 +188,31 @@ class LoopbackRecorder(QObject):
         if self._paused:
             return (None, pyaudio.paContinue)
         try:
+            now = time.monotonic()
             if self._first_sample_wallclock is None:
-                self._first_sample_wallclock = time.monotonic()
+                self._first_sample_wallclock = now
+            elif self._last_callback_wallclock is not None and self._wf is not None:
+                # WASAPI loopback can stop firing callbacks during
+                # silence (no renderer active -> audio engine sleeps).
+                # Detect the gap by wall-clock vs frame-time delta;
+                # fill with silence so the WAV stays continuously
+                # wall-clock-aligned. Without this, two separate
+                # audio bursts land back-to-back in sys.wav and the
+                # second one plays at the wrong moment in playback.
+                gap = gap_frames_to_fill(
+                    now_wallclock=now,
+                    last_callback_wallclock=self._last_callback_wallclock,
+                    frame_count=frame_count,
+                    sample_rate=self._native_rate,
+                )
+                if gap > 0:
+                    log.info(
+                        "LoopbackRecorder gap-fill: %d frames (%.0f ms)",
+                        gap, gap * 1000 / self._native_rate,
+                    )
+                    self._write_silence_frames(gap)
+                    self._gap_fill_frames_total += gap
+            self._last_callback_wallclock = now
             if self._wf is not None:
                 self._wf.writeframes(in_data)
             pcm = np.frombuffer(in_data, dtype=np.int16)
@@ -224,6 +257,25 @@ class LoopbackRecorder(QObject):
         self._maybe_pad_wav()
         log.info("LoopbackRecorder stopped")
         self.stopped.emit()
+
+    def _write_silence_frames(self, frame_count: int) -> None:
+        """Append `frame_count` of all-zero PCM to the current WAV.
+
+        Sampwidth is 2 (int16); channels = self._channels. Stream
+        in 64 KB blocks so a long gap (rare but possible) doesn't
+        materialize a giant byte string.
+        """
+        if self._wf is None or frame_count <= 0:
+            return
+        bytes_per_frame = self._channels * 2
+        BLOCK_FRAMES = 8192
+        block = b"\x00" * (BLOCK_FRAMES * bytes_per_frame)
+        remaining = frame_count
+        while remaining >= BLOCK_FRAMES:
+            self._wf.writeframes(block)
+            remaining -= BLOCK_FRAMES
+        if remaining > 0:
+            self._wf.writeframes(b"\x00" * (remaining * bytes_per_frame))
 
     def _maybe_pad_wav(self) -> None:
         """Rewrite the WAV with leading + trailing silence to span
