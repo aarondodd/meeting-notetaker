@@ -65,8 +65,8 @@ class AudioPlayer(QObject):
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
-        # The mixed buffer as int16 PCM, mono. None when no session
-        # is loaded.
+        # The mixed buffer as float32 PCM in [-1, 1], mono. None when
+        # no session is loaded.
         self._buffer: Optional[np.ndarray] = None
         # Playback cursor in frames (int). Read/written by the
         # audio callback thread; main thread reads it on the
@@ -75,6 +75,18 @@ class AudioPlayer(QObject):
         self._cursor_frames: int = 0
         self._total_frames: int = 0
         self._stream = None  # sounddevice OutputStream
+        # Increments each time we build a stream. The finished_callback
+        # closes over its generation id; the handler ignores callbacks
+        # whose generation is stale (i.e. a newer stream has replaced
+        # the one being reported about). This is the fix for the
+        # "click in transcript pauses playback" regression: stop() on
+        # the old stream queues a finished_callback that lands AFTER
+        # seek_ms has already built and started a new stream, and the
+        # handler would otherwise tear that new stream down.
+        self._stream_generation: int = 0
+        # Diagnostic-only: count callbacks since the last play() so we
+        # can log just the first few invocations without flooding.
+        self._callbacks_logged: int = 0
         self._lock = threading.Lock()  # protects _stream lifecycle
         # 100 ms tick for position updates. Runs while playing; one-
         # shot after a seek so the UI snaps to the new position even
@@ -201,11 +213,21 @@ class AudioPlayer(QObject):
         position updates. The previous shape paired tick.stop() inside
         _stop_stream but only put tick.start() in play(); seek_ms
         cycled the stream and the tick stayed dead.
+
+        Each stream gets a unique generation id. The finished_callback
+        closes over it; the main-thread handler compares against the
+        current generation and drops stale callbacks. Without this,
+        a stop() of the old stream + immediate _start_stream race
+        causes the queued finished_callback to tear down the new
+        stream.
         """
         with self._lock:
             if self._stream is not None:
                 self._tick.start()  # be defensive; idempotent if already running
                 return
+            self._stream_generation += 1
+            my_generation = self._stream_generation
+            self._callbacks_logged = 0
             import sounddevice as sd  # noqa: PLC0415
             try:
                 self._stream = sd.OutputStream(
@@ -213,9 +235,14 @@ class AudioPlayer(QObject):
                     channels=1,
                     dtype="float32",
                     callback=self._audio_callback,
-                    finished_callback=self._on_stream_finished,
+                    finished_callback=lambda g=my_generation: self._on_stream_finished(g),
                 )
                 self._stream.start()
+                log.info(
+                    "AudioPlayer: stream started (generation=%d, rate=%d, "
+                    "blocksize=%s)",
+                    my_generation, _PLAYBACK_RATE, self._stream.blocksize,
+                )
             except Exception:
                 log.exception("AudioPlayer: failed to start sounddevice stream")
                 self._stream = None
@@ -237,16 +264,37 @@ class AudioPlayer(QObject):
     def _audio_callback(self, outdata, frames, time_info, status) -> None:
         # Called on sounddevice's PortAudio thread. Must NOT do Qt I/O
         # here -- emit only via the QTimer tick on the main thread.
+        # Diagnostic logging the first few calls so playback issues
+        # are debuggable from the log alone.
         if self._buffer is None or self._total_frames == 0:
             outdata[:] = 0.0
+            if self._callbacks_logged < 3:
+                log.info(
+                    "AudioPlayer cb: empty buffer (frames=%d, total_frames=%d)",
+                    frames, self._total_frames,
+                )
+                self._callbacks_logged += 1
             return
         start = self._cursor_frames
         end = start + frames
         chunk = self._buffer[start:end]
+        if self._callbacks_logged < 3:
+            log.info(
+                "AudioPlayer cb #%d: frames=%d cursor=%d/%d chunk=%d "
+                "status=%s outdata_shape=%s buffer_dtype=%s",
+                self._callbacks_logged, frames, start, self._total_frames,
+                chunk.size, status, outdata.shape, self._buffer.dtype,
+            )
+            self._callbacks_logged += 1
         if chunk.size < frames:
             outdata[: chunk.size, 0] = chunk
             outdata[chunk.size :, 0] = 0.0
             self._cursor_frames = self._total_frames
+            log.info(
+                "AudioPlayer cb: buffer drained at frame=%d/%d (chunk=%d, "
+                "requested=%d); raising CallbackStop",
+                start, self._total_frames, chunk.size, frames,
+            )
             # Signal end-of-stream to PortAudio. CallbackStop drains
             # the device and calls finished_callback once cleanly.
             # Without this, the callback would keep producing silence
@@ -257,13 +305,17 @@ class AudioPlayer(QObject):
         outdata[:, 0] = chunk
         self._cursor_frames = end
 
-    def _on_stream_finished(self) -> None:
+    def _on_stream_finished(self, generation: int) -> None:
         # Called on the PortAudio thread after stop()/close(). Use a
         # zero-delay QTimer to bounce onto the main thread before
-        # emitting Qt signals.
-        QTimer.singleShot(0, self._handle_stream_finished_on_main_thread)
+        # emitting Qt signals. The generation id is passed through
+        # so the main-thread handler can drop stale callbacks.
+        QTimer.singleShot(
+            0,
+            lambda g=generation: self._handle_stream_finished_on_main_thread(g),
+        )
 
-    def _handle_stream_finished_on_main_thread(self) -> None:
+    def _handle_stream_finished_on_main_thread(self, generation: int) -> None:
         """Tear down the stream after sounddevice signals end-of-stream.
 
         Fires from two paths:
@@ -275,10 +327,29 @@ class AudioPlayer(QObject):
         subsequent play() builds a new one. Only emit
         playback_finished in the drained case (Stop already updated
         the UI on the way down).
+
+        The generation check is the load-bearing piece for the
+        seek-during-playback fix: stop() on the old stream queues a
+        finished_callback that arrives AFTER seek_ms has already
+        built a new stream. Without the guard, the queued handler
+        would close the new stream we just started.
         """
+        if generation != self._stream_generation:
+            log.debug(
+                "AudioPlayer: dropping stale finished callback "
+                "(generation=%d, current=%d)",
+                generation, self._stream_generation,
+            )
+            return
         finished_via_drain = (
             self._cursor_frames >= self._total_frames
             and self._total_frames > 0
+        )
+        log.info(
+            "AudioPlayer: stream finished (generation=%d, drained=%s, "
+            "cursor=%d, total=%d)",
+            generation, finished_via_drain,
+            self._cursor_frames, self._total_frames,
         )
         with self._lock:
             if self._stream is not None:

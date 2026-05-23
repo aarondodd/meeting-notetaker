@@ -172,6 +172,46 @@ def test_seek_during_playback_restarts_position_tick(qt_app, tmp_path):
         )
 
 
+def test_stale_finished_callback_does_not_close_new_stream(qt_app, tmp_path):
+    """Regression: stop() on the old stream schedules a queued
+    finished_callback. seek_ms then builds a new stream BEFORE the
+    queued callback fires. The handler must ignore the stale
+    callback (generation mismatch) instead of closing the new
+    stream and stopping the tick."""
+    mic = tmp_path / "mic.wav"
+    _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
+    player = AudioPlayer()
+    player.load(mic, None)
+    qt_app.processEvents()
+
+    fake_stream = mock.MagicMock()
+    fake_stream.active = True
+    fake_sd = mock.MagicMock()
+    fake_sd.OutputStream = mock.MagicMock(return_value=fake_stream)
+
+    with mock.patch.dict(sys.modules, {"sounddevice": fake_sd}):
+        player.play()
+        # After play, generation = 1; we'd be processing finished
+        # callbacks for generation 1.
+        gen_first = player._stream_generation  # noqa: SLF001
+        # Simulate the seek+restart that bumps the generation.
+        player.seek_ms(100)
+        gen_after_seek = player._stream_generation  # noqa: SLF001
+        assert gen_after_seek > gen_first, (
+            "seek-during-playback must bump the generation so the old "
+            "stream's queued finished_callback is treated as stale"
+        )
+        # Now simulate the OLD stream's queued finished callback
+        # arriving on the main thread. Pass the OLD generation.
+        player._handle_stream_finished_on_main_thread(gen_first)  # noqa: SLF001
+        # The NEW stream must still be set; the tick must still be
+        # running.
+        assert player._stream is not None, (  # noqa: SLF001
+            "the stale callback should NOT have torn down the new stream"
+        )
+        assert player._tick.isActive()  # noqa: SLF001
+
+
 def test_play_calls_start_stream(qt_app, tmp_path):
     """play() opens a sounddevice OutputStream. Patch the
     construction so we don't need PortAudio in the test env."""
