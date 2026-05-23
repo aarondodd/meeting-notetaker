@@ -241,7 +241,27 @@ correctness assertions.
 - Hash-gated bundled-prompt upgrade with line-ending normalization so a
   CRLF Windows checkout upgrades cleanly.
 
-### v0.6.3 (current)
+### v0.6.4 (current)
+
+Two small bug fixes against the v0.6.3 preview panes:
+
+- **Right-click Copy Image** in the My Notes / Synthesis / Previous Notes
+  preview now copies the rendered image to the system clipboard. The
+  default QTextBrowser context menu only exposes Copy as a text-selection
+  action, which made the image-copy affordance look broken.
+- **Images clamp to viewport width** in the in-app preview, and to the
+  printer's paint rect (in points) on PDF / hard-copy export. The
+  preview re-clamps on resize so growing the window restores native
+  image size when there's room. Earlier draft pinned doc.pageSize to
+  printer device-pixels and shrank all body text by the
+  printerPageRect / pageSize ratio; the final version leaves pageSize
+  alone so the print engine's own pagination is preserved.
+
+Shared `clamp_image_widths(doc, max_width)` helper lives in
+`ui/markdown_preview.py` and is reused by `PrintTextDocument.
+clamp_images_to_printer(printer)`. 582 tests passing.
+
+### v0.6.3
 
 Synthesis automation lands behind a per-install Settings toggle. When
 enabled, the Generate Synthesis Prompt + Paste Response Back buttons
