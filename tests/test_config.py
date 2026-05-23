@@ -212,6 +212,38 @@ def test_resolved_cpu_threads_explicit_passes_through():
     assert cfg.transcription.resolved_cpu_threads(cpu_count=64) == 4
 
 
+def test_retain_format_defaults_to_opus(isolated_data_dir):
+    """Opus is the default retained-recording format -- best size, near-
+    transparent for speech. Pin so a refactor doesn't accidentally
+    change the default user experience."""
+    cfg = Config()
+    assert cfg.audio.retain_format == "opus"
+    assert cfg.validate() == []
+
+
+def test_retain_format_round_trip(isolated_data_dir):
+    cfg = Config()
+    cfg.audio.retain_format = "flac"
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.audio.retain_format == "flac"
+
+
+def test_retain_format_wav_is_valid(isolated_data_dir):
+    """The 'wav' value is the escape hatch (no re-encode); the validator
+    must accept it."""
+    cfg = Config()
+    cfg.audio.retain_format = "wav"
+    assert cfg.validate() == []
+
+
+def test_retain_format_rejects_unknown(isolated_data_dir):
+    cfg = Config()
+    cfg.audio.retain_format = "mp3"
+    errors = cfg.validate()
+    assert any("retain_format" in e for e in errors)
+
+
 def test_synthesis_defaults(isolated_data_dir):
     """Automation feature must default OFF; target must default to claude."""
     cfg = Config()

@@ -61,11 +61,18 @@ from .paths import config_path
 
 VALID_MODEL_SIZES = ("tiny.en", "base.en", "small.en", "medium.en")
 VALID_LLM_TARGETS = ("claude", "copilot")
+VALID_RETAIN_FORMATS = ("opus", "flac", "wav")
 
 
 @dataclass
 class AudioConfig:
     retain_audio_default: bool = False
+    # Saved-recording format for sessions where retain_audio is True.
+    # opus = ~96% size reduction vs WAV, perceptually transparent for
+    # speech. flac = lossless, ~50% reduction. wav = no re-encode, keep
+    # the source file as-is (matches v0.6.4 behavior, kept as an
+    # escape hatch).
+    retain_format: str = "opus"
     vad_enabled: bool = True
     vad_min_silence_ms: int = 500
     mic_device_name: str = ""
@@ -215,6 +222,11 @@ class Config:
             errors.append(
                 f"audio.vad_min_silence_ms must be between 50 and 5000, "
                 f"got {self.audio.vad_min_silence_ms}"
+            )
+        if self.audio.retain_format not in VALID_RETAIN_FORMATS:
+            errors.append(
+                f"audio.retain_format must be one of {VALID_RETAIN_FORMATS}, "
+                f"got {self.audio.retain_format!r}"
             )
         if not (0 <= self.transcription.cpu_threads <= 128):
             errors.append(

@@ -241,6 +241,25 @@ class SettingsDialog(QDialog):
         )
         audio_form.addRow(self._retain_default)
 
+        # Retained-recording format. Opus shaves ~96% off WAV at no
+        # practical quality loss for speech; FLAC is lossless but
+        # ~50% only; WAV is the v0.6.4 escape hatch.
+        self._retain_format = QComboBox(self)
+        self._retain_format.addItem("Opus (best size, lossy)", "opus")
+        self._retain_format.addItem("FLAC (lossless)", "flac")
+        self._retain_format.addItem("WAV (no re-encode)", "wav")
+        _format_to_index = {"opus": 0, "flac": 1, "wav": 2}
+        self._retain_format.setCurrentIndex(
+            _format_to_index.get(config.audio.retain_format, 0)
+        )
+        self._retain_format.setToolTip(
+            "Format used for retained recordings. Opus is 24x smaller "
+            "than WAV with near-transparent quality for speech. FLAC is "
+            "exactly lossless but only 2x smaller. WAV keeps the source "
+            "file unchanged (matches v0.6.4 behavior)."
+        )
+        audio_form.addRow("Retained format:", self._retain_format)
+
         self._vad_enabled = QCheckBox("Enable VAD trimming (recommended)", self)
         self._vad_enabled.setChecked(config.audio.vad_enabled)
         self._vad_enabled.setToolTip(
@@ -617,6 +636,7 @@ class SettingsDialog(QDialog):
         self._config.transcription.cpu_threads = self._cpu_threads_spin.value()
         self._config.transcription.num_workers = self._num_workers_spin.value()
         self._config.audio.retain_audio_default = self._retain_default.isChecked()
+        self._config.audio.retain_format = self._retain_format.currentData() or "opus"
         self._config.audio.vad_enabled = self._vad_enabled.isChecked()
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()
         self._config.audio.mic_device_name = self._mic_picker.currentData() or ""

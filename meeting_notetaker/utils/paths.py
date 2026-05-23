@@ -51,6 +51,43 @@ def session_audio_dir(session_id: str) -> Path:
     return path
 
 
+# Audio file basenames the recorder writes plus the suffixes a retained
+# session may end up with after re-encoding. Order within each tuple
+# is search order: WAV first (still present mid-retention or for the
+# "wav" retain_format), then compressed.
+_AUDIO_BASENAMES = ("mic", "sys")
+_AUDIO_SUFFIXES = (".wav", ".opus", ".flac")
+
+
+def session_audio_files(session_id: str) -> list[Path]:
+    """Return every audio file on disk for this session, mic+sys.
+
+    Each session can have a mic and a system-loopback recording (one,
+    both, or neither). Each may be in its original .wav form or
+    re-encoded to .opus / .flac, depending on retain_format. We search
+    the audio dir and return whichever files actually exist, in stable
+    order (mic before sys).
+
+    Returns an empty list when no audio is retained -- safe to call
+    on any session.
+    """
+    audio_dir = session_dir(session_id) / "audio"
+    if not audio_dir.is_dir():
+        return []
+    out: list[Path] = []
+    for base in _AUDIO_BASENAMES:
+        for suffix in _AUDIO_SUFFIXES:
+            candidate = audio_dir / f"{base}{suffix}"
+            if candidate.exists():
+                out.append(candidate)
+                break  # one extension per base; don't double-count
+    return out
+
+
+def has_retained_audio(session_id: str) -> bool:
+    return bool(session_audio_files(session_id))
+
+
 def models_dir() -> Path:
     path = app_data_dir() / "models"
     path.mkdir(parents=True, exist_ok=True)

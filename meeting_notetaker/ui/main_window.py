@@ -39,6 +39,7 @@ from ..models.session import (
     Session,
 )
 from ..utils.icons import app_icon
+from ..utils.paths import has_retained_audio
 from .session_view import SessionView
 from .status_indicators import SegmentState, StatusSegment
 
@@ -78,6 +79,8 @@ class MainWindow(QMainWindow):
     delete_sessions_requested = pyqtSignal(list)   # list of session_ids
     rename_session_requested = pyqtSignal(str, str)  # session_id, new_title
     edit_session_timestamp_requested = pyqtSignal(str, str)  # session_id, new_created_at_iso (UTC)
+    open_recording_requested = pyqtSignal(str)     # session_id
+    delete_recording_requested = pyqtSignal(str)   # session_id
     session_selected = pyqtSignal(str)             # session_id
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -306,14 +309,43 @@ class MainWindow(QMainWindow):
         action_rename.setEnabled(len(selected) == 1)
         action_edit_timestamp = menu.addAction("Edit timestamp...")
         action_edit_timestamp.setEnabled(len(selected) == 1)
+        # Recording actions only make sense on a single session that
+        # actually has audio retained on disk -- check the disk rather
+        # than the session's has_audio flag since the flag could lag
+        # behind a manual delete.
+        single_id = selected[0].data(_COL_TITLE, Qt.ItemDataRole.UserRole) \
+            if len(selected) == 1 else None
+        has_audio = bool(single_id) and has_retained_audio(single_id)
+        action_open_recording = menu.addAction("Open recording in media player")
+        action_open_recording.setEnabled(has_audio)
+        action_delete_recording = menu.addAction("Delete recording...")
+        action_delete_recording.setEnabled(has_audio)
+        menu.addSeparator()
         action_delete = menu.addAction("Delete...")
         action = menu.exec(self._list.viewport().mapToGlobal(pos))
         if action is action_rename:
             self._rename_selected()
         elif action is action_edit_timestamp:
             self._edit_timestamp_selected()
+        elif action is action_open_recording and single_id:
+            self.open_recording_requested.emit(single_id)
+        elif action is action_delete_recording and single_id:
+            self._confirm_delete_recording(single_id)
         elif action is action_delete:
             self._delete_selected()
+
+    def _confirm_delete_recording(self, session_id: str) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "Delete recording",
+            "Delete the saved audio for this session?\n\n"
+            "The transcript and notes are kept. Only the recording "
+            "(mic + system audio files) is removed. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm == QMessageBox.StandardButton.Yes:
+            self.delete_recording_requested.emit(session_id)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         # Treat any double-click as "rename this session". Other columns

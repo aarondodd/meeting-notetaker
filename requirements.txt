@@ -2,6 +2,11 @@ PyQt6>=6.5.0
 PyAudio>=0.2.14
 PyAudioWPatch>=0.2.12.7; sys_platform == 'win32'
 faster-whisper>=1.1.0
+# PyAV (ffmpeg/libav bindings). Used by faster-whisper transitively for
+# audio decoding and by audio/encode.py directly to re-encode retained
+# WAVs to Opus / FLAC. Pinned explicitly so we don't silently lose the
+# dep if faster-whisper changes its decoding backend.
+av>=11.0
 numpy>=1.24.0
 # webrtcvad-wheels is a Windows-wheel fork of webrtcvad. Provides the
 # same `webrtcvad` import; published as a different PyPI name because

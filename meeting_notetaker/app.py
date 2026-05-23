@@ -794,6 +794,8 @@ class MainApp(QObject):
         self.window.delete_sessions_requested.connect(self._on_delete_sessions)
         self.window.rename_session_requested.connect(self._on_rename_session)
         self.window.edit_session_timestamp_requested.connect(self._on_edit_session_timestamp)
+        self.window.open_recording_requested.connect(self._on_open_recording)
+        self.window.delete_recording_requested.connect(self._on_delete_recording)
 
         self.tray.open_main_window.connect(self._foreground_window)
         self.tray.new_session_requested.connect(self._on_new_session)
@@ -1470,6 +1472,49 @@ class MainApp(QObject):
         if sv._session is not None and sv._session.id == session_id:
             sv.set_created_at(new_created_at_iso)
         self.window.status("Session timestamp updated.", timeout_ms=4000)
+
+    # ---- recording context-menu actions -----------------------------------
+
+    def _on_open_recording(self, session_id: str) -> None:
+        """Launch the OS default media player on the session's recording.
+
+        Tries the mic file first (always present when audio is retained),
+        falls back to whichever exists in session_audio_files(). The
+        user can replay either side from the player's open-file dialog;
+        we just need to give them an entry point.
+        """
+        from PyQt6.QtCore import QUrl  # noqa: PLC0415
+        from PyQt6.QtGui import QDesktopServices  # noqa: PLC0415
+        from .utils.paths import session_audio_files  # noqa: PLC0415
+        files = session_audio_files(session_id)
+        if not files:
+            self.window.status("No recording on disk for this session.", timeout_ms=5000)
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(files[0]))):
+            self.window.status(
+                f"Could not open {files[0].name} (no default player?)",
+                timeout_ms=5000,
+            )
+
+    def _on_delete_recording(self, session_id: str) -> None:
+        """Delete the session's audio files; keep transcript + notes."""
+        from .utils.paths import session_audio_files  # noqa: PLC0415
+        removed = 0
+        for path in session_audio_files(session_id):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                log.exception("could not unlink recording %s", path)
+        # Flip the on-disk has_audio flag so the session-list audio
+        # column matches reality, and so a future Open in player call
+        # has nothing to look at.
+        self.store.update_session(session_id, has_audio=False)
+        self._refresh_session_list()
+        self.window.status(
+            f"Deleted recording ({removed} file{'s' if removed != 1 else ''}).",
+            timeout_ms=5000,
+        )
 
     # ---- bulk delete -------------------------------------------------------
 
