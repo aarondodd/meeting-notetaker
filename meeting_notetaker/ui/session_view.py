@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QPlainTextEdit,
     QVBoxLayout,
@@ -42,7 +43,9 @@ from ..utils.paths import session_dir
 from .attendee_sidebar import AttendeeSidebar
 from .live_notes_widget import LiveNotesWidget
 from .previous_notes_widget import PreviousNotesWidget
+from .scaled_image_label import ScaledImageLabel
 from .screencap_sidebar import ScreencapSidebar
+from .screenshot_rail import ScreenshotRail
 from .slides_widget import SlidesWidget
 from .transcript_player_bar import TranscriptPlayerBar
 
@@ -349,6 +352,12 @@ class SessionView(QWidget):
         # synthesis a user is reviewing.
         self._slides_view = SlidesWidget(self)
         self._slides_view.delete_requested.connect(self._on_screenshot_delete_requested)
+        # The Slides tab carries its own player bar. Forward its
+        # signals up so MainApp's existing transcript_* handlers wire
+        # one player to both bars.
+        self._slides_view.play_clicked.connect(self._on_slides_play_clicked)
+        self._slides_view.pause_clicked.connect(self._on_slides_pause_clicked)
+        self._slides_view.seek_ms_requested.connect(self._on_slides_seek_requested)
         self._tabs.addTab(self._slides_view, "Slides")
 
         # Previous Notes: list of archived synthesis versions + a
@@ -364,23 +373,33 @@ class SessionView(QWidget):
         )
         self._tabs.addTab(self._previous_view, "Previous Notes")
 
-        # Transcript pane: editor + a playback toolbar below. Wrapped
-        # in a QWidget so the QTabWidget treats them as one tab.
+        # Transcript pane has two layouts living in a QStackedWidget:
+        #
+        # Idle layout (default + paused):
+        #   QSplitter horizontal:
+        #     transcript editor (with click-to-seek + highlight)
+        #     ScreenshotRail (hidden if no screenshots this session)
+        #
+        # Playback layout (active while audio is playing):
+        #   QSplitter vertical:
+        #     ScaledImageLabel showing the current screenshot
+        #     transcript editor (re-parented from the idle page)
+        #
+        # The same _ClickableTranscriptView instance lives in both
+        # layouts via re-parenting; that keeps the highlight + scroll
+        # state intact as the layout flips. The player bar sits below
+        # both layouts and is shared too.
         transcript_page = QWidget(self)
         transcript_layout = QVBoxLayout(transcript_page)
         transcript_layout.setContentsMargins(0, 0, 0, 0)
         transcript_layout.setSpacing(4)
+
         self._transcript_view = _ClickableTranscriptView(transcript_page)
         self._transcript_view.setReadOnly(True)
         self._transcript_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         mono = QFont("Consolas")
         mono.setStyleHint(QFont.StyleHint.Monospace)
         self._transcript_view.setFont(mono)
-        # An empty transcript pane could read as a bug. Set placeholder
-        # text that explains the expected state: the transcript only
-        # populates after the recording is stopped and the batch pass
-        # has finished. With capture-only mode being the v0.6.5 default,
-        # this is the normal state during a recording.
         self._transcript_view.setPlaceholderText(
             "Transcription will appear here once the recording is stopped "
             "and the post-meeting transcription pass has finished.\n\n"
@@ -389,18 +408,74 @@ class SessionView(QWidget):
             "the meeting."
         )
         self._transcript_view.line_clicked.connect(self._on_transcript_line_clicked)
-        transcript_layout.addWidget(self._transcript_view, 1)
+
+        # Idle layout: editor + side rail.
+        self._transcript_idle_page = QWidget(transcript_page)
+        idle_layout = QHBoxLayout(self._transcript_idle_page)
+        idle_layout.setContentsMargins(0, 0, 0, 0)
+        idle_layout.setSpacing(0)
+        self._transcript_idle_splitter = QSplitter(
+            Qt.Orientation.Horizontal, self._transcript_idle_page,
+        )
+        self._transcript_idle_splitter.setChildrenCollapsible(False)
+        self._transcript_idle_splitter.addWidget(self._transcript_view)
+        self._screenshot_rail = ScreenshotRail(self._transcript_idle_splitter)
+        self._screenshot_rail.set_transcript_view(self._transcript_view)
+        self._screenshot_rail.delete_requested.connect(
+            self._on_screenshot_delete_requested
+        )
+        self._screenshot_rail.setVisible(False)  # Off until any anchors arrive.
+        self._transcript_idle_splitter.addWidget(self._screenshot_rail)
+        self._transcript_idle_splitter.setStretchFactor(0, 3)
+        self._transcript_idle_splitter.setStretchFactor(1, 0)
+        idle_layout.addWidget(self._transcript_idle_splitter, 1)
+
+        # Playback layout: image on top, transcript below.
+        self._transcript_playback_page = QWidget(transcript_page)
+        playback_layout = QVBoxLayout(self._transcript_playback_page)
+        playback_layout.setContentsMargins(0, 0, 0, 0)
+        playback_layout.setSpacing(0)
+        self._transcript_playback_splitter = QSplitter(
+            Qt.Orientation.Vertical, self._transcript_playback_page,
+        )
+        self._transcript_playback_splitter.setChildrenCollapsible(False)
+        self._playback_image = ScaledImageLabel(self._transcript_playback_splitter)
+        self._transcript_playback_splitter.addWidget(self._playback_image)
+        # The editor is re-parented into this splitter when we swap
+        # to playback layout. We add a placeholder so the splitter's
+        # second slot is reserved; _enter_playback_layout swaps the
+        # real editor in.
+        self._playback_editor_placeholder = QWidget(self._transcript_playback_splitter)
+        self._transcript_playback_splitter.addWidget(self._playback_editor_placeholder)
+        self._transcript_playback_splitter.setStretchFactor(0, 3)
+        self._transcript_playback_splitter.setStretchFactor(1, 2)
+        playback_layout.addWidget(self._transcript_playback_splitter, 1)
+
+        self._transcript_layout_stack = QStackedWidget(transcript_page)
+        self._transcript_layout_stack.addWidget(self._transcript_idle_page)
+        self._transcript_layout_stack.addWidget(self._transcript_playback_page)
+        transcript_layout.addWidget(self._transcript_layout_stack, 1)
+
         self._player_bar = TranscriptPlayerBar(transcript_page)
         self._player_bar.play_clicked.connect(self._on_player_bar_play_clicked)
         self._player_bar.pause_clicked.connect(self._on_player_bar_pause_clicked)
         self._player_bar.seek_ms_requested.connect(self._on_player_bar_seek_requested)
         transcript_layout.addWidget(self._player_bar, 0)
         self._tabs.addTab(transcript_page, "Transcript")
+
         # Per-line timestamp index. Built each time the transcript text
         # changes; consumed by the position-driven highlight and the
         # click-to-seek path. Each tuple is (start_ms, block_number).
         self._transcript_timestamps: list[tuple[int, int]] = []
         self._current_highlight_block: Optional[int] = None
+        # Screenshot offsets relative to recording start, sorted
+        # ascending by offset. Populated by MainApp via
+        # set_screenshot_offsets() on session select + after capture /
+        # delete.
+        self._screenshot_offsets: list[tuple[Path, int]] = []
+        # Tracks the currently-shown screenshot in the playback top
+        # pane so we only call set_image_path on actual changes.
+        self._current_playback_screenshot: Optional[Path] = None
 
         # Horizontal container holding the tab widget on the left and the
         # click-to-tag attendee sidebar on the right. The sidebar is
@@ -475,8 +550,10 @@ class SessionView(QWidget):
             self._state_label.setText("")
             self._raw_transcript_text = ""
             self._transcript_view.setPlainText("")
+            self._screenshot_offsets = []
             self._refresh_transcript_timestamps()
             self.set_player_enabled(False)
+            self._leave_playback_layout()
             self._notes_view.set_session_dir(None)
             self._set_notes_text("")
             self._previous_view.set_session_id("")
@@ -672,21 +749,25 @@ class SessionView(QWidget):
     # ---- transcript playback API used by MainApp -------------------------
 
     def set_player_enabled(self, enabled: bool) -> None:
-        """Master enable for the player bar.
+        """Master enable for the player bars.
 
         MainApp calls this with True when the active session has
         retained audio (the player has something to play) and False
-        otherwise.
+        otherwise. Forwards to both the Transcript pane's bar AND the
+        Slides tab's bar so a single state controls both surfaces.
         """
         self._player_bar.set_enabled_state(enabled)
+        self._slides_view.set_player_enabled(enabled)
         if not enabled:
             self._clear_transcript_highlight()
 
     def set_player_total_ms(self, total_ms: int) -> None:
         self._player_bar.set_total_ms(total_ms)
+        self._slides_view.set_player_total_ms(total_ms)
 
     def set_player_position_ms(self, ms: int) -> None:
         self._player_bar.set_position_ms(ms)
+        self._slides_view.set_player_position_ms(ms)
         # Highlight the transcript line that owns this timestamp. We
         # do this on every position update so the highlight follows
         # playback in real time. Skip when the user is mid-drag --
@@ -694,9 +775,35 @@ class SessionView(QWidget):
         if self._player_bar.is_user_dragging():
             return
         self._refresh_transcript_highlight(ms)
+        # Drive the playback layout's top image off the same position.
+        # In idle layout this is a no-op (the helper short-circuits).
+        self._refresh_playback_image(ms)
 
     def set_player_is_playing(self, playing: bool) -> None:
         self._player_bar.set_is_playing(playing)
+        self._slides_view.set_player_is_playing(playing)
+        if playing:
+            self._enter_playback_layout()
+        else:
+            # Both pause and finished end up here. Both should revert
+            # the layout per Aaron's "at end of playback, revert to
+            # normal view".
+            self._leave_playback_layout()
+
+    def _on_slides_play_clicked(self) -> None:
+        if self._session is None:
+            return
+        self.transcript_play_clicked.emit(self._session.id)
+
+    def _on_slides_pause_clicked(self) -> None:
+        if self._session is None:
+            return
+        self.transcript_pause_clicked.emit(self._session.id)
+
+    def _on_slides_seek_requested(self, ms: int) -> None:
+        if self._session is None:
+            return
+        self.transcript_seek_ms_requested.emit(self._session.id, int(ms))
 
     def _on_player_bar_play_clicked(self) -> None:
         if self._session is None:
@@ -728,12 +835,16 @@ class SessionView(QWidget):
         """Rebuild the timestamp index from the transcript view text.
 
         Called whenever set_transcript_text / set_session updates the
-        displayed text. Click-to-seek and position-driven highlight
-        both consume this list.
+        displayed text. Click-to-seek, position-driven highlight, and
+        the screenshot rail all consume this list (transcript blocks
+        are where the rail anchors thumbnails).
         """
         text = self._transcript_view.toPlainText()
         self._transcript_timestamps = _parse_transcript_timestamps(text)
         self._clear_transcript_highlight()
+        # Rail anchors depend on the timestamp list -- a re-parse means
+        # a re-anchor.
+        self._refresh_screenshot_rail()
 
     def _refresh_transcript_highlight(self, position_ms: int) -> None:
         block_number = _block_for_position_ms(
@@ -767,6 +878,97 @@ class SessionView(QWidget):
     def _clear_transcript_highlight(self) -> None:
         self._current_highlight_block = None
         self._transcript_view.setExtraSelections([])
+
+    # ---- screenshots <-> transcript wiring -------------------------------
+
+    def set_screenshot_offsets(self, offsets: list[tuple[Path, int]]) -> None:
+        """Pin the (path, offset_ms) list MainApp computed at session-load.
+
+        Triggers a rebuild of the side rail, pushes the same list to
+        the Slides tab so its position-driven advance + click-to-seek
+        share one source of truth, and refreshes the playback top
+        image against the current player position.
+        """
+        self._screenshot_offsets = list(offsets)
+        self._slides_view.set_screenshot_offsets(self._screenshot_offsets)
+        self._refresh_screenshot_rail()
+        # If we're in playback layout, refresh the top image against
+        # the player's current position so a fresh capture surfaces
+        # immediately.
+        if self._is_in_playback_layout():
+            self._refresh_playback_image(self._player_bar._slider.value())  # noqa: SLF001
+
+    def _refresh_screenshot_rail(self) -> None:
+        """Recompute the screenshot -> block anchors and push to the rail."""
+        if not self._screenshot_offsets or not self._transcript_timestamps:
+            self._screenshot_rail.set_anchors([])
+            self._screenshot_rail.setVisible(False)
+            return
+        from ..screencap.timestamps import match_screenshots_to_blocks  # noqa: PLC0415
+        anchors = match_screenshots_to_blocks(
+            self._screenshot_offsets,
+            self._transcript_timestamps,
+        )
+        self._screenshot_rail.set_anchors(anchors)
+        self._screenshot_rail.setVisible(bool(anchors))
+
+    # ---- layout swap (idle <-> playback) ---------------------------------
+
+    def _is_in_playback_layout(self) -> bool:
+        return self._transcript_layout_stack.currentWidget() is self._transcript_playback_page
+
+    def _enter_playback_layout(self) -> None:
+        """Swap the transcript pane into the screenshare-style layout.
+
+        No-op when there are no screenshots for this session -- the
+        layout swap would just produce an empty top pane. Audio still
+        plays in idle layout in that case.
+        """
+        if not self._screenshot_offsets:
+            return  # Stay in idle layout; audio still plays beneath.
+        if self._is_in_playback_layout():
+            return
+        # Move the editor from the idle splitter into the playback
+        # splitter. setParent + addWidget keeps the QPlainTextEdit's
+        # contents + scroll + selection state intact.
+        self._transcript_playback_splitter.insertWidget(1, self._transcript_view)
+        self._playback_editor_placeholder.hide()
+        self._transcript_layout_stack.setCurrentWidget(self._transcript_playback_page)
+
+    def _leave_playback_layout(self) -> None:
+        if not self._is_in_playback_layout():
+            return
+        # Move the editor back into the idle splitter.
+        self._transcript_idle_splitter.insertWidget(0, self._transcript_view)
+        self._playback_editor_placeholder.show()
+        self._transcript_layout_stack.setCurrentWidget(self._transcript_idle_page)
+        self._playback_image.clear_image()
+        self._current_playback_screenshot = None
+
+    def _refresh_playback_image(self, position_ms: int) -> None:
+        """Sticky-image lookup against the screenshot offsets list.
+
+        If the position precedes every screenshot, clear the top
+        pane (Aaron's "if no image is relevant at the start, don't
+        show yet"). Otherwise show the latest screenshot whose
+        offset <= position; the pane stays on that image until the
+        next capture's offset is reached.
+        """
+        if not self._is_in_playback_layout():
+            return
+        from ..screencap.timestamps import current_screenshot_for_position  # noqa: PLC0415
+        match = current_screenshot_for_position(
+            self._screenshot_offsets, position_ms,
+        )
+        if match is None:
+            if self._playback_image.has_image():
+                self._playback_image.clear_image()
+            self._current_playback_screenshot = None
+            return
+        if match == self._current_playback_screenshot:
+            return
+        self._playback_image.set_image_path(match)
+        self._current_playback_screenshot = match
 
     def update_batch_progress(self, pct: int) -> None:
         """Reflect background batch-refinement progress in the state label."""

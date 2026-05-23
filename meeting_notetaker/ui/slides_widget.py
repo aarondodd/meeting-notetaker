@@ -19,6 +19,9 @@ from typing import Optional
 
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QImage, QPixmap
+from .scaled_image_label import ScaledImageLabel
+from .transcript_player_bar import TranscriptPlayerBar
+
 from PyQt6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -28,7 +31,6 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -40,14 +42,37 @@ _THUMB_H = 100
 
 
 class SlidesWidget(QWidget):
-    """Replaces a one-pane image dump with a thumbnail + full-view UI."""
+    """Thumbnail + full-view UI plus an audio player bar.
+
+    The player bar at the bottom is the same TranscriptPlayerBar
+    component the Transcript tab uses. MainApp drives both bars from
+    a single AudioPlayer instance so playback state stays in sync
+    across the two tabs.
+
+    While playback is active, the full-view auto-advances to the
+    screenshot whose recording-relative offset is the latest <=
+    current playback position. Clicking a thumbnail (or its full-view)
+    while audio is loaded seeks the player to that screenshot's
+    timestamp -- the metaphor is "jump to the moment this slide was
+    being shown".
+    """
 
     delete_requested = pyqtSignal(Path)  # MainApp does the unlink
+    play_clicked = pyqtSignal()
+    pause_clicked = pyqtSignal()
+    seek_ms_requested = pyqtSignal(int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._paths: list[Path] = []
         self._current_index: int = 0  # used while in full mode
+        # (path, offset_ms) per screenshot. Empty until MainApp pushes
+        # the offsets via set_screenshot_offsets. The player-driven
+        # auto-advance bisects this list on each position tick.
+        self._offsets: list[tuple[Path, int]] = []
+        # Whether MainApp's AudioPlayer has audio loaded for this
+        # session. Drives the click-thumbnail-seeks-audio behavior.
+        self._audio_available = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -101,7 +126,7 @@ class SlidesWidget(QWidget):
         self._caption.setStyleSheet("color: gray; font-size: 11px;")
         full_layout.addWidget(self._caption)
 
-        self._full_view = _ScaledImageLabel(full_page)
+        self._full_view = ScaledImageLabel(full_page)
         self._full_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._full_view.customContextMenuRequested.connect(
             self._on_full_context_menu
@@ -112,8 +137,67 @@ class SlidesWidget(QWidget):
         self._stack.addWidget(full_page)
         outer.addWidget(self._stack)
 
+        # Player bar at the bottom. Disabled by default; MainApp
+        # flips it on via set_player_enabled when retained audio is
+        # present.
+        self._player_bar = TranscriptPlayerBar(self)
+        self._player_bar.play_clicked.connect(self.play_clicked.emit)
+        self._player_bar.pause_clicked.connect(self.pause_clicked.emit)
+        self._player_bar.seek_ms_requested.connect(self.seek_ms_requested.emit)
+        outer.addWidget(self._player_bar)
+
     # ------------------------------------------------------------------
     # Public API
+
+    def set_screenshot_offsets(self, offsets: list[tuple[Path, int]]) -> None:
+        """Pin (path, recording_offset_ms) for each screenshot.
+
+        Used to drive the position-tick auto-advance (latest screenshot
+        with offset <= position) and the click-thumbnail-to-seek
+        action.
+        """
+        self._offsets = list(offsets)
+
+    def set_player_enabled(self, enabled: bool) -> None:
+        self._player_bar.set_enabled_state(enabled)
+        self._audio_available = bool(enabled)
+
+    def set_player_total_ms(self, total_ms: int) -> None:
+        self._player_bar.set_total_ms(total_ms)
+
+    def set_player_position_ms(self, ms: int) -> None:
+        self._player_bar.set_position_ms(ms)
+        # Auto-advance the displayed thumbnail / full-view to track
+        # the playback position. Only kicks in when there are offsets
+        # to consult; without them the slides tab is a passive grid.
+        if not self._offsets:
+            return
+        from ..screencap.timestamps import current_screenshot_for_position  # noqa: PLC0415
+        match = current_screenshot_for_position(self._offsets, ms)
+        if match is None:
+            return
+        try:
+            idx = self._paths.index(match)
+        except ValueError:
+            return
+        # In full-view mode, advance to the matched image; in grid
+        # mode, select it (visual highlight). Don't open full-view
+        # automatically from grid -- that would steal focus mid-
+        # browse.
+        if self._stack.currentIndex() == 1:  # full view
+            if idx != self._current_index:
+                self._current_index = idx
+                self._refresh_full_view()
+        else:
+            if self._list.currentRow() != idx:
+                self._list.blockSignals(True)
+                try:
+                    self._list.setCurrentRow(idx)
+                finally:
+                    self._list.blockSignals(False)
+
+    def set_player_is_playing(self, playing: bool) -> None:
+        self._player_bar.set_is_playing(playing)
 
     def set_screenshots(self, paths: list[Path]) -> None:
         """Repopulate the grid + reset to grid mode."""
@@ -143,7 +227,25 @@ class SlidesWidget(QWidget):
     # Grid handlers
 
     def _on_thumb_clicked(self, item: QListWidgetItem) -> None:
-        self._show_full_for(self._list.row(item))
+        idx = self._list.row(item)
+        self._show_full_for(idx)
+        # If audio is loaded for this session AND we know this
+        # thumbnail's recording-relative offset, seek the player to
+        # that moment. Lines up with the metaphor: clicking a slide
+        # in a recording playback means "jump to when this slide
+        # was being shown".
+        self._maybe_seek_to_thumb(idx)
+
+    def _maybe_seek_to_thumb(self, idx: int) -> None:
+        if not self._audio_available or not self._offsets:
+            return
+        if not (0 <= idx < len(self._paths)):
+            return
+        target_path = self._paths[idx]
+        for path, offset_ms in self._offsets:
+            if path == target_path:
+                self.seek_ms_requested.emit(max(0, int(offset_ms)))
+                return
 
     def _on_thumb_double_clicked(self, item: QListWidgetItem) -> None:
         # Single-click already opens; double-click is intentionally a
@@ -257,45 +359,6 @@ class SlidesWidget(QWidget):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-
-
-class _ScaledImageLabel(QLabel):
-    """QLabel that keeps its pixmap fit-to-width on resize.
-
-    Plain QLabel renders the pixmap at native size, which makes the
-    full-view image either spill out of the pane or render with a
-    huge margin. Scaling on resize gives the user a "open this
-    screenshot inline at viewport size" experience.
-    """
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self._source: Optional[QPixmap] = None
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumHeight(200)
-        self.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
-        )
-
-    def set_image_path(self, path: Path) -> None:
-        pix = QPixmap(str(path))
-        self._source = None if pix.isNull() else pix
-        self._refresh()
-
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
-        self._refresh()
-
-    def _refresh(self) -> None:
-        if self._source is None:
-            self.clear()
-            return
-        scaled = self._source.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.setPixmap(scaled)
 
 
 def _pretty_label(path: Path) -> str:

@@ -910,6 +910,10 @@ class MainApp(QObject):
         # there's nothing on disk; loading itself is a no-op for
         # already-loaded sessions.
         self._maybe_load_player_for_session(session_id)
+        # Push the screenshot offset list so the rail + Slides tab
+        # can anchor + auto-advance against this session's recording-
+        # start moment.
+        self._push_screenshot_offsets(session_id)
         # Populate the prompt-template picker with the available
         # templates + restore the session's saved choice.
         templates = [t.name for t in prompts_mod.list_templates()]
@@ -1605,6 +1609,10 @@ class MainApp(QObject):
             )
             return
         self.window.session_view.refresh_screenshots()
+        # Re-push offsets so the new capture anchors into the rail
+        # and shows up as a candidate for the playback-mode auto-
+        # advance.
+        self._push_screenshot_offsets(session_id)
         if insert:
             # Relative path anchored at the session dir so the My Notes
             # preview's setSearchPaths resolves it.
@@ -1624,6 +1632,9 @@ class MainApp(QObject):
         # the user has navigated away, the next set_session will pick
         # up the new state from disk.
         self.window.session_view.refresh_screenshots()
+        # Re-push offsets so the rail and Slides-tab auto-advance
+        # drop the deleted screenshot from their anchor list.
+        self._push_screenshot_offsets(session_id)
         self.window.status(
             f"Deleted screenshot: {path.name}", timeout_ms=4000,
         )
@@ -1642,6 +1653,23 @@ class MainApp(QObject):
         player.playback_finished.connect(self._on_player_finished)
         self._audio_player = player
         return player
+
+    def _push_screenshot_offsets(self, session_id: str) -> None:
+        """Compute (path, offset_ms) for every screenshot + push to view.
+
+        Called on session select AND after capture / delete so both
+        the side rail and the Slides tab's auto-advance stay in sync
+        with whatever's on disk.
+        """
+        from .screencap.timestamps import screenshot_offsets  # noqa: PLC0415
+        from .utils.paths import list_screenshots  # noqa: PLC0415
+        session = self.store.get_session(session_id)
+        if session is None:
+            self.window.session_view.set_screenshot_offsets([])
+            return
+        paths = list_screenshots(session_id)
+        offsets = screenshot_offsets(paths, session.started_at)
+        self.window.session_view.set_screenshot_offsets(offsets)
 
     def _maybe_load_player_for_session(self, session_id: str) -> None:
         """Load the session's retained audio into the player, if any.
