@@ -873,7 +873,7 @@ flowchart LR
     state{State<br/>COMPLETE/ERROR?}
     skip[Don't load player]
     decode[Decode mic + sys<br/>via PyAV<br/>resample to 16k mono]
-    mix[Mix to float32 buffer<br/>(end-aligned, leading pad)]
+    mix["Mix to float32 buffer<br/>(end-aligned, leading pad)"]
     ready[Player ready,<br/>total_ms known]
     click_play[User clicks Play]
     stream[sounddevice OutputStream<br/>float32, callback-driven]
