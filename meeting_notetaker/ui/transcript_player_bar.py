@@ -95,9 +95,15 @@ class TranscriptPlayerBar(QWidget):
         self._refresh_time_label(int(ms))
 
     def set_is_playing(self, playing: bool) -> None:
-        """Flip the toggle button label."""
+        """Flip the toggle button label.
+
+        Labels "Play" / "Stop" rather than "Play" / "Pause" -- there's
+        no separate Resume affordance, so a Stop press keeps the
+        playhead where it is and the next Play picks up from the same
+        spot. Aaron preferred Stop as the clearer verb.
+        """
         self._is_playing = bool(playing)
-        self._play_btn.setText("Pause" if self._is_playing else "Play")
+        self._play_btn.setText("Stop" if self._is_playing else "Play")
 
     def is_user_dragging(self) -> bool:
         return self._slider.isSliderDown()

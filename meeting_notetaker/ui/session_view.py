@@ -468,6 +468,15 @@ class SessionView(QWidget):
         # click-to-seek path. Each tuple is (start_ms, block_number).
         self._transcript_timestamps: list[tuple[int, int]] = []
         self._current_highlight_block: Optional[int] = None
+        # When the user clicks a transcript line we seek the player
+        # to (line.t_start - 10s) for the lead-in. The position-tick
+        # auto-highlight would then jump to whatever line is being
+        # spoken 10s before the clicked one -- confusing visual
+        # feedback. _pinned_highlight_block holds the clicked block;
+        # _pinned_until_ms is the timestamp at which the auto-highlight
+        # takes over again. Cleared when either fires.
+        self._pinned_highlight_block: Optional[int] = None
+        self._pinned_until_ms: int = 0
         # Screenshot offsets relative to recording start, sorted
         # ascending by offset. Populated by MainApp via
         # set_screenshot_offsets() on session select + after capture /
@@ -826,6 +835,14 @@ class SessionView(QWidget):
         start_ms = _start_ms_for_block(self._transcript_timestamps, block_number)
         if start_ms is None:
             return
+        # Pin the clicked line as the highlight until playback catches
+        # up to its timestamp. Without the pin, the audio seek (10s
+        # earlier) would drag the highlight back to an earlier line,
+        # then walk forward to the clicked one over the next 10s --
+        # confusing feedback for "I clicked here".
+        self._pinned_highlight_block = block_number
+        self._pinned_until_ms = int(start_ms)
+        self._apply_highlight_to_block(block_number, scroll_into_view=True)
         # Seek a few seconds before the clicked line so the listen-back
         # catches the lead-in (Aaron's "~10s before that line").
         target = max(0, int(start_ms) - _TRANSCRIPT_SEEK_LEAD_MS)
@@ -847,6 +864,28 @@ class SessionView(QWidget):
         self._refresh_screenshot_rail()
 
     def _refresh_transcript_highlight(self, position_ms: int) -> None:
+        """Update the highlighted line from the current playback position.
+
+        If the user has clicked a line, the highlight stays pinned to
+        that line until playback reaches the line's timestamp -- so
+        the 10-second seek lead-in doesn't drag the visual focus
+        backward.
+        """
+        # Pinned-block branch: keep showing the clicked line until
+        # playback catches up to it. The +1ms slack avoids a
+        # one-tick flicker right at the boundary.
+        if self._pinned_highlight_block is not None:
+            if position_ms + 1 < self._pinned_until_ms:
+                # Re-apply in case the document changed underneath
+                # us between the click and now.
+                if self._current_highlight_block != self._pinned_highlight_block:
+                    self._apply_highlight_to_block(
+                        self._pinned_highlight_block, scroll_into_view=False,
+                    )
+                return
+            # Pin's expired; fall through to normal auto-highlight.
+            self._pinned_highlight_block = None
+            self._pinned_until_ms = 0
         block_number = _block_for_position_ms(
             self._transcript_timestamps, position_ms,
         )
@@ -855,10 +894,18 @@ class SessionView(QWidget):
             return
         if block_number == self._current_highlight_block:
             return
+        self._apply_highlight_to_block(block_number, scroll_into_view=True)
+
+    def _apply_highlight_to_block(
+        self, block_number: int, *, scroll_into_view: bool,
+    ) -> None:
+        """Paint the highlight ExtraSelection on the given block.
+
+        Shared between the position-driven path and the user-click
+        path. The ExtraSelection format paints behind the text without
+        disrupting cursor / read-only state.
+        """
         self._current_highlight_block = block_number
-        # Build a single ExtraSelection that highlights the entire
-        # block. The selection's format paints behind the text without
-        # disrupting the cursor (the view is read-only anyway).
         from PyQt6.QtWidgets import QTextEdit  # noqa: PLC0415
         sel = QTextEdit.ExtraSelection()
         fmt = QTextCharFormat()
@@ -869,14 +916,16 @@ class SessionView(QWidget):
         cursor.clearSelection()
         sel.cursor = cursor
         self._transcript_view.setExtraSelections([sel])
-        # Scroll the highlight into view if it's offscreen.
-        view_cursor = self._transcript_view.textCursor()
-        view_cursor.setPosition(cursor.position())
-        self._transcript_view.setTextCursor(view_cursor)
-        self._transcript_view.ensureCursorVisible()
+        if scroll_into_view:
+            view_cursor = self._transcript_view.textCursor()
+            view_cursor.setPosition(cursor.position())
+            self._transcript_view.setTextCursor(view_cursor)
+            self._transcript_view.ensureCursorVisible()
 
     def _clear_transcript_highlight(self) -> None:
         self._current_highlight_block = None
+        self._pinned_highlight_block = None
+        self._pinned_until_ms = 0
         self._transcript_view.setExtraSelections([])
 
     # ---- screenshots <-> transcript wiring -------------------------------

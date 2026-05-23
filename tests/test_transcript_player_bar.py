@@ -42,7 +42,7 @@ def test_play_button_label_flips_with_is_playing(qt_app):
     bar.set_is_playing(False)
     assert bar._play_btn.text() == "Play"  # noqa: SLF001
     bar.set_is_playing(True)
-    assert bar._play_btn.text() == "Pause"  # noqa: SLF001
+    assert bar._play_btn.text() == "Stop"  # noqa: SLF001
     bar.set_is_playing(False)
     assert bar._play_btn.text() == "Play"  # noqa: SLF001
 

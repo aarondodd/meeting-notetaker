@@ -9,9 +9,10 @@ import secrets
 import sys
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from .automation import messages as automation_messages
@@ -325,12 +326,18 @@ class MainApp(QObject):
         """
         msg_type = msg.get("type", "")
         request_id = msg.get("request_id", "")
-        log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
+        # Pongs arrive every keep-alive cycle (~25s) and never carry
+        # information beyond "the worker is alive"; logging them at
+        # INFO floods the production log. The Verify-wizard handshake
+        # tracks pongs via a threading.Event so the log line wasn't
+        # load-bearing for correctness either.
         if msg_type == "pong":
+            log.debug("bridge worker: <- pong rid=%s", request_id)
             evt = self._pending_pings.pop(request_id, None)
             if evt is not None:
                 evt.set()
             return
+        log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
         self.bridge_message_received.emit(msg)
 
     def _dispatch_bridge_message(self, msg: dict) -> None:
@@ -1768,12 +1775,17 @@ class MainApp(QObject):
         """Prompt for a destination + format, mix mic+sys, write the file.
 
         QFileDialog's filter list drives which container the exporter
-        uses. The default suggested name embeds the session title and
-        date; the user gets a one-click flow for the common case
-        ("share this meeting's audio with a colleague").
+        uses. MP3 is the default filter -- it plays natively in every
+        Windows player without codec packs and is the "share this with
+        a colleague" lingua franca. The encode runs on a worker thread
+        with an indeterminate progress dialog so the UI stays
+        responsive on a long meeting (decoding a 1-hour stereo source
+        takes a few seconds on a fast machine).
         """
-        from PyQt6.QtWidgets import QFileDialog, QMessageBox  # noqa: PLC0415
-        from .audio.export import export_mixed, known_extensions  # noqa: PLC0415
+        from PyQt6.QtWidgets import (  # noqa: PLC0415
+            QFileDialog, QMessageBox, QProgressDialog,
+        )
+        from .audio.export import known_extensions  # noqa: PLC0415
         from .utils.export import default_export_filename  # noqa: PLC0415
         from .utils.paths import session_audio_files  # noqa: PLC0415
 
@@ -1786,19 +1798,23 @@ class MainApp(QObject):
         session = self.store.get_session(session_id)
         title = session.title if session is not None else "session"
 
-        # Build the QFileDialog filter string. .flac is offered first
-        # as the "lossless, plays everywhere" pick.
+        # Build the QFileDialog filter string. MP3 sits first so it's
+        # the default selection -- the common case is "send a colleague
+        # a playable file" and MP3 is the safest pick for that.
         ext_labels = {
-            ".flac": "FLAC -- lossless (*.flac)",
             ".mp3":  "MP3 -- universal compatibility (*.mp3)",
+            ".flac": "FLAC -- lossless (*.flac)",
             ".m4a":  "AAC -- broad compatibility (*.m4a)",
             ".opus": "Opus -- smallest (*.opus)",
             ".wav":  "WAV -- raw PCM (*.wav)",
         }
         filters = ";;".join(ext_labels[e] for e in known_extensions())
 
-        suggested = default_export_filename(title, "Audio", ".flac")
-        suggested_path = str(session_audio_files(session_id)[0].parent / suggested)
+        # Suggested filename uses MP3 to match the default filter so
+        # the .mp3 extension is pre-typed; the user can switch the
+        # filter dropdown to change format.
+        suggested = default_export_filename(title, "Audio", ".mp3")
+        suggested_path = str(files[0].parent / suggested)
         path_str, chosen_filter = QFileDialog.getSaveFileName(
             self.window,
             "Export recording",
@@ -1808,9 +1824,6 @@ class MainApp(QObject):
         if not path_str:
             return
         target = Path(path_str)
-        # If the user typed a path without an extension OR with a
-        # different extension than the chosen filter, honor the chosen
-        # filter so the codec lookup picks a working format.
         ext_for_filter = next(
             (ext for ext, label in ext_labels.items() if label == chosen_filter),
             None,
@@ -1820,18 +1833,43 @@ class MainApp(QObject):
 
         mic_path = next((p for p in files if p.stem == "mic"), None)
         sys_path = next((p for p in files if p.stem == "sys"), None)
-        try:
-            export_mixed(mic_path, sys_path, target)
-        except Exception as exc:
-            log.exception("export_mixed failed for session %s", session_id)
-            QMessageBox.warning(
-                self.window, "Export recording",
-                f"Could not export audio: {exc}",
-            )
-            return
-        self.window.status(
-            f"Exported recording to {target.name}", timeout_ms=5000,
+
+        # Worker thread + indeterminate progress dialog. Indeterminate
+        # (range 0,0) gives a marquee animation since we can't easily
+        # report PyAV encoder progress per-frame across the thread
+        # boundary. The dialog is modal so the user can't interact
+        # with the rest of the app mid-encode (avoiding the
+        # session-deselect-during-encode race).
+        progress = QProgressDialog(
+            f"Exporting {target.name}...",
+            None,  # no Cancel button; PyAV encode isn't cleanly interruptible
+            0, 0, self.window,
         )
+        progress.setWindowTitle("Export recording")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        progress.setCancelButton(None)
+
+        worker = _AudioExportWorker(mic_path, sys_path, target)
+
+        def on_done(err_msg: str) -> None:
+            progress.cancel()
+            if err_msg:
+                log.error("export_mixed failed: %s", err_msg)
+                QMessageBox.warning(
+                    self.window, "Export recording",
+                    f"Could not export audio: {err_msg}",
+                )
+            else:
+                self.window.status(
+                    f"Exported recording to {target.name}", timeout_ms=5000,
+                )
+            worker.deleteLater()
+
+        worker.finished_with_result.connect(on_done)
+        progress.show()
+        worker.start()
 
     def _on_delete_recording(self, session_id: str) -> None:
         """Delete the session's audio files; keep transcript + notes."""
@@ -2515,6 +2553,31 @@ class MainApp(QObject):
         self.window.showNormal()
         self.window.raise_()
         self.window.activateWindow()
+
+
+class _AudioExportWorker(QThread):
+    """Run audio/export.export_mixed off the GUI thread.
+
+    Emits ``finished_with_result(error_message)`` exactly once: an
+    empty string means success, anything else is the failure reason
+    for the MessageBox.
+    """
+
+    finished_with_result = pyqtSignal(str)
+
+    def __init__(self, mic_path, sys_path, target) -> None:
+        super().__init__()
+        self._mic = mic_path
+        self._sys = sys_path
+        self._target = target
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from .audio.export import export_mixed  # noqa: PLC0415
+            export_mixed(self._mic, self._sys, self._target)
+            self.finished_with_result.emit("")
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
+            self.finished_with_result.emit(str(exc))
 
 
 def _set_windows_app_user_model_id() -> None:

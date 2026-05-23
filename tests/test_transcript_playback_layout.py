@@ -138,3 +138,31 @@ def test_screenshot_rail_hidden_without_screenshots(qt_app, tmp_path):
     view = SessionView()
     _seed_session(view, tmp_path, with_screenshots=False)
     assert view._screenshot_rail.isHidden()  # noqa: SLF001
+
+
+def test_click_pins_highlight_during_lead_in(qt_app, tmp_path):
+    """Clicking a line pins the highlight to that line until playback
+    catches up, so the 10s seek lead-in doesn't drag the highlight
+    backward to an earlier segment."""
+    view = SessionView()
+    _seed_session(view, tmp_path, with_screenshots=False)
+    # Segments are at 3s, 11s, 30s (block_numbers 0, 1, 2).
+    # User clicks line 1 (11_000 ms). Expected: pin highlight to
+    # block 1; seek emits 1_000 (11_000 - 10_000).
+    captured_seeks: list[tuple[str, int]] = []
+    view.transcript_seek_ms_requested.connect(
+        lambda sid, ms: captured_seeks.append((sid, ms))
+    )
+    view._on_transcript_line_clicked(1)  # noqa: SLF001
+    assert captured_seeks[-1][1] == 1_000
+    assert view._current_highlight_block == 1  # noqa: SLF001
+    assert view._pinned_highlight_block == 1  # noqa: SLF001
+    # While playback is still in the lead-in window, position-driven
+    # highlight is suppressed -- the clicked line stays highlighted.
+    view.set_player_position_ms(2_000)
+    assert view._current_highlight_block == 1  # noqa: SLF001
+    # Once playback reaches the clicked line's start, the pin
+    # releases and the auto-highlight resumes.
+    view.set_player_position_ms(12_000)
+    assert view._pinned_highlight_block is None  # noqa: SLF001
+    assert view._current_highlight_block == 1  # noqa: SLF001 (still on block 1 because position is within its range)

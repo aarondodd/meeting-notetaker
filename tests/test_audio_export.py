@@ -51,8 +51,10 @@ def sources(tmp_path):
 def test_known_extensions_returns_supported_formats():
     exts = known_extensions()
     assert set(exts) == {".flac", ".mp3", ".m4a", ".opus", ".wav"}
-    # Lossless first; the save dialog presents this as the default.
-    assert exts[0] == ".flac"
+    # MP3 first: the QFileDialog default filter is index 0, and MP3
+    # is the safest "share with a colleague" pick (plays in every
+    # default Windows player without codec packs).
+    assert exts[0] == ".mp3"
 
 
 @pytest.mark.parametrize("ext", [".flac", ".mp3", ".m4a", ".opus", ".wav"])

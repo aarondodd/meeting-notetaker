@@ -195,7 +195,10 @@ def _encode_mono_float32(
 def known_extensions() -> tuple[str, ...]:
     """Return supported export-file extensions, with the leading dot.
 
-    Stable order: lossless first, then descending compatibility. The
-    save dialog uses this to build its filter strings.
+    Order is "share-friendliness first": MP3 plays everywhere
+    natively (including default Windows tooling without codec
+    packs), FLAC is lossless if the user wants it, then m4a / opus
+    / wav for the other use cases. The save dialog uses index 0 as
+    the default filter.
     """
-    return (".flac", ".mp3", ".m4a", ".opus", ".wav")
+    return (".mp3", ".flac", ".m4a", ".opus", ".wav")
