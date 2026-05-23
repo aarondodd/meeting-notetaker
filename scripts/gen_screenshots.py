@@ -262,7 +262,7 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
         ),
         "voice": SegmentState(
             color="yellow",
-            short_label="Voice",
+            short_label="Voiceprint",
             tooltip="No voice sample has been recorded.",
         ),
     }

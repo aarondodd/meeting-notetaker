@@ -44,7 +44,7 @@ from .status_indicators import SegmentState, StatusSegment
 
 
 # Status-bar segment keys, in left-to-right display order.
-_STATUS_SEGMENT_KEYS = ("mic", "sys", "cal", "spk", "voice", "det", "syn")
+_STATUS_SEGMENT_KEYS = ("mic", "sys", "cal", "voice", "det", "syn")
 
 
 # Per-state cell content + tooltip for the transcription-state column.

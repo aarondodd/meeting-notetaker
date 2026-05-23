@@ -1559,9 +1559,6 @@ class MainApp(QObject):
         cal = self._calendar_segment()
         if cal is not None:
             indicators["cal"] = cal
-        spk = self._speakers_segment()
-        if spk is not None:
-            indicators["spk"] = spk
         voice = self._voice_segment()
         if voice is not None:
             indicators["voice"] = voice
@@ -1653,38 +1650,6 @@ class MainApp(QObject):
             tooltip=state.status_tooltip(),
         )
 
-    def _speakers_segment(self) -> Optional[SegmentState]:
-        """SegmentState for the speakers-known pill, or None.
-
-        Hidden when speaker ID is off or no speakers are stored yet --
-        "Spk 0" would be noise on a fresh install. Tooltip lists up to
-        8 stored names so the user can sanity-check the library without
-        opening Settings.
-        """
-        if not self.config.speakers.enabled:
-            return None
-        try:
-            store = open_speaker_store()
-            try:
-                records = store.list_all()
-            finally:
-                store.close()
-        except Exception:
-            log.exception("speakers indicator: store unreadable")
-            return None
-        if not records:
-            return None
-        names = [r.name for r in records]
-        preview = ", ".join(names[:8])
-        if len(names) > 8:
-            preview += f" (+{len(names) - 8} more)"
-        return SegmentState(
-            color="green",
-            short_label="Spk",
-            payload=str(len(names)),
-            tooltip=f"Known speakers ({len(names)}): {preview}",
-        )
-
     def _detection_segment(self) -> Optional[SegmentState]:
         """SegmentState for the ad-hoc-meeting-detect pill, or None.
 
@@ -1742,7 +1707,7 @@ class MainApp(QObject):
             return None
         return SegmentState(
             color="yellow",
-            short_label="Voice",
+            short_label="Voiceprint",
             tooltip=(
                 "No voice sample has been recorded. Settings > Speaker "
                 "Identification > Record voice sample lets the refiner "

@@ -145,7 +145,8 @@ def test_main_window_set_status_indicators_hides_missing_keys(qt_app):
         assert not win._status_segments["syn"].isHidden()  # noqa: SLF001
         # Segments not passed in this call must hide.
         assert win._status_segments["cal"].isHidden()  # noqa: SLF001
-        assert win._status_segments["spk"].isHidden()  # noqa: SLF001
+        assert win._status_segments["voice"].isHidden()  # noqa: SLF001
+        assert win._status_segments["det"].isHidden()  # noqa: SLF001
         # Re-call without "syn"; it should hide now.
         win.set_status_indicators(
             version="9.9.9",

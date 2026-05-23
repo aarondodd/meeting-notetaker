@@ -123,7 +123,7 @@ def exists(*, path: Optional[Path] = None) -> bool:
 
     Returns True if any voiceprint file is present on disk, regardless
     of whether its dimension matches the active encoder. The status-bar
-    indicator surfaces "Voice: not enrolled" based on `load()`, which
+    indicator (the yellow "Voiceprint" pill) is driven by `load()`, which
     is dim-aware, so a stale-dim file correctly surfaces as needing
     re-enrollment in the UI even though the file is present.
     """
