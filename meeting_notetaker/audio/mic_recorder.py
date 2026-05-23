@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import wave
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .chunk_buffer import ChunkBuffer
 from .resample import to_mono_16k
+from .wav_align import compute_pad_frames, pad_wav
 
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,13 @@ class MicRecorder(QObject):
         self._native_rate = 16000
         self._channels = 1
         self._device_index: Optional[int] = None
+        # Wall-clock tracking for post-stop WAV alignment. The
+        # recorder's WAV ends up holding only the frames the callback
+        # actually wrote; pad_wav fills in the leading + trailing
+        # silence so the file spans the full [start, stop] window.
+        self._start_wallclock: Optional[float] = None
+        self._first_sample_wallclock: Optional[float] = None
+        self._stop_wallclock: Optional[float] = None
 
     @property
     def is_recording(self) -> bool:
@@ -77,6 +86,9 @@ class MicRecorder(QObject):
         self._wf.setsampwidth(2)
         self._wf.setframerate(self._native_rate)
         self._is_recording = True
+        self._start_wallclock = time.monotonic()
+        self._first_sample_wallclock = None
+        self._stop_wallclock = None
         open_kwargs: dict = dict(
             format=pyaudio.paInt16,
             channels=self._channels,
@@ -103,6 +115,8 @@ class MicRecorder(QObject):
             # Drop the buffer; do not append to WAV. Live view pauses too.
             return (None, pyaudio.paContinue)
         try:
+            if self._first_sample_wallclock is None:
+                self._first_sample_wallclock = time.monotonic()
             if self._wf is not None:
                 self._wf.writeframes(in_data)
             pcm = np.frombuffer(in_data, dtype=np.int16)
@@ -129,6 +143,7 @@ class MicRecorder(QObject):
             if not self._is_recording and self._stream is None:
                 return
             self._is_recording = False
+            self._stop_wallclock = time.monotonic()
             try:
                 if self._stream is not None:
                     self._stream.stop_stream()
@@ -147,8 +162,51 @@ class MicRecorder(QObject):
                     self._wf.close()
                 finally:
                     self._wf = None
+        self._maybe_pad_wav()
         log.info("MicRecorder stopped")
         self.stopped.emit()
+
+    def _maybe_pad_wav(self) -> None:
+        """Rewrite the WAV with leading + trailing silence to span
+        [start_wallclock, stop_wallclock]. Mic capture is usually
+        continuous so this is a near-no-op for the mic side, but
+        applying it symmetrically with the loopback recorder keeps
+        the two files exactly the same length and naturally aligned
+        for transcription / playback / export.
+        """
+        if (
+            self._start_wallclock is None
+            or self._stop_wallclock is None
+        ):
+            return
+        try:
+            with wave.open(str(self.wav_path), "rb") as rf:
+                actual_frames = rf.getnframes()
+        except (FileNotFoundError, wave.Error):
+            return
+        leading, trailing = compute_pad_frames(
+            start_wallclock=self._start_wallclock,
+            first_sample_wallclock=self._first_sample_wallclock,
+            stop_wallclock=self._stop_wallclock,
+            actual_frames=actual_frames,
+            sample_rate=self._native_rate,
+        )
+        if leading == 0 and trailing == 0:
+            return
+        log.info(
+            "MicRecorder pad: leading=%d frames (%.0f ms), "
+            "trailing=%d frames (%.0f ms), rate=%d",
+            leading, leading * 1000 / self._native_rate,
+            trailing, trailing * 1000 / self._native_rate,
+            self._native_rate,
+        )
+        try:
+            pad_wav(
+                self.wav_path,
+                leading_frames=leading, trailing_frames=trailing,
+            )
+        except Exception:
+            log.exception("MicRecorder: pad_wav failed for %s", self.wav_path)
 
 
 def _is_store_python() -> bool:

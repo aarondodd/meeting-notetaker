@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import wave
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .chunk_buffer import ChunkBuffer
 from .resample import to_mono_16k
+from .wav_align import compute_pad_frames, pad_wav
 
 
 log = logging.getLogger(__name__)
@@ -60,6 +62,16 @@ class LoopbackRecorder(QObject):
         self._paused = False
         self._native_rate = 48000
         self._channels = 2
+        # Wall-clock tracking for post-stop WAV alignment. WASAPI
+        # loopback typically does not deliver any frames until
+        # something actually plays through the speakers (the audio
+        # engine is asleep until then), so first_sample_wallclock
+        # can be many seconds after start_wallclock. pad_wav at stop
+        # fills in that leading silence so sys.wav spans the same
+        # wall-clock window as mic.wav.
+        self._start_wallclock: Optional[float] = None
+        self._first_sample_wallclock: Optional[float] = None
+        self._stop_wallclock: Optional[float] = None
 
     @staticmethod
     def is_available() -> bool:
@@ -137,6 +149,9 @@ class LoopbackRecorder(QObject):
         self._wf.setsampwidth(2)
         self._wf.setframerate(self._native_rate)
         self._is_recording = True
+        self._start_wallclock = time.monotonic()
+        self._first_sample_wallclock = None
+        self._stop_wallclock = None
         self._stream = self._pa.open(
             format=pyaudio.paInt16,
             channels=self._channels,
@@ -163,6 +178,8 @@ class LoopbackRecorder(QObject):
         if self._paused:
             return (None, pyaudio.paContinue)
         try:
+            if self._first_sample_wallclock is None:
+                self._first_sample_wallclock = time.monotonic()
             if self._wf is not None:
                 self._wf.writeframes(in_data)
             pcm = np.frombuffer(in_data, dtype=np.int16)
@@ -185,6 +202,7 @@ class LoopbackRecorder(QObject):
             if not self._is_recording and self._stream is None:
                 return
             self._is_recording = False
+            self._stop_wallclock = time.monotonic()
             try:
                 if self._stream is not None:
                     self._stream.stop_stream()
@@ -203,5 +221,48 @@ class LoopbackRecorder(QObject):
                     self._wf.close()
                 finally:
                     self._wf = None
+        self._maybe_pad_wav()
         log.info("LoopbackRecorder stopped")
         self.stopped.emit()
+
+    def _maybe_pad_wav(self) -> None:
+        """Rewrite the WAV with leading + trailing silence to span
+        [start_wallclock, stop_wallclock]. Loopback's leading
+        silence can be several seconds when the Windows audio
+        engine sleeps until first audio plays.
+        """
+        if (
+            self._start_wallclock is None
+            or self._stop_wallclock is None
+        ):
+            return
+        try:
+            with wave.open(str(self.wav_path), "rb") as rf:
+                actual_frames = rf.getnframes()
+        except (FileNotFoundError, wave.Error):
+            return
+        leading, trailing = compute_pad_frames(
+            start_wallclock=self._start_wallclock,
+            first_sample_wallclock=self._first_sample_wallclock,
+            stop_wallclock=self._stop_wallclock,
+            actual_frames=actual_frames,
+            sample_rate=self._native_rate,
+        )
+        if leading == 0 and trailing == 0:
+            return
+        log.info(
+            "LoopbackRecorder pad: leading=%d frames (%.0f ms), "
+            "trailing=%d frames (%.0f ms), rate=%d",
+            leading, leading * 1000 / self._native_rate,
+            trailing, trailing * 1000 / self._native_rate,
+            self._native_rate,
+        )
+        try:
+            pad_wav(
+                self.wav_path,
+                leading_frames=leading, trailing_frames=trailing,
+            )
+        except Exception:
+            log.exception(
+                "LoopbackRecorder: pad_wav failed for %s", self.wav_path,
+            )
