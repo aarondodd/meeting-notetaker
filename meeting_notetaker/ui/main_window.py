@@ -63,9 +63,10 @@ _STATE_BADGE: dict[str, tuple[str, str]] = {
 }
 
 _COL_AUDIO = 0
-_COL_STATE = 1
-_COL_DATE = 2
-_COL_TITLE = 3
+_COL_SLIDES = 1
+_COL_STATE = 2
+_COL_DATE = 3
+_COL_TITLE = 4
 
 
 class MainWindow(QMainWindow):
@@ -75,6 +76,8 @@ class MainWindow(QMainWindow):
     open_outlook_diagnostic_requested = pyqtSignal()
     open_log_viewer_requested = pyqtSignal()
     open_dependency_check_requested = pyqtSignal()
+    open_about_requested = pyqtSignal()
+    open_user_guide_requested = pyqtSignal()
     check_for_updates_requested = pyqtSignal()
     upgrade_requested = pyqtSignal()
     quit_requested = pyqtSignal()
@@ -124,12 +127,20 @@ class MainWindow(QMainWindow):
         action_depcheck.triggered.connect(self.open_dependency_check_requested.emit)
         debug_menu.addAction(action_depcheck)
         help_menu.addSeparator()
+        action_user_guide = QAction("&User Guide...", self)
+        action_user_guide.triggered.connect(self.open_user_guide_requested.emit)
+        help_menu.addAction(action_user_guide)
+        help_menu.addSeparator()
         action_check_updates = QAction("Check for &Updates...", self)
         action_check_updates.triggered.connect(self.check_for_updates_requested.emit)
         help_menu.addAction(action_check_updates)
         action_upgrade = QAction("&Upgrade...", self)
         action_upgrade.triggered.connect(self.upgrade_requested.emit)
         help_menu.addAction(action_upgrade)
+        help_menu.addSeparator()
+        action_about = QAction("&About Meeting Notetaker...", self)
+        action_about.triggered.connect(self.open_about_requested.emit)
+        help_menu.addAction(action_about)
 
         # Body: splitter
         central = QWidget(self)
@@ -151,7 +162,7 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self._new_btn)
         left_layout.addLayout(header_row)
         self._list = QTreeWidget(left)
-        self._list.setColumnCount(4)
+        self._list.setColumnCount(5)
         self._list.setHeaderHidden(True)
         self._list.setRootIsDecorated(False)
         self._list.setUniformRowHeights(True)
@@ -163,13 +174,16 @@ class MainWindow(QMainWindow):
         rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self._list)
         rename_shortcut.activated.connect(self._rename_selected)
         header = self._list.header()
-        # Audio + state are narrow glyph columns; date is fixed-width
-        # to fit "YYYY-MM-DD HH:MM"; title takes the remaining space.
+        # Audio + slides + state are narrow glyph columns; date is
+        # fixed-width to fit "YYYY-MM-DD HH:MM"; title takes the
+        # remaining space.
         header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_SLIDES, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
         self._list.setColumnWidth(_COL_AUDIO, 28)
+        self._list.setColumnWidth(_COL_SLIDES, 28)
         self._list.setColumnWidth(_COL_STATE, 28)
         self._list.setColumnWidth(_COL_DATE, 110)
         left_layout.addWidget(self._list, 1)
@@ -272,19 +286,33 @@ class MainWindow(QMainWindow):
             if s.has_audio
             else "Audio status: not retained (recording deleted after refinement)"
         )
+        # Camera glyph if any screenshots are on disk for this session.
+        # has_retained_audio mirrors this pattern for audio; we use the
+        # same path helper here.
+        from ..utils.paths import list_screenshots  # noqa: PLC0415
+        has_slides = bool(list_screenshots(s.id))
+        slides_glyph = "📷" if has_slides else ""
+        slides_tooltip = (
+            "Screenshots saved on disk for this session"
+            if has_slides
+            else "No screenshots captured for this session"
+        )
         state_glyph, state_tooltip = _STATE_BADGE.get(s.state, ("", s.state))
         state_tooltip = f"Transcription state: {state_tooltip}"
 
         when, title = _session_date_and_title(s)
         item = QTreeWidgetItem([
             audio_glyph,
+            slides_glyph,
             state_glyph,
             when,
             title,
         ])
         item.setTextAlignment(_COL_AUDIO, Qt.AlignmentFlag.AlignCenter)
+        item.setTextAlignment(_COL_SLIDES, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_STATE, Qt.AlignmentFlag.AlignCenter)
         item.setToolTip(_COL_AUDIO, audio_tooltip)
+        item.setToolTip(_COL_SLIDES, slides_tooltip)
         item.setToolTip(_COL_STATE, state_tooltip)
         item.setData(_COL_TITLE, Qt.ItemDataRole.UserRole, s.id)
         # Stash the full ISO created_at so Edit Timestamp can seed the

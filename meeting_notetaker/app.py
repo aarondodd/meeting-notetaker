@@ -825,6 +825,8 @@ class MainApp(QObject):
         self.window.open_outlook_diagnostic_requested.connect(self._on_outlook_diagnostic)
         self.window.open_log_viewer_requested.connect(self._on_log_viewer)
         self.window.open_dependency_check_requested.connect(self._on_dependency_check)
+        self.window.open_about_requested.connect(self._on_about)
+        self.window.open_user_guide_requested.connect(self._on_user_guide)
         self.window.check_for_updates_requested.connect(self._on_check_for_updates)
         self.window.upgrade_requested.connect(self._on_upgrade)
         self.window.quit_requested.connect(self.qt_app.quit)
@@ -2073,6 +2075,25 @@ class MainApp(QObject):
         self._dep_check.show()
         self._dep_check.raise_()
         self._dep_check.activateWindow()
+
+    def _on_about(self) -> None:
+        from .ui.about_dialog import AboutDialog  # noqa: PLC0415
+        AboutDialog(parent=self.window).exec()
+
+    def _on_user_guide(self) -> None:
+        """Open the GitHub README at the User Guide anchor.
+
+        Keeping the how-to in the README (where mermaid renders) and
+        deep-linking from the app avoids maintaining two copies. The
+        repo's main branch is the source of truth; if the user is on
+        an older build the link still points to the latest docs --
+        appropriate for a how-to-use guide.
+        """
+        from PyQt6.QtCore import QUrl  # noqa: PLC0415
+        from PyQt6.QtGui import QDesktopServices  # noqa: PLC0415
+        QDesktopServices.openUrl(QUrl(
+            "https://github.com/aarondodd/meeting-notetaker#user-guide"
+        ))
 
     def _on_settings(self) -> None:
         dialog = SettingsDialog(
