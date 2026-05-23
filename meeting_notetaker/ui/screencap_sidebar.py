@@ -17,14 +17,17 @@ from __future__ import annotations
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QCheckBox, QLabel, QPushButton, QVBoxLayout, QWidget,
+)
 
 
 class ScreencapSidebar(QWidget):
-    """Stack of Capture / Insert buttons + a 'not armed' help label."""
+    """Capture / Insert buttons + Auto-capture toggle + help label."""
 
     capture_clicked = pyqtSignal()
     insert_clicked = pyqtSignal()
+    auto_capture_toggled = pyqtSignal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -53,6 +56,22 @@ class ScreencapSidebar(QWidget):
         self._insert_btn.clicked.connect(self.insert_clicked.emit)
         layout.addWidget(self._insert_btn)
 
+        # Auto-capture toggle. Cadence + dedup threshold live in
+        # main Settings; this is the per-session on/off.
+        self._auto_checkbox = QCheckBox("Auto-capture", self)
+        self._auto_checkbox.setToolTip(
+            "Snapshot the region every N seconds (set in Settings). "
+            "Each new capture is compared against the most-recently-"
+            "kept image; near-duplicates are discarded so only "
+            "meaningfully-different content sticks around. Manual "
+            "Capture / Insert clicks always keep their image."
+        )
+        self._auto_checkbox.toggled.connect(self.auto_capture_toggled.emit)
+        layout.addWidget(self._auto_checkbox)
+        self._auto_interval_label = QLabel("", self)
+        self._auto_interval_label.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(self._auto_interval_label)
+
         self._help = QLabel(
             "Click Start Screen Capture above, then draw a region "
             "to enable these buttons.",
@@ -64,11 +83,32 @@ class ScreencapSidebar(QWidget):
 
         # Fixed width keeps the sidebar from sliding the editor pane
         # around when armed/disarmed.
-        self.setFixedWidth(150)
+        self.setFixedWidth(160)
         self.set_armed(False)
 
     def set_armed(self, armed: bool) -> None:
-        """Enable/disable the buttons. Help label toggles too."""
+        """Enable/disable the buttons. Help label toggles too.
+
+        Disarm also forces the auto-capture checkbox off so the
+        timer in MainApp tears down cleanly.
+        """
         self._capture_btn.setEnabled(armed)
         self._insert_btn.setEnabled(armed)
+        self._auto_checkbox.setEnabled(armed)
         self._help.setVisible(not armed)
+        if not armed and self._auto_checkbox.isChecked():
+            # Suppress the toggled signal on programmatic uncheck;
+            # the parent already handled disarm.
+            self._auto_checkbox.blockSignals(True)
+            self._auto_checkbox.setChecked(False)
+            self._auto_checkbox.blockSignals(False)
+        self._auto_interval_label.setVisible(armed)
+
+    def set_auto_interval_seconds(self, seconds: int) -> None:
+        """Update the helper text next to the auto-capture checkbox."""
+        self._auto_interval_label.setText(
+            f"every {seconds} s (Settings to change)"
+        )
+
+    def is_auto_capture_checked(self) -> bool:
+        return self._auto_checkbox.isChecked()

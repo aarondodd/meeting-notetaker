@@ -119,6 +119,15 @@ class UiConfig:
     # popup on subsequent captures so the workflow doesn't get
     # interrupted every meeting.
     screen_capture_first_time_seen: bool = False
+    # Auto-capture: when armed, snapshot the screen-capture region
+    # every N seconds. Captures are deduplicated against the most-
+    # recently-kept image via dHash + Hamming distance; only
+    # captures whose hash differs by more than dedup_threshold bits
+    # are kept. Manual Capture / Insert clicks always keep their
+    # image (no dedup check) and reset the baseline.
+    screen_capture_auto_enabled_default: bool = False
+    screen_capture_auto_interval_sec: int = 30
+    screen_capture_auto_dedup_threshold: int = 10
 
 
 @dataclass
@@ -273,6 +282,16 @@ class Config:
             errors.append(
                 f"detection.cooldown_minutes must be between 1 and 120, "
                 f"got {self.detection.cooldown_minutes}"
+            )
+        if not (5 <= self.ui.screen_capture_auto_interval_sec <= 300):
+            errors.append(
+                "ui.screen_capture_auto_interval_sec must be between 5 "
+                f"and 300, got {self.ui.screen_capture_auto_interval_sec}"
+            )
+        if not (0 <= self.ui.screen_capture_auto_dedup_threshold <= 64):
+            errors.append(
+                "ui.screen_capture_auto_dedup_threshold must be between 0 "
+                f"and 64, got {self.ui.screen_capture_auto_dedup_threshold}"
             )
         if self.synthesis.llm_target not in VALID_LLM_TARGETS:
             errors.append(

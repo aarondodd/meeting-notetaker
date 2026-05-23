@@ -217,6 +217,42 @@ def test_resolved_cpu_threads_explicit_passes_through():
     assert cfg.transcription.resolved_cpu_threads(cpu_count=64) == 4
 
 
+def test_auto_capture_defaults_and_round_trip(isolated_data_dir):
+    """Auto-capture defaults: off, 30 s interval, 10-bit dedup threshold."""
+    cfg = Config()
+    assert cfg.ui.screen_capture_auto_enabled_default is False
+    assert cfg.ui.screen_capture_auto_interval_sec == 30
+    assert cfg.ui.screen_capture_auto_dedup_threshold == 10
+    cfg.ui.screen_capture_auto_enabled_default = True
+    cfg.ui.screen_capture_auto_interval_sec = 60
+    cfg.ui.screen_capture_auto_dedup_threshold = 15
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.ui.screen_capture_auto_enabled_default is True
+    assert loaded.ui.screen_capture_auto_interval_sec == 60
+    assert loaded.ui.screen_capture_auto_dedup_threshold == 15
+
+
+def test_auto_capture_interval_validation(isolated_data_dir):
+    cfg = Config()
+    cfg.ui.screen_capture_auto_interval_sec = 2  # below floor
+    errors = cfg.validate()
+    assert any("screen_capture_auto_interval_sec" in e for e in errors)
+    cfg.ui.screen_capture_auto_interval_sec = 999  # above ceiling
+    errors = cfg.validate()
+    assert any("screen_capture_auto_interval_sec" in e for e in errors)
+
+
+def test_auto_capture_dedup_threshold_validation(isolated_data_dir):
+    cfg = Config()
+    cfg.ui.screen_capture_auto_dedup_threshold = -1
+    errors = cfg.validate()
+    assert any("screen_capture_auto_dedup_threshold" in e for e in errors)
+    cfg.ui.screen_capture_auto_dedup_threshold = 100  # > 64
+    errors = cfg.validate()
+    assert any("screen_capture_auto_dedup_threshold" in e for e in errors)
+
+
 def test_screen_capture_first_time_seen_defaults_false(isolated_data_dir):
     """Fresh installs have NOT seen the screen-capture notice. The first
     Start Screen Capture click shows the popup, then flips this to True

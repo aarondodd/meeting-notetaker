@@ -282,6 +282,74 @@ class SettingsDialog(QDialog):
         audio_form.addRow("", self._vad_value_label)
         layout.addWidget(audio_group)
 
+        # Screen Capture group ---------------------------------------------
+        screencap_group = QGroupBox("Screen Capture", self)
+        screencap_form = QFormLayout(screencap_group)
+        screencap_blurb = QLabel(
+            "While recording, the Start Screen Capture button lets "
+            "you draw a region on screen and the My Notes sidebar "
+            "Capture / Insert buttons snapshot that region. Optional "
+            "auto-capture mode snapshots periodically; near-duplicate "
+            "captures are filtered out so only meaningful slide / "
+            "screen changes are kept.",
+            self,
+        )
+        screencap_blurb.setWordWrap(True)
+        screencap_form.addRow(screencap_blurb)
+
+        self._screencap_auto_interval = QSlider(Qt.Orientation.Horizontal, self)
+        self._screencap_auto_interval.setMinimum(5)
+        self._screencap_auto_interval.setMaximum(300)
+        self._screencap_auto_interval.setSingleStep(5)
+        self._screencap_auto_interval.setPageStep(15)
+        self._screencap_auto_interval.setValue(
+            int(config.ui.screen_capture_auto_interval_sec)
+        )
+        self._screencap_auto_interval_label = QLabel(
+            f"{int(config.ui.screen_capture_auto_interval_sec)} s", self,
+        )
+        self._screencap_auto_interval.valueChanged.connect(
+            lambda v: self._screencap_auto_interval_label.setText(f"{v} s")
+        )
+        self._screencap_auto_interval.setToolTip(
+            "Auto-capture cadence -- how often to snapshot the armed "
+            "region. 30 s is a good fit for slide-driven meetings; "
+            "10-15 s for fast-changing content; 60 s+ when most of "
+            "the meeting is talking heads."
+        )
+        screencap_form.addRow("Auto-capture interval:", self._screencap_auto_interval)
+        screencap_form.addRow("", self._screencap_auto_interval_label)
+
+        self._screencap_dedup_threshold = QSlider(Qt.Orientation.Horizontal, self)
+        self._screencap_dedup_threshold.setMinimum(0)
+        self._screencap_dedup_threshold.setMaximum(32)
+        self._screencap_dedup_threshold.setSingleStep(1)
+        self._screencap_dedup_threshold.setPageStep(5)
+        self._screencap_dedup_threshold.setValue(
+            int(config.ui.screen_capture_auto_dedup_threshold)
+        )
+        self._screencap_dedup_threshold_label = QLabel(
+            f"{int(config.ui.screen_capture_auto_dedup_threshold)} bits", self,
+        )
+        self._screencap_dedup_threshold.valueChanged.connect(
+            lambda v: self._screencap_dedup_threshold_label.setText(
+                f"{v} bits"
+            )
+        )
+        self._screencap_dedup_threshold.setToolTip(
+            "Auto-capture dedup sensitivity. Each fresh capture's "
+            "perceptual dHash is compared against the most-recently-"
+            "kept image; captures within this many bits (out of 64) "
+            "are treated as duplicates and discarded. 0 = only "
+            "byte-identical images dedup; 10 = ignore cursor / minor "
+            "animation; 20+ = treat moderately-different slides as "
+            "the same. Manual Capture / Insert always keep their "
+            "image regardless."
+        )
+        screencap_form.addRow("Dedup threshold:", self._screencap_dedup_threshold)
+        screencap_form.addRow("", self._screencap_dedup_threshold_label)
+        layout.addWidget(screencap_group)
+
         # Speakers group ---------------------------------------------------
         speakers_group = QGroupBox("Speakers", self)
         speakers_form = QFormLayout(speakers_group)
@@ -655,6 +723,12 @@ class SettingsDialog(QDialog):
             if piece.strip()
         ]
         self._config.ui.user_name = self._user_name_edit.text().strip()
+        self._config.ui.screen_capture_auto_interval_sec = int(
+            self._screencap_auto_interval.value()
+        )
+        self._config.ui.screen_capture_auto_dedup_threshold = int(
+            self._screencap_dedup_threshold.value()
+        )
         self._config.synthesis.automation_enabled = self._auto_enabled.isChecked()
         self._config.synthesis.llm_target = (
             self._auto_target.currentData() or "claude"

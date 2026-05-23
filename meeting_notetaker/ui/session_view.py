@@ -109,6 +109,7 @@ class SessionView(QWidget):
     stop_screen_capture_clicked = pyqtSignal(str)         # session_id
     screencap_capture_clicked = pyqtSignal(str)           # session_id
     screencap_insert_clicked = pyqtSignal(str)            # session_id
+    screencap_auto_toggled = pyqtSignal(str, bool)        # session_id, enabled
     # Right-click on a Slides thumbnail / full view: delete the file.
     delete_screenshot_clicked = pyqtSignal(str, Path)     # session_id, path
     # Transcript-pane playback control. The bar fires these for the
@@ -507,6 +508,9 @@ class SessionView(QWidget):
         self._screencap_sidebar = ScreencapSidebar(right_column)
         self._screencap_sidebar.capture_clicked.connect(self._on_screencap_capture)
         self._screencap_sidebar.insert_clicked.connect(self._on_screencap_insert)
+        self._screencap_sidebar.auto_capture_toggled.connect(
+            self._on_screencap_auto_toggled
+        )
         right_column_layout.addWidget(self._screencap_sidebar)
         self._attendee_sidebar = AttendeeSidebar(right_column)
         self._attendee_sidebar.tag_clicked.connect(self._on_attendee_tag_clicked)
@@ -736,6 +740,16 @@ class SessionView(QWidget):
         if self._session is None:
             return
         self.screencap_insert_clicked.emit(self._session.id)
+
+    def _on_screencap_auto_toggled(self, enabled: bool) -> None:
+        if self._session is None:
+            return
+        self.screencap_auto_toggled.emit(self._session.id, enabled)
+
+    def set_screencap_auto_interval(self, seconds: int) -> None:
+        """Push the configured interval (Settings -> auto-capture) into
+        the sidebar's helper text so the user sees 'every Ns'."""
+        self._screencap_sidebar.set_auto_interval_seconds(seconds)
 
     def _on_screenshot_delete_requested(self, path: Path) -> None:
         if self._session is None:

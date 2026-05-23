@@ -135,6 +135,14 @@ class MainApp(QObject):
         # session id so multi-session-in-flight (a v0.6 feature) still
         # routes captures to the right session.
         self._screen_capture_regions: dict[str, tuple[int, int, int, int]] = {}
+        # Auto-capture state. Keyed by session id; only present
+        # while auto-capture is armed AND running for that session.
+        # _auto_capture_baseline_hash holds the dHash of the most-
+        # recently-kept screenshot (manual or auto). New auto-captures
+        # compare against it; matches within the threshold get
+        # deleted, mismatches keep the file and update the baseline.
+        self._auto_capture_timers: dict[str, QTimer] = {}
+        self._auto_capture_baseline_hash: dict[str, int] = {}
         # Persistent on-screen outline showing the armed region. There
         # is one overlay at a time (only one session captures at a
         # time); _arm_screen_capture_overlay creates it, _disarm tears
@@ -231,6 +239,11 @@ class MainApp(QObject):
 
     def _apply_user_name(self) -> None:
         self.window.session_view.set_user_name(self.config.ui.user_name)
+        # Push the configured auto-capture interval into the sidebar
+        # at startup so the hint text shows the current cadence.
+        self.window.session_view.set_screencap_auto_interval(
+            int(self.config.ui.screen_capture_auto_interval_sec)
+        )
 
     def _apply_synthesis_automation(self) -> None:
         """Push the current setting state into the SessionView, swapping
@@ -861,6 +874,7 @@ class MainApp(QObject):
         sv.stop_screen_capture_clicked.connect(self._on_stop_screen_capture)
         sv.screencap_capture_clicked.connect(self._on_screencap_capture)
         sv.screencap_insert_clicked.connect(self._on_screencap_insert)
+        sv.screencap_auto_toggled.connect(self._on_auto_capture_toggled)
         sv.delete_screenshot_clicked.connect(self._on_delete_screenshot)
         # Transcript playback wiring. The player bar fires play / pause /
         # seek; MainApp owns the single AudioPlayer and routes them.
@@ -1060,6 +1074,7 @@ class MainApp(QObject):
         if state in (STATE_COMPLETE, STATE_ERROR, STATE_NEW, STATE_PROCESSING):
             if session_id in self._screen_capture_regions:
                 self._screen_capture_regions.pop(session_id, None)
+                self._stop_auto_capture(session_id)
                 self._hide_armed_region_overlay()
                 self.window.session_view.set_screencap_armed(False)
 
@@ -1576,6 +1591,7 @@ class MainApp(QObject):
 
     def _on_stop_screen_capture(self, session_id: str) -> None:
         self._screen_capture_regions.pop(session_id, None)
+        self._stop_auto_capture(session_id)
         self._hide_armed_region_overlay()
         self.window.session_view.set_screencap_armed(False)
 
@@ -1592,6 +1608,91 @@ class MainApp(QObject):
             self._armed_region_overlay.close()
             self._armed_region_overlay = None
 
+    # ---- auto-capture lifecycle ------------------------------------------
+
+    def _start_auto_capture(self, session_id: str) -> None:
+        """Begin periodic screenshots for an armed session.
+
+        Cadence comes from config.ui.screen_capture_auto_interval_sec.
+        Each tick goes through the dedup gate -- captures whose
+        dHash is within the threshold of the most-recent KEPT image
+        are deleted; only differing captures stick around. Manual
+        Capture / Insert clicks bypass the dedup check and reset
+        the baseline.
+        """
+        if session_id in self._auto_capture_timers:
+            return  # already running
+        if self._screen_capture_regions.get(session_id) is None:
+            log.warning(
+                "auto-capture start requested but no region armed for %s",
+                session_id,
+            )
+            return
+        interval_ms = max(
+            1000,
+            int(self.config.ui.screen_capture_auto_interval_sec * 1000),
+        )
+        timer = QTimer(self)
+        timer.setInterval(interval_ms)
+        timer.timeout.connect(
+            lambda sid=session_id: self._auto_capture_tick(sid),
+        )
+        self._auto_capture_timers[session_id] = timer
+        timer.start()
+        log.info(
+            "auto-capture started for %s (interval=%d ms, threshold=%d bits)",
+            session_id, interval_ms,
+            self.config.ui.screen_capture_auto_dedup_threshold,
+        )
+
+    def _stop_auto_capture(self, session_id: str) -> None:
+        timer = self._auto_capture_timers.pop(session_id, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            log.info("auto-capture stopped for %s", session_id)
+        # Drop the baseline too so the next session starts clean.
+        self._auto_capture_baseline_hash.pop(session_id, None)
+
+    def _on_auto_capture_toggled(self, session_id: str, enabled: bool) -> None:
+        """SessionView pushes the per-session checkbox state here."""
+        if enabled:
+            self._start_auto_capture(session_id)
+        else:
+            self._stop_auto_capture(session_id)
+
+    def _auto_capture_tick(self, session_id: str) -> None:
+        """Periodic auto-capture body. Same as _capture_screenshot but
+        passes the result through the dedup gate."""
+        region = self._screen_capture_regions.get(session_id)
+        if region is None:
+            # Region was disarmed while the timer was pending; stop.
+            self._stop_auto_capture(session_id)
+            return
+        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
+        from .screencap.dedup import dhash_path, is_dedup_match  # noqa: PLC0415
+        from .utils.paths import session_screenshots_dir  # noqa: PLC0415
+        dst_dir = session_screenshots_dir(session_id)
+        saved = capture_region_to_file(region, dst_dir)
+        if saved is None:
+            log.warning("auto-capture: capture_region_to_file returned None")
+            return
+        new_hash = dhash_path(saved)
+        baseline = self._auto_capture_baseline_hash.get(session_id)
+        threshold = int(self.config.ui.screen_capture_auto_dedup_threshold)
+        if new_hash is not None and is_dedup_match(new_hash, baseline, threshold):
+            # Too similar; delete and skip the UI refresh.
+            try:
+                saved.unlink()
+            except OSError:
+                log.exception("auto-capture: failed to unlink dedup %s", saved)
+            return
+        if new_hash is not None:
+            self._auto_capture_baseline_hash[session_id] = new_hash
+        self.window.session_view.refresh_screenshots()
+        self._push_screenshot_offsets(session_id)
+        log.info("auto-capture: kept %s", saved.name)
+
     def _on_screencap_capture(self, session_id: str) -> None:
         self._capture_screenshot(session_id, insert=False)
 
@@ -1599,12 +1700,13 @@ class MainApp(QObject):
         self._capture_screenshot(session_id, insert=True)
 
     def _capture_screenshot(self, session_id: str, *, insert: bool) -> None:
-        """Shared body for Capture and Insert.
+        """Shared body for the manual Capture and Insert buttons.
 
-        Both grab the armed region, save a PNG, and refresh the Slides
-        tab; Insert additionally drops a markdown image-ref at the My
-        Notes cursor. The dual-path makes the no-op-on-failure semantics
-        identical regardless of which button the user clicked.
+        Manual captures (this path) ALWAYS keep the saved image and
+        update the dedup baseline -- the user explicitly asked for
+        this image so an auto-dedup check would be wrong here. The
+        auto-capture path uses _auto_capture_tick, which goes
+        through the dedup check.
         """
         region = self._screen_capture_regions.get(session_id)
         if region is None:
@@ -1614,6 +1716,7 @@ class MainApp(QObject):
             )
             return
         from .screencap.capture import capture_region_to_file  # noqa: PLC0415
+        from .screencap.dedup import dhash_path  # noqa: PLC0415
         from .utils.paths import session_screenshots_dir  # noqa: PLC0415
         dst_dir = session_screenshots_dir(session_id)
         saved = capture_region_to_file(region, dst_dir)
@@ -1622,6 +1725,11 @@ class MainApp(QObject):
                 "Screen capture failed (see log).", timeout_ms=5000,
             )
             return
+        # Update the dedup baseline so the next auto-capture compares
+        # against THIS manual image, not whatever came before.
+        new_hash = dhash_path(saved)
+        if new_hash is not None:
+            self._auto_capture_baseline_hash[session_id] = new_hash
         self.window.session_view.refresh_screenshots()
         # Re-push offsets so the new capture anchors into the rail
         # and shows up as a candidate for the playback-mode auto-
@@ -1989,6 +2097,11 @@ class MainApp(QObject):
         self._apply_audio_monitor_config()
         self._apply_synthesis_automation()
         self._refresh_status_indicators()
+        # Push the new auto-capture interval to the sidebar so the
+        # "every Ns" hint reflects what Settings just saved.
+        self.window.session_view.set_screencap_auto_interval(
+            int(self.config.ui.screen_capture_auto_interval_sec)
+        )
         self.window.status("Settings saved.", timeout_ms=4000)
 
     # ---- status bar indicators -------------------------------------------
