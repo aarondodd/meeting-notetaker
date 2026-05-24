@@ -117,6 +117,30 @@ class PreviousNotesWidget(QWidget):
     def set_session_id(self, session_id: str) -> None:
         self._session_id = session_id
 
+    def find_target(self) -> QWidget:
+        """Return the markdown preview pane so Ctrl+F can search it.
+
+        The archive list on the left is short by design and uses Qt's
+        own keyboard navigation; the right-side preview holds the
+        actual body content the user wants to grep through.
+        """
+        return self._preview
+
+    def select_archive_by_name(self, archive_name: str) -> bool:
+        """Pick the list row whose Path basename matches `archive_name`.
+
+        Used by the cross-session search dialog when the user
+        activates a Previous Notes hit -- we need to surface the
+        specific archive that contained the match. Returns True when
+        a match is selected, False otherwise (caller can fall back
+        to whatever was previously selected).
+        """
+        for i, path in enumerate(self._archives):
+            if path.name == archive_name:
+                self._list.setCurrentRow(i)
+                return True
+        return False
+
     def set_archives(self, paths: list[Path]) -> None:
         """Populate the version list. Paths come from
         ``TranscriptStore.list_previous_notes()`` -- already sorted

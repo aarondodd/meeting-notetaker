@@ -112,6 +112,15 @@ class LiveNotesWidget(QWidget):
     def setPlaceholderText(self, text: str) -> None:
         self._editor.setPlaceholderText(text)
 
+    def find_target(self) -> QWidget:
+        """Return the active widget for Ctrl+F to bind to.
+
+        Edit mode -> the QPlainTextEdit; Preview mode -> the
+        QTextBrowser. Both inherit `.find()` so FindBar's text
+        navigation works uniformly across the two states.
+        """
+        return self._stack.currentWidget()
+
     def is_in_preview(self) -> bool:
         return self._stack.currentWidget() is self._preview
 

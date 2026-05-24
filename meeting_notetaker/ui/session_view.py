@@ -40,7 +40,11 @@ from ..models.transcript import (
 )
 from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
+from ..models.highlights import HighlightSet
 from .attendee_sidebar import AttendeeSidebar
+from .classification_bar import ClassificationBar
+from .find_bar import FindBar
+from .highlight_bar import HighlightBar
 from .live_notes_widget import LiveNotesWidget
 from .previous_notes_widget import PreviousNotesWidget
 from .scaled_image_label import ScaledImageLabel
@@ -98,6 +102,17 @@ class SessionView(QWidget):
     # and the post-meeting refiner uses tags to constrain the clusterer.
     tag_speaker_clicked = pyqtSignal(str, str)            # session_id, name
     remove_last_tag_clicked = pyqtSignal(str, str)        # session_id, name
+    # Classification chip-row signals (v0.7.0+); MainApp persists the
+    # mutations via ClassificationStore + repaints the bar.
+    add_topic_requested = pyqtSignal(str, str)            # session_id, name
+    remove_topic_requested = pyqtSignal(str, int)         # session_id, topic_id
+    accept_topic_requested = pyqtSignal(str, int)         # session_id, topic_id
+    add_person_requested = pyqtSignal(str, str)           # session_id, name
+    remove_person_requested = pyqtSignal(str, int)        # session_id, person_id
+    set_series_requested = pyqtSignal(str, str)           # session_id, series_name ("" clears)
+    # Highlight bar mutations (v0.7.0+). The bar carries the whole
+    # HighlightSet to keep the signal-fired writes atomic.
+    highlights_changed = pyqtSignal(str, object)          # session_id, HighlightSet
     # Screen-capture lifecycle. start_screen_capture_clicked carries the
     # session id; MainApp shows the first-time popup (if needed) and
     # launches the region picker. stop_screen_capture_clicked tears the
@@ -466,6 +481,13 @@ class SessionView(QWidget):
         self._player_bar.pause_clicked.connect(self._on_player_bar_pause_clicked)
         self._player_bar.seek_ms_requested.connect(self._on_player_bar_seek_requested)
         transcript_layout.addWidget(self._player_bar, 0)
+        # v0.7.0 highlight bar: shaded markers + Start/End toggle +
+        # Clear All. Sits directly under the player bar so the
+        # markers align with the scrubber visually. Mutations
+        # bubble up via highlights_changed for MainApp to persist.
+        self._highlight_bar = HighlightBar(transcript_page)
+        self._highlight_bar.highlights_changed.connect(self._on_highlights_changed)
+        transcript_layout.addWidget(self._highlight_bar, 0)
         self._tabs.addTab(transcript_page, "Transcript")
 
         # Per-line timestamp index. Built each time the transcript text
@@ -527,7 +549,41 @@ class SessionView(QWidget):
         self._right_column.setVisible(False)
         body_row.addWidget(self._right_column, 0)
         layout.addLayout(body_row, 1)
+        # Classification bar (v0.7.0+): series + people + topics
+        # chips for the active session. Slots in between body_row
+        # and the find bar so it's always visible regardless of
+        # which tab is active. Mutations bubble up to MainApp via
+        # the *_requested signals.
+        # NOTE: We add it AFTER body_row in code order but the body
+        # took stretch=1 in addLayout so the bar lands BELOW the
+        # body in painted order. To keep the chips visible above
+        # the tabs as the issue intended, we re-insert at index 0
+        # of the outer layout (single insert is cheaper than
+        # reshuffling the body code).
+        self._classification_bar = ClassificationBar(self)
+        layout.insertWidget(0, self._classification_bar)
+        # Within-tab find bar (Ctrl+F). Hidden by default; the
+        # `Ctrl+F` shortcut wires _open_find_bar() to attach it to
+        # whichever text widget is in the active tab. Sits at the
+        # bottom of the SessionView so it spans the body width.
+        self._find_bar = FindBar(self)
+        layout.addWidget(self._find_bar)
+        # The shortcut is scoped to this widget so it doesn't fire
+        # when focus is in the session list (Ctrl+F there is reserved
+        # by the system).
+        from PyQt6.QtGui import QShortcut, QKeySequence  # noqa: PLC0415
+        find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        find_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        find_shortcut.activated.connect(self._open_find_bar)
+
         self._tabs.currentChanged.connect(self._on_tab_changed)
+        # Re-emit classification bar signals upward unchanged.
+        self._classification_bar.add_topic_requested.connect(self.add_topic_requested.emit)
+        self._classification_bar.remove_topic_requested.connect(self.remove_topic_requested.emit)
+        self._classification_bar.accept_topic_requested.connect(self.accept_topic_requested.emit)
+        self._classification_bar.add_person_requested.connect(self.add_person_requested.emit)
+        self._classification_bar.remove_person_requested.connect(self.remove_person_requested.emit)
+        self._classification_bar.set_series_requested.connect(self.set_series_requested.emit)
 
         self._set_buttons_for_state(STATE_NEW, has_transcript=False, has_notes=False)
         self.set_session(None, transcript="", notes="", previous_notes_paths=[])
@@ -791,10 +847,13 @@ class SessionView(QWidget):
     def set_player_total_ms(self, total_ms: int) -> None:
         self._player_bar.set_total_ms(total_ms)
         self._slides_view.set_player_total_ms(total_ms)
+        # Highlight bar uses the same time axis as the scrubber.
+        self._highlight_bar.set_total_ms(total_ms)
 
     def set_player_position_ms(self, ms: int) -> None:
         self._player_bar.set_position_ms(ms)
         self._slides_view.set_player_position_ms(ms)
+        self._highlight_bar.set_player_position(ms)
         # Highlight the transcript line that owns this timestamp. We
         # do this on every position update so the highlight follows
         # playback in real time. Skip when the user is mid-drag --
@@ -1469,6 +1528,110 @@ class SessionView(QWidget):
             "notes": "Synthesis",
             "previous": "Previous Notes",
         }.get(tab_id or "", "")
+
+    def set_session_highlights(
+        self,
+        total_ms: int,
+        highlights: HighlightSet,
+    ) -> None:
+        """Load the given highlight set into the bar.
+
+        Called from MainApp on session selection. total_ms is the
+        loaded audio's duration (0 disables the bar's toggle
+        button cleanly).
+        """
+        session_id = self._session.id if self._session else ""
+        self._highlight_bar.set_session_state(session_id, total_ms, highlights)
+
+    def _on_highlights_changed(self, hs: HighlightSet) -> None:
+        """Bar mutation -> bubble up so MainApp persists."""
+        if self._session is None:
+            return
+        self.highlights_changed.emit(self._session.id, hs)
+
+    def set_classification(self, classification) -> None:
+        """Push fresh classification data into the chips bar.
+
+        Called from MainApp whenever the active session's series /
+        people / topics change. None-session is handled by passing
+        an empty SessionClassification (the bar disables its
+        mutator buttons).
+        """
+        session_id = self._session.id if self._session else None
+        self._classification_bar.set_session(session_id, classification)
+
+    def set_active_tab(
+        self, tab_id: str, archive_name: Optional[str] = None,
+    ) -> bool:
+        """Switch to the named tab. Returns True if the tab exists.
+
+        Used by the cross-session search dialog: after the user
+        double-clicks a result, MainApp selects the session, then
+        calls this to drill into the matching tab. For previous-
+        notes hits, `archive_name` (the notes-YYYYMMDD-HHMM.md
+        filename) is passed through to the widget so it selects the
+        matching archive.
+        """
+        target_widget = None
+        if tab_id == "transcript":
+            # Transcript page is held under a stack; the tab widget
+            # is the page that contains either the idle or playback
+            # variant. Find it by searching the tab widget's pages
+            # for the parent of self._transcript_view.
+            for i in range(self._tabs.count()):
+                if self._tabs.tabText(i) == "Transcript":
+                    target_widget = self._tabs.widget(i)
+                    break
+        elif tab_id == "live_notes":
+            target_widget = self._live_notes_editor
+        elif tab_id == "notes":
+            target_widget = self._notes_view
+        elif tab_id == "previous":
+            target_widget = self._previous_view
+            if archive_name:
+                try:
+                    self._previous_view.select_archive_by_name(archive_name)
+                except AttributeError:
+                    # Older builds without select_archive_by_name will
+                    # still scroll to the tab; the user picks from
+                    # the list manually.
+                    pass
+        if target_widget is None:
+            return False
+        idx = self._tabs.indexOf(target_widget)
+        if idx < 0:
+            return False
+        self._tabs.setCurrentIndex(idx)
+        return True
+
+    def _find_target_for_active_tab(self) -> Optional[QWidget]:
+        """Return the text widget Ctrl+F should bind to in the active tab.
+
+        Slides tab has no searchable text and returns None; the find
+        bar treats that as a "nothing to search here" no-op so the
+        shortcut is silently inert rather than focus-shifting into
+        another tab.
+        """
+        tab_id = self._active_tab_id()
+        if tab_id == "transcript":
+            return self._transcript_view
+        if tab_id == "live_notes":
+            return self._live_notes_editor.find_target()
+        if tab_id == "notes":
+            return self._notes_view.find_target()
+        if tab_id == "previous":
+            return self._previous_view.find_target()
+        return None
+
+    def _open_find_bar(self) -> None:
+        """Ctrl+F handler. Bind the bar to the active tab's text widget
+        + reveal it. If the active tab has no searchable content
+        (Slides), the find bar stays hidden so the shortcut doesn't
+        appear broken via an empty-binding state."""
+        target = self._find_target_for_active_tab()
+        if target is None:
+            return
+        self._find_bar.show_for(target)
 
     def _on_previous_restore_requested(self, session_id: str, path: Path) -> None:
         self.restore_previous_notes_clicked.emit(session_id, path)

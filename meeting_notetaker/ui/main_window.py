@@ -40,6 +40,7 @@ from ..models.session import (
 )
 from ..utils.icons import app_icon
 from ..utils.paths import has_retained_audio
+from .classification_navigator import ClassificationNavigator
 from .session_view import SessionView
 from .status_indicators import SegmentState, StatusSegment
 
@@ -62,11 +63,48 @@ _STATE_BADGE: dict[str, tuple[str, str]] = {
     STATE_ERROR:      ("❌", "Error -- partial transcript may exist"),
 }
 
-_COL_AUDIO = 0
-_COL_SLIDES = 1
-_COL_STATE = 2
-_COL_DATE = 3
-_COL_TITLE = 4
+# Session list column order (v0.7.0+): the human-relevant columns
+# (Date + Title) lead so the eye can scan them first; the narrow
+# indicator glyphs (Audio retained / Screenshots present / pipeline
+# state) trail. Sortable columns are Date and Title only -- clicking
+# any of the three indicator columns snaps back to the active sort.
+_COL_DATE = 0
+_COL_TITLE = 1
+_COL_AUDIO = 2
+_COL_SLIDES = 3
+_COL_STATE = 4
+
+_INDICATOR_COLUMNS = (_COL_AUDIO, _COL_SLIDES, _COL_STATE)
+
+
+# Sort-spec serialization. Stored verbatim in config.toml under
+# ui.session_list_sort; values that don't match snap to "date_desc".
+_DEFAULT_SORT_SPEC = "date_desc"
+
+
+def _sort_spec_to_column_order(spec: str) -> tuple[int, Qt.SortOrder]:
+    """Translate a persisted sort spec string into (column, order).
+
+    Unknown specs fall back to the default (date descending).
+    """
+    table: dict[str, tuple[int, Qt.SortOrder]] = {
+        "date_desc":  (_COL_DATE,  Qt.SortOrder.DescendingOrder),
+        "date_asc":   (_COL_DATE,  Qt.SortOrder.AscendingOrder),
+        "title_asc":  (_COL_TITLE, Qt.SortOrder.AscendingOrder),
+        "title_desc": (_COL_TITLE, Qt.SortOrder.DescendingOrder),
+    }
+    return table.get(spec, table[_DEFAULT_SORT_SPEC])
+
+
+def _column_order_to_sort_spec(column: int, order: Qt.SortOrder) -> str:
+    """Inverse of _sort_spec_to_column_order. Indicator columns return
+    the default spec (callers use this to snap a click on an indicator
+    column back to a real sort)."""
+    if column == _COL_DATE:
+        return "date_asc" if order == Qt.SortOrder.AscendingOrder else "date_desc"
+    if column == _COL_TITLE:
+        return "title_asc" if order == Qt.SortOrder.AscendingOrder else "title_desc"
+    return _DEFAULT_SORT_SPEC
 
 
 class MainWindow(QMainWindow):
@@ -89,12 +127,30 @@ class MainWindow(QMainWindow):
     export_video_requested = pyqtSignal(str)       # session_id
     delete_recording_requested = pyqtSignal(str)   # session_id
     session_selected = pyqtSignal(str)             # session_id
+    session_list_sort_changed = pyqtSignal(str)    # one of VALID_SESSION_LIST_SORTS
+    classification_filter_changed = pyqtSignal(str, object)
+    # view (str -- one of VIEW_*), value_id (Optional[int]); emitted by
+    # the navigator when the user picks a different filter.
+    open_search_requested = pyqtSignal()           # Ctrl+Shift+F
+    rebuild_search_index_requested = pyqtSignal()  # Help > Debug
+    show_session_tab_requested = pyqtSignal(str, str, object)
+    # session_id, tab_id ('transcript' | 'live_notes' | 'notes' | 'previous'),
+    # optional archive_path (str | None); emitted by the cross-session
+    # search dialog after the user double-clicks a hit.
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Meeting Notetaker")
         self.setWindowIcon(app_icon())
         self.resize(1024, 720)
+
+        # Global shortcut: Ctrl+Shift+F opens the cross-session search
+        # dialog. Window-scoped so it fires no matter which pane has
+        # focus (session list, session view, or the find bar itself).
+        search_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+F"), self,
+        )
+        search_shortcut.activated.connect(self.open_search_requested.emit)
 
         # Menu bar
         menubar = self.menuBar()
@@ -127,6 +183,14 @@ class MainWindow(QMainWindow):
         action_depcheck = QAction("&Check Dependencies...", self)
         action_depcheck.triggered.connect(self.open_dependency_check_requested.emit)
         debug_menu.addAction(action_depcheck)
+        # Rebuild Search Index: nuclear option for the FTS5 store
+        # under app_data/search.db. Useful after a corrupt write or
+        # a schema bump. Runs synchronously with a progress dialog.
+        action_rebuild_search = QAction("&Rebuild Search Index", self)
+        action_rebuild_search.triggered.connect(
+            self.rebuild_search_index_requested.emit
+        )
+        debug_menu.addAction(action_rebuild_search)
         help_menu.addSeparator()
         action_user_guide = QAction("&User Guide...", self)
         action_user_guide.triggered.connect(self.open_user_guide_requested.emit)
@@ -162,9 +226,19 @@ class MainWindow(QMainWindow):
         self._new_btn.clicked.connect(self.new_session_requested.emit)
         header_row.addWidget(self._new_btn)
         left_layout.addLayout(header_row)
+        # Classification navigator (v0.7.0+): All / By Series / By
+        # Person / By Topic filter pulldown. Emits filter_changed
+        # for MainApp to route into a filtered session list.
+        self._navigator = ClassificationNavigator(left)
+        left_layout.addWidget(self._navigator)
         self._list = QTreeWidget(left)
         self._list.setColumnCount(5)
-        self._list.setHeaderHidden(True)
+        # v0.7.0: header is visible so Date + Title can be clicked to
+        # sort. Indicator columns (Audio / Slides / State) carry no
+        # text -- their headers stay blank but are still focusable so
+        # the column boundary can be dragged.
+        self._list.setHeaderLabels(["Date", "Title", "", "", ""])
+        self._list.setHeaderHidden(False)
         self._list.setRootIsDecorated(False)
         self._list.setUniformRowHeights(True)
         self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -175,19 +249,50 @@ class MainWindow(QMainWindow):
         rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self._list)
         rename_shortcut.activated.connect(self._rename_selected)
         header = self._list.header()
-        # Audio + slides + state are narrow glyph columns; date is
-        # fixed-width to fit "YYYY-MM-DD HH:MM"; title takes the
-        # remaining space.
+        # Date is fixed-width to fit "YYYY-MM-DD HH:MM"; title takes
+        # the remaining horizontal space; audio + slides + state are
+        # narrow glyph columns trailing on the right.
+        header.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_SLIDES, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
+        self._list.setColumnWidth(_COL_DATE, 130)
         self._list.setColumnWidth(_COL_AUDIO, 28)
         self._list.setColumnWidth(_COL_SLIDES, 28)
         self._list.setColumnWidth(_COL_STATE, 28)
-        self._list.setColumnWidth(_COL_DATE, 110)
+        # Indicator-column headers are blank text but still get
+        # informative tooltips so users learn the glyph meaning by
+        # hovering. Same content the per-item tooltips carry.
+        header.model().setHeaderData(
+            _COL_AUDIO, Qt.Orientation.Horizontal,
+            "Audio retained on disk", Qt.ItemDataRole.ToolTipRole,
+        )
+        header.model().setHeaderData(
+            _COL_SLIDES, Qt.Orientation.Horizontal,
+            "Screenshots captured for this session", Qt.ItemDataRole.ToolTipRole,
+        )
+        header.model().setHeaderData(
+            _COL_STATE, Qt.Orientation.Horizontal,
+            "Transcription pipeline state", Qt.ItemDataRole.ToolTipRole,
+        )
+        # Enable sortable headers. Date sort is the safe default
+        # (YYYY-MM-DD HH:MM lex order = chronological); Title sort
+        # is A->Z then Z->A on second click. Clicks on indicator
+        # columns are snapped back via _on_sort_indicator_changed.
+        self._list.setSortingEnabled(True)
+        header.setSectionsClickable(True)
+        self._current_sort_spec = _DEFAULT_SORT_SPEC
+        self._suppress_sort_emission = False
+        header.sortIndicatorChanged.connect(self._on_sort_indicator_changed)
+        # Apply the default before any items are loaded so the first
+        # set_sessions call respects it; set_session_list_sort()
+        # called from MainApp at startup overrides with the persisted
+        # value.
+        col, order = _sort_spec_to_column_order(self._current_sort_spec)
+        self._list.sortByColumn(col, order)
         left_layout.addWidget(self._list, 1)
+        self._navigator.filter_changed.connect(self.classification_filter_changed.emit)
         bulk_row = QHBoxLayout()
         bulk_row.addStretch(1)
         self._delete_btn = QPushButton("Delete Selected", left)
@@ -254,11 +359,94 @@ class MainWindow(QMainWindow):
                 segment.apply(state)
 
     def set_sessions(self, sessions: Iterable[Session]) -> None:
+        # Disabling sorting during bulk insert is the documented Qt idiom
+        # for avoiding O(N log N) re-sort per row; we re-enable + sort
+        # once at the end. Also blocking selection-changed signal so a
+        # mass-replace doesn't fire the per-row selection handler.
         self._list.blockSignals(True)
+        was_sorting = self._list.isSortingEnabled()
+        self._list.setSortingEnabled(False)
         self._list.clear()
         for s in sessions:
             self._add_item(s)
+        if was_sorting:
+            self._list.setSortingEnabled(True)
+            col, order = _sort_spec_to_column_order(self._current_sort_spec)
+            self._list.sortByColumn(col, order)
         self._list.blockSignals(False)
+
+    def set_classification_choices(
+        self,
+        *,
+        series: list[tuple[int, str]] | None = None,
+        people: list[tuple[int, str]] | None = None,
+        topics: list[tuple[int, str]] | None = None,
+    ) -> None:
+        """Push fresh series / people / topics into the navigator combo.
+
+        Called from MainApp after any classification mutation so the
+        pulldown shows current state. Pass only the changed dimension
+        to avoid unnecessary list rebuilds.
+        """
+        if series is not None:
+            self._navigator.set_series(series)
+        if people is not None:
+            self._navigator.set_people(people)
+        if topics is not None:
+            self._navigator.set_topics(topics)
+
+    def reset_classification_filter(self) -> None:
+        """Snap the navigator back to View=All. Used when the underlying
+        store is rebuilt or when MainApp wants a clean slate after a
+        bulk import."""
+        self._navigator.reset()
+
+    def set_session_list_sort(self, spec: str) -> None:
+        """Apply a persisted sort spec to the list.
+
+        Called once from MainApp at startup with the value loaded from
+        config.toml. The header click handler keeps the spec + display
+        in sync after that. Invalid specs fall through to the default
+        via _sort_spec_to_column_order.
+        """
+        self._current_sort_spec = spec or _DEFAULT_SORT_SPEC
+        col, order = _sort_spec_to_column_order(self._current_sort_spec)
+        # Apply the sort without re-emitting back to MainApp; this is
+        # the initial-state load, not a user action.
+        self._suppress_sort_emission = True
+        try:
+            self._list.sortByColumn(col, order)
+            self._list.header().setSortIndicator(col, order)
+        finally:
+            self._suppress_sort_emission = False
+
+    def _on_sort_indicator_changed(self, column: int, order: Qt.SortOrder) -> None:
+        """Handle a header click.
+
+        If the column is one of the indicator columns (Audio / Slides
+        / State), snap back to the previously-active sort -- those
+        columns hold emoji glyphs and sorting by them is nonsensical.
+        Otherwise persist the new spec back to MainApp.
+        """
+        if self._suppress_sort_emission:
+            return
+        if column in _INDICATOR_COLUMNS:
+            # Snap back. Set the indicator + actually sort to the
+            # previous (column, order) under signal-suppression so we
+            # don't recurse into this handler.
+            prev_col, prev_order = _sort_spec_to_column_order(self._current_sort_spec)
+            self._suppress_sort_emission = True
+            try:
+                self._list.header().setSortIndicator(prev_col, prev_order)
+                self._list.sortByColumn(prev_col, prev_order)
+            finally:
+                self._suppress_sort_emission = False
+            return
+        new_spec = _column_order_to_sort_spec(column, order)
+        if new_spec == self._current_sort_spec:
+            return
+        self._current_sort_spec = new_spec
+        self.session_list_sort_changed.emit(new_spec)
 
     def select_session(self, session_id: str) -> None:
         root = self._list.invisibleRootItem()
@@ -302,12 +490,13 @@ class MainWindow(QMainWindow):
         state_tooltip = f"Transcription state: {state_tooltip}"
 
         when, title = _session_date_and_title(s)
+        # v0.7.0 column order: Date | Title | Audio | Slides | State.
         item = QTreeWidgetItem([
+            when,
+            title,
             audio_glyph,
             slides_glyph,
             state_glyph,
-            when,
-            title,
         ])
         item.setTextAlignment(_COL_AUDIO, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_SLIDES, Qt.AlignmentFlag.AlignCenter)

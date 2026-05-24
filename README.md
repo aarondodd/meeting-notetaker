@@ -9,9 +9,14 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.6.5. End-to-end capture, transcription, synthesis,
-> screen capture, retained-audio playback + export, and transcript-
-> synchronized playback all working. Performance tuning is ongoing.
+> **Status:** v0.7.0 (in development). End-to-end capture,
+> transcription, synthesis, screen capture, retained-audio playback +
+> export, and transcript-synchronized playback all working.
+> v0.7.0 adds within-tab Ctrl+F find + cross-session full-text search
+> (Ctrl+Shift+F), per-session classification (series / people / topics
+> chips + filter pulldown), reorderable + sortable session list
+> columns, and highlight markers with MP4/audio export. Performance
+> tuning is ongoing.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -34,6 +39,28 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.0
+
+- **Cross-session full-text search** (`Ctrl+Shift+F`) over the
+  transcript, My Notes, Synthesis, and Previous Notes tabs of every
+  session. Backed by SQLite FTS5, indexed on save with a 30s catch-up
+  scan. Help > Debug > Rebuild Search Index for cold starts.
+- **Within-tab find** (`Ctrl+F`) on every text tab: incremental
+  search, Next/Prev navigation, case + whole-word toggles.
+- **Session classification:** every session has a Series (recurring
+  meeting), People (auto-pulled from My Notes' `# Attendees`), and
+  Topics (deterministic extractor over the synthesis output -- no
+  LLM). Chips bar at the top of the session view; filter pulldown
+  above the session list (All / By Series / By Person / By Topic).
+- **Session list reorder + sort:** columns now appear as Date | Title
+  | Audio | Slides | State; the Date and Title headers click to
+  sort ascending / descending and the choice persists across launches.
+- **Highlight markers + export:** mark interesting moments via the
+  Start/End toggle below the playback scrubber, optionally title
+  each one, then export an MP4 (with 2-second title + jump
+  interstitials) or audio file (MP3/FLAC/AAC/Opus/WAV with short
+  silent gaps) of just the highlights.
 
 ## What's in v0.6.5
 
