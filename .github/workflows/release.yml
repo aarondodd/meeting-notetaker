@@ -1,0 +1,78 @@
+name: Build Windows installer
+
+# Tag-driven Windows build: pushing vX.Y.Z creates a GitHub Release
+# (if one isn't already there) and attaches the Inno Setup installer +
+# the raw PyInstaller .exe. workflow_dispatch runs the same pipeline
+# for smoke-testing without producing a release.
+#
+# Cost: $0 on public repos. windows-latest minutes are unmetered for
+# public repos, and release-asset storage + bandwidth are unmetered.
+# The workflow deliberately does NOT call actions/upload-artifact so
+# nothing lands in the 500 MB Actions-artifact quota.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+        shell: pwsh
+
+      - name: Build PyInstaller bundle
+        run: .\build.ps1
+        shell: pwsh
+
+      - name: Derive installer version
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -match '^v(.+)$') {
+            $version = $matches[1]
+          } else {
+            $version = "0.0.0-dev"
+          }
+          Write-Host "Installer version: $version"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc /DAppVersion=${{ steps.ver.outputs.version }} installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem Output
+
+      - name: Upload installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          # generate_release_notes=true populates the release body with
+          # auto-summarized commit + PR diffs since the previous tag, so
+          # we don't have to keep a hand-curated changelog in sync.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            Output/meeting-notetaker-setup-${{ steps.ver.outputs.version }}.exe
+            dist/meeting-notetaker.exe

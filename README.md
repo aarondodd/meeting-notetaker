@@ -120,7 +120,21 @@ etc.) live in [Technical Details](#technical-details) below.
 
 ## Installation
 
-### Packaged build (typical user path)
+### Windows installer (typical user path, v0.6.6+)
+
+Download `meeting-notetaker-setup-X.Y.Z.exe` from the [latest
+release](https://github.com/aarondodd/meeting-notetaker/releases/latest)
+and run it. The installer:
+
+- Installs per-user by default (no admin required); the UAC dialog
+  lets you elevate for a Program Files install if you prefer
+- Creates a Start Menu shortcut + optional desktop shortcut
+- Registers with Add/Remove Programs for clean uninstall
+
+The bundled .exe is also attached to the release for portable use
+without an installer.
+
+### Build locally (Windows)
 
 ```powershell
 .\build.ps1                         # produces dist\meeting-notetaker.exe
