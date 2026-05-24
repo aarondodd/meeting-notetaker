@@ -256,6 +256,13 @@ class MainApp(QObject):
         self._search_index_scan_timer.setInterval(30_000)
         self._search_index_scan_timer.timeout.connect(self._scan_search_index_stale)
 
+        # Persist window geometry + splitter state at app exit.
+        # aboutToQuit fires regardless of how the app shuts down
+        # (X button, menu Quit, tray Quit, Cmd+Q, OS signal) so this
+        # is the single canonical save point. Single write -- no
+        # debouncing needed for one-shot exit.
+        self.qt_app.aboutToQuit.connect(self._persist_window_layout)
+
         self._wire_signals()
         self._apply_user_name()
         self._apply_synthesis_automation()
@@ -311,6 +318,14 @@ class MainApp(QObject):
         # the app the way they left it. Sort is set before any sessions
         # load via _refresh_sessions, so the first render is sorted.
         self.window.set_session_list_sort(self.config.ui.session_list_sort)
+        # Restore the persisted window size + position + horizontal
+        # splitter ratio. Has to run before window.show() ideally,
+        # but Qt accepts restoreGeometry after show too -- it just
+        # repositions the live window. Either way, applied here.
+        self.window.restore_layout_state(
+            self.config.ui.main_window_geometry,
+            self.config.ui.main_splitter_state,
+        )
 
     def _on_transcript_playback_split_changed(self, pct: int) -> None:
         """Persist the user's new splitter ratio (debounced)."""
@@ -322,6 +337,24 @@ class MainApp(QObject):
             self._save_split_timer.setSingleShot(True)
             self._save_split_timer.setInterval(500)
             self._save_split_timer.timeout.connect(self.config.save)
+
+    def _persist_window_layout(self) -> None:
+        """Serialize + write window size/position + splitter state
+        to config.toml at app exit.
+
+        Tolerant of partial failure: if either save returns an empty
+        string, the corresponding config field stays at the last
+        successfully-saved value (no half-update). aboutToQuit is
+        the only caller, so logging is enough on failure -- the user
+        is exiting anyway.
+        """
+        try:
+            geom, split = self.window.save_layout_state()
+            self.config.ui.main_window_geometry = geom or self.config.ui.main_window_geometry
+            self.config.ui.main_splitter_state = split or self.config.ui.main_splitter_state
+            self.config.save()
+        except Exception:
+            log.exception("window layout persist failed")
 
     def _on_session_list_sort_changed(self, spec: str) -> None:
         """Persist the user's chosen sort order for the session list.
@@ -1063,18 +1096,30 @@ class MainApp(QObject):
         return [s for s in sessions if s.id in allowed]
 
     def _refresh_classification_choices(self) -> None:
-        """Re-populate the navigator combo with current series /
-        people / topics. Cheap (sub-millisecond at any realistic
-        store size) so we run it on every list refresh rather than
-        tracking dirty bits."""
+        """Re-populate the navigator combo + chips-bar pickers with
+        current series / people / topics. Cheap (sub-millisecond at
+        any realistic store size) so we run it on every list
+        refresh rather than tracking dirty bits."""
         if self.classification is None:
             return
         try:
-            series = [(s.id, s.name) for s in self.classification.list_series()]
-            people = [(p.id, p.display_name) for p in self.classification.list_people()]
-            topics = [(t.id, t.name) for t in self.classification.list_topics()]
+            series_rows = self.classification.list_series()
+            people_rows = self.classification.list_people()
+            topic_rows = self.classification.list_topics()
+            series = [(s.id, s.name) for s in series_rows]
+            people = [(p.id, p.display_name) for p in people_rows]
+            topics = [(t.id, t.name) for t in topic_rows]
             self.window.set_classification_choices(
                 series=series, people=people, topics=topics,
+            )
+            # Same lists -- name-only -- power the chips bar's
+            # dropdown+text combo. ClassificationBar reads these on
+            # button click so a stale push between clicks just shows
+            # slightly old options for one click.
+            self.window.session_view.set_classification_known_lists(
+                series=[s.name for s in series_rows],
+                people=[p.display_name for p in people_rows],
+                topics=[t.name for t in topic_rows],
             )
         except Exception:
             log.exception("classification refresh failed")
@@ -1085,13 +1130,23 @@ class MainApp(QObject):
             return
         store = TranscriptStore(session_id)
         live_notes_body = store.read_live_notes()
+        notes_body = store.read_notes()
         self.window.session_view.set_session(
             session,
             transcript=store.read_transcript(),
-            notes=store.read_notes(),
+            notes=notes_body,
             previous_notes_paths=store.list_previous_notes(),
             live_notes=live_notes_body,
         )
+        # Backfill classification from whatever's on disk, so pre-
+        # v0.7.0 sessions get People + Topic suggestions populated as
+        # the user clicks through them. Both calls are cheap and
+        # idempotent -- sync_session_people replaces only the
+        # attendee_list-source rows; replace_session_topic_suggestions
+        # only replaces unaccepted auto-suggestions.
+        self._sync_attendees_to_people(session_id, live_notes_body)
+        if notes_body.strip():
+            self._extract_topics_for_session(session_id, notes_body)
         # Load the session's retained audio into the player (if any).
         # The player bar in the Transcript pane greys out cleanly when
         # there's nothing on disk; loading itself is a no-op for

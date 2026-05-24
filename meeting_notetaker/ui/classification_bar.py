@@ -114,6 +114,13 @@ class ClassificationBar(QWidget):
         super().__init__(parent)
         self._session_id: str = ""
         self._classification = SessionClassification()
+        # Known names (alphabetical lists pushed from MainApp via
+        # set_known_lists). Drive the dropdown+text combo in the
+        # Add/Change pickers so the user can pick from existing
+        # values OR type something new.
+        self._known_series: list[str] = []
+        self._known_people: list[str] = []
+        self._known_topics: list[str] = []
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
@@ -180,6 +187,28 @@ class ClassificationBar(QWidget):
             w.setEnabled(enabled)
         self._render()
 
+    def set_known_lists(
+        self,
+        *,
+        series: Optional[list[str]] = None,
+        people: Optional[list[str]] = None,
+        topics: Optional[list[str]] = None,
+    ) -> None:
+        """Push alphabetically-sorted known names from MainApp.
+
+        Drives the dropdown half of the Add/Change pickers. Pass
+        only the changed dimension to avoid unnecessary list
+        replacement. Idempotent -- the bar reads these on click,
+        not at render time, so they can change between session
+        switches without forcing a repaint.
+        """
+        if series is not None:
+            self._known_series = list(series)
+        if people is not None:
+            self._known_people = list(people)
+        if topics is not None:
+            self._known_topics = list(topics)
+
     def _render(self) -> None:
         # Series.
         if self._classification.series is not None:
@@ -220,6 +249,8 @@ class ClassificationBar(QWidget):
             self._topics_layout.addWidget(placeholder)
 
     # ---- handlers ----
+    _CLEAR_SENTINEL = "-- clear (unfile) --"
+
     def _on_change_series(self) -> None:
         if not self._session_id:
             return
@@ -227,41 +258,75 @@ class ClassificationBar(QWidget):
             self._classification.series.name
             if self._classification.series else ""
         )
-        new_name, ok = QInputDialog.getText(
+        # Build items: sentinel for "clear" + alphabetical existing
+        # series. editable=True so the user can type a brand-new
+        # name; current selection seeds the combo.
+        items = [self._CLEAR_SENTINEL] + sorted(self._known_series)
+        try:
+            current_idx = items.index(current) if current else 0
+        except ValueError:
+            current_idx = 0
+        choice, ok = QInputDialog.getItem(
             self, "Set Series",
-            "Series name (leave blank to unfile):",
-            QLineEdit.EchoMode.Normal,
-            current,
+            "Pick an existing series, type a new one, "
+            "or pick \"clear (unfile)\":",
+            items, current_idx, True,
         )
         if not ok:
             return
-        # Empty string clears the assignment; the parent sees "" and
-        # calls assign_series(None).
-        self.set_series_requested.emit(self._session_id, new_name.strip())
+        chosen = choice.strip()
+        if chosen == self._CLEAR_SENTINEL or not chosen:
+            self.set_series_requested.emit(self._session_id, "")
+            return
+        self.set_series_requested.emit(self._session_id, chosen)
 
     def _on_add_person(self) -> None:
         if not self._session_id:
             return
-        name, ok = QInputDialog.getText(
+        # Filter out people already on the session -- showing them
+        # in the picker would just be noise.
+        already_on_session = {
+            sp.person.display_name.casefold()
+            for sp in self._classification.people
+        }
+        items = [
+            name for name in sorted(self._known_people)
+            if name.casefold() not in already_on_session
+        ]
+        choice, ok = QInputDialog.getItem(
             self, "Add Person",
-            "Person name:",
-            QLineEdit.EchoMode.Normal,
+            "Pick an existing person or type a new name:",
+            items, 0, True,
         )
-        if not ok or not name.strip():
+        if not ok:
             return
-        self.add_person_requested.emit(self._session_id, name.strip())
+        name = choice.strip()
+        if not name:
+            return
+        self.add_person_requested.emit(self._session_id, name)
 
     def _on_add_topic(self) -> None:
         if not self._session_id:
             return
-        name, ok = QInputDialog.getText(
+        already_on_session = {
+            st.topic.name.casefold()
+            for st in self._classification.topics
+        }
+        items = [
+            name for name in sorted(self._known_topics)
+            if name.casefold() not in already_on_session
+        ]
+        choice, ok = QInputDialog.getItem(
             self, "Add Topic",
-            "Topic name:",
-            QLineEdit.EchoMode.Normal,
+            "Pick an existing topic or type a new one:",
+            items, 0, True,
         )
-        if not ok or not name.strip():
+        if not ok:
             return
-        self.add_topic_requested.emit(self._session_id, name.strip())
+        name = choice.strip()
+        if not name:
+            return
+        self.add_topic_requested.emit(self._session_id, name)
 
     def _emit_remove_person(self, person_id: int) -> None:
         if not self._session_id:

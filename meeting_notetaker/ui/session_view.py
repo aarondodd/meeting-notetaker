@@ -280,6 +280,16 @@ class SessionView(QWidget):
         )
         self._copy_btn.clicked.connect(self._on_copy_active_tab)
         synthesis.addWidget(self._copy_btn)
+        # Find-in-tab. Mirrors the Ctrl+F shortcut so a mouse-only
+        # user has a visible affordance. Wired directly to the
+        # same handler; if the active tab has no searchable text
+        # (Slides) the handler no-ops cleanly.
+        self._find_btn = QPushButton("Find...", self)
+        self._find_btn.setToolTip(
+            "Search within the active tab (Ctrl+F)"
+        )
+        self._find_btn.clicked.connect(self._open_find_bar)
+        synthesis.addWidget(self._find_btn)
         self._print_btn = QPushButton("Print...", self)
         self._print_btn.setToolTip(
             "Send the active tab (My Notes or Synthesis) to a physical "
@@ -1548,6 +1558,22 @@ class SessionView(QWidget):
         if self._session is None:
             return
         self.highlights_changed.emit(self._session.id, hs)
+
+    def set_classification_known_lists(
+        self,
+        *,
+        series: Optional[list[str]] = None,
+        people: Optional[list[str]] = None,
+        topics: Optional[list[str]] = None,
+    ) -> None:
+        """Forward the alphabetical known-name lists to the chips bar.
+
+        Drives the dropdown half of the Add/Change pickers so the
+        user picks-or-types instead of free-form-only.
+        """
+        self._classification_bar.set_known_lists(
+            series=series, people=people, topics=topics,
+        )
 
     def set_classification(self, classification) -> None:
         """Push fresh classification data into the chips bar.

@@ -212,6 +212,64 @@ def test_date_column_is_fixed_with_room_for_header_and_arrow(qt_app):
         win.deleteLater()
 
 
+def test_save_layout_state_returns_base64_strings(qt_app):
+    """Both fields must serialize to non-empty base64 that's safe to
+    store in config.toml. Empty output means Qt failed to serialize
+    -- the persist path would no-op silently and the user would
+    keep losing their window state."""
+    import base64
+    from meeting_notetaker.ui.main_window import MainWindow
+    win = MainWindow()
+    try:
+        win.resize(1234, 678)
+        win._main_splitter.setSizes([200, 800])  # noqa: SLF001
+        geom_b64, split_b64 = win.save_layout_state()
+        assert geom_b64
+        assert split_b64
+        # Round-trip decode: the strings must be valid base64.
+        base64.b64decode(geom_b64)
+        base64.b64decode(split_b64)
+    finally:
+        win.deleteLater()
+
+
+# Note: full geometry round-trip is only verifiable on a real
+# display because offscreen Qt doesn't fully realize widget
+# geometry until show() runs against an actual platform window.
+# The save/restore code itself is dead-simple binary glue
+# (QMainWindow.saveGeometry / restoreGeometry); we cover the
+# safety properties (non-empty output, garbage tolerance, no-op
+# on empty) above and leave the round-trip to a manual
+# launch-resize-relaunch test on Windows.
+
+
+def test_restore_layout_with_empty_strings_is_noop(qt_app):
+    """Brand-new install has empty config fields; restore must NOT
+    crash, just leave Qt's defaults in place."""
+    from meeting_notetaker.ui.main_window import MainWindow
+    win = MainWindow()
+    try:
+        default_size = (win.width(), win.height())
+        win.restore_layout_state("", "")
+        assert (win.width(), win.height()) == default_size
+    finally:
+        win.deleteLater()
+
+
+def test_restore_layout_with_garbage_is_noop(qt_app):
+    """A corrupt config field shouldn't crash the app at launch.
+    QByteArray.fromBase64 returns empty on bad input, and Qt's
+    restoreGeometry returns False on empty/invalid state."""
+    from meeting_notetaker.ui.main_window import MainWindow
+    win = MainWindow()
+    try:
+        # Not a panic if these don't change anything; the contract
+        # is "doesn't raise".
+        win.restore_layout_state("not-valid-base64!!", "@@@")
+    finally:
+        win.deleteLater()
+
+
 def test_title_is_the_only_column_set_to_stretch(qt_app):
     from PyQt6.QtWidgets import QHeaderView
     from meeting_notetaker.ui.main_window import (

@@ -213,6 +213,9 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter(Qt.Orientation.Horizontal, central)
+        # Hold a reference so save_layout_state can serialize the
+        # split ratio; the local `splitter` name is shadowed below.
+        self._main_splitter = splitter
         layout.addWidget(splitter)
 
         # Left pane: session list + buttons
@@ -222,6 +225,14 @@ class MainWindow(QMainWindow):
         header_row = QHBoxLayout()
         header_row.addWidget(QLabel("Sessions", left))
         header_row.addStretch(1)
+        # Search button mirrors the Ctrl+Shift+F shortcut so users
+        # who reach for the mouse first have a visible affordance.
+        self._search_btn = QPushButton("Search", left)
+        self._search_btn.setToolTip(
+            "Search across all sessions (Ctrl+Shift+F)"
+        )
+        self._search_btn.clicked.connect(self.open_search_requested.emit)
+        header_row.addWidget(self._search_btn)
         self._new_btn = QPushButton("+ New", left)
         self._new_btn.clicked.connect(self.new_session_requested.emit)
         header_row.addWidget(self._new_btn)
@@ -412,6 +423,60 @@ class MainWindow(QMainWindow):
         store is rebuilt or when MainApp wants a clean slate after a
         bulk import."""
         self._navigator.reset()
+
+    def save_layout_state(self) -> tuple[str, str]:
+        """Serialize window geometry + main-splitter state to base64.
+
+        Returns (geometry_b64, splitter_b64). MainApp persists both
+        to config.toml on aboutToQuit so launch->resize->relaunch
+        round-trips the user's preferred window size + left/right
+        pane ratio.
+
+        Empty strings on either side mean "Qt couldn't serialize"
+        and the restore path will fall back to defaults.
+        """
+        import base64  # noqa: PLC0415
+        try:
+            geom = base64.b64encode(bytes(self.saveGeometry())).decode("ascii")
+        except Exception:
+            geom = ""
+        try:
+            split = base64.b64encode(
+                bytes(self._main_splitter.saveState()),
+            ).decode("ascii")
+        except Exception:
+            split = ""
+        return geom, split
+
+    def restore_layout_state(
+        self,
+        geometry_b64: str,
+        splitter_b64: str,
+    ) -> None:
+        """Apply persisted geometry + splitter state from config.
+
+        Qt's restoreGeometry returns False when the stored rect is
+        off-screen (e.g. a monitor was removed since the last
+        save); we ignore the result and let Qt fall back to its
+        platform-default position rather than risking an invisible
+        window. Empty / malformed strings short-circuit to no-op.
+        """
+        import base64  # noqa: PLC0415
+        from PyQt6.QtCore import QByteArray  # noqa: PLC0415
+        if geometry_b64:
+            try:
+                self.restoreGeometry(
+                    QByteArray(base64.b64decode(geometry_b64))
+                )
+            except Exception:
+                pass
+        if splitter_b64:
+            try:
+                self._main_splitter.restoreState(
+                    QByteArray(base64.b64decode(splitter_b64))
+                )
+            except Exception:
+                pass
 
     def set_session_list_sort(self, spec: str) -> None:
         """Apply a persisted sort spec to the list.

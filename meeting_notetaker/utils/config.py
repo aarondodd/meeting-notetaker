@@ -139,6 +139,14 @@ class UiConfig:
     # date_asc (oldest first), title_asc (A-Z), title_desc (Z-A). MainWindow
     # parses + applies; clicking the Date/Title header updates the value.
     session_list_sort: str = "date_desc"
+    # Persisted window layout: QMainWindow.saveGeometry() output
+    # (size + position + maximized state) and the main horizontal
+    # splitter's saveState() output (left/right pane ratio), each
+    # base64-encoded for TOML safety. Saved on app aboutToQuit;
+    # restored at startup. Empty strings mean "use Qt defaults"
+    # (first launch or after a stale-state recovery).
+    main_window_geometry: str = ""
+    main_splitter_state: str = ""
 
 
 @dataclass
