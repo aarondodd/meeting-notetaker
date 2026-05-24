@@ -96,6 +96,23 @@ _TRAY_FOR_STATE = {
 }
 
 
+def _upgrade_path_blurb() -> str:
+    """Phrasing reused by the auto-check and Help > Check for Updates dialogs.
+
+    Both surfaces need to explain that the built-in updater only handles
+    installer-managed installs; source / portable users need to upgrade
+    via whatever workflow they originally used.
+    """
+    return (
+        "If you installed via the Inno Setup installer, choose Help > "
+        "Upgrade... to download and apply the new installer silently.\n\n"
+        "If you built your own .exe via pyinstaller or are running "
+        "directly from source (python main.py), upgrade however you "
+        "originally set it up (git pull + rebuild, or replace your "
+        "portable .exe with the one attached to the GitHub release)."
+    )
+
+
 class MainApp(QObject):
     # Cross-thread inbound message from the synthesis bridge. The bridge
     # reader runs on its own worker thread; we emit this signal from
@@ -210,17 +227,6 @@ class MainApp(QObject):
         self._apply_audio_monitor_config()
         self._refresh_status_indicators()
         # Clean up the .old file left over from a prior in-place upgrade.
-        # On Windows the previous .exe is renamed (not deleted) when the
-        # new one is installed; the rename succeeds while the app is
-        # running, but the unlink can only happen once the old binary
-        # is no longer loaded. The next launch is the natural cleanup
-        # point.
-        try:
-            if updater_mod.cleanup_old_exe():
-                log.info("Cleaned up stale .old executable from prior upgrade.")
-        except Exception:
-            log.exception("cleanup of stale .old exec failed")
-
         self.window.show()
         self.tray.set_state("idle")
 
@@ -2651,7 +2657,7 @@ class MainApp(QObject):
             f"A new version of Meeting Notetaker is available.\n\n"
             f"Current version: {local}\n"
             f"Latest version: {remote}\n\n"
-            "Use Help > Upgrade... to install it.",
+            + _upgrade_path_blurb(),
         )
 
     def _on_check_for_updates(self) -> None:
@@ -2679,7 +2685,8 @@ class MainApp(QObject):
                 f"A new version is available.\n\n"
                 f"Current version: {__version__}\n"
                 f"Latest version: {remote}\n\n"
-                "Upgrade now?",
+                + _upgrade_path_blurb()
+                + "\n\nUpgrade now?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if choice == QMessageBox.StandardButton.Yes:
@@ -2693,10 +2700,32 @@ class MainApp(QObject):
         self.window.status("Ready", timeout_ms=2000)
 
     def _on_upgrade(self) -> None:
-        """Help > Upgrade... -- confirm + run UpgradeProgressDialog."""
+        """Help > Upgrade... -- confirm + run UpgradeProgressDialog.
+
+        On a frozen install, this downloads the latest release's
+        installer asset and launches it silently; Inno Setup's Restart
+        Manager hooks close this app, install in place, and relaunch.
+
+        On a source / portable build, the upgrade() call returns a
+        guidance message immediately (no download) explaining that the
+        user needs to upgrade via their own workflow.
+        """
         # Imported here so the static graph stays light when the dialog is
         # never opened.
         from .ui.upgrade_dialog import UpgradeProgressDialog
+
+        if not updater_mod.is_frozen():
+            QMessageBox.information(
+                self.window,
+                "Upgrade",
+                "This Meeting Notetaker is running from source, not from "
+                "the Inno Setup installer.\n\n"
+                "The built-in updater only upgrades installer-managed "
+                "installs. To update a source / portable build, use your "
+                "own workflow (for example: git pull + .\\build.ps1, or "
+                "re-download a portable .exe from the Releases page).",
+            )
+            return
 
         release = updater_mod.get_latest_release()
         if release is None:
@@ -2718,9 +2747,14 @@ class MainApp(QObject):
             self.window,
             "Confirm Upgrade",
             f"Upgrade from {__version__} to {remote}?\n\n"
-            "This downloads the new release and runs the build script "
-            "(pyinstaller). The app needs to be restarted afterwards to "
-            "pick up the new build.",
+            "This downloads the new release's installer and runs it "
+            "silently in the background. Meeting Notetaker will close "
+            "shortly after the download finishes; Windows Restart "
+            "Manager handles the upgrade and relaunches the app when "
+            "the install completes.\n\n"
+            "If you originally installed system-wide (Program Files), "
+            "Windows will show a single UAC dialog. Per-user installs "
+            "upgrade fully silently.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirm != QMessageBox.StandardButton.Yes:
@@ -2731,61 +2765,18 @@ class MainApp(QObject):
             parent=self.window,
         )
         dialog.exec()
-        ok, message = dialog.result_summary()
+        ok, _message = dialog.result_summary()
         if not ok:
             return
-        # Only offer Restart Now when we actually installed in place;
-        # in dev (non-frozen) the new build is in dist/ and the user
-        # has to move it manually, so a restart wouldn't pick up the
-        # new code.
-        if not updater_mod.is_frozen():
-            return
-        target = updater_mod.current_exe_path()
-        if target is None:
-            return
-        choice = QMessageBox.question(
-            self.window,
-            "Restart to finish upgrade",
-            "The upgrade is installed. Restart Meeting Notetaker now to "
-            "load the new build?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        # Installer is now running detached. Quit cleanly so Restart
+        # Manager doesn't have to force-close us; Inno Setup's
+        # RestartApplications=yes will relaunch the app once the
+        # install finishes.
+        self.window.status(
+            "Installer launched. Closing for in-place upgrade...",
+            timeout_ms=4000,
         )
-        if choice == QMessageBox.StandardButton.Yes:
-            self._restart_app(target)
-
-    def _restart_app(self, exe_path) -> None:
-        """Launch the freshly installed exe and quit this process.
-
-        On Windows a detached subprocess survives the parent exit; the
-        new process opens its own window and re-acquires the single-
-        instance lock once this one releases it. POSIX doesn't have a
-        bundled .exe in this app's workflow, so the branch is included
-        for completeness but is essentially unused.
-        """
-        import subprocess
-        try:
-            kwargs = {}
-            if sys.platform.startswith("win"):
-                # DETACHED_PROCESS so the child doesn't inherit our
-                # console handles; CREATE_NEW_PROCESS_GROUP so a
-                # Ctrl-C in a parent terminal doesn't kill it.
-                kwargs["creationflags"] = (
-                    getattr(subprocess, "DETACHED_PROCESS", 0)
-                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                )
-                kwargs["close_fds"] = True
-            subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent), **kwargs)
-        except OSError as exc:
-            log.exception("failed to launch new build at %s", exe_path)
-            QMessageBox.warning(
-                self.window,
-                "Restart failed",
-                f"Could not launch the new build:\n\n{exc}\n\n"
-                "Quit and start the app manually to pick up the new "
-                "version.",
-            )
-            return
-        self.qt_app.quit()
+        QTimer.singleShot(1500, self.qt_app.quit)
 
     # ---- environment warnings ---------------------------------------------
 

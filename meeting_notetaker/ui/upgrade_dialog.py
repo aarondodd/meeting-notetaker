@@ -1,17 +1,16 @@
 """Upgrade-progress dialog.
 
 Runs `utils.updater.upgrade` on a worker thread so the UI stays
-responsive while the build script (which calls pyinstaller) churns. The
-build can take several minutes on a fresh install; this dialog streams
-each stdout line into a read-only text view so the user can see what's
-happening rather than staring at a frozen window.
+responsive during the download. The upgrade flow itself is now short:
+fetch metadata, download the installer asset, launch it silently. The
+heavy lifting (extracting + installing) happens inside Inno Setup
+*after* this Python process has exited.
 """
 from __future__ import annotations
 
 from typing import Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
-from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -47,7 +46,7 @@ class _UpgradeWorker(QThread):
 
 
 class UpgradeProgressDialog(QDialog):
-    """Modal dialog: status line + streaming build output + Close button."""
+    """Modal dialog: status line + step log + Close button."""
 
     def __init__(
         self,
@@ -58,7 +57,7 @@ class UpgradeProgressDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Upgrading Meeting Notetaker")
-        self.setMinimumSize(640, 420)
+        self.setMinimumSize(560, 320)
         self.setModal(True)
 
         self._success = False
@@ -70,12 +69,9 @@ class UpgradeProgressDialog(QDialog):
         self._status_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(self._status_label)
 
-        self._output_view = QTextEdit(self)
-        self._output_view.setReadOnly(True)
-        mono = QFont("Consolas", 9)
-        mono.setStyleHint(QFont.StyleHint.Monospace)
-        self._output_view.setFont(mono)
-        layout.addWidget(self._output_view, 1)
+        self._log_view = QTextEdit(self)
+        self._log_view.setReadOnly(True)
+        layout.addWidget(self._log_view, 1)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
@@ -102,25 +98,19 @@ class UpgradeProgressDialog(QDialog):
     # ---- worker callbacks --------------------------------------------------
 
     def _on_progress(self, stage: str, message: str) -> None:
-        if stage == "build_output":
-            self._output_view.append(message)
-            scrollbar = self._output_view.verticalScrollBar()
-            if scrollbar is not None:
-                scrollbar.setValue(scrollbar.maximum())
-        else:
-            self._status_label.setText(message)
-            self._output_view.append(f"\n=== {message} ===\n")
+        self._status_label.setText(message)
+        self._log_view.append(f"[{stage}] {message}")
         QApplication.processEvents()
 
     def _on_finished(self, success: bool, message: str) -> None:
         self._success = success
         self._message = message
         if success:
-            self._status_label.setText("Upgrade complete.")
+            self._status_label.setText("Installer launched.")
             self._status_label.setStyleSheet("font-weight: bold; color: #4caf50;")
-            self._output_view.append(f"\n=== SUCCESS ===\n{message}")
+            self._log_view.append(f"\n=== SUCCESS ===\n{message}")
         else:
-            self._status_label.setText("Upgrade failed.")
+            self._status_label.setText("Upgrade did not start.")
             self._status_label.setStyleSheet("font-weight: bold; color: #e53935;")
-            self._output_view.append(f"\n=== FAILED ===\n{message}")
+            self._log_view.append(f"\n=== FAILED ===\n{message}")
         self._close_btn.setEnabled(True)

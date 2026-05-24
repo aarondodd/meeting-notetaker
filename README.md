@@ -75,7 +75,9 @@ leaves the machine; no API key required.
   image paste, and merge-into-synthesis.
 - **PDF export + printing** with embedded images preserved.
 - **Crash-resilient** + **self-updating** (weekly GitHub release
-  check + one-click rebuild).
+  check + Help > Upgrade downloads and silently runs the latest
+  installer for installer-managed installs; source / portable
+  installs are told to upgrade via the user's own workflow).
 
 ## Why this exists
 
@@ -120,11 +122,25 @@ etc.) live in [Technical Details](#technical-details) below.
 
 ## Installation
 
-### Packaged build (typical user path)
+### Windows installer (typical user path, v0.6.6+)
+
+Download `meeting-notetaker-setup-X.Y.Z.exe` from the [latest
+release](https://github.com/aarondodd/meeting-notetaker/releases/latest)
+and run it. The installer:
+
+- Installs per-user by default (no admin required); the UAC dialog
+  lets you elevate for a Program Files install if you prefer
+- Creates a Start Menu shortcut + optional desktop shortcut
+- Registers with Add/Remove Programs for clean uninstall
+- Subsequent versions self-upgrade silently (Help > Upgrade or the
+  weekly background check) by downloading the new installer and
+  re-running it in place
+
+### Build locally (Windows)
 
 ```powershell
-.\build.ps1                         # produces dist\meeting-notetaker.exe
-.\dist\meeting-notetaker.exe
+.\build.ps1                         # produces dist\meeting-notetaker\meeting-notetaker.exe
+.\dist\meeting-notetaker\meeting-notetaker.exe
 ```
 
 The executable bundles the Python runtime, PyQt6, faster-whisper,

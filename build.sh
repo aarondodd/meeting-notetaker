@@ -28,7 +28,8 @@ pyinstaller --noconfirm --clean meeting_notetaker.spec
 # Strip those vars + reduce PATH to the system default before running.
 echo
 echo "==> Running post-build dependency self-test (in clean env)..."
-EXE="$(pwd)/dist/meeting-notetaker"
+# Onedir layout: dist/meeting-notetaker/meeting-notetaker + sibling .so files.
+EXE="$(pwd)/dist/meeting-notetaker/meeting-notetaker"
 if ! env -u VIRTUAL_ENV -u PYTHONHOME -u PYTHONPATH \
        PATH="/usr/local/bin:/usr/bin:/bin" \
        "$EXE" --check-deps; then
