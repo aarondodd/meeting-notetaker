@@ -25,6 +25,7 @@ Most of the heavy work is delegated to the existing audio/export
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
@@ -712,17 +713,99 @@ def _line_width_for(draw, font, line: str) -> int:
     return bbox[2] - bbox[0]
 
 
+_FONT_CANDIDATES_LINUX = (
+    "DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
+_FONT_CANDIDATES_WINDOWS = (
+    # Full paths first -- PIL's bare-name lookup on Windows is
+    # patchy across versions and has been the source of silent
+    # font-load failures (-> load_default fallback at bitmap size).
+    "C:/Windows/Fonts/arialbd.ttf",
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/segoeuib.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
+    # Bare names as a last-ditch try in case the user has a
+    # non-standard install or a portable variant on PATH.
+    "arialbd.ttf",
+    "arial.ttf",
+    "Arial Bold.ttf",
+    "Arial.ttf",
+)
+_FONT_CANDIDATES_MACOS = (
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+)
+
+
 def _load_interstitial_font(*, size: int):
-    """Try a couple of platform-portable font names before falling
-    back to PIL's default bitmap font. Wrapped so the test path
-    can monkey-patch without poking PIL internals."""
+    """Return a sized TrueType font for the interstitial text card.
+
+    Tries a platform-appropriate list of full paths first, then bare
+    names. If everything fails -- shouldn't happen on any standard
+    install but possible on a stripped Linux container -- falls
+    back to `ImageFont.load_default(size=size)`. Pillow >=10
+    (our pinned floor) supports the size kwarg and returns a
+    properly-scaled TTF instead of the legacy tiny bitmap.
+
+    The earlier implementation only tried bare names and on Windows
+    consistently silently fell through to the un-sized load_default,
+    rendering interstitial text at ~10pt regardless of what the
+    auto-fit chose -- the bug Aaron reported after v0.7.0 testing.
+    """
     from PIL import ImageFont
-    for name in ("DejaVuSans-Bold.ttf", "Arial.ttf", "Helvetica.ttf"):
+
+    # Platform-priority order; cross-platform candidates come last
+    # so a Windows box picks an Arial variant before trying DejaVu
+    # (rarely installed on Windows) and vice versa.
+    if sys.platform.startswith("win"):
+        candidates = (
+            *_FONT_CANDIDATES_WINDOWS,
+            *_FONT_CANDIDATES_LINUX,
+            *_FONT_CANDIDATES_MACOS,
+        )
+    elif sys.platform == "darwin":
+        candidates = (
+            *_FONT_CANDIDATES_MACOS,
+            *_FONT_CANDIDATES_WINDOWS,
+            *_FONT_CANDIDATES_LINUX,
+        )
+    else:
+        candidates = (
+            *_FONT_CANDIDATES_LINUX,
+            *_FONT_CANDIDATES_WINDOWS,
+            *_FONT_CANDIDATES_MACOS,
+        )
+
+    for name in candidates:
         try:
-            return ImageFont.truetype(name, size)
+            font = ImageFont.truetype(name, size)
+            log.debug(
+                "_load_interstitial_font: loaded %s at %dpt", name, size,
+            )
+            return font
         except (OSError, IOError):
             continue
-    return ImageFont.load_default()
+    # Last resort: ask Pillow for its bundled default at the right
+    # size. Pillow 10+ ships DejaVu and respects the size kwarg;
+    # older Pillows would fall back to the un-sized bitmap (we pin
+    # Pillow>=10 in requirements.txt to avoid that).
+    log.warning(
+        "_load_interstitial_font: no system TTF found, falling back "
+        "to Pillow's bundled default at %dpt -- interstitial text "
+        "may render at the wrong size if Pillow < 10",
+        size,
+    )
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        # Pillow <10 doesn't accept size kwarg. We require >=10 in
+        # requirements.txt; this branch exists only as a paranoid
+        # guard for unusual dev environments.
+        return ImageFont.load_default()
 
 
 def _wrap_text(text: str, font, draw, max_width: int) -> list[str]:

@@ -370,6 +370,111 @@ def test_fit_empty_string_renders_safely():
     assert size == _INTERSTITIAL_MAX_FONT_PT
 
 
+# ---- font-load fallback regression -----------------------------------
+# v0.7.0 first cut shipped with a 3-name bare-string list. On Windows
+# PIL couldn't resolve "Arial.ttf" / "Helvetica.ttf" from a bare name
+# in some installs and silently fell through to ImageFont.load_default,
+# which ignores the size parameter -> rendered text at ~10pt regardless
+# of what the auto-fit picked. Aaron caught this on first Windows run.
+# These tests pin the fix: full Windows paths come first, and the
+# default fallback uses Pillow 10+'s sized load_default.
+
+
+def test_font_loader_returns_sized_truetype_on_dev_path():
+    """In a dev env with DejaVuSans-Bold available, the loader must
+    return a FreeTypeFont (sized) -- never the un-sized
+    ImageFont.load_default bitmap."""
+    from meeting_notetaker.audio.highlights_export import _load_interstitial_font
+
+    font = _load_interstitial_font(size=300)
+    # FreeTypeFont is the sized TTF class; ImageFont.load_default
+    # returns a different class with no `size` attribute (or one
+    # that ignores set values).
+    klass_name = type(font).__name__
+    assert klass_name == "FreeTypeFont", (
+        f"loaded {klass_name} -- if this is ImageFont it'd ignore the "
+        "size parameter and render tiny text (the bug we're fixing)"
+    )
+    # And the size sticks (load_default historically returned 10pt
+    # regardless of what was passed).
+    assert getattr(font, "size", 0) >= 200
+
+
+def test_font_loader_falls_back_to_sized_load_default(monkeypatch):
+    """When every full-path + bare-name candidate fails (the Windows
+    failure mode), the loader must hit ImageFont.load_default(size=N)
+    -- not the un-sized variant that silently shipped tiny text.
+
+    Care: ImageFont.load_default(size=N) itself uses truetype()
+    internally against a BytesIO payload, so we only fail the
+    string-path calls and let the BytesIO ones through. That
+    matches what would happen on a real Windows install where the
+    file lookups fail but the Pillow-bundled font is reachable.
+    """
+    from PIL import ImageFont
+    from meeting_notetaker.audio import highlights_export
+
+    real_truetype = ImageFont.truetype
+
+    def _fail_string_paths_only(*args, **kwargs):
+        if args and isinstance(args[0], str):
+            raise OSError("simulated font-not-found")
+        return real_truetype(*args, **kwargs)
+    monkeypatch.setattr(ImageFont, "truetype", _fail_string_paths_only)
+
+    # Capture which load_default form was used. Pillow 10's
+    # load_default(size=N) returns a sized TTF; the un-sized
+    # load_default() returns a tiny bitmap that ignores size.
+    captured = {}
+    real_load_default = ImageFont.load_default
+
+    def _spy_load_default(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = dict(kwargs)
+        return real_load_default(*args, **kwargs)
+    monkeypatch.setattr(ImageFont, "load_default", _spy_load_default)
+
+    highlights_export._load_interstitial_font(size=240)
+    assert "size" in captured["kwargs"], (
+        "fallback called load_default() without size= -- on Pillow >=10 "
+        "this is the bug: text will render at the bitmap default size, "
+        "not the requested 240pt"
+    )
+    assert captured["kwargs"]["size"] == 240
+
+
+def test_font_loader_prefers_windows_paths_on_win32(monkeypatch):
+    """On Windows the loader must try the full C:/Windows/Fonts/ paths
+    before bare names. Otherwise the bare-name path that historically
+    failed for Aaron's install would still be tried first."""
+    from PIL import ImageFont
+    from meeting_notetaker.audio import highlights_export
+
+    monkeypatch.setattr(highlights_export.sys, "platform", "win32")
+    attempts: list[str] = []
+
+    def _record_attempts(name, size):
+        attempts.append(name)
+        if name.startswith("C:/Windows/Fonts/"):
+            # Pretend a Windows TTF loaded successfully.
+            return _RealFakeFont(size)
+        raise OSError("simulated miss for: " + name)
+    monkeypatch.setattr(ImageFont, "truetype", _record_attempts)
+
+    highlights_export._load_interstitial_font(size=200)
+    # First successful candidate has to be a Windows full path.
+    successful = next(n for n in attempts if n.startswith("C:/Windows/Fonts/"))
+    assert successful, "no Windows path attempted at all"
+    # Specifically: arialbd.ttf (bold) gets first crack.
+    assert attempts[0] == "C:/Windows/Fonts/arialbd.ttf"
+
+
+class _RealFakeFont:
+    """Stand-in 'TTF-like' object for the monkey-patched truetype."""
+    def __init__(self, size: int) -> None:
+        self.size = size
+
+
 def test_render_interstitial_frame_long_title_does_not_crash():
     """End-to-end: a long title renders without raising. Detects
     regressions in the wrap+shrink interaction that would only
