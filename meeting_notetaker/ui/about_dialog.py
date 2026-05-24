@@ -56,13 +56,8 @@ class AboutDialog(QDialog):
         layout.addWidget(description)
 
         attribution = QLabel(
-            "<b>Vibe coded</b> by <a href=\"https://www.anthropic.com/"
-            "claude-code\">Claude Code</a> via Aaron Dodd. "
-            "<a href=\"https://www.anthropic.com/news/claude-code\">"
-            "Claude Code</a> is Anthropic's agentic coding tool; the "
-            "human-in-the-loop drove direction, design feedback, and "
-            "real-world Windows testing across the v0.x development "
-            "cycle.",
+            "<b>Vibe coded</b> by Aaron Dodd using <a href=\"https://www.anthropic.com/"
+            "claude-code\">Claude Code</a>. ",
             self,
         )
         attribution.setWordWrap(True)
