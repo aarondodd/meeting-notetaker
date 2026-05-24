@@ -144,3 +144,89 @@ def test_config_round_trips_session_list_sort_through_toml(tmp_path):
     cfg.save(path)
     loaded = Config.load(path)
     assert loaded.ui.session_list_sort == "title_asc"
+
+
+# ----------------------------------------------------------------------
+# Header column-width regression. The PR-#27 first cut shipped with
+# stretchLastSection at its Qt default (True), which made the State
+# column expand to fill the window whenever the user resized -- the
+# previous hidden-header behavior had been masking the default. This
+# group of tests pins the fix: Title is the only column that
+# stretches; everything else stays at its configured Fixed width.
+
+@pytest.fixture(scope="module")
+def qt_app():
+    """Module-scoped QApplication so MainWindow instantiation works
+    in the offscreen Qt platform CI runs in."""
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication(sys.argv)
+
+
+def test_header_does_not_stretch_last_section(qt_app):
+    """The State column (last visible) must not auto-fill the window;
+    Qt's default stretchLastSection=True is explicitly disabled."""
+    from meeting_notetaker.ui.main_window import MainWindow
+    win = MainWindow()
+    try:
+        assert win._list.header().stretchLastSection() is False  # noqa: SLF001
+    finally:
+        win.deleteLater()
+
+
+def test_each_indicator_column_is_fixed_28px(qt_app):
+    from PyQt6.QtWidgets import QHeaderView
+    from meeting_notetaker.ui.main_window import (
+        MainWindow,
+        _COL_AUDIO, _COL_SLIDES, _COL_STATE,
+    )
+    win = MainWindow()
+    try:
+        header = win._list.header()  # noqa: SLF001
+        for col in (_COL_AUDIO, _COL_SLIDES, _COL_STATE):
+            assert (
+                header.sectionResizeMode(col)
+                == QHeaderView.ResizeMode.Fixed
+            ), f"column {col} should be Fixed"
+            assert header.sectionSize(col) == 28, (
+                f"column {col} should be 28px wide"
+            )
+    finally:
+        win.deleteLater()
+
+
+def test_date_column_is_fixed_with_room_for_header_and_arrow(qt_app):
+    """Date column carries 'YYYY-MM-DD HH:MM' + the 'Date' header
+    text + the sort indicator arrow. 150 px is the wall we've
+    picked; bumping it would be a UX call."""
+    from PyQt6.QtWidgets import QHeaderView
+    from meeting_notetaker.ui.main_window import MainWindow, _COL_DATE
+    win = MainWindow()
+    try:
+        header = win._list.header()  # noqa: SLF001
+        assert (
+            header.sectionResizeMode(_COL_DATE)
+            == QHeaderView.ResizeMode.Fixed
+        )
+        assert header.sectionSize(_COL_DATE) == 150
+    finally:
+        win.deleteLater()
+
+
+def test_title_is_the_only_column_set_to_stretch(qt_app):
+    from PyQt6.QtWidgets import QHeaderView
+    from meeting_notetaker.ui.main_window import (
+        MainWindow,
+        _COL_DATE, _COL_TITLE, _COL_AUDIO, _COL_SLIDES, _COL_STATE,
+    )
+    win = MainWindow()
+    try:
+        header = win._list.header()  # noqa: SLF001
+        stretch_cols = [
+            col for col in (_COL_DATE, _COL_TITLE, _COL_AUDIO, _COL_SLIDES, _COL_STATE)
+            if header.sectionResizeMode(col) == QHeaderView.ResizeMode.Stretch
+        ]
+        assert stretch_cols == [_COL_TITLE], (
+            f"only Title should stretch; got {stretch_cols}"
+        )
+    finally:
+        win.deleteLater()

@@ -249,15 +249,27 @@ class MainWindow(QMainWindow):
         rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self._list)
         rename_shortcut.activated.connect(self._rename_selected)
         header = self._list.header()
-        # Date is fixed-width to fit "YYYY-MM-DD HH:MM"; title takes
-        # the remaining horizontal space; audio + slides + state are
-        # narrow glyph columns trailing on the right.
+        # Date is fixed-width to fit "YYYY-MM-DD HH:MM" + the sort
+        # arrow; title takes the remaining horizontal space; audio +
+        # slides + state are narrow glyph columns trailing on the
+        # right. Critically, stretchLastSection has to be disabled --
+        # Qt defaults it to True, which would override the State
+        # column's Fixed mode and let it expand to fill the window
+        # (the regression Aaron called out post-PR-#27 since the
+        # header was previously hidden and the default was moot).
+        header.setStretchLastSection(False)
+        # Qt's default minimum section size on a sortable header is
+        # 38 px to reserve room for the sort-indicator triangle. We
+        # disable sortIndicator on indicator columns via the snap-
+        # back handler, so the triangle never paints there -- but
+        # the minimum still applies unless we lower it explicitly.
+        header.setMinimumSectionSize(20)
         header.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_SLIDES, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
-        self._list.setColumnWidth(_COL_DATE, 130)
+        self._list.setColumnWidth(_COL_DATE, 150)
         self._list.setColumnWidth(_COL_AUDIO, 28)
         self._list.setColumnWidth(_COL_SLIDES, 28)
         self._list.setColumnWidth(_COL_STATE, 28)
