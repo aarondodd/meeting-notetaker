@@ -39,7 +39,8 @@ pyinstaller --noconfirm --clean meeting_notetaker.spec
 # gate said OK because the activated venv was leaking through.)
 Write-Host ""
 Write-Host "==> Running post-build dependency self-test (in clean env)..."
-$ExePath = "$(Get-Location)\dist\meeting-notetaker.exe"
+# Onedir layout: dist/meeting-notetaker/meeting-notetaker.exe + sibling DLLs.
+$ExePath = "$(Get-Location)\dist\meeting-notetaker\meeting-notetaker.exe"
 
 $SysPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
 if (-not $SysPath) { $SysPath = "$env:SystemRoot;$env:SystemRoot\System32" }
@@ -88,3 +89,4 @@ if ($DepCheckExit -ne 0) {
 
 Write-Host ""
 Write-Host "Built: $ExePath"
+Write-Host "Bundle directory: $(Split-Path $ExePath -Parent)"

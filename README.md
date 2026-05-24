@@ -132,15 +132,15 @@ and run it. The installer:
   lets you elevate for a Program Files install if you prefer
 - Creates a Start Menu shortcut + optional desktop shortcut
 - Registers with Add/Remove Programs for clean uninstall
-
-The bundled .exe is also attached to the release for portable use
-without an installer.
+- Subsequent versions self-upgrade silently (Help > Upgrade or the
+  weekly background check) by downloading the new installer and
+  re-running it in place
 
 ### Build locally (Windows)
 
 ```powershell
-.\build.ps1                         # produces dist\meeting-notetaker.exe
-.\dist\meeting-notetaker.exe
+.\build.ps1                         # produces dist\meeting-notetaker\meeting-notetaker.exe
+.\dist\meeting-notetaker\meeting-notetaker.exe
 ```
 
 The executable bundles the Python runtime, PyQt6, faster-whisper,

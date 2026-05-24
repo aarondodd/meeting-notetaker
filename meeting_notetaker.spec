@@ -1,5 +1,9 @@
 # pyinstaller spec for Meeting Notetaker. Run via `pyinstaller meeting_notetaker.spec`.
-# Mirrors progman-py's pattern: --windowed --onefile, collect-all for PyQt6 and faster_whisper.
+# --windowed --onedir: produces dist/meeting-notetaker/ directory containing
+# meeting-notetaker.exe + sibling .pyd/.dll/data files. The Inno Setup installer
+# (installer.iss) recurses the whole tree into the install dir. Onedir avoids
+# the onefile self-extraction to %TEMP% on every launch -- faster startup, no
+# orphan _MEI* directories on crash, fewer antivirus heuristic hits.
 # -*- mode: python ; coding: utf-8 -*-
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files
@@ -98,23 +102,34 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
+# Onedir split: the EXE block produces only the launcher .exe (no binaries
+# bundled in), then COLLECT walks the binaries + zipfiles + datas next to it
+# in dist/meeting-notetaker/. The installer ships the whole directory tree.
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="meeting-notetaker",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="meeting-notetaker",
 )

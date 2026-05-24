@@ -73,6 +73,8 @@ jobs:
           # we don't have to keep a hand-curated changelog in sync.
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: |
-            Output/meeting-notetaker-setup-${{ steps.ver.outputs.version }}.exe
-            dist/meeting-notetaker.exe
+          # We ship the installer only. The raw PyInstaller .exe is a
+          # launcher under --onedir; it can't run without the sibling
+          # DLL/data tree, so attaching it as a standalone asset would
+          # only confuse users.
+          files: Output/meeting-notetaker-setup-${{ steps.ver.outputs.version }}.exe

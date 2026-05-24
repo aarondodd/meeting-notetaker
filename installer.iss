@@ -57,7 +57,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "dist\meeting-notetaker.exe"; DestDir: "{app}"; Flags: ignoreversion
+; PyInstaller --onedir produces dist\meeting-notetaker\ with the launcher
+; .exe plus several hundred sibling .pyd / .dll / data files (torch,
+; speechbrain, PyQt6, faster-whisper). Recurse the whole tree into {app}
+; preserving the layout the launcher expects to find.
+Source: "dist\meeting-notetaker\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Meeting Notetaker"; Filename: "{app}\meeting-notetaker.exe"
