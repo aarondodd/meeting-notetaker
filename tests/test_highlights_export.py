@@ -475,6 +475,125 @@ class _RealFakeFont:
         self.size = size
 
 
+# ---- title-card subtitle ("Recorded on ...") -------------------------
+# Title interstitials carry a second line with the session's recording
+# date/time below the highlight title. Tests pin both the planner-side
+# propagation and the renderer-side layout.
+
+
+def test_format_recorded_on_subtitle_renders_local_time(monkeypatch):
+    import time
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset not available on this platform")
+    monkeypatch.setenv("TZ", "Pacific/Honolulu")
+    time.tzset()
+    from meeting_notetaker.audio.highlights_export import (
+        format_recorded_on_subtitle,
+    )
+    out = format_recorded_on_subtitle("2026-05-24T21:00:00Z")
+    # 21:00 UTC -> 11:00 HST (UTC-10) -- same convention the rest
+    # of the UI uses for session-list dates.
+    assert out == "Recorded on 2026-05-24 11:00"
+
+
+def test_format_recorded_on_subtitle_empty_or_garbage_returns_empty():
+    from meeting_notetaker.audio.highlights_export import (
+        format_recorded_on_subtitle,
+    )
+    assert format_recorded_on_subtitle("") == ""
+    assert format_recorded_on_subtitle("not-a-date") == ""
+    assert format_recorded_on_subtitle(None) == ""  # defensive
+
+
+def test_plan_propagates_title_subtitle_to_title_segments_only():
+    """The subtitle goes on title cards. Jump cards and highlight
+    segments must NOT carry it -- the planner is the right place to
+    enforce that so downstream renderers don't have to special-case."""
+    h1 = Highlight(0, 5_000, "First")
+    h2 = Highlight(20_000, 25_000, "Second")
+    plan = plan_highlight_timeline(
+        [h1, h2], mode="video",
+        title_subtitle="Recorded on 2026-05-24 14:30",
+    )
+    titles = [s for s in plan if s.kind == SEGMENT_TITLE]
+    jumps = [s for s in plan if s.kind == SEGMENT_JUMP]
+    highlights = [s for s in plan if s.kind == SEGMENT_HIGHLIGHT]
+    assert len(titles) == 2
+    assert all(t.subtitle == "Recorded on 2026-05-24 14:30" for t in titles)
+    assert all(j.subtitle == "" for j in jumps)
+    assert all(h.subtitle == "" for h in highlights)
+
+
+def test_plan_audio_mode_ignores_subtitle():
+    """Audio export has no surface to render text on; the subtitle
+    kwarg is harmless but should produce empty subtitle fields on
+    the planned segments."""
+    plan = plan_highlight_timeline(
+        [Highlight(0, 1000)], mode="audio",
+        title_subtitle="ignored",
+    )
+    # Audio mode has no title segments at all -- the subtitle has
+    # nowhere to land.
+    assert all(s.subtitle == "" for s in plan)
+
+
+def test_plan_default_subtitle_is_empty():
+    """Backwards-compat: callers that don't pass title_subtitle
+    must get the same plan they got before the kwarg existed."""
+    plan = plan_highlight_timeline(
+        [Highlight(0, 1000, "x")], mode="video",
+    )
+    titles = [s for s in plan if s.kind == SEGMENT_TITLE]
+    assert titles
+    assert all(t.subtitle == "" for t in titles)
+
+
+def test_render_with_subtitle_produces_more_painted_pixels_than_without():
+    """Direct evidence the subtitle landed on the canvas. A two-line
+    render must paint more non-black pixels than the same title
+    rendered alone. We count `> 0` (any non-black) because the
+    subtitle is drawn in gray (190,190,190) to read as secondary,
+    not pure white -- a `> 200` threshold would miss it."""
+    from meeting_notetaker.audio.highlights_export import (
+        _render_interstitial_frame,
+    )
+    bare = _render_interstitial_frame("Highlight 1")
+    with_sub = _render_interstitial_frame(
+        "Highlight 1", "Recorded on 2026-05-24 14:30",
+    )
+    bare_painted = int((bare > 0).any(axis=2).sum())
+    sub_painted = int((with_sub > 0).any(axis=2).sum())
+    assert sub_painted > bare_painted, (
+        f"subtitle should add pixels: bare={bare_painted}, "
+        f"with_sub={sub_painted}"
+    )
+
+
+def test_render_with_subtitle_returns_full_canvas():
+    """Shape stays at 1080p regardless of subtitle presence."""
+    from meeting_notetaker.audio.highlights_export import (
+        _render_interstitial_frame,
+    )
+    arr = _render_interstitial_frame(
+        "Highlight 1", "Recorded on 2026-05-24 14:30",
+    )
+    assert arr.shape == (1080, 1920, 3)
+
+
+def test_render_with_long_subtitle_does_not_crash():
+    """Defensive: a long subtitle wraps + shrinks the same way the
+    title does, but doesn't raise."""
+    from meeting_notetaker.audio.highlights_export import (
+        _render_interstitial_frame,
+    )
+    arr = _render_interstitial_frame(
+        "Decision on MDM phase 3 quarterly rollout",
+        "Recorded on 2026-05-24 14:30 by the platform team during "
+        "the long planning meeting",
+    )
+    assert arr.shape == (1080, 1920, 3)
+
+
 def test_render_interstitial_frame_long_title_does_not_crash():
     """End-to-end: a long title renders without raising. Detects
     regressions in the wrap+shrink interaction that would only

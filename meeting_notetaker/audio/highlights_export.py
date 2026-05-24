@@ -69,6 +69,10 @@ class TimelineSegment:
     "Jumping to 00:30:15") for SEGMENT_TITLE / SEGMENT_JUMP, or
     empty string for SEGMENT_HIGHLIGHT.
 
+    `subtitle` is a secondary line rendered below the main label on
+    title cards (e.g. "Recorded on 2026-05-24 14:30"). Empty for
+    jump cards and highlight segments.
+
     `source_highlight_index` is the position of the underlying
     highlight in the input list, used by the SRT generator to
     attribute transcript lines.
@@ -77,6 +81,7 @@ class TimelineSegment:
     duration_ms: int
     output_start_ms: int
     label: str = ""
+    subtitle: str = ""
     source_start_ms: int = 0
     source_end_ms: int = 0
     source_highlight_index: int = -1
@@ -93,6 +98,7 @@ def plan_highlight_timeline(
     title_interstitial_ms: int = DEFAULT_TITLE_INTERSTITIAL_MS,
     jump_interstitial_ms: int = DEFAULT_JUMP_INTERSTITIAL_MS,
     audio_gap_ms: int = DEFAULT_AUDIO_GAP_MS,
+    title_subtitle: str = "",
 ) -> List[TimelineSegment]:
     """Build the segment plan for a highlight export.
 
@@ -105,6 +111,12 @@ def plan_highlight_timeline(
     Highlights are auto-sorted by their `start_ms` so the planner
     accepts an unsorted input -- the bar widget keeps them in
     insertion order on disk, but the export expects time order.
+
+    `title_subtitle` is rendered on title cards as a second line
+    below the main title (e.g. "Recorded on 2026-05-24 14:30").
+    Per Aaron's spec for the video export: anchors the highlights
+    to when the meeting actually happened so a viewer who pulls up
+    the file weeks later has the context up-front.
     """
     if mode not in {"video", "audio"}:
         raise ValueError(f"unknown mode {mode!r} (use 'video' or 'audio')")
@@ -127,6 +139,7 @@ def plan_highlight_timeline(
                 duration_ms=title_interstitial_ms,
                 output_start_ms=cursor,
                 label=title_text,
+                subtitle=title_subtitle,
             ))
             cursor += title_interstitial_ms
         elif n > 0:
@@ -168,6 +181,29 @@ def plan_highlight_timeline(
 def total_output_duration_ms(plan: Iterable[TimelineSegment]) -> int:
     plan_list = list(plan)
     return plan_list[-1].output_end_ms if plan_list else 0
+
+
+def format_recorded_on_subtitle(started_at_iso: str) -> str:
+    """Render a UTC ISO timestamp as "Recorded on YYYY-MM-DD HH:MM"
+    in the user's local timezone, the standard subtitle line on
+    every title card.
+
+    Returns "" on bad / missing input -- callers can pass an empty
+    string through to plan_highlight_timeline to suppress the
+    subtitle entirely (e.g. for an unrecorded session, which
+    shouldn't have highlights anyway but the export path is
+    defensive).
+    """
+    from datetime import datetime as _dt
+    iso = (started_at_iso or "").strip()
+    if not iso:
+        return ""
+    try:
+        utc_aware = _dt.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    local = utc_aware.astimezone()
+    return "Recorded on " + local.strftime("%Y-%m-%d %H:%M")
 
 
 def _format_mmss(ms: int) -> str:
@@ -358,6 +394,7 @@ def export_highlights_video(
     *,
     title_interstitial_ms: int = DEFAULT_TITLE_INTERSTITIAL_MS,
     jump_interstitial_ms: int = DEFAULT_JUMP_INTERSTITIAL_MS,
+    session_started_at_iso: str = "",
     progress: Optional[Callable[[int], None]] = None,
 ) -> None:
     """Render a highlights-only MP4 with title + jump interstitials.
@@ -366,6 +403,10 @@ def export_highlights_video(
     title card before every highlight and a 2s jump card between
     consecutive highlights. SRT sidecar is generated against the
     new (output) timeline so subtitles align with the cuts.
+
+    `session_started_at_iso` (UTC ISO from the SessionStore) feeds
+    the "Recorded on <date/time>" subtitle that appears below
+    each highlight title. Empty string suppresses the subtitle.
 
     Mirrors export_video's encoder configuration (1920x1080 / 30fps
     H.264 + AAC mono); the only structural difference is the
@@ -381,11 +422,13 @@ def export_highlights_video(
     )
     from ..screencap.timestamps import current_screenshot_for_position
 
+    title_subtitle = format_recorded_on_subtitle(session_started_at_iso)
     plan = plan_highlight_timeline(
         highlights,
         mode="video",
         title_interstitial_ms=title_interstitial_ms,
         jump_interstitial_ms=jump_interstitial_ms,
+        title_subtitle=title_subtitle,
     )
     if not plan:
         raise ValueError("no highlights to export")
@@ -515,17 +558,22 @@ def _encode_highlight_video(
         (_TARGET_HEIGHT, _TARGET_WIDTH, 3), dtype=np.uint8,
     )
     scaled_cache: dict[Path, np.ndarray] = {}
-    interstitial_cache: dict[str, np.ndarray] = {}
+    # Key on (label, subtitle) so two title cards with the same
+    # title text but different subtitles (shouldn't happen in
+    # practice -- title_subtitle is a per-export constant -- but
+    # cheap to be correct) get distinct cached frames.
+    interstitial_cache: dict[tuple[str, str], np.ndarray] = {}
     last_progress_pct = -1
 
     frame_idx = 0
     for seg in plan:
         seg_frames = int(seg.duration_ms * _TARGET_FPS / 1000)
         if seg.kind in (SEGMENT_TITLE, SEGMENT_JUMP):
-            card = interstitial_cache.get(seg.label)
+            cache_key = (seg.label, seg.subtitle)
+            card = interstitial_cache.get(cache_key)
             if card is None:
-                card = _render_interstitial_frame(seg.label)
-                interstitial_cache[seg.label] = card
+                card = _render_interstitial_frame(seg.label, seg.subtitle)
+                interstitial_cache[cache_key] = card
             for _ in range(seg_frames):
                 av_frame = av.VideoFrame.from_ndarray(card, format="rgb24")
                 av_frame.pts = frame_idx
@@ -590,16 +638,18 @@ _INTERSTITIAL_MIN_FONT_PT = 60
 _INTERSTITIAL_FONT_STEP_PT = 12
 
 
-def _render_interstitial_frame(text: str) -> np.ndarray:
+def _render_interstitial_frame(text: str, subtitle: str = "") -> np.ndarray:
     """Render a black-background centered-text card to a (H, W, 3)
     uint8 array.
 
-    Auto-sizes the font: starts at _INTERSTITIAL_MAX_FONT_PT and
-    steps down until the wrapped text fits inside
-    (canvas_width * 0.90, canvas_height * 0.80). Short labels like
-    "Highlight 1" end up at the maximum size and fill the canvas;
-    long titles wrap and shrink as needed. Uses PIL (already a
-    hard dependency for the existing slideshow path).
+    Auto-sizes the title: starts at _INTERSTITIAL_MAX_FONT_PT and
+    steps down until the wrapped text fits inside the canvas
+    budget. When `subtitle` is non-empty, leaves room for it below
+    the title (smaller font, ~50% of the title's size) and centers
+    the combined block vertically. Short labels like "Highlight 1"
+    still hit the title-max-size, gaining a small secondary line
+    below them. Long titles wrap and shrink as needed; subtitle
+    follows suit at half-size.
     """
     from PIL import Image, ImageDraw
     from .video_export import _TARGET_HEIGHT, _TARGET_WIDTH
@@ -607,28 +657,77 @@ def _render_interstitial_frame(text: str) -> np.ndarray:
     canvas = Image.new("RGB", (_TARGET_WIDTH, _TARGET_HEIGHT), (0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     max_w = int(_TARGET_WIDTH * _INTERSTITIAL_WIDTH_PCT)
-    max_h = int(_TARGET_HEIGHT * _INTERSTITIAL_HEIGHT_PCT)
+    # Title budget is the full height when there's no subtitle;
+    # leaves ~25% for the subtitle when one is present (title gets
+    # ~55%, with the rest going to inter-line gap + subtitle).
+    if subtitle:
+        title_h_budget = int(_TARGET_HEIGHT * (_INTERSTITIAL_HEIGHT_PCT - 0.25))
+    else:
+        title_h_budget = int(_TARGET_HEIGHT * _INTERSTITIAL_HEIGHT_PCT)
 
-    font, lines, font_size = _fit_text_to_card(
-        draw, text, max_w, max_h,
+    title_font, title_lines, title_size = _fit_text_to_card(
+        draw, text, max_w, title_h_budget,
     )
-    # Inter-line spacing proportional to font size; 1/6 the size
-    # gives comfortable breathing room without dominating the
-    # vertical budget.
-    line_spacing = max(8, font_size // 6)
+    title_line_spacing = max(8, title_size // 6)
+    title_line_heights = [
+        _line_height_for(draw, title_font) for _ in title_lines
+    ]
+    title_block_h = (
+        sum(title_line_heights)
+        + max(0, len(title_lines) - 1) * title_line_spacing
+    )
 
-    line_heights = []
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        line_heights.append(bbox[3] - bbox[1])
-    total_h = sum(line_heights) + max(0, len(lines) - 1) * line_spacing
+    # Subtitle setup.
+    subtitle_lines: list[str] = []
+    subtitle_font = None
+    subtitle_line_spacing = 0
+    subtitle_block_h = 0
+    title_subtitle_gap = 0
+    if subtitle:
+        # Subtitle gets roughly half the title size, with a floor so
+        # it stays legible even on a wrap-heavy title that drives
+        # the title font down to the min.
+        target_subtitle_size = max(48, title_size // 2)
+        sub_h_budget = int(_TARGET_HEIGHT * 0.20)
+        subtitle_font, subtitle_lines, subtitle_size = _fit_text_to_card(
+            draw, subtitle, max_w, sub_h_budget,
+            preferred_max_size=target_subtitle_size,
+        )
+        subtitle_line_spacing = max(6, subtitle_size // 8)
+        subtitle_line_heights = [
+            _line_height_for(draw, subtitle_font) for _ in subtitle_lines
+        ]
+        subtitle_block_h = (
+            sum(subtitle_line_heights)
+            + max(0, len(subtitle_lines) - 1) * subtitle_line_spacing
+        )
+        # Gap between title and subtitle: ~half a title line height,
+        # so the two read as one centered block instead of two
+        # disconnected pieces.
+        title_subtitle_gap = max(20, title_size // 3)
+
+    total_h = title_block_h + title_subtitle_gap + subtitle_block_h
     y = (_TARGET_HEIGHT - total_h) // 2
-    for line, lh in zip(lines, line_heights):
-        bbox = draw.textbbox((0, 0), line, font=font)
-        w = bbox[2] - bbox[0]
+    # Title.
+    for line, lh in zip(title_lines, title_line_heights):
+        w = _line_width_for(draw, title_font, line)
         x = (_TARGET_WIDTH - w) // 2
-        draw.text((x, y), line, fill=(255, 255, 255), font=font)
-        y += lh + line_spacing
+        draw.text((x, y), line, fill=(255, 255, 255), font=title_font)
+        y += lh + title_line_spacing
+    # Strip the trailing line_spacing past the last title line; the
+    # explicit title_subtitle_gap takes over.
+    if title_lines:
+        y -= title_line_spacing
+    # Subtitle (lighter gray to read as secondary text).
+    if subtitle_font is not None:
+        y += title_subtitle_gap
+        for line in subtitle_lines:
+            w = _line_width_for(draw, subtitle_font, line)
+            x = (_TARGET_WIDTH - w) // 2
+            draw.text(
+                (x, y), line, fill=(190, 190, 190), font=subtitle_font,
+            )
+            y += _line_height_for(draw, subtitle_font) + subtitle_line_spacing
     return np.asarray(canvas, dtype=np.uint8)
 
 
@@ -637,6 +736,8 @@ def _fit_text_to_card(
     text: str,
     max_w: int,
     max_h: int,
+    *,
+    preferred_max_size: Optional[int] = None,
 ) -> tuple[object, list[str], int]:
     """Find the largest font size at which `text` fits the card.
 
@@ -656,12 +757,22 @@ def _fit_text_to_card(
     multi-line layout: a single line at a slightly smaller size
     almost always reads better.
 
+    `preferred_max_size` (subtitle path) caps the starting font so
+    the subtitle stays visually secondary to the title even when
+    the title's auto-fit landed at a lower size than the global
+    max. Falls back to _INTERSTITIAL_MAX_FONT_PT when unset.
+
     Returns (font, wrapped_lines, font_size).
     """
     text = text.strip() or " "
+    start_size = (
+        preferred_max_size if preferred_max_size is not None
+        else _INTERSTITIAL_MAX_FONT_PT
+    )
+    start_size = max(_INTERSTITIAL_MIN_FONT_PT, start_size)
     # Pass 1: single-line preference.
     for size in range(
-        _INTERSTITIAL_MAX_FONT_PT,
+        start_size,
         _INTERSTITIAL_MIN_FONT_PT - 1,
         -_INTERSTITIAL_FONT_STEP_PT,
     ):
@@ -674,7 +785,7 @@ def _fit_text_to_card(
         return font, [text], size
     # Pass 2: allow wrapping.
     for size in range(
-        _INTERSTITIAL_MAX_FONT_PT,
+        start_size,
         _INTERSTITIAL_MIN_FONT_PT - 1,
         -_INTERSTITIAL_FONT_STEP_PT,
     ):
