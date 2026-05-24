@@ -124,6 +124,19 @@ _AD_HOC_DETECT: tuple[_Check, ...] = (
 # documents that the package was packaged in. winreg is the registry
 # helper used by installer.register_native_host on Windows; checking
 # it surfaces a frozen-build packaging bug if it were ever dropped.
+# Screen capture (v0.6.5+) + video export. mss does conditional
+# platform imports, Pillow dynamically loads codec plugins on Image.open
+# / Image.save, and PyAV ships bundled FFmpeg shared libs. All three
+# are listed in the spec's collect_all and probed here so a missing-
+# from-bundle case surfaces at build-gate time rather than at runtime
+# when a user tries to take a screenshot or export a video.
+_SCREEN_CAPTURE: tuple[_Check, ...] = (
+    _Check("mss", "Screen capture (region grabber)", "mss"),
+    _Check("Pillow", "Screen capture + video export (image I/O)", "PIL"),
+    _Check("PyAV", "Video export (MP4 mux + libx264 + AAC)", "av"),
+)
+
+
 _AUTOMATION: tuple[_Check, ...] = (
     _Check(
         "meeting_notetaker.automation",
@@ -148,6 +161,7 @@ _GROUPS: tuple[tuple[str, tuple[_Check, ...]], ...] = (
     ("Networking / TLS", _NETWORKING),
     ("Outlook calendar (Windows)", _OUTLOOK),
     ("Ad-hoc meeting detection (Windows)", _AD_HOC_DETECT),
+    ("Screen capture + video export", _SCREEN_CAPTURE),
     ("Synthesis automation", _AUTOMATION),
 )
 

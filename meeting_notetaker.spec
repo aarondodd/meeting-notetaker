@@ -30,6 +30,23 @@ for pkg in (
     "silero_vad",
     "huggingface_hub",
     "scipy",
+    # PyAV ships bundled FFmpeg shared libs (libavcodec, libavformat,
+    # libswresample). pyinstaller-hooks-contrib has hook-av.py which
+    # picks these up via collect_dynamic_libs, but listing av in
+    # collect_all here is defensive: hooks-contrib coverage shifts
+    # release to release and the video export pipeline is core to v0.6.
+    "av",
+    # Pillow does dynamic plugin loading: Image.open() / Image.save()
+    # imports PIL.<format>ImagePlugin at runtime. PyInstaller's static
+    # analyzer can't trace that path; without collect_all here the
+    # frozen build can save a PNG fine on the dev machine and fail at
+    # runtime on a user box that exercises a different decoder.
+    "PIL",
+    # mss has conditional platform imports (mss.windows / mss.linux /
+    # mss.darwin selected via sys.platform at runtime). Hook-mss.py
+    # exists but explicit collect_all guarantees the Windows path
+    # ships in CI builds that happen to introspect from another OS.
+    "mss",
 ):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
