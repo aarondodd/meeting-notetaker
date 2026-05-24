@@ -71,44 +71,65 @@ def test_starts_in_idle_layout(qt_app, tmp_path):
     assert not view._is_in_playback_layout()  # noqa: SLF001
 
 
-def test_set_player_is_playing_enters_playback_when_screenshots_present(
-    qt_app, tmp_path,
-):
+def test_set_player_position_enters_playback_when_engaged(qt_app, tmp_path):
+    """Non-zero position with screenshots present -> swap to playback
+    layout so the matching image is visible. Updated in v0.6.5: the
+    layout swap is now driven by position, not by 'playing' state --
+    this is what makes click-to-seek-while-paused show the right
+    image (previously the layout stayed idle and the image stayed
+    stuck)."""
     view = SessionView()
     _seed_session(view, tmp_path, with_screenshots=True)
-    view.set_player_is_playing(True)
+    assert not view._is_in_playback_layout()  # noqa: SLF001 -- initial idle
+    view.set_player_position_ms(8_000)
     assert view._is_in_playback_layout()  # noqa: SLF001
 
 
-def test_set_player_is_playing_skips_playback_layout_when_no_screenshots(
+def test_set_player_position_skips_playback_layout_when_no_screenshots(
     qt_app, tmp_path,
 ):
-    """No screenshots -> the playback layout would be an empty pane.
-    Stay in idle layout; audio still plays in MainApp."""
+    """No screenshots -> the playback layout would be an empty top
+    pane. Stay in idle layout regardless of position."""
     view = SessionView()
     _seed_session(view, tmp_path, with_screenshots=False)
-    view.set_player_is_playing(True)
+    view.set_player_position_ms(8_000)
     assert not view._is_in_playback_layout()  # noqa: SLF001
 
 
-def test_pause_reverts_to_idle_layout(qt_app, tmp_path):
+def test_pause_keeps_playback_layout(qt_app, tmp_path):
+    """v0.6.5 fix: pause/stop keeps the playback layout up so the
+    user still sees the current-position screenshot. Only natural
+    end-of-playback (via revert_to_idle_layout) reverts."""
     view = SessionView()
     _seed_session(view, tmp_path, with_screenshots=True)
-    view.set_player_is_playing(True)
-    view.set_player_is_playing(False)
+    view.set_player_position_ms(8_000)
+    assert view._is_in_playback_layout()  # noqa: SLF001
+    view.set_player_is_playing(False)  # user pressed Stop
+    assert view._is_in_playback_layout()  # noqa: SLF001 -- stays
+
+
+def test_revert_to_idle_layout_explicitly(qt_app, tmp_path):
+    """Natural-end-of-playback path calls revert_to_idle_layout
+    explicitly. Reverts even if position is non-zero."""
+    view = SessionView()
+    _seed_session(view, tmp_path, with_screenshots=True)
+    view.set_player_position_ms(8_000)
+    assert view._is_in_playback_layout()  # noqa: SLF001
+    view.revert_to_idle_layout()
     assert not view._is_in_playback_layout()  # noqa: SLF001
 
 
 def test_position_drives_playback_top_image(qt_app, tmp_path):
-    """In playback layout, set_player_position_ms swaps the top
-    image to the sticky-latest screenshot."""
+    """set_player_position_ms swaps the top image to the sticky-
+    latest screenshot, regardless of play/pause state."""
     view = SessionView()
     _seed_session(view, tmp_path, with_screenshots=True)
-    view.set_player_is_playing(True)
-    # Before the first screenshot -> top pane is empty.
+    # Before the first screenshot -> top pane is empty (position
+    # gate kicks in below first screenshot's offset).
     view.set_player_position_ms(3_000)
     assert not view._playback_image.has_image()  # noqa: SLF001
-    # After the first screenshot -> first image.
+    # After the first screenshot -> first image; layout is now
+    # playback (position > 0 + screenshots present).
     view.set_player_position_ms(7_000)
     assert view._playback_image.has_image()  # noqa: SLF001
     first_path = view._current_playback_screenshot  # noqa: SLF001
@@ -118,13 +139,12 @@ def test_position_drives_playback_top_image(qt_app, tmp_path):
     assert view._current_playback_screenshot != first_path  # noqa: SLF001
 
 
-def test_leaving_playback_clears_top_image(qt_app, tmp_path):
+def test_revert_to_idle_clears_top_image(qt_app, tmp_path):
     view = SessionView()
     _seed_session(view, tmp_path, with_screenshots=True)
-    view.set_player_is_playing(True)
     view.set_player_position_ms(8_000)
     assert view._playback_image.has_image()  # noqa: SLF001
-    view.set_player_is_playing(False)
+    view.revert_to_idle_layout()
     assert not view._playback_image.has_image()  # noqa: SLF001
 
 

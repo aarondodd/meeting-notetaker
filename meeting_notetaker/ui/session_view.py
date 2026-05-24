@@ -798,20 +798,37 @@ class SessionView(QWidget):
         if self._player_bar.is_user_dragging():
             return
         self._refresh_transcript_highlight(ms)
+        # Any non-zero position means the user has engaged playback
+        # (played at some point, or click-to-seeked from the
+        # transcript). Show the playback layout so the matching
+        # screenshot is visible for that moment, even when audio
+        # isn't actively playing.
+        if ms > 0 and self._screenshot_offsets:
+            self._enter_playback_layout()
         # Drive the playback layout's top image off the same position.
         # In idle layout this is a no-op (the helper short-circuits).
         self._refresh_playback_image(ms)
 
     def set_player_is_playing(self, playing: bool) -> None:
+        """Flip the play/stop button labels.
+
+        v0.6.5 update: this no longer drives the layout swap.
+        Pause/Stop keeps the playback layout up so the user still sees
+        the current-position screenshot; the layout reverts only when
+        playback drains naturally (handled in
+        revert_to_idle_layout()) or the session changes.
+        """
         self._player_bar.set_is_playing(playing)
         self._slides_view.set_player_is_playing(playing)
-        if playing:
-            self._enter_playback_layout()
-        else:
-            # Both pause and finished end up here. Both should revert
-            # the layout per Aaron's "at end of playback, revert to
-            # normal view".
-            self._leave_playback_layout()
+
+    def revert_to_idle_layout(self) -> None:
+        """Force the transcript pane back to the side-rail layout.
+
+        MainApp calls this after natural end-of-playback so the user
+        sees the rail again with the playhead reset to 0. Idempotent
+        if already in idle layout.
+        """
+        self._leave_playback_layout()
 
     def _on_slides_play_clicked(self) -> None:
         if self._session is None:

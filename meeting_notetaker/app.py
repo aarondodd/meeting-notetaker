@@ -836,6 +836,7 @@ class MainApp(QObject):
         self.window.edit_session_timestamp_requested.connect(self._on_edit_session_timestamp)
         self.window.open_recording_requested.connect(self._on_open_recording)
         self.window.export_recording_requested.connect(self._on_export_recording)
+        self.window.export_video_requested.connect(self._on_export_video)
         self.window.delete_recording_requested.connect(self._on_delete_recording)
 
         self.tray.open_main_window.connect(self._foreground_window)
@@ -1861,9 +1862,15 @@ class MainApp(QObject):
         self.window.session_view.set_player_position_ms(int(ms))
 
     def _on_player_finished(self) -> None:
+        # Natural end-of-playback: revert to the side-rail layout
+        # (per Aaron's "at end of playback, revert to normal view"
+        # spec) and reset the playhead. set_player_position_ms(0)
+        # would re-enter the playback layout in v0.6.5; call the
+        # idle-revert AFTER so the layout stays on idle.
         sv = self.window.session_view
         sv.set_player_is_playing(False)
         sv.set_player_position_ms(0)
+        sv.revert_to_idle_layout()
 
     def _on_transcript_play(self, _session_id: str) -> None:
         if self._audio_player is None:
@@ -2001,6 +2008,104 @@ class MainApp(QObject):
                 )
             worker.deleteLater()
 
+        worker.finished_with_result.connect(on_done)
+        progress.show()
+        worker.start()
+
+    def _on_export_video(self, session_id: str) -> None:
+        """Render the session as a slideshow MP4 with mixed audio + SRT.
+
+        Builds the screenshot offset list from disk, reads the transcript
+        text, then runs the encode on a worker thread with a determinate
+        progress dialog. PyAV reports per-frame progress out of the
+        encoder so the user sees real movement, not just a marquee.
+        Output is a single MP4 plus a same-named .srt sidecar; the SRT
+        is what makes subtitles toggleable in every standard player
+        without baking them into the video stream.
+        """
+        from PyQt6.QtWidgets import (  # noqa: PLC0415
+            QFileDialog, QMessageBox, QProgressDialog,
+        )
+        from .models.transcript import TranscriptStore  # noqa: PLC0415
+        from .screencap.timestamps import screenshot_offsets  # noqa: PLC0415
+        from .utils.export import default_export_filename  # noqa: PLC0415
+        from .utils.paths import (  # noqa: PLC0415
+            list_screenshots, session_audio_files,
+        )
+
+        files = session_audio_files(session_id)
+        if not files:
+            self.window.status(
+                "No recording on disk for this session.", timeout_ms=5000,
+            )
+            return
+        session = self.store.get_session(session_id)
+        if session is None:
+            self.window.status(
+                "Session metadata missing; cannot export.", timeout_ms=5000,
+            )
+            return
+        title = session.title
+
+        suggested = default_export_filename(title, "Video", ".mp4")
+        suggested_path = str(files[0].parent / suggested)
+        path_str, _ = QFileDialog.getSaveFileName(
+            self.window,
+            "Export session as video",
+            suggested_path,
+            "MP4 video -- H.264 + AAC (*.mp4)",
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        if target.suffix.lower() != ".mp4":
+            target = target.with_suffix(".mp4")
+
+        mic_path = next((p for p in files if p.stem == "mic"), None)
+        sys_path = next((p for p in files if p.stem == "sys"), None)
+        offsets = screenshot_offsets(
+            list_screenshots(session_id), session.started_at,
+        )
+        try:
+            transcript_text = TranscriptStore(session_id).read_transcript()
+        except OSError:
+            log.exception("could not read transcript for %s", session_id)
+            transcript_text = ""
+
+        progress = QProgressDialog(
+            f"Rendering {target.name}...",
+            None,
+            0, 100, self.window,
+        )
+        progress.setWindowTitle("Export session as video")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        progress.setCancelButton(None)
+        progress.setValue(0)
+
+        worker = _VideoExportWorker(
+            mic_path, sys_path, offsets, transcript_text, target,
+        )
+
+        def on_progress(pct: int) -> None:
+            progress.setValue(pct)
+
+        def on_done(err_msg: str) -> None:
+            progress.cancel()
+            if err_msg:
+                log.error("export_video failed: %s", err_msg)
+                QMessageBox.warning(
+                    self.window, "Export session as video",
+                    f"Could not render video: {err_msg}",
+                )
+            else:
+                self.window.status(
+                    f"Exported video to {target.name}", timeout_ms=5000,
+                )
+            worker.deleteLater()
+
+        worker.progress_changed.connect(on_progress)
         worker.finished_with_result.connect(on_done)
         progress.show()
         worker.start()
@@ -2733,6 +2838,42 @@ class _AudioExportWorker(QThread):
         try:
             from .audio.export import export_mixed  # noqa: PLC0415
             export_mixed(self._mic, self._sys, self._target)
+            self.finished_with_result.emit("")
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
+            self.finished_with_result.emit(str(exc))
+
+
+class _VideoExportWorker(QThread):
+    """Run audio/video_export.export_video off the GUI thread.
+
+    Emits ``progress_changed(pct)`` while encoding (0-100) and
+    ``finished_with_result(error_message)`` once at the end. The
+    progress callback fires from the encoder loop, which runs in this
+    thread; Qt marshals the signal back to the GUI thread for the
+    QProgressDialog update.
+    """
+
+    progress_changed = pyqtSignal(int)
+    finished_with_result = pyqtSignal(str)
+
+    def __init__(
+        self, mic_path, sys_path, screenshots, transcript_text, target,
+    ) -> None:
+        super().__init__()
+        self._mic = mic_path
+        self._sys = sys_path
+        self._screenshots = screenshots
+        self._transcript_text = transcript_text
+        self._target = target
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from .audio.video_export import export_video  # noqa: PLC0415
+            export_video(
+                self._mic, self._sys, self._screenshots,
+                self._transcript_text, self._target,
+                progress=self.progress_changed.emit,
+            )
             self.finished_with_result.emit("")
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
             self.finished_with_result.emit(str(exc))
