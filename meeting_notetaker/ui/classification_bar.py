@@ -1,32 +1,43 @@
-"""Classification chips row for the session view.
+"""Compact classification bar for the session view.
 
-Displays the current session's Series, People, and Topics as a single
-horizontal row above the tabs. Each chip carries an X to remove the
-association; per-dimension `+` buttons let the user add new ones via
-a small input dialog. The bar is read-only when no session is
-selected.
+Three buttons above the tabs -- Series, People, Topics -- each
+showing a count of associated items rather than rendering them
+inline. Clicking opens a popup menu with the full list and
+add/remove/accept actions.
 
-Auto-extracted topic suggestions (source=auto, accepted=False) render
-in a distinct dimmed style with Accept + Reject affordances, so the
-user can confirm or drop them in-place rather than via a separate
-panel.
+This is the v0.7.0 rewrite of the original "inline chips" bar. The
+chip layout forced the bar's preferred width to grow with content
+(every chip was a fixed-width child widget), which the parent
+window honored by widening itself. The button-with-menu approach
+keeps the bar at a fixed horizontal footprint regardless of how
+many people or topics a session accumulates.
+
+Series stays a single-value picker (one click -> change dialog).
+People + Topics use QToolButton's InstantPopup mode with menus
+rebuilt on each render so they reflect current state without
+manually wiring per-action updates.
+
+Auto-extracted topic suggestions (source=auto, accepted=False)
+render in the Topics menu under a "Suggestions" separator with a
+"+" prefix -- clicking the action accepts the suggestion. Manually
+accepting a suggestion through the menu has the same semantics as
+the old in-bar chip accept button.
 
 Mutations emit signals upward; persistence is handled by MainApp
 (which owns the ClassificationStore + threads the session lifecycle).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
-    QMessageBox,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QToolButton,
@@ -36,73 +47,12 @@ from PyQt6.QtWidgets import (
 from ..models.classification import SessionClassification, SessionTopic
 
 
-class _Chip(QWidget):
-    """One chip = label + close X. Click X to emit removed()."""
-
-    removed = pyqtSignal()
-    accepted = pyqtSignal()  # only used by suggestion chips
-
-    def __init__(
-        self,
-        text: str,
-        *,
-        suggestion: bool = False,
-        parent: Optional[QWidget] = None,
-    ) -> None:
-        super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 2, 4, 2)
-        layout.setSpacing(4)
-        self._label = QLabel(text, self)
-        if suggestion:
-            # Dimmed font + italic so the eye distinguishes
-            # suggestions from confirmed chips without needing a
-            # secondary widget.
-            font = QFont(self._label.font())
-            font.setItalic(True)
-            self._label.setFont(font)
-            self._label.setStyleSheet("color: gray;")
-        layout.addWidget(self._label)
-        if suggestion:
-            accept_btn = QToolButton(self)
-            accept_btn.setText("+")
-            accept_btn.setToolTip("Accept this topic suggestion")
-            accept_btn.setAutoRaise(True)
-            accept_btn.clicked.connect(self.accepted.emit)
-            layout.addWidget(accept_btn)
-        remove_btn = QToolButton(self)
-        remove_btn.setText("X")
-        remove_btn.setToolTip("Remove")
-        remove_btn.setAutoRaise(True)
-        remove_btn.clicked.connect(self.removed.emit)
-        layout.addWidget(remove_btn)
-        self.setSizePolicy(
-            QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed,
-        )
-
-
-@dataclass
-class _PendingMutation:
-    """A user-driven add/remove the controller (MainApp) must persist."""
-    kind: str          # "add_topic" | "remove_topic" | "accept_topic" |
-                       # "add_person" | "remove_person" |
-                       # "set_series" | "clear_series"
-    payload: object    # str (name) or int (topic_id / person_id) or None
-
-
 class ClassificationBar(QWidget):
-    """Read+write surface over a session's classification.
+    """Compact, fixed-width-friendly classification surface.
 
-    Provides display + light editing only. The actual data lives in
-    a ClassificationStore the parent app owns; this widget signals
-    intentions and lets the parent apply them.
+    Public mutation signals (re-emitted from MainApp into the store):
     """
 
-    # Each user click maps to one of these signals. Payload semantics
-    # in _PendingMutation above. session_id is always passed for
-    # routing -- the bar carries the id alongside the classification
-    # snapshot to avoid stale-id race conditions when the user
-    # double-clicks rapidly across sessions.
     add_topic_requested = pyqtSignal(str, str)              # session_id, topic_name
     remove_topic_requested = pyqtSignal(str, int)           # session_id, topic_id
     accept_topic_requested = pyqtSignal(str, int)           # session_id, topic_id
@@ -114,62 +64,74 @@ class ClassificationBar(QWidget):
         super().__init__(parent)
         self._session_id: str = ""
         self._classification = SessionClassification()
-        # Known names (alphabetical lists pushed from MainApp via
-        # set_known_lists). Drive the dropdown+text combo in the
-        # Add/Change pickers so the user can pick from existing
-        # values OR type something new.
+        # Alphabetical known-name pools (pushed from MainApp). Drive
+        # the dropdown half of the Add/Change pickers.
         self._known_series: list[str] = []
         self._known_people: list[str] = []
         self._known_topics: list[str] = []
+        # Cap the bar's own height so it never grows with content;
+        # menus do the heavy lifting.
+        self.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed,
+        )
 
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(4, 4, 4, 4)
-        outer.setSpacing(8)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(10)
 
-        self._series_label = QLabel("Series:", self)
-        self._series_label.setStyleSheet("color: gray;")
-        outer.addWidget(self._series_label)
-        self._series_value = QLabel("(none)", self)
-        self._series_value.setStyleSheet("font-weight: 600;")
-        outer.addWidget(self._series_value)
-        self._series_btn = QPushButton("Change", self)
-        self._series_btn.setFlat(True)
+        # Series: shown as a single QPushButton labelled with the
+        # current series name (or "(none)"). Click -> change dialog.
+        layout.addWidget(QLabel("Series:", self))
+        self._series_btn = QPushButton("(none)", self)
+        self._series_btn.setToolTip(
+            "Set or change this session's series. Pick from existing "
+            "or type a new name; clear to unfile."
+        )
         self._series_btn.clicked.connect(self._on_change_series)
-        outer.addWidget(self._series_btn)
+        layout.addWidget(self._series_btn)
 
         self._sep1 = QLabel("|", self)
         self._sep1.setStyleSheet("color: gray;")
-        outer.addWidget(self._sep1)
+        layout.addWidget(self._sep1)
 
-        outer.addWidget(QLabel("People:", self))
-        self._people_container = QWidget(self)
-        self._people_layout = QHBoxLayout(self._people_container)
-        self._people_layout.setContentsMargins(0, 0, 0, 0)
-        self._people_layout.setSpacing(4)
-        outer.addWidget(self._people_container)
-        self._add_person_btn = QToolButton(self)
-        self._add_person_btn.setText("+ Person")
-        self._add_person_btn.setAutoRaise(True)
-        self._add_person_btn.clicked.connect(self._on_add_person)
-        outer.addWidget(self._add_person_btn)
+        # People: QToolButton with popup menu. Label carries the
+        # count; menu carries the full list + an Add action at top.
+        self._people_btn = QToolButton(self)
+        self._people_btn.setText("People")
+        self._people_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly
+        )
+        self._people_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self._people_menu = QMenu(self._people_btn)
+        self._people_btn.setMenu(self._people_menu)
+        # Rebuild the menu just before it shows so it reflects any
+        # changes since the last render.
+        self._people_menu.aboutToShow.connect(self._rebuild_people_menu)
+        layout.addWidget(self._people_btn)
 
         self._sep2 = QLabel("|", self)
         self._sep2.setStyleSheet("color: gray;")
-        outer.addWidget(self._sep2)
+        layout.addWidget(self._sep2)
 
-        outer.addWidget(QLabel("Topics:", self))
-        self._topics_container = QWidget(self)
-        self._topics_layout = QHBoxLayout(self._topics_container)
-        self._topics_layout.setContentsMargins(0, 0, 0, 0)
-        self._topics_layout.setSpacing(4)
-        outer.addWidget(self._topics_container)
-        self._add_topic_btn = QToolButton(self)
-        self._add_topic_btn.setText("+ Topic")
-        self._add_topic_btn.setAutoRaise(True)
-        self._add_topic_btn.clicked.connect(self._on_add_topic)
-        outer.addWidget(self._add_topic_btn)
+        # Topics: same shape as People plus an extra Suggestions
+        # section in the menu for auto-extracted-but-unaccepted
+        # topic candidates.
+        self._topics_btn = QToolButton(self)
+        self._topics_btn.setText("Topics")
+        self._topics_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly
+        )
+        self._topics_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self._topics_menu = QMenu(self._topics_btn)
+        self._topics_btn.setMenu(self._topics_menu)
+        self._topics_menu.aboutToShow.connect(self._rebuild_topics_menu)
+        layout.addWidget(self._topics_btn)
 
-        outer.addStretch(1)
+        layout.addStretch(1)
         self.set_session(None, SessionClassification())
 
     # ---- public API ----
@@ -181,11 +143,9 @@ class ClassificationBar(QWidget):
         self._session_id = session_id or ""
         self._classification = classification
         enabled = bool(session_id)
-        for w in (
-            self._series_btn, self._add_person_btn, self._add_topic_btn,
-        ):
+        for w in (self._series_btn, self._people_btn, self._topics_btn):
             w.setEnabled(enabled)
-        self._render()
+        self._refresh_button_labels()
 
     def set_known_lists(
         self,
@@ -196,11 +156,7 @@ class ClassificationBar(QWidget):
     ) -> None:
         """Push alphabetically-sorted known names from MainApp.
 
-        Drives the dropdown half of the Add/Change pickers. Pass
-        only the changed dimension to avoid unnecessary list
-        replacement. Idempotent -- the bar reads these on click,
-        not at render time, so they can change between session
-        switches without forcing a repaint.
+        Drives the dropdown half of the Add/Change pickers. Idempotent.
         """
         if series is not None:
             self._known_series = list(series)
@@ -209,44 +165,123 @@ class ClassificationBar(QWidget):
         if topics is not None:
             self._known_topics = list(topics)
 
-    def _render(self) -> None:
-        # Series.
+    # ---- label refresh ----
+
+    # Series-button label cap (in chars). Longer series names get
+    # elided with "..." so the bar width stays bounded; the full
+    # name lives in the button's tooltip for hover lookup. 30 chars
+    # fits "Platform Team Sync -- Weekly" comfortably and ellides
+    # only obviously long titles.
+    _SERIES_LABEL_CAP = 30
+
+    def _refresh_button_labels(self) -> None:
+        # Series. Elide overlong names to keep the bar's width
+        # constant regardless of how long a user names a series.
         if self._classification.series is not None:
-            self._series_value.setText(self._classification.series.name)
+            full = self._classification.series.name
+            if len(full) > self._SERIES_LABEL_CAP:
+                display = full[: self._SERIES_LABEL_CAP - 3] + "..."
+            else:
+                display = full
+            self._series_btn.setText(display)
+            self._series_btn.setToolTip(
+                "Set or change this session's series.\n"
+                f"Current: {full}"
+            )
         else:
-            self._series_value.setText("(none)")
-        # People.
-        self._clear_layout(self._people_layout)
-        for sp in self._classification.people:
-            chip = _Chip(sp.person.display_name, parent=self._people_container)
-            pid = sp.person.id
-            chip.removed.connect(lambda pid=pid: self._emit_remove_person(pid))
-            self._people_layout.addWidget(chip)
-        if not self._classification.people:
-            placeholder = QLabel("(none)", self._people_container)
-            placeholder.setStyleSheet("color: gray;")
-            self._people_layout.addWidget(placeholder)
-        # Topics -- show accepted first, then suggestions dimmed.
-        self._clear_layout(self._topics_layout)
+            self._series_btn.setText("(none)")
+            self._series_btn.setToolTip(
+                "Set this session's series. Pick from existing or "
+                "type a new name."
+            )
+        # People count.
+        n_people = len(self._classification.people)
+        self._people_btn.setText(
+            f"People ({n_people})" if n_people else "People"
+        )
+        # Topics count -- accepted + suggestions shown separately.
         accepted = [t for t in self._classification.topics if t.accepted]
         suggestions = [t for t in self._classification.topics if not t.accepted]
-        for st in accepted:
-            chip = _Chip(st.topic.name, parent=self._topics_container)
-            tid = st.topic.id
-            chip.removed.connect(lambda tid=tid: self._emit_remove_topic(tid))
-            self._topics_layout.addWidget(chip)
-        for st in suggestions:
-            chip = _Chip(
-                st.topic.name, suggestion=True, parent=self._topics_container,
+        if not accepted and not suggestions:
+            self._topics_btn.setText("Topics")
+        elif suggestions:
+            self._topics_btn.setText(
+                f"Topics ({len(accepted)}, {len(suggestions)} suggested)"
             )
-            tid = st.topic.id
-            chip.accepted.connect(lambda tid=tid: self._emit_accept_topic(tid))
-            chip.removed.connect(lambda tid=tid: self._emit_remove_topic(tid))
-            self._topics_layout.addWidget(chip)
-        if not self._classification.topics:
-            placeholder = QLabel("(none)", self._topics_container)
-            placeholder.setStyleSheet("color: gray;")
-            self._topics_layout.addWidget(placeholder)
+        else:
+            self._topics_btn.setText(f"Topics ({len(accepted)})")
+
+    # ---- menu builders ----
+    def _rebuild_people_menu(self) -> None:
+        menu = self._people_menu
+        menu.clear()
+        add_action = QAction("+ Add Person...", menu)
+        add_action.triggered.connect(self._on_add_person)
+        menu.addAction(add_action)
+        if not self._classification.people:
+            empty = QAction("(no people)", menu)
+            empty.setEnabled(False)
+            menu.addSeparator()
+            menu.addAction(empty)
+            return
+        menu.addSeparator()
+        for sp in self._classification.people:
+            pid = sp.person.id
+            label = f"x  {sp.person.display_name}"
+            act = QAction(label, menu)
+            act.setToolTip("Remove this person from the session")
+            act.triggered.connect(
+                lambda _checked=False, pid=pid: self._emit_remove_person(pid)
+            )
+            menu.addAction(act)
+
+    def _rebuild_topics_menu(self) -> None:
+        menu = self._topics_menu
+        menu.clear()
+        add_action = QAction("+ Add Topic...", menu)
+        add_action.triggered.connect(self._on_add_topic)
+        menu.addAction(add_action)
+        accepted = [t for t in self._classification.topics if t.accepted]
+        suggestions = [t for t in self._classification.topics if not t.accepted]
+        if not accepted and not suggestions:
+            menu.addSeparator()
+            empty = QAction("(no topics)", menu)
+            empty.setEnabled(False)
+            menu.addAction(empty)
+            return
+        if accepted:
+            menu.addSeparator()
+            for st in accepted:
+                tid = st.topic.id
+                label = f"x  {st.topic.name}"
+                act = QAction(label, menu)
+                act.setToolTip("Remove this topic from the session")
+                act.triggered.connect(
+                    lambda _checked=False, tid=tid: self._emit_remove_topic(tid)
+                )
+                menu.addAction(act)
+        if suggestions:
+            menu.addSeparator()
+            header = QAction("Suggestions:", menu)
+            header.setEnabled(False)
+            menu.addAction(header)
+            for st in suggestions:
+                tid = st.topic.id
+                # Accept + (separately) reject for suggestions. Two
+                # menu rows per suggestion keeps the click intent
+                # unambiguous: "+ accept" vs "x reject".
+                accept_act = QAction(f"+  {st.topic.name}", menu)
+                accept_act.setToolTip("Accept this suggested topic")
+                accept_act.triggered.connect(
+                    lambda _checked=False, tid=tid: self._emit_accept_topic(tid)
+                )
+                menu.addAction(accept_act)
+                reject_act = QAction(f"     x  {st.topic.name} (reject)", menu)
+                reject_act.setToolTip("Drop this suggestion without accepting")
+                reject_act.triggered.connect(
+                    lambda _checked=False, tid=tid: self._emit_remove_topic(tid)
+                )
+                menu.addAction(reject_act)
 
     # ---- handlers ----
     _CLEAR_SENTINEL = "-- clear (unfile) --"
@@ -258,9 +293,6 @@ class ClassificationBar(QWidget):
             self._classification.series.name
             if self._classification.series else ""
         )
-        # Build items: sentinel for "clear" + alphabetical existing
-        # series. editable=True so the user can type a brand-new
-        # name; current selection seeds the combo.
         items = [self._CLEAR_SENTINEL] + sorted(self._known_series)
         try:
             current_idx = items.index(current) if current else 0
@@ -283,8 +315,6 @@ class ClassificationBar(QWidget):
     def _on_add_person(self) -> None:
         if not self._session_id:
             return
-        # Filter out people already on the session -- showing them
-        # in the picker would just be noise.
         already_on_session = {
             sp.person.display_name.casefold()
             for sp in self._classification.people
@@ -342,14 +372,3 @@ class ClassificationBar(QWidget):
         if not self._session_id:
             return
         self.accept_topic_requested.emit(self._session_id, topic_id)
-
-    @staticmethod
-    def _clear_layout(layout: QHBoxLayout) -> None:
-        """Remove every child widget. Used between renders to wipe
-        prior chips before drawing the fresh set."""
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
