@@ -232,3 +232,153 @@ def test_format_srt_handles_long_durations():
     cues = [(3_661_500, 3_665_000, "after an hour")]
     out = format_srt(cues)
     assert "01:01:01,500 --> 01:01:05,000" in out
+
+
+# ----------------------------------------------------------------------
+# Interstitial frame rendering. Aaron flagged post-PR-#27 that the
+# initial 72pt-hardcoded text was unreadable on a 1080p slide; the
+# renderer now auto-fits the font size so the text fills ~90% of the
+# canvas width. These tests pin the contract: short labels land on
+# the maximum font size, long labels wrap (and shrink if needed),
+# and the rendered frame is the right shape regardless.
+
+import numpy as np
+import pytest
+
+from meeting_notetaker.audio.highlights_export import (
+    _INTERSTITIAL_MAX_FONT_PT,
+    _INTERSTITIAL_MIN_FONT_PT,
+    _INTERSTITIAL_WIDTH_PCT,
+    _fit_text_to_card,
+    _render_interstitial_frame,
+)
+
+
+PIL = pytest.importorskip("PIL.ImageDraw")
+
+
+def _draw_for_fit():
+    from PIL import Image, ImageDraw
+    return ImageDraw.Draw(Image.new("RGB", (1920, 1080), (0, 0, 0)))
+
+
+def test_render_interstitial_frame_returns_1080p_rgb():
+    """Output shape must match video_export's encoder expectations
+    (height, width, channels) -- a wrong shape would silently
+    produce a malformed MP4."""
+    arr = _render_interstitial_frame("Highlight 1")
+    assert arr.shape == (1080, 1920, 3)
+    assert arr.dtype == np.uint8
+
+
+def test_render_interstitial_frame_has_visible_text():
+    """At least some pixels are non-black (the rendered text).
+    Black-only output would mean the font failed silently."""
+    arr = _render_interstitial_frame("Hello")
+    # Sum across all three channels; non-black pixels accumulate.
+    assert arr.sum() > 0
+    # And the text takes a meaningful share of the canvas -- a
+    # one-letter fluke wouldn't reach this floor.
+    bright_pixels = (arr > 200).any(axis=2).sum()
+    assert bright_pixels > 5_000, (
+        f"only {bright_pixels} bright pixels; text likely too small"
+    )
+
+
+def test_fit_short_label_fills_card_at_very_large_size():
+    """A short label like "Highlight 1" should pick the LARGEST
+    font size that fits the width budget -- not the configured
+    max (which might not fit a 1080p card for a string with this
+    char count, so the auto-fit steps down). The criterion is
+    'noticeably larger than the original 72pt' and 'actually
+    fills the width budget'."""
+    draw = _draw_for_fit()
+    max_w = int(1920 * _INTERSTITIAL_WIDTH_PCT)
+    max_h = int(1080 * 0.80)
+    font, lines, size = _fit_text_to_card(draw, "Highlight 1", max_w, max_h)
+    assert len(lines) == 1
+    # Well above the legacy 72pt baseline (which prompted Aaron's
+    # "too small" feedback). 200pt is roughly 3x larger.
+    assert size >= 200, (
+        f"short label landed at {size}pt -- expected >=200pt to "
+        "look right on a 1080p slide"
+    )
+    # And it should actually fill most of the width budget, not
+    # leave huge whitespace either side.
+    from meeting_notetaker.audio.highlights_export import _line_width_for
+    rendered_width = _line_width_for(draw, font, lines[0])
+    assert rendered_width >= int(max_w * 0.70), (
+        f"rendered width {rendered_width} px below 70% of budget "
+        f"{max_w} px -- font sized down too aggressively"
+    )
+
+
+def test_fit_jump_label_fills_card_at_very_large_size():
+    """The "Jumping to MM:SS" cards have a couple more characters,
+    but the same expectation applies: large + width-filling. The
+    19-char string at DejaVuSans-Bold ends up around 140pt -- still
+    ~2x the old 72pt baseline and right at the width budget."""
+    draw = _draw_for_fit()
+    max_w = int(1920 * _INTERSTITIAL_WIDTH_PCT)
+    max_h = int(1080 * 0.80)
+    font, lines, size = _fit_text_to_card(
+        draw, "Jumping to 00:30:15", max_w, max_h,
+    )
+    assert len(lines) == 1
+    assert size >= 140
+    from meeting_notetaker.audio.highlights_export import _line_width_for
+    rendered_width = _line_width_for(draw, font, lines[0])
+    assert rendered_width >= int(max_w * 0.70)
+
+
+def test_fit_long_title_wraps_or_shrinks():
+    """A long user-supplied title that wouldn't fit on one line at
+    max size has to either wrap or shrink. The constraint is that
+    the rendered output respects the width budget."""
+    long_title = (
+        "Decision on whether to roll out MDM phase 3 next quarter "
+        "given the licensing changes from Informatica"
+    )
+    draw = _draw_for_fit()
+    max_w = int(1920 * _INTERSTITIAL_WIDTH_PCT)
+    max_h = int(1080 * 0.80)
+    font, lines, size = _fit_text_to_card(draw, long_title, max_w, max_h)
+    # Either size dropped below max, or text wrapped to multiple
+    # lines (or both). One-line-at-max would mean we overflowed
+    # the width budget, which is the bug.
+    assert size <= _INTERSTITIAL_MAX_FONT_PT
+    assert size >= _INTERSTITIAL_MIN_FONT_PT
+    fits_one_line_at_max = (
+        size == _INTERSTITIAL_MAX_FONT_PT and len(lines) == 1
+    )
+    assert not fits_one_line_at_max, (
+        "long title shouldn't fit on one line at max font size"
+    )
+
+
+def test_fit_empty_string_renders_safely():
+    """An empty title would otherwise blow up the wrap loop; the
+    fallback to " " keeps the card non-empty (and the frame
+    properly black)."""
+    draw = _draw_for_fit()
+    font, lines, size = _fit_text_to_card(
+        draw, "", int(1920 * 0.9), int(1080 * 0.8),
+    )
+    # Lines list must be non-empty so the renderer's loop runs.
+    assert lines
+    # Falls back to MAX (the placeholder space fits trivially).
+    assert size == _INTERSTITIAL_MAX_FONT_PT
+
+
+def test_render_interstitial_frame_long_title_does_not_crash():
+    """End-to-end: a long title renders without raising. Detects
+    regressions in the wrap+shrink interaction that would only
+    surface at frame-render time."""
+    long_title = (
+        "An extremely long title that the user typed in a fit of "
+        "enthusiasm and which absolutely cannot fit on one line "
+        "at any reasonable font size for a 1080p video"
+    )
+    arr = _render_interstitial_frame(long_title)
+    assert arr.shape == (1080, 1920, 3)
+    assert arr.sum() > 0   # something painted

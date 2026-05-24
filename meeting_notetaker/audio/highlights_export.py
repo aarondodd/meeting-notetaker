@@ -572,38 +572,144 @@ def _encode_highlight_video(
         progress(100)
 
 
+# Auto-fit constraints for interstitial cards. The text fills the
+# canvas aggressively per Aaron's "make it very large" feedback --
+# the cards exist for at-a-glance viewing during fast playback, so
+# legibility trumps margin. The width budget is 90% of the canvas;
+# the height budget is 80% (leaves a small letterbox so single-line
+# text doesn't sit edge-to-edge top-and-bottom).
+_INTERSTITIAL_WIDTH_PCT = 0.90
+_INTERSTITIAL_HEIGHT_PCT = 0.80
+# Font-size search bounds. Start at the upper bound and step down
+# until both width + height constraints are met. The lower bound
+# is the floor where text is still legible on a 1080p slide; tex
+# never falls below it, even if it has to wrap to many lines.
+_INTERSTITIAL_MAX_FONT_PT = 320
+_INTERSTITIAL_MIN_FONT_PT = 60
+_INTERSTITIAL_FONT_STEP_PT = 12
+
+
 def _render_interstitial_frame(text: str) -> np.ndarray:
     """Render a black-background centered-text card to a (H, W, 3)
-    uint8 array. Uses PIL (already a hard dependency for the
-    existing slideshow path) so we don't introduce a new package."""
-    from PIL import Image, ImageDraw, ImageFont
+    uint8 array.
+
+    Auto-sizes the font: starts at _INTERSTITIAL_MAX_FONT_PT and
+    steps down until the wrapped text fits inside
+    (canvas_width * 0.90, canvas_height * 0.80). Short labels like
+    "Highlight 1" end up at the maximum size and fill the canvas;
+    long titles wrap and shrink as needed. Uses PIL (already a
+    hard dependency for the existing slideshow path).
+    """
+    from PIL import Image, ImageDraw
     from .video_export import _TARGET_HEIGHT, _TARGET_WIDTH
 
     canvas = Image.new("RGB", (_TARGET_WIDTH, _TARGET_HEIGHT), (0, 0, 0))
     draw = ImageDraw.Draw(canvas)
-    # Pick a reasonable font size relative to canvas height; PIL's
-    # default font is bitmap-only and unreadable at 1080p, but
-    # `load_default` covers the worst case where no system font is
-    # available. Try Helvetica/Arial first.
-    font = _load_interstitial_font(size=72)
-    # Multi-line wrap by hand: split on words and pack into lines
-    # no wider than 80% of the canvas. PIL's textbbox tells us the
-    # actual rendered width for the chosen font.
-    max_w = int(_TARGET_WIDTH * 0.8)
-    lines = _wrap_text(text, font, draw, max_w)
+    max_w = int(_TARGET_WIDTH * _INTERSTITIAL_WIDTH_PCT)
+    max_h = int(_TARGET_HEIGHT * _INTERSTITIAL_HEIGHT_PCT)
+
+    font, lines, font_size = _fit_text_to_card(
+        draw, text, max_w, max_h,
+    )
+    # Inter-line spacing proportional to font size; 1/6 the size
+    # gives comfortable breathing room without dominating the
+    # vertical budget.
+    line_spacing = max(8, font_size // 6)
+
     line_heights = []
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
         line_heights.append(bbox[3] - bbox[1])
-    total_h = sum(line_heights) + max(0, len(lines) - 1) * 12
+    total_h = sum(line_heights) + max(0, len(lines) - 1) * line_spacing
     y = (_TARGET_HEIGHT - total_h) // 2
     for line, lh in zip(lines, line_heights):
         bbox = draw.textbbox((0, 0), line, font=font)
         w = bbox[2] - bbox[0]
         x = (_TARGET_WIDTH - w) // 2
         draw.text((x, y), line, fill=(255, 255, 255), font=font)
-        y += lh + 12
+        y += lh + line_spacing
     return np.asarray(canvas, dtype=np.uint8)
+
+
+def _fit_text_to_card(
+    draw,
+    text: str,
+    max_w: int,
+    max_h: int,
+) -> tuple[object, list[str], int]:
+    """Find the largest font size at which `text` fits the card.
+
+    Strategy is single-line-preferred:
+
+    1. Walk sizes max -> min. The largest size at which the text
+       fits on ONE line within `max_w` and `max_h` wins.
+    2. If no single-line fit exists in the range, walk again
+       allowing the wrapper to break into multiple lines, and
+       pick the largest size where the wrapped block fits.
+    3. Final fallback: minimum size + whatever wrap that gives
+       (renderer still produces a valid frame; the user may see
+       a clipped corner for absurdly long titles).
+
+    The two-pass approach prevents the "Highlight 1" -> ["Highlight",
+    "1"] tradeoff where a slightly larger font wraps to an awkward
+    multi-line layout: a single line at a slightly smaller size
+    almost always reads better.
+
+    Returns (font, wrapped_lines, font_size).
+    """
+    text = text.strip() or " "
+    # Pass 1: single-line preference.
+    for size in range(
+        _INTERSTITIAL_MAX_FONT_PT,
+        _INTERSTITIAL_MIN_FONT_PT - 1,
+        -_INTERSTITIAL_FONT_STEP_PT,
+    ):
+        font = _load_interstitial_font(size=size)
+        width = _line_width_for(draw, font, text)
+        if width > max_w:
+            continue
+        if _line_height_for(draw, font) > max_h:
+            continue
+        return font, [text], size
+    # Pass 2: allow wrapping.
+    for size in range(
+        _INTERSTITIAL_MAX_FONT_PT,
+        _INTERSTITIAL_MIN_FONT_PT - 1,
+        -_INTERSTITIAL_FONT_STEP_PT,
+    ):
+        font = _load_interstitial_font(size=size)
+        lines = _wrap_text(text, font, draw, max_w)
+        if not lines:
+            continue
+        line_spacing = max(8, size // 6)
+        line_h = _line_height_for(draw, font)
+        total_h = (
+            len(lines) * line_h
+            + max(0, len(lines) - 1) * line_spacing
+        )
+        widest = max(
+            _line_width_for(draw, font, line) for line in lines
+        )
+        if widest <= max_w and total_h <= max_h:
+            return font, lines, size
+    # Last resort.
+    font = _load_interstitial_font(size=_INTERSTITIAL_MIN_FONT_PT)
+    lines = _wrap_text(text, font, draw, max_w)
+    return font, lines, _INTERSTITIAL_MIN_FONT_PT
+
+
+def _line_height_for(draw, font) -> int:
+    """Stable per-line height using a 'Mg' probe so descenders are
+    accounted for regardless of which words land on which line."""
+    bbox = draw.textbbox((0, 0), "Mg", font=font)
+    return bbox[3] - bbox[1]
+
+
+def _line_width_for(draw, font, line: str) -> int:
+    if not line:
+        return 0
+    bbox = draw.textbbox((0, 0), line, font=font)
+    return bbox[2] - bbox[0]
 
 
 def _load_interstitial_font(*, size: int):
