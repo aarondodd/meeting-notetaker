@@ -1,391 +1,81 @@
 # Meeting Notetaker
 
-Local meeting capture for Windows. Records your microphone and the system
-audio (whatever is playing through your speakers, including Teams / Zoom /
-Meet calls), transcribes both streams on-device with faster-whisper, and
-hands the resulting transcript to you for synthesis by any LLM you trust,
-via clipboard. No audio leaves the machine; no API key required.
+Local meeting capture for Windows. Records your microphone and the
+system audio (whatever is playing through your speakers, including
+Teams / Zoom / Meet calls), transcribes both streams on-device with
+faster-whisper, captures screenshots of any region you draw, plays
+the recording back in-app, and hands the resulting transcript to you
+for synthesis by any LLM you trust -- either via clipboard or a
+bundled Chrome extension that drives Claude.ai for you. No audio
+leaves the machine; no API key required.
 
-> **Status:** v0.6 alpha. End-to-end capture, transcription, and synthesis
-> work. Performance tuning is ongoing.
+> **Status:** v0.6.5. End-to-end capture, transcription, synthesis,
+> screen capture, retained-audio playback + export, and transcript-
+> synchronized playback all working. Performance tuning is ongoing.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
-> transcription product. The transcript exists to seed an LLM synthesis
-> pass; the LLM smooths the kinds of errors a CPU-only Whisper run
-> produces (homophones like "there" vs "their", mild punctuation
-> drift, occasional dropped articles). If you need legal-grade verbatim
-> transcripts, use Teams' built-in transcription or a hosted service --
-> this app trades raw accuracy for local-only processing, low CPU cost,
-> and an LLM-friendly transcript that synthesizes well.
+> transcription product. The transcript exists to seed an LLM
+> synthesis pass; the LLM smooths the kinds of errors a CPU-only
+> Whisper run produces (homophones like "there" vs "their", mild
+> punctuation drift, occasional dropped articles). If you need
+> legal-grade verbatim transcripts, use Teams' built-in
+> transcription or a hosted service -- this app trades raw accuracy
+> for local-only processing, low CPU cost, and an LLM-friendly
+> transcript that synthesizes well.
 >
-> **Diarization (speaker identification) is rough.** The current pass
-> reliably separates two or three distinct voices in clean audio, but a
-> four-person meeting routinely splits into 20+ "speakers" depending on
-> mic, codec, and noise floor. The goal is **sufficient speaker context
-> to attribute concepts and discussion threads to the right person** --
-> not perfect labeling. The synthesis prompt sees speaker labels as
-> hints, and the LLM is fully capable of reconciling "Speaker 7 and
-> Speaker 12 are likely the same person" given the surrounding text.
-> The defaults are a starting point, not a destination -- the merge /
-> match thresholds are tunable in Settings, and live click-to-tag
-> during recording (v0.6) feeds the clustering directly so you can
-> correct in-meeting. Active iteration; the rest of the app does not
-> depend on it being right.
-
-## Features
-
-- **On-device transcription** via faster-whisper (CPU, int8). Runs live
-  during the meeting and refines after Stop. Quality is tuned for LLM
-  synthesis -- sufficient to capture what was said and who said it,
-  not a verbatim court reporter. The synthesis pass smooths the
-  remaining word-choice errors (homophones, mild punctuation).
-- **Mic + system-audio capture** through WASAPI loopback, so both sides
-  of a Teams / Zoom / Meet call are recorded.
-- **Clipboard-mediated synthesis** (default) **or one-click automation**
-  (opt-in, v0.6.3+). Generate a prompt and paste it into any approved
-  chatbot, then paste the reply back -- or install the bundled Chrome
-  extension and let it drive a Claude.ai tab on a single button press.
-  Either way, the browser stays the LLM intermediary; no audio or
-  transcript ever touches a third-party API. See **Synthesis automation
-  (optional)** below.
-- **Speaker identification.** SpeechBrain ECAPA-TDNN embeddings cluster
-  the loopback channel into per-speaker turns and match them against a
-  local library that grows as you label voices.
-- **Outlook calendar awareness.** Tray notifications a few minutes before
-  scheduled meetings; clicking pre-fills the New Session dialog with the
-  invite's title, attendees, and agenda.
-- **Ad-hoc meeting detection.** Optional: watches the Windows audio
-  mixer for sustained audio from a known meeting app (Teams, Zoom,
-  WebEx, ...) and offers to start a session. The OS already tracks which
-  apps are playing; we read the metadata, not the stream.
-- **Live notes alongside the transcript.** Markdown editor with image
-  paste, auto-save, and a section template (Attendees / Agenda / Notes /
-  Action Items). Notes merge into the synthesis prompt.
-- **Editable synthesis output.** The LLM reply lands in an editable
-  Markdown tab so it can be tweaked in place before sharing.
-- **PDF export and printing.** Native Qt PDF backend preserves embedded
-  images and clickable links.
-- **Crash-resilient.** Sessions left in a transient state at startup
-  surface in a recovery dialog; WAV files are preserved.
-- **Self-updating.** Weekly check against GitHub releases; one-click
-  download + rebuild + in-place install.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    mic[Microphone]
-    sys["System audio<br/>(WASAPI loopback)"]
-    whisper["Local Whisper<br/>faster-whisper, CPU, int8"]
-    transcript[raw.transcript.md]
-    diar["Speaker ID pass"]
-    prompt[Generate<br/>Synthesis Prompt]
-    clip[Clipboard]
-    chatbot["Your chosen chatbot<br/>(Claude.ai, Copilot, ChatGPT, ...)"]
-    paste[Paste Response Back]
-    notes[notes.md]
-
-    mic -->|mic.wav| whisper
-    sys -->|sys.wav| whisper
-    whisper --> transcript
-    sys -. loopback only .-> diar
-    diar -->|rewrites with<br/>speaker names| transcript
-    transcript --> prompt --> clip --> chatbot --> paste --> notes
-```
-
-The WASAPI loopback path is adapted from
-[Danaor/WhisperType](https://github.com/Danaor/WhisperType).
-
-## Screenshots
-
-The main window splits a session list (left) and a per-session view (right).
-Recording controls sit above four tabs: the live transcript, your own
-notes, the synthesized result, and any earlier synthesis runs archived for
-the same session.
-
-**Transcript -- interleaved mic + system audio, timestamped per line.**
-
-![Main window -- Transcript tab](docs/screenshots/01-main-transcript.png)
-
-The session list has two narrow indicator columns to the left of each
-title: a speaker icon if the audio recording is still on disk, and a
-state dot (red while recording, yellow while the post-Stop refinement
-pass is running, green when refined). Hover any cell to see what that
-column conveys.
-
-**My Notes -- your running buffer alongside the transcript.** Markdown
-source with a small formatting toolbar. Sections (`# Attendees / # Agenda
-/ # Notes / # Action Items`) auto-seed on first open. Everything you
-type auto-saves continuously and is fed back into the synthesis prompt.
-Paste an image from the clipboard (or click **Image** in the toolbar to
-insert a file) and the app copies it into the session's `images/` folder
-and inserts a Markdown reference.
-
-![Main window -- My Notes (edit mode)](docs/screenshots/02-main-my-notes-edit.png)
-
-Click **Preview** in the toolbar to render the Markdown in place:
-
-![Main window -- My Notes (preview mode)](docs/screenshots/03-main-my-notes-preview.png)
-
-**Synthesis -- the response from your chatbot, editable in place.**
-Populated after you click *Paste Response Back* with the LLM's reply.
-Same Preview / Edit toggle as My Notes, so the generated note can be
-tweaked before sharing. The **Print...** button above the tabs sends
-the active tab to a physical printer. For a PDF copy use **Export
-PDF...** -- it writes a PDF directly via Qt's PDF backend, which
-preserves images and clickable links. The **Copy** button copies
-whichever tab is currently active.
-
-#### Paste-target coverage for Copy
-
-The Copy button on the **My Notes** and **Synthesis** tabs puts two
-payloads on the clipboard at once: the raw Markdown source (for
-plain-text editors) and a rendered HTML version with each embedded
-image inlined as a `data:image/...;base64` URI (for rich-text paste
-targets). Different destinations pick different sides of that
-clipboard payload and apply their own sanitization on top, which
-means coverage varies:
-
-| Destination | Formatting | Images | Notes |
-|---|---|---|---|
-| Word (desktop) | yes | yes | Best target -- reads CF_HTML, accepts data: URIs natively. |
-| OneNote (desktop) | yes | yes | Same as Word. |
-| Outlook (desktop, compose) | yes | yes | Same as Word. |
-| Notion (web) | yes | yes | Notion re-uploads each data: URI to its own CDN on paste. |
-| Outlook Web (compose) | yes | **no** | Microsoft's web compose sanitizer strips data: URIs by policy. Formatting (headings, bold, lists) survives. |
-| Microsoft Teams (desktop, compose) | yes | **no** | Same sanitizer as Outlook Web. Formatting survives. |
-| Slack | mixed | mixed | Depends on which compose surface (channel post, DM, thread). |
-| Gmail (web compose) | yes | usually no | Browser-paste sanitizer behavior; varies by account / extension state. |
-| VS Code / Obsidian / plain editors | -- | -- | Take the Markdown side unchanged. This is the intended path for tools that natively understand Markdown. |
-| Transcript tab + Previous Notes tab | -- | -- | These tabs hold plain text. Copy puts the text on the clipboard as plain text; no HTML render is attempted because there's nothing markdown-formatted to preserve. |
-
-**The image-loss story specifically.** Microsoft's web-paste pipeline
-(Outlook Web, Teams desktop) strips `<img src="data:...">` references
-from pasted HTML on receipt. This is a deliberate security stance
-against XSS in pasted content; it is not a bug we can patch around
-from the sender side without uploading images to a hosting service,
-which violates the local-only design.
-
-**What does survive in Teams / Outlook Web.** As of v0.6.2 the
-Markdown -> HTML rendering pipeline runs through a sanitizer that
-strips Qt-specific markers (`<meta name="qrichtext">`, `-qt-*` CSS
-properties, Qt's internal head `<style>` block). Without that
-sanitizer pass the receiving app would see the Qt-flavored payload,
-decide it was internal-only content, and fall back to the
-plain-Markdown side -- the symptom Aaron observed before v0.6.2. With
-sanitization, headings + bold + italic + lists + paragraphs all
-preserve.
-
-**Workaround for images into Teams / Outlook Web.** The fastest path
-when an image absolutely has to land in a Teams or OWA message is to
-paste the message text first, then go back to My Notes, right-click
-the image, and use the OS-level *Copy Image* from the preview to put
-just that image on the clipboard as a binary; paste it into the Teams
-/ OWA compose as a second operation. Tedious but reliable.
-
-**Potential future enhancement.** CF_RTF generation (the Rich Text
-Format clipboard variant that Word / Outlook desktop natively prefer)
-would give Word and Outlook desktop a second guaranteed-good path,
-but it would not help Teams or Outlook Web (Electron + browser both
-read HTML, not RTF). The marginal value is low for the engineering
-effort -- skipped for now; revisit if a future paste target turns
-out to read RTF but reject CF_HTML.
-
-![Main window -- Synthesis tab](docs/screenshots/04-main-synthesis.png)
-
-**Previous Notes -- earlier synthesis runs, kept as an audit trail.**
-Every time you paste a new response, the prior `notes.md` is archived to
-`notes-YYYYMMDD-HHMM.md` and listed here.
-
-![Main window -- Previous Notes tab](docs/screenshots/05-main-previous-notes.png)
-
-### Dialogs
-
-**New Session** -- title plus a per-session "Keep recording" override.
-When Outlook is reachable, a **Pick from Calendar...** button appears so
-you can pre-create a session for an upcoming meeting:
-
-![New Session dialog](docs/screenshots/06-dialog-new-session.png)
-
-**Pick from Calendar** -- lists today's remaining meetings; select one
-to pre-fill the session title (still editable) and queue the attendees
-+ agenda for the new session's My Notes:
-
-![Calendar picker](docs/screenshots/11-dialog-calendar-picker.png)
-
-**New Session pre-filled from a calendar invite** -- click the
-"Meeting starting" tray notification and the dialog opens with the
-meeting subject already entered; attendees + agenda land in My Notes
-when you accept:
-
-![New Session dialog (calendar pre-fill)](docs/screenshots/10-dialog-new-session-calendar-prefill.png)
-
-**Settings** -- model size, capture / refinement toggles, custom
-vocabulary, audio device picker, Outlook calendar watch, ad-hoc meeting
-detection, VAD, your name, and a shortcut to the prompt-templates
-folder. The interface follows the OS dark/light setting automatically.
-
-![Settings dialog](docs/screenshots/07-dialog-settings.png)
-
-**Generate Synthesis Prompt** -- pick a template, preview the rendered
-prompt, copy to clipboard:
-
-![Generate Synthesis Prompt dialog](docs/screenshots/08-dialog-generate-prompt.png)
-
-**Paste Response Back** -- paste the LLM's reply; on Save the prior
-notes file is auto-archived:
-
-![Paste Response Back dialog](docs/screenshots/09-dialog-paste-response.png)
-
-**Label Unknown Speakers** -- pops automatically after the post-meeting
-speaker-identification pass if any voice in the recording did not match
-the speaker library. Each card shows the top example transcript lines
-for that cluster plus a name field that autocompletes from Outlook
-attendees and known speakers:
-
-![Label Unknown Speakers dialog](docs/screenshots/12-dialog-label-unknown-speakers.png)
-
-**Review Speakers** -- a button on the session view that walks every
-detected speaker for after-the-fact correction. Rename, forget, or
-confirm; corrections feed back into the store:
-
-![Review Speakers dialog](docs/screenshots/13-dialog-review-speakers.png)
-
-**Manage Speakers** -- the speaker library lives at
-`%APPDATA%/MeetingNotetaker/speakers.db`. Open via Settings >
-Manage Speakers...; Rename / Forget per row, with a Forget All
-escape hatch:
-
-![Manage Speakers dialog](docs/screenshots/14-dialog-manage-speakers.png)
-
-## Synthesis automation (optional)
-
-By default the app uses a **manual** synthesis flow: click **Generate
-Synthesis Prompt**, paste the prompt into your approved chatbot, then
-**Paste Response Back** to land the reply in the Synthesis tab.
-
-Starting in v0.6.3, **Settings > Synthesis Automation** can replace the
-Generate + Paste buttons with a single **Send to Claude.ai** button. A
-bundled Chrome extension drives the chat tab for you: opens the
-conversation, pastes the prompt, watches for the response to stream in,
-clicks Claude's Copy button to read it back as proper markdown, then
-closes the tab. The Copy button stays visible regardless of the toggle.
-
-![Synthesis tab with automation enabled](docs/screenshots/15-main-synthesis-automation.png)
-
-### What stays the same
-
-- **No API calls.** The extension uses your existing Claude.ai (or,
-  in a future build, M365 Copilot) browser session -- exactly what
-  approved chatbot use looks like today.
-- **The browser remains the intermediary.** The extension types into
-  the chat composer and reads Claude's rendered response via its own
-  Copy button; it does not bypass the LLM's web interface.
-- **The proxy interstitial still gates traffic.** If your outbound
-  proxy shows a "PROCEED" page on the first AI request, the extension
-  detects it, shows a toast, and waits for you to click PROCEED. The
-  human-in-the-loop ack stays intact.
-
-### Hard dependencies
-
-- **Google Chrome** (or Chromium / Edge) installed on the same
-  machine as Meeting Notetaker. The extension is Manifest V3 and
-  loads as an unpacked extension; no other browser is supported in
-  v0.6.3.
-- **Windows.** The native-messaging bridge registers itself in HKCU
-  on the user side; macOS and Linux paths are scaffolded but not
-  packaged in this release.
-- **A signed-in Claude.ai account.** First-time use also prompts
-  Chrome for one-time per-site permissions; see below.
-
-### One-time install (Path 3: guided manual)
-
-Chrome does not permit silent install of unpacked extensions, so the
-install flow is a three-step wizard launched from
-**Settings > Synthesis Automation > Install / Verify...**:
-
-![Install wizard](docs/screenshots/16-dialog-automation-install.png)
-
-1. **Extract the extension files.** Click *Extract and open folder*;
-   the app drops the unpacked extension into
-   `%LOCALAPPDATA%\MeetingNotetaker\automation\extension` and opens
-   the folder in Explorer.
-2. **Load in Chrome.** Open `chrome://extensions`, toggle Developer
-   mode on, click **Load unpacked**, and select the folder from step 1.
-3. **Verify.** Back in the wizard, click *Verify*. The app registers
-   the native-messaging bridge in HKCU (per-user, no admin needed)
-   and waits up to a minute for the extension to connect. Green
-   indicator means done.
-
-To remove later: **Uninstall bridge** in Settings tears down the
-registry registration; to also remove the extension from Chrome,
-delete it from `chrome://extensions`.
-
-### Chrome permissions you'll be asked to grant
-
-On the first synthesis, Chrome shows **one-time per-site prompts**:
-
-- **"Allow claude.ai to see text and images copied to the clipboard?"**
-  Click **Allow**. The extension uses Claude's own Copy button + the
-  Clipboard API to read the response back as markdown; without this
-  permission, the synthesis fails with a clear "permission needed"
-  dialog (no garbage data lands in the Synthesis tab).
-
-Both prompts persist per Claude.ai origin; you only see them once.
-
-### Optional: route into a Claude project
-
-Synthesis output piles up in your default Claude.ai chat list by
-default. To send everything into a named **Claude project** instead
-(e.g. a "Meeting Notes" project), paste the project's UUID into
-**Settings > Synthesis Automation > Claude project ID**. Every Send
-then opens `https://claude.ai/project/<id>` rather than `/new`.
-
-The project ID is the UUID portion of a Claude project URL --
-something like `019e5077-c745-7541-b2c8-08caeb0f3051`. Leave the
-field blank to disable.
-
-### Per-session prompt template
-
-The synthesis tab now has a **Prompt** dropdown that picks which
-template to use for that session. Selection persists across app
-restarts. Each meeting can use a different template (e.g.
-`one-on-one` vs `standup`) without changing global settings; both
-the automation Send flow and the manual Generate dialog honor the
-selection. Edit or add templates via *Settings > Open Prompts
-Folder*.
-
-### Status bar connection state
-
-The status bar shows one of three values when synthesis automation
-is enabled in Settings:
-
-- **`Synthesis: Chrome not running`** -- Send is enabled and clicking
-  it launches Chrome at the synthesis URL automatically.
-- **`Synthesis: Chrome running, connected`** -- Send is ready.
-- **`Synthesis: Chrome running, disconnected`** -- Send is **disabled**.
-  The extension's service worker has been killed by Chrome's MV3
-  idle timer; it auto-reconnects within ~60 seconds via the
-  combined app-side ping + extension chrome.alarms retry. If it
-  persists, open the extension popup and click **Reconnect to app**.
-
-### Trade-offs
-
-- **Brittle to LLM UI changes.** The content script targets Claude.ai
-  selectors as of late 2026. The detector uses Claude's stop-button
-  toggle (resilient to class-name churn) and Claude's own Copy
-  button (works against Claude's serialization, not ours), but
-  significant DOM restructuring would still require a patch.
-- **Claude.ai only in v0.6.3.** The settings dropdown lists Microsoft
-  365 Copilot but its content script is a stub that surfaces "not
-  yet implemented"; the plumbing is in place so the next release
-  can drop in the Copilot adapter without an architectural change.
-- **Chrome only.** The bridge is also registered for Edge in HKCU
-  but the extension hasn't been smoke-tested there.
-- **Cold-start adds a few seconds.** If Chrome isn't running when you
-  click Send, the app launches it and waits up to 60 seconds for
-  the extension to connect before proceeding. Warm Chrome is
-  instant.
+> **Diarization (speaker identification) is rough.** The current
+> pass reliably separates two or three distinct voices in clean
+> audio, but a four-person meeting routinely splits into 20+
+> "speakers" depending on mic, codec, and noise floor. The goal is
+> *sufficient speaker context to attribute concepts and discussion
+> threads to the right person* -- not perfect labeling. The
+> synthesis prompt sees speaker labels as hints, and the LLM is
+> fully capable of reconciling "Speaker 7 and Speaker 12 are likely
+> the same person" given the surrounding text. Tunable merge /
+> match thresholds in Settings, plus live click-to-tag during
+> recording, let you correct in-meeting.
+
+## What's in v0.6.5
+
+- **On-device transcription** via faster-whisper (CPU, int8). Runs
+  live during the meeting (optional) and refines after Stop.
+- **Mic + system-audio capture** through WASAPI loopback. Both WAVs
+  are now wall-clock-aligned at the recorder level -- mid-recording
+  silence on the system side (WASAPI engine sleeps when nothing
+  plays) is filled with silence so the two streams stay synced for
+  transcription, playback, and export.
+- **Screen capture.** Draw a region once at the start of a recording
+  and snapshot it on demand or every N seconds (with perceptual-
+  hash dedup so only meaningfully different captures are kept).
+  Right-click any thumbnail to Copy / Open / Delete.
+- **Retain + play back recorded audio.** Recordings are encoded to
+  Opus (best size) / FLAC (lossless) / WAV after the meeting. In-
+  app Play button drives the recording through a transcript-aware
+  player: the active line highlights as audio progresses; click a
+  line to seek; the Slides tab auto-advances to the matching
+  screenshot.
+- **Export recording** to MP3 / FLAC / AAC / Opus / WAV (mixed
+  mic + sys, single file) via right-click on the session list.
+- **Export session as video.** Right-click a session to render an
+  MP4 slideshow: H.264 1080p / 30 fps video, AAC mono audio,
+  letterboxed screenshots that advance at their captured timestamps,
+  plus a sidecar SRT subtitle file built from the transcript
+  (toggleable on or off in any standard player).
+- **Transcript playback layout** defaults to 70% screenshot / 30%
+  transcript when playing; drag the divider to resize and the new
+  ratio is remembered for future sessions.
+- **Clipboard-mediated synthesis** (default) **or Chrome-extension
+  automation** that drives Claude.ai end-to-end for you.
+- **Speaker identification** using SpeechBrain ECAPA-TDNN
+  embeddings clustered against a local library that grows as you
+  label voices.
+- **Outlook calendar awareness** + **ad-hoc meeting detection** for
+  pre-filled session creation.
+- **Live notes alongside the transcript** with Markdown editing,
+  image paste, and merge-into-synthesis.
+- **PDF export + printing** with embedded images preserved.
+- **Crash-resilient** + **self-updating** (weekly GitHub release
+  check + one-click rebuild).
 
 ## Why this exists
 
@@ -395,51 +85,57 @@ Many workstations forbid:
 - Synthesizing via any LLM other than an approved one.
 
 SaaS meeting-note tools (Granola, Otter, Fireflies, and similar)
-generally violate one or both. This app moves transcription on-device
-and keeps the synthesis step manual: paste the prompt into your
-approved chatbot, then paste the response back. The user is the
-explicit transport between the local transcript and the LLM.
+generally violate one or both. This app moves transcription
+on-device and keeps the synthesis step either fully manual (paste
+the prompt, paste the response back) or controlled by a Chrome
+extension that uses your existing browser session with the LLM --
+the user is always the explicit transport between the local
+transcript and the LLM provider. No audio, no transcript, no API
+keys ever leave the machine.
 
-Tighter LLM integration is a future possibility, but the initial
-release deliberately keeps audio on-device and routes synthesis through
-a human hand-off.
+---
+
+# User Guide
+
+This section walks through everyday use. Technical internals (how
+the recorder aligns the two streams, how the Chrome bridge works,
+etc.) live in [Technical Details](#technical-details) below.
 
 ## Requirements
 
 - Windows 10 / 11 (the WASAPI loopback capture is Windows-only).
-- Python 3.10+ (3.11+ recommended).
 - A working microphone and a default speaker / output device.
-- ~500 MB of disk for the default `small.en` Whisper model. The model
-  downloads on first run.
-- **For optional synthesis automation (v0.6.3+):** Google Chrome on
-  the same machine. The automation feature opens a Claude.ai tab in
-  your existing Chrome session and reads the response back via
-  Chrome's clipboard API; no other browser is supported. See
-  [Synthesis automation (optional)](#synthesis-automation-optional).
+- ~500 MB of disk for the default `small.en` Whisper model. The
+  model downloads on first run.
+- **For optional synthesis automation:** Google Chrome on the same
+  machine. The automation feature opens a Claude.ai tab in your
+  existing Chrome session and reads the response back via Chrome's
+  clipboard API.
 
-The dev environment installs PyAudio's PortAudio binding. On Windows the
-pip wheel ships PortAudio binaries; no extra system install is needed.
-
-> **Microsoft Store Python is unsupported.** Microsoft Store Python runs
-> in a UWP AppContainer sandbox that blocks microphone access at the OS
-> level. The app detects this at startup and shows a warning dialog. Use
-> [python.org](https://www.python.org/downloads/) instead. To check:
->
-> ```powershell
-> where.exe python
-> # If the first hit contains "WindowsApps", it is the Store Python.
-> # python.org installs to:
-> #   C:\Users\<you>\AppData\Local\Programs\Python\Python312\python.exe
-> # or C:\Program Files\Python312\python.exe (system-wide install).
-> ```
+> **Microsoft Store Python is unsupported** (dev install only).
+> Microsoft Store Python runs in a UWP AppContainer sandbox that
+> blocks microphone access at the OS level. The app detects this
+> at startup and shows a warning dialog. Use
+> [python.org](https://www.python.org/downloads/) instead.
 
 ## Installation
+
+### Packaged build (typical user path)
+
+```powershell
+.\build.ps1                         # produces dist\meeting-notetaker.exe
+.\dist\meeting-notetaker.exe
+```
+
+The executable bundles the Python runtime, PyQt6, faster-whisper,
+and PyAV. The Whisper model itself is downloaded on first run into
+`%APPDATA%\MeetingNotetaker\models\`.
 
 ### From source (dev)
 
 ```powershell
 # Windows PowerShell
-.\install-deps.ps1        # creates .venv, installs everything
+.\install-deps.ps1                  # creates .venv, installs everything
 .\.venv\Scripts\Activate.ps1
 python main.py
 ```
@@ -451,91 +147,67 @@ source .venv/bin/activate
 python main.py
 ```
 
-The install wrappers run `pip install -r requirements-dev.txt`. The
-speaker-embedding encoder (SpeechBrain ECAPA-TDNN,
-`speechbrain/spkrec-ecapa-voxceleb`, Apache-2.0) installs cleanly from
-PyPI. Its checkpoint is ~22 MB and downloads from Hugging Face Hub on
-first batch refinement, then caches under `<app_data>/models/ecapa/` for
-offline runs after that.
+## Recording a meeting
 
-### Packaged build (Windows)
+The main window splits a session list (left) and a per-session
+view (right). Recording controls sit above five tabs: **My Notes**
+(your running buffer), **Synthesis** (the LLM-generated note),
+**Slides** (captured screenshots), **Previous Notes** (archived
+prior synthesis runs), and **Transcript** (live + final
+transcription).
 
-The packaged build produces a clickable `.exe`:
+![Main window -- Transcript tab](docs/screenshots/01-main-transcript.png)
 
-```powershell
-.\build.ps1                 # produces dist\meeting-notetaker.exe
-.\dist\meeting-notetaker.exe
-```
+The session list has two narrow indicator columns to the left of
+each title: a speaker icon if the audio recording is still on
+disk, and a state dot (red while recording, yellow during the
+post-Stop refinement pass, green when refined). Hover any cell to
+see what that column conveys.
 
-The executable bundles the Python runtime, PyQt6, and faster-whisper.
-The Whisper model itself is downloaded on first run into
-`%APPDATA%\MeetingNotetaker\models\`.
+### The flow
 
-**Post-build dependency gate.** `build.ps1` runs the freshly-built
-`.exe` with `--check-deps` immediately after PyInstaller finishes.
-The flag invokes the same self-test as **Help > Debug > Check
-Dependencies...** but in headless mode -- prints a report to stdout
-and exits non-zero if any dependency is MISSING. If PyInstaller's
-static analysis missed a hidden import (a recurring failure mode for
-libraries that resolve classes from yaml strings or plugin entry
-points), the build fails loudly here rather than producing a binary
-that will silently skip features at runtime.
+1. **File -> New Session...** (or `Ctrl+N`). Enter a title.
+   Optionally tick "Keep the audio recording after transcription"
+   to retain the WAV files for this session. When Outlook is
+   reachable, a **Pick from Calendar...** button appears so you
+   can pre-create a session for an upcoming meeting:
 
-When the gate fails, add the missing module to
-`meeting_notetaker.spec`'s `hiddenimports` list (or its `collect_all()`
-loop if it's a whole package subtree) and rebuild. You can also run
-`.\dist\meeting-notetaker.exe --check-deps` manually any time to
-re-verify a built binary.
+   ![New Session dialog](docs/screenshots/06-dialog-new-session.png)
 
-## Quick start
+   ![Calendar picker](docs/screenshots/11-dialog-calendar-picker.png)
 
-1. Launch the app. A blue dot appears in the system tray; the main
-   window shows an empty session list.
-2. **File -> New Session...** (or `Ctrl+N`). Enter a title. Optionally
-   tick "Keep the audio recording after transcription" to retain the
-   WAV files for this session.
-3. Select the new session in the list. Click **Start**.
-4. The tray icon turns red and pulses. The transcript pane fills with
-   lines labeled `Me:` (your mic) and `Them:` (system audio),
-   interleaved by time.
-5. **Pause** / **Resume** at any time. The recorder drops buffers
-   during pause without writing them to the WAV.
-6. **Stop** when the meeting ends. The tray shows a purple "processing"
-   dot while the final transcription pass runs. When it finishes the
-   tray returns to blue and the transcript view shows the refined
-   final transcript.
-7. Click **Generate Synthesis Prompt**. Pick a template (default,
-   one-on-one, standup, or any you added). The rendered prompt + your
-   live notes + transcript is copied to your clipboard.
-8. Switch to your chatbot of choice, paste, send.
-9. Copy the response, come back to Meeting Notetaker, click **Paste
-   Response Back...**, paste, save. The Synthesis tab now shows the
-   rendered response. If a prior notes file existed it is auto-archived
-   as `notes-YYYYMMDD-HHMM.md` and shown under the Previous Notes tab.
-10. Click **Copy** any time to grab the active tab's contents in raw
-    text form. The button label updates to match the active tab.
-11. Click **Print...** to print whichever of My Notes / Synthesis is
-    active, or **Export PDF...** to save a PDF that keeps images
-    embedded and Markdown links clickable.
+2. Select the new session in the list. Click **Start**. The tray
+   icon turns red and pulses.
+3. The transcript pane fills with lines labeled `Me:` (your mic)
+   and `Them:` (system audio), interleaved by time. (Live
+   transcription is off by default in v0.6.5 -- toggle it in
+   Settings if you want lines arriving in real time during the
+   meeting.)
+4. **Stop** when the meeting ends. The tray shows a purple
+   "processing" dot while the final transcription pass runs. When
+   it finishes the tray returns to blue and the transcript view
+   shows the refined final transcript.
+5. Switch to the **Synthesis** flow. Either:
+   - **Manual:** click **Generate Synthesis Prompt**, paste into
+     your chatbot, paste the response back.
+   - **Automated (with the bundled extension installed):** click
+     **Send to Claude.ai**.
+
+   See [Synthesis automation](#synthesis-automation) below for the
+   automated path.
 
 ## Taking notes in parallel (My Notes)
 
-The **My Notes** tab is an editable Markdown buffer that lives next to
-the transcript. A small toolbar above the editor handles common
-formatting:
+The **My Notes** tab is an editable Markdown buffer that lives
+next to the transcript. A small toolbar above the editor handles
+common formatting (Bold / Italic / Headings / Lists / Code /
+Image / HR / Preview toggle).
 
-- **B** / **I** -- bold (`Ctrl+B`) and italic (`Ctrl+I`); wraps
-  selection in `**...**` or `*...*`
-- **H1 / H2 / H3** -- replaces the current line's heading marker
-- **List** / **1. List** / **Task** -- prefixes selected lines with
-  `- `, `1. 2. ...`, or `- [ ] `
-- **Quote** -- prefixes selected lines with `> `
-- **Code** -- inline code (`Ctrl+\``); **Code Block** -- fenced
-  ` ``` ` block
-- **Link** -- inserts `[text](url)` (`Ctrl+K`)
-- **HR** -- inserts a `---` divider
-- **Preview** -- toggle between Markdown source (edit) and rendered
-  view; the button label flips to **Edit** while previewing
+![My Notes -- edit mode](docs/screenshots/02-main-my-notes-edit.png)
+
+Click **Preview** in the toolbar to render the Markdown in place:
+
+![My Notes -- preview mode](docs/screenshots/03-main-my-notes-preview.png)
 
 Open a new session and the editor is pre-seeded with:
 
@@ -551,310 +223,465 @@ Open a new session and the editor is pre-seeded with:
 ```
 
 Everything you type auto-saves continuously (no Save button).
+Names from the `# Attendees` bulleted list are parsed out
+separately and passed into the synthesis prompt as
+`{{attendees}}`, so action-item owners come from the people who
+were actually in the meeting.
 
-When you click **Generate Synthesis Prompt**, your live notes are
-included in the prompt alongside the transcript. The default template
-asks the LLM to *merge* the two -- using your notes as the source of
-truth for intent, framing, and any pre-meeting context that does not
-appear in the transcript. Names from the `# Attendees` bulleted list
-are parsed out separately and passed in as `{{attendees}}`, so
-action-item owners come from the people who were actually in the
-meeting instead of "TBD".
+**Image paste.** Paste an image from the clipboard (or click
+**Image** in the toolbar to insert a file) and the app copies it
+into the session's `images/` folder and inserts a Markdown
+reference. The Preview pane renders these inline.
 
-If you do not touch the My Notes tab at all, the prompt substitutes
-"(none -- user did not take live notes)" for the live-notes block and
-falls back to a transcript-only synthesis.
+## Screen capture
 
-If the app crashes mid-meeting, on next launch the recovery dialog
-lists any sessions left in a transient state. The WAV files (and your
-live notes) survive; you can re-run the transcription against them, or
-delete the session.
+The Screen Capture feature snapshots a region of your screen on
+demand or every N seconds. Use it during shared-screen meetings
+to keep visual context with your notes.
+
+### Manual flow
+
+1. While recording, click **Start Screen Capture** in the
+   controls row.
+2. A translucent overlay appears across all monitors. Drag to
+   draw the region you want to capture (typically the
+   shared-screen area in Teams / Zoom).
+3. A thin cyan outline persists around the armed region for the
+   duration of the recording so you can see what will be
+   captured.
+4. In the **My Notes** tab's right sidebar, the Capture and
+   Insert buttons are now enabled.
+5. Click **Capture** to snapshot the region into the session's
+   `screenshots/` folder. Click **Insert** to do the same AND
+   drop a markdown image-ref at the cursor in My Notes.
+
+### Auto-capture
+
+Tick the **Auto-capture** checkbox in the same sidebar. While
+armed, the region is snapshotted every N seconds (default 30,
+set in Settings). Each fresh capture's perceptual dHash is
+compared against the most-recently-kept image; near-duplicates
+are discarded. Only meaningfully-different content sticks
+around. Manual Capture / Insert clicks always keep their image
+(no dedup check) and update the dedup baseline.
+
+### Viewing captured slides
+
+The **Slides** tab lists every captured screenshot as a
+thumbnail grid:
+
+- **Click a thumbnail** -- switch to full-image view with
+  Previous / Next / Back navigation.
+- **Right-click** -- Copy image to clipboard / Open in default
+  viewer / Delete.
+
+While **playback** is active (see below), the Slides tab
+auto-advances to track the recording position; clicking a
+thumbnail seeks the audio to that screenshot's recording-relative
+timestamp.
+
+## Playing back the recording
+
+If you kept the audio (checkbox in New Session, or default in
+Settings), the **Transcript** tab grows a slim Play / Stop +
+scrubber + time-readout bar at the bottom.
+
+- **Click Play** -- the recording plays back. The active
+  transcript line highlights as audio progresses.
+- **Click a transcript line** -- the audio seeks to about 10
+  seconds before that line's timestamp and continues playing
+  from there. The clicked line stays highlighted until playback
+  catches up to it.
+- **Drag the scrubber** -- seek to any moment.
+- **Stop** -- pause where you are. The next Play resumes from
+  the same spot.
+
+If the session also has captured screenshots, hitting Play (or
+clicking any transcript line while paused) swaps the Transcript
+tab to a screenshare-style layout: the matching screenshot shows
+up top, the transcript scrolls below. As playback crosses each
+captured screenshot's recording-relative timestamp, the top image
+updates. The split defaults to 70% screenshot / 30% transcript;
+drag the divider to resize and the new ratio is remembered for
+future sessions. Pausing keeps the layout up; only natural end of
+playback returns to the full-width transcript view.
+
+The Slides tab also gets its own Play bar that drives the same
+player.
+
+## Exporting the recording
+
+Right-click any session with a retained recording in the session
+list:
+
+- **Open recording in media player** -- launches your OS default
+  player on the source file.
+- **Export recording as...** -- opens a save dialog with filter
+  options for MP3 (default, most universal), FLAC, AAC, Opus, or
+  WAV. Both source streams (mic + sys) are mixed into a single
+  file at the chosen format. An indeterminate progress dialog
+  shows while encoding runs in a worker thread.
+- **Export session as video...** -- renders an MP4 slideshow with
+  the mixed audio + screenshots flipping at their captured
+  timestamps. H.264 1080p / 30 fps video, AAC mono audio, black
+  frames before the first screenshot, letterbox bars to preserve
+  aspect ratio. A matching `.srt` sidecar carries the transcript
+  as toggleable subtitles -- every standard player auto-loads the
+  SRT and lets the viewer turn subtitles on or off; delete the
+  SRT if you'd rather share the MP4 alone. A determinate progress
+  dialog tracks per-frame encode progress.
+- **Delete recording...** -- removes the audio files but keeps
+  the transcript + notes.
+
+## Synthesis: chatbot hand-off
+
+The default flow is **manual** (clipboard hand-off). You can
+optionally install the bundled Chrome extension to automate the
+flow against Claude.ai.
+
+### Manual flow
+
+1. Click **Generate Synthesis Prompt**. A dialog opens with a
+   template picker, a rendered preview of the merged prompt
+   (your live notes + the transcript), and a Copy to clipboard
+   button:
+
+   ![Generate Synthesis Prompt dialog](docs/screenshots/08-dialog-generate-prompt.png)
+
+2. Paste into your chatbot of choice (Claude.ai, M365 Copilot,
+   etc.). Wait for the reply.
+
+3. Copy the response, come back to Meeting Notetaker, click
+   **Paste Response Back...**, paste, save:
+
+   ![Paste Response Back dialog](docs/screenshots/09-dialog-paste-response.png)
+
+4. The **Synthesis** tab now shows the rendered response. If a
+   prior notes file existed, it's auto-archived to
+   `notes-YYYYMMDD-HHMM.md` and listed under **Previous Notes**.
+
+The Synthesis tab is editable in place (Markdown source + Preview
+toggle, same as My Notes), so you can polish the LLM's output
+before sharing.
+
+![Synthesis tab](docs/screenshots/04-main-synthesis.png)
+
+The **Copy** button puts the active tab's contents on the
+clipboard as both Markdown and rendered HTML (with images inlined
+as base64 data: URIs) for paste into Word / OneNote / Notion /
+plain editors. Coverage varies by destination; see the
+paste-target table in the [Technical Details](#technical-details)
+section.
+
+The **Print** and **Export PDF** buttons render the active tab
+to a printer or a PDF file (with images preserved and Markdown
+links clickable).
+
+### Synthesis automation (optional)
+
+Starting in v0.6.3, the **Settings -> Synthesis Automation**
+section can replace the Generate + Paste buttons with a single
+**Send to Claude.ai** button. A bundled Chrome extension drives
+the chat tab for you: opens the conversation, pastes the prompt,
+watches for the response to stream in, clicks Claude's Copy
+button to read it back as proper markdown, then closes the tab.
+
+![Synthesis tab with automation enabled](docs/screenshots/15-main-synthesis-automation.png)
+
+**What stays the same:**
+
+- **No API calls.** The extension uses your existing Claude.ai
+  browser session.
+- **The browser remains the intermediary.** The extension types
+  into the chat composer and reads the rendered response via
+  Claude's own Copy button.
+- **The proxy interstitial still gates traffic.** If your
+  outbound proxy shows a "PROCEED" page on the first AI request,
+  the extension detects it, shows a toast, and waits for you to
+  click PROCEED.
+
+**Hard dependencies:**
+
+- Google Chrome on the same machine. The extension is Manifest
+  V3 and loads as an unpacked extension.
+- Windows (the native-messaging bridge registers itself in HKCU).
+- A signed-in Claude.ai account.
+
+**One-time install (Path 3: guided manual).** Chrome doesn't
+permit silent install of unpacked extensions, so the install flow
+is a three-step wizard launched from **Settings > Synthesis
+Automation > Install / Verify...**:
+
+![Install wizard](docs/screenshots/16-dialog-automation-install.png)
+
+1. **Extract the extension files.** Click *Extract and open
+   folder*; the app drops the unpacked extension into
+   `%LOCALAPPDATA%\MeetingNotetaker\automation\extension` and
+   opens it in Explorer.
+2. **Load in Chrome.** Open `chrome://extensions`, toggle
+   Developer mode on, click **Load unpacked**, select the
+   folder.
+3. **Verify.** Back in the wizard, click *Verify*. The app
+   registers the native-messaging bridge in HKCU and waits up
+   to a minute for the extension to connect.
+
+**Chrome permissions you'll be asked to grant.** On the first
+synthesis, Chrome shows a one-time per-site prompt asking the
+extension to access the clipboard for `claude.ai`. Click
+**Allow**. The extension uses Claude's own Copy button + the
+Clipboard API to read the response back as markdown.
+
+**Status bar.** The **Syn** pill in the status bar carries the
+connection state in its dot color: green = connected, yellow =
+Chrome cold (Send will launch it), red = disconnected. Hover for
+the full description.
+
+**Optional: route into a Claude project.** Paste a project UUID
+into **Settings > Synthesis Automation > Claude project ID** and
+every Send goes into that project instead of the default chat
+list.
+
+**Per-session prompt template.** The synthesis tab has a
+**Prompt** dropdown that picks which template (default,
+one-on-one, standup, or any custom file in
+`%APPDATA%\MeetingNotetaker\prompts\`) to use for that session.
+Selection persists across app restarts.
 
 ## Speaker identification
 
-After each recording, the app tries to label the *system audio* side of
-the transcript with real names ("Alice:", "Bob:") instead of the
-generic "Them:". It learns who is who over time -- the first meeting
-with a new colleague needs one quick labeling pass; subsequent meetings
-recognize that voice automatically. All processing is on-device. No
-audio, transcript, or voice embedding ever leaves the machine.
+After each recording, the app tries to label the *system audio*
+side of the transcript with real names ("Alice:", "Bob:") instead
+of the generic "Them:". It learns who is who over time -- the
+first meeting with a new colleague needs one quick labeling pass;
+subsequent meetings recognize that voice automatically. All
+processing is on-device.
 
-### The pipeline
+### What you'll see
 
-```mermaid
-flowchart TD
-    A[sys.wav] --> B[Segment by voice activity<br/>silero-vad, ~30ms frames]
-    B --> C[Embed each turn<br/>SpeechBrain ECAPA-TDNN, 192-dim vector]
-    C --> D[Cluster by cosine similarity<br/>greedy agglomerative]
-    D --> E{Match centroid<br/>vs speakers.db<br/>at threshold}
-    E -->|matched| F[Auto-label cluster<br/>with stored name]
-    E -->|no match| G[Label Speaker N<br/>and prompt user]
-    F --> H[Rewrite raw.transcript.md<br/>with real names]
-    G --> H
-    G -. user assigns name .-> I[Save embedding to<br/>speakers.db]
-    I -. next meeting .-> E
-    H --> J[diarization.json<br/>cluster -> name map for<br/>Review Speakers later]
-```
+If any voice in the recording didn't match the speaker library,
+the **Label Unknown Speakers** dialog pops automatically after
+the post-meeting pass. Each card shows the top example transcript
+lines for that cluster plus a name field that autocompletes from
+Outlook attendees and known speakers:
 
-The mic channel is always the user; it does not go through this
-pipeline and keeps the `{{user_name}}:` / `Me:` rendering it always had.
+![Label Unknown Speakers dialog](docs/screenshots/12-dialog-label-unknown-speakers.png)
 
-### What runs automatically
+After the fact, **Review Speakers** (button on the session view)
+walks every detected speaker and lets you rename / forget /
+confirm:
 
-When you click **Stop** on a recording, the controller chains:
+![Review Speakers dialog](docs/screenshots/13-dialog-review-speakers.png)
 
-1. **Final transcription** (existing batch pass; rewrites the live
-   transcript with a cleaner version).
-2. **Voice segmentation** on `sys.wav`: silero-vad chops the loopback
-   channel into per-turn voiced spans (typical meeting: 30-200 turns).
-   Falls back to webrtcvad and then an energy threshold if silero or
-   torch can't load.
-3. **Embedding**: SpeechBrain's ECAPA-TDNN produces a 192-dim vector
-   per turn. Voiced turns shorter than 1.0 s are skipped because
-   short-clip embeddings are unreliable and tend to pull two real
-   speakers' centroids together.
-4. **Clustering**: greedy agglomerative cosine merge collapses turns
-   into per-speaker clusters (Merge threshold tunable in Settings,
-   default 0.75). Raise this knob when two real speakers keep getting
-   merged into one cluster; lower it if a single speaker keeps
-   splitting into multiple clusters.
-5. **Matching**: each cluster centroid is compared against every name
-   in `speakers.db`. Above the threshold (default 0.75 cosine
-   similarity), the cluster auto-labels with the stored name.
-6. **Transcript rewrite**: `raw.transcript.md` is rewritten with the
-   resolved names where matched, `Speaker N` fallback where not.
-7. **`diarization.json` saved** alongside the transcript so the Review
-   Speakers walker works on this session forever, even after `sys.wav`
-   is cleaned up.
-8. **Unknown-speaker dialog**: if any cluster did not match, the
-   Label Unknown Speakers dialog pops with example transcript lines
-   per cluster and a name picker seeded from Outlook attendees +
-   names already in your speaker library.
+The speaker library lives at
+`%APPDATA%/MeetingNotetaker/speakers.db`. Open via **Settings >
+Manage Speakers...**; Rename / Forget per row, with a Forget All
+escape hatch:
 
-All of this is automatic. The pipeline runs unless **Settings > Enable
-speaker identification** is unchecked, the recording has no system
-audio (mic-only session), or SpeechBrain fails to load.
+![Manage Speakers dialog](docs/screenshots/14-dialog-manage-speakers.png)
 
-### Improving accuracy over time
+### Tips for accuracy
 
 The library starts empty. It grows as you label voices, and the
-running-average centroid update tightens each stored embedding with
-every confirmation. A few minutes of attention up front pays off
-across every subsequent meeting with the same colleagues.
+running-average centroid update tightens each stored embedding
+with every confirmation.
 
-- **Label voices the first time you see them.** When the Label Unknown
-  Speakers dialog pops at end of meeting, type or pick a name for each
-  card and click OK. Use a consistent form (`Alice Smith` every time,
-  not `Alice` sometimes and `Alice S.` other times) -- the store keys
-  on the exact string, so two variants become two separate records.
-- **Skip what you don't recognize.** A bad label trains the wrong
-  embedding into the store and has to be Forget-ed later. Skip the
-  dialog (or specific cards) when you're not sure; the cluster keeps
-  its `Speaker N` label and the embedding is not persisted.
-- **Use Review Speakers when something looks wrong.** The button
-  appears on any session that has a `diarization.json`. If the
-  auto-labeling called Bob "Alice", click Rename on the card, pick the
-  correct name, OK. The transcript rewrites on disk and the centroid
-  update goes to the *new* name's record (it does not undo the old
-  one -- if Alice now has a Bob-sounding embedding in her history, use
-  Manage Speakers > Forget Alice and start her over).
-- **Lean on the Outlook attendee list.** When you record a meeting that
-  has a calendar invite, the attendee names are pre-populated in the
-  name combo box. This is the easiest way to keep your library
-  consistent across colleagues.
-- **Periodically prune the library.** Settings > Manage Speakers shows
-  the full list with sample counts and last-seen dates. Forget anyone
-  you'll never recognize again -- a smaller library is faster to match
-  against and keeps the auto-recognition cleaner.
+- **Label voices the first time you see them.** Use a consistent
+  form (`Alice Smith` every time, not `Alice` sometimes) -- the
+  store keys on the exact string.
+- **Skip what you don't recognize.** A bad label trains the
+  wrong embedding into the store.
+- **Use Review Speakers when something looks wrong.** Rename
+  pushes the centroid update to the *new* name; the old name's
+  record is unchanged (Forget it manually via Manage Speakers if
+  it's corrupted).
+- **Lean on the Outlook attendee list.** Calendar-pre-filled
+  sessions have attendee names ready in the name combo box.
 
-### Tuning diarization thresholds
+Both the merge threshold (within-meeting clustering) and the
+match threshold (cross-meeting recognition) are tunable in
+Settings; see the [Tuning diarization
+thresholds](#tuning-diarization-thresholds) subsection below.
 
-The two knobs in Settings (default 75% each) control different stages
-of the pipeline and address opposite symptoms. Touch one at a time and
-re-run a representative recording before moving the other.
+## Settings reference
 
-**Merge threshold** -- governs clustering *within* a single meeting.
-This is the cosine-similarity floor for two turns to land in the same
-cluster. Symptom-to-action table:
+Open via **File -> Settings...** (`Ctrl+,`) or the tray menu. All
+of these are also editable directly in `config.toml`.
 
-| Symptom | What to do | Try first |
-|---|---|---|
-| Four people show up as 20+ "Speaker N" clusters. Each person fragments into multiple labels. | Lower the merge threshold so similar-but-not-identical turns merge. | **0.60**, then 0.55 if still split |
-| Two distinct people keep merging into one cluster. | Raise the merge threshold so the algorithm holds them apart. | **0.80**, then 0.85 |
-| Looks roughly right but one person fragments while others are clean. | The fragmenting voice probably changed channel mid-meeting (handheld -> headset, mic re-plug). The threshold can't fix that case -- use Review Speakers to merge the strays manually. | -- |
-
-Over-splitting is the more common failure mode (the defaults err on the
-side of keeping speakers distinct), so try **lowering merge first** if
-you don't know which direction to move.
-
-**Match threshold** -- governs *cross-meeting* recall against
-`speakers.db`. This is the cosine-similarity floor for a cluster
-centroid to auto-adopt a stored speaker's name. Symptom-to-action
-table:
-
-| Symptom | What to do | Try first |
-|---|---|---|
-| A colleague you've labeled in prior meetings keeps coming back as "Speaker N" (no auto-match). Different mic, codec, or noise floor between meetings. | Lower the match threshold to widen recall. | **0.70**, then 0.65 |
-| A cluster gets auto-named with the wrong stored speaker. The voices sound vaguely alike to the embedding model. | Raise the match threshold to demand a stricter match. | **0.80**, then 0.85 |
-| Same person showing up under two different names across meetings (e.g. "Alice" in one, "Alice Smith" in another). | This is a naming consistency issue, not a threshold issue. Settings > Manage Speakers, Forget one, relabel the other consistently going forward. | -- |
-
-**The two knobs are independent and apply in order.** Merge happens
-first (within the recording); match happens second (against the
-library). A "4 participants, 56 speakers" report is purely a merge
-problem -- the match threshold can't compensate for fragmented
-clusters because there's no cluster to match. Fix merge first, then
-re-evaluate match.
-
-**Iterating.** Both settings are saved to `config.toml` and take effect
-on the *next* speaker-identification pass. To re-evaluate a past
-recording at new thresholds, open the session and click Review
-Speakers, or delete `diarization.json` and re-Stop (if the WAV files
-were retained). Without the WAV the existing clusters are frozen on
-disk.
-
-**This is the easy knob.** Even with both sliders dialed in, the
-clusters depend on a 192-dim embedding from a small CPU model running
-on imperfect telephony audio. Expect to spend a minute in Review
-Speakers after most meetings until your library is broad enough that
-match recall kicks in.
-
-### Limits
-
-The diarization goal is **enough speaker context for the synthesis
-pass to attribute concepts and discussions to the right people** --
-not a perfect speaker-labeled transcript. An over-split cluster
-("Alice" showing up as Speaker 3, Speaker 8, and Speaker 14 across
-the meeting) is annoying but not fatal: the LLM reading the transcript
-during synthesis can usually reconcile this from the conversational
-context. Spend the click-to-tag effort on the people whose attribution
-actually matters for the notes (the discussion leads, the
-decision-makers); let strangers stay as "Speaker N".
-
-This is a small CPU-only model running on recorded audio. It is good at
-distinguishing two or three clearly-different voices in a quiet
-meeting. It struggles with:
-
-- **Overlapping speech.** Cross-talk or two people speaking at the
-  same time produces a turn with mixed embeddings; the cluster goes
-  somewhere ambiguous. Most of the time this surfaces as an extra
-  `Speaker N` cluster you can ignore or forget.
-- **The same person on different microphones.** A colleague who
-  joins one meeting from a headset and another from a phone speaker
-  may not match across meetings. The match threshold (Settings,
-  default 75%) is the knob; loosening it improves recall on this
-  case at the cost of more false matches.
-- **Very short utterances.** A "thanks" or "agreed" turn under about
-  half a second gets dropped by the segmenter (too little audio for a
-  reliable embedding). The transcript still has the line; diarization
-  just doesn't try to attribute it.
-- **Channel changes.** Different Teams / Zoom audio paths,
-  bluetooth-vs-USB, codec changes, or aggressive noise suppression
-  can shift the embedding enough to miss a match. Re-label once on
-  the new channel and the running-average will accommodate.
-
-### Privacy and footprint
-
-- Audio, embeddings, and the speaker library all live on the local
-  machine. The ECAPA-TDNN model checkpoint (~22 MB) is downloaded once
-  from Hugging Face Hub on first batch refinement and cached under
-  `%APPDATA%/MeetingNotetaker/models/ecapa/`. No Hugging Face account
-  or token is required. After the first download, the speaker-ID path
-  makes no network calls.
-- The speaker library is just `%APPDATA%/MeetingNotetaker/speakers.db`
-  (sqlite). To wipe it, delete the file or use **Settings > Manage
-  Speakers > Forget All**.
-- SpeechBrain transitively pulls `huggingface_hub`, `sentencepiece`,
-  `torchaudio`, `scipy`, and `torch`. The frozen `.exe` is
-  correspondingly larger (~1 GB).
-
-## Settings
-
-Open via **File -> Settings...** (`Ctrl+,`) or the tray menu. All of
-these are also editable directly in `config.toml`.
+![Settings dialog](docs/screenshots/07-dialog-settings.png)
 
 | Setting | Default | What it does |
 |---|---|---|
-| Your name | (empty -> "Me") | Replaces "Me:" in the transcript display and in the synthesis prompt. When set, the LLM sees your real name and assigns action items by name instead of "TBD". The on-disk transcript is always stored with the neutral "Me:" label and rewritten on display, so changing your name later does not break old sessions. |
+| Your name | (empty -> "Me") | Replaces "Me:" in the transcript display and in the synthesis prompt. When set, the LLM sees your real name and assigns action items by name instead of "TBD". |
 | Model size | `small.en` | Which faster-whisper model to use. See [Choosing a model](#choosing-a-model). |
-| Capture-only mode | off | Skip live transcription; run a single Whisper pass when you click Stop. Lower CPU during the meeting, no live view. Per-session override is available in the New Session dialog so a single recording can flip the toggle without changing the global default. |
-| Skip post-Stop refinement | off | Make the live transcript final. No second Whisper pass after you click Stop. See [Performance](#performance) for the trade-off. |
-| High accuracy mode | off | Off = greedy decoding (beam_size=1, the default; ~3x faster on the refinement pass). On = beam_size=5 (slower, slightly more accurate). For transcripts that feed an LLM synthesis pass, the default is the right call -- the LLM smooths the kinds of errors greedy decoding makes. Turn this on only if you need verbatim transcripts and never use the synthesis path. |
-| CPU threads per worker | 0 (auto) | CTranslate2 `cpu_threads`. 0 derives a value from `cpu_count() / num_workers` with a minimum of 2. Override only if you know your CPU well; total OS threads in flight = `cpu_threads * num_workers`, keep <= physical core count to avoid L3 cache thrash. |
-| Parallel workers | 2 | CTranslate2 `num_workers`. Lets independent transcribe() calls run truly in parallel inside one model instance. 2 is the right call for two-source meetings (mic + sys batch passes run together). Drop to 1 if you only ever record a single source and have spare cores for elsewhere. |
-| Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. Per-session override stays available. |
-| Enable VAD | on | Trim silent stretches before Whisper decodes them. Saves CPU. Disable if it ever clips speech. |
-| VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. 250-2000 ms range. |
-| Mic device | (System default) | Which input device to capture from. Persists by name so the same device is picked after replug or reboot. |
-| Loopback device | (System default) | Which WASAPI loopback device to capture system audio from. Windows-only. |
-| Custom vocabulary | (empty) | One phrase per line in `vocabulary.txt`. Biases the transcriber toward proper nouns and corporate terms it would otherwise mis-hear. Per-session hotwords are also auto-derived from your `# Attendees` block and the agenda body when present. |
-| Watch Outlook calendar | off | Poll Outlook for upcoming meetings and pop a tray notification a few minutes before each one starts. Click the notification to open New Session with the meeting subject, attendees, and agenda pre-filled. Recording is never started automatically. Windows + Outlook only. |
+| Capture-only mode | **on** | Skip live transcription; run a single Whisper pass when you click Stop. v0.6.5+ default. Lower CPU during the meeting. Per-session override available in the New Session dialog. |
+| Skip post-Stop refinement | off | Make the live transcript final. No second Whisper pass after you click Stop. |
+| High accuracy mode | off | Off = greedy decoding (beam_size=1); on = beam_size=5 (slower, slightly more accurate). |
+| CPU threads per worker | 0 (auto) | CTranslate2 `cpu_threads`. 0 derives from `cpu_count() / num_workers`, minimum 2. |
+| Parallel workers | 2 | CTranslate2 `num_workers`. Lets independent transcribe() calls run truly in parallel. |
+| Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. |
+| Retained format | Opus | Opus / FLAC / WAV. Opus trims a 1-hour meeting from ~1 GB to ~45 MB with no practical speech-quality loss. |
+| Auto-capture interval | 30 s | Cadence for the screen-capture auto-mode (5-300 s range). |
+| Auto-capture dedup threshold | 10 bits | Sensitivity for the dHash-based duplicate filter (0-32, of 64 bits). |
+| Enable VAD | on | Trim silent stretches before Whisper decodes them. |
+| VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. |
+| Mic device | (System default) | Persists by name so the same device is picked after replug. |
+| Loopback device | (System default) | WASAPI loopback. Windows-only. |
+| Custom vocabulary | (empty) | One phrase per line in `vocabulary.txt`. Per-session hotwords also auto-derived from `# Attendees` + agenda. |
+| Watch Outlook calendar | off | Poll Outlook for upcoming meetings. Click a tray notification to open New Session with the meeting subject + attendees + agenda pre-filled. |
 | Notify within (min) | 5 | How far in advance to surface the calendar notification. |
-| Detect ad-hoc meetings | off | Watch the Windows audio mixer for sustained audio from a known meeting app (Teams, Zoom, Slack, WebEx, ...). When audio sustains long enough to look like a call rather than a notification chirp, a tray toast offers to open New Session pre-filled with the app name and timestamp. Recording never auto-starts. No audio is captured. |
-| Enable speaker identification | on | After each meeting, group the system-audio loopback channel into per-speaker turns and try to match each group against the stored speaker library. Unmatched groups prompt the Label Unknown Speakers dialog so you can name them. Disable to keep the generic "Them:" labels. |
-| Match threshold | 75% | Cosine-similarity floor for auto-matching a meeting voice against a stored speaker. Higher = stricter (more unknowns surfaced for manual labeling); lower = looser (more auto-labels, higher risk of calling Bob Alice). 50-95% range. |
-| Merge threshold | 75% | Cosine-similarity floor for merging two clusters into one during the agglomerative clustering pass. Raise this when two real speakers keep getting merged into one cluster; lower it when a single speaker keeps splitting into multiple. 50-95% range. |
-| Manage Speakers... | -- | Opens a list of every stored speaker with sample count, last-seen date, Rename + Forget per row, and Forget All. The library lives at `speakers.db` and never leaves the machine. |
+| Detect ad-hoc meetings | off | Watch the Windows audio mixer for sustained audio from a known meeting app (Teams, Zoom, ...). |
+| Enable speaker identification | on | Run the post-meeting clustering pass. Disable to keep generic "Them:" labels. |
+| Match threshold | 75% | Cosine-similarity floor for matching a meeting voice against a stored speaker. |
+| Merge threshold | 75% | Cosine-similarity floor for merging two clusters into one during the agglomerative pass. |
+| Manage Speakers... | -- | Opens the speaker-library editor. |
 
-## Performance
+---
 
-Two Whisper passes run for every recording:
+# Technical Details
 
-- **Live transcription**, while recording. Each source (mic + system
-  audio) runs as its own background worker, popping 10-second windows
-  with 5-second overlap from a ring buffer. Each window is decoded as
-  it arrives. By the time you click Stop, the transcript pane is
-  almost always within a few seconds of the actual end of audio. This
-  is the "good enough" version -- it works well in practice but does
-  not see cross-sentence context across window boundaries.
-- **Batch refinement**, after Stop. The full mic + sys WAV files are
-  re-transcribed end-to-end so Whisper has the entire context to lean
-  on. Quality is slightly higher (better punctuation, fewer split
-  sentences, fewer mis-heard words at chunk boundaries). On CPU this
-  is roughly **real-time** -- a 30-minute meeting on `small.en` takes
-  ~30 minutes of CPU to refine.
+This section is for understanding how the pieces fit together (for
+debugging, contributing, or just curiosity). Day-to-day use only
+needs the User Guide above.
 
-You do not have to wait for the refinement pass before synthesizing.
-The status label switches from "Recording" to **"Refining transcript --
-you can synthesize now"** the moment Stop completes, the Generate /
-Paste / Copy buttons are immediately available, and the percentage
-updates live as the refinement runs in the background. Anything you do
-during refinement uses the live transcript; if you re-generate after
-refinement finishes, the better version is used automatically.
+## Architecture overview
 
-As of v0.6.2 the refinement pass defaults are tuned for a multi-core
-laptop: `beam_size=1` (the "fast" path) is on by default, and
-CTranslate2 runs with `num_workers=2` so mic + sys batch passes truly
-run in parallel inside one model instance, plus `cpu_threads` auto-
-derived from `cpu_count() / num_workers`. On a 12-core CPU this lands
-the refinement of a 30-minute two-source meeting in the 3-5 minute
-range. The old defaults (single CT2 worker, beam=5) were closer to
-real-time.
+```mermaid
+flowchart TD
+    mic[Microphone]
+    sys["System audio<br/>(WASAPI loopback)"]
+    align["Wall-clock<br/>alignment<br/>(wav_align)"]
+    whisper["faster-whisper<br/>CPU, int8"]
+    diar["Speaker ID<br/>(SpeechBrain ECAPA)"]
+    encoder["Opus / FLAC<br/>encoder"]
+    transcript[raw.transcript.md]
+    sshots[screenshots/]
+    notes_live[live_notes.md]
+    notes[notes.md]
+    prompt[Synthesis prompt]
+    llm["Claude.ai / Copilot<br/>(your browser session)"]
 
-If the refinement wait still bothers you:
+    mic -->|mic.wav| align
+    sys -->|sys.wav| align
+    align --> whisper
+    align --> encoder
+    sys -. loopback only .-> diar
+    diar -->|rewrites with<br/>speaker names| transcript
+    whisper --> transcript
+    sshots -. anchored by<br/>recording time .-> transcript
+    notes_live --> prompt
+    transcript --> prompt
+    prompt -->|clipboard or<br/>Chrome extension| llm
+    llm --> notes
+```
 
-- **Skip post-Stop refinement.** Best if you find live quality
-  acceptable. Settings -> Skip post-Stop refinement = on. No CPU cost
-  after Stop; transcription is "done" immediately.
-- **Smaller model.** `base.en` is roughly 3x faster than `small.en`
-  for both live and batch passes. Quality is a real step down, but
-  workable for many meetings.
-- **Capture-only mode (concurrent meetings).** Recording four meetings
-  back to back? Flip Capture-only on (Settings, or per-session via the
-  New Session dialog) so the live transcription workers don't fight
-  the model. The post-Stop refinement still produces a full transcript
-  on each session; only the live pane is skipped.
-- **Tune CT2 manually.** If your CPU isn't 12 cores or you have an
-  unusual workload, the `CPU threads per worker` + `Parallel workers`
-  settings give you direct control. Total OS threads = `threads *
-  workers`; keep <= physical core count.
-- **Retain the audio.** Per-session "Keep audio" toggle keeps the WAV
-  files. If you ever want to re-run Whisper with a different model or
-  settings, you have the source material to do it.
+The WASAPI loopback path is adapted from
+[Danaor/WhisperType](https://github.com/Danaor/WhisperType).
 
-Two-source recordings (mic + system audio, e.g. a Teams call with
-system audio captured) get a free 2x speedup on the refinement pass:
-both sources run in parallel on different CPU cores. Single-source
-recordings (mic only) get no benefit from this.
+## Recording pipeline
+
+```mermaid
+flowchart TD
+    start([User clicks Start])
+    mic_start[MicRecorder.start<br/>opens PyAudio stream<br/>opens mic.wav]
+    sys_start[LoopbackRecorder.start<br/>opens PyAudioWPatch loopback<br/>opens sys.wav]
+    mic_cb[mic _callback fires<br/>continuously at device rate]
+    sys_cb["sys _callback fires<br/>(WASAPI sleeps when<br/>nothing plays)"]
+    gap[gap detected:<br/>now - last_callback > 100 ms]
+    pad_silence[Write gap-fill silence<br/>to WAV before new chunk]
+    write[Write chunk to WAV]
+    stop([User clicks Stop])
+    pad_lead[pad_wav: leading silence<br/>start -> first_sample]
+    pad_trail[pad_wav: trailing silence<br/>last_callback -> stop]
+    final_wav[mic.wav + sys.wav<br/>both span same<br/>wall-clock window]
+
+    start --> mic_start
+    start --> sys_start
+    mic_start --> mic_cb
+    sys_start --> sys_cb
+    mic_cb --> write
+    sys_cb --> gap
+    gap -->|yes| pad_silence
+    pad_silence --> write
+    gap -->|no| write
+    stop --> pad_lead
+    pad_lead --> pad_trail
+    pad_trail --> final_wav
+```
+
+The load-bearing piece for keeping mic.wav and sys.wav aligned is
+wall-clock-driven WAV padding. WASAPI loopback doesn't deliver
+samples when the Windows audio engine is asleep (nothing playing
+through the speakers), so without intervention sys.wav would be
+shorter than mic.wav and the system-audio content would land at
+the wrong moment in playback / transcription. Three places fix
+this:
+
+1. **First-sample delay** -- between `start()` and the first
+   callback, no samples arrive. At stop, `pad_wav` prepends
+   silence to cover that window.
+2. **Mid-recording gaps** -- if WASAPI stops firing callbacks
+   during a silent stretch, the next callback's wall-clock delta
+   exceeds the frame time. The recorder writes the missing
+   silence into the WAV before the new chunk.
+3. **Trailing dropout** -- after the last callback and before
+   `stop()` is called, no samples arrive. At stop, `pad_wav`
+   appends silence to fill.
+
+After all three pads, mic.wav and sys.wav both span exactly
+`[start_wallclock, stop_wallclock]` with audio in the right
+positions. Everything downstream (transcription, encoder, player,
+export) sees naturally-aligned files.
+
+### Audio retention
+
+If the user kept "Retain audio" for the session, after the batch
+transcription pass commits, the WAVs are re-encoded to the
+configured format (Opus / FLAC / WAV) and the WAVs are deleted.
+
+```mermaid
+flowchart TD
+    wav[mic.wav<br/>sys.wav]
+    decide{retain_audio<br/>+ format}
+    delete[delete WAVs]
+    opus[mic.opus<br/>sys.opus<br/>~96% smaller]
+    flac[mic.flac<br/>sys.flac<br/>~50% smaller, lossless]
+    keep_wav[keep WAVs as-is]
+
+    wav --> decide
+    decide -->|False| delete
+    decide -->|True, format=opus| opus
+    decide -->|True, format=flac| flac
+    decide -->|True, format=wav| keep_wav
+```
+
+Each encode preserves the wall-clock alignment from the source
+WAV (PyAV decode + resample writes the same duration out the
+other side).
+
+## Transcription
+
+Two Whisper passes can run for every recording (one or both,
+depending on Settings):
+
+- **Live transcription**, while recording (off by default in
+  v0.6.5). Each source (mic + system audio) runs as its own
+  background worker, popping 10-second windows with 5-second
+  overlap from a ring buffer. Each window is decoded as it
+  arrives.
+- **Batch refinement**, after Stop. The full mic + sys WAV files
+  are re-transcribed end-to-end so Whisper has the entire
+  context to lean on. Quality is slightly higher (better
+  punctuation, fewer split sentences). On CPU this is roughly
+  **real-time** -- a 30-minute meeting on `small.en` takes ~30
+  minutes of CPU to refine.
+
+You don't have to wait for the refinement pass before
+synthesizing. The status label switches from "Recording" to
+**"Refining transcript -- you can synthesize now"** the moment
+Stop completes; Generate / Paste / Send are immediately
+available. Anything you do during refinement uses the live
+transcript; if you re-generate after refinement finishes, the
+better version is used automatically.
 
 ### Choosing a model
 
@@ -865,158 +692,425 @@ recordings (mic only) get no benefit from this.
 | `small.en` | ~480 MB | Good | Recommended for real meetings. |
 | `medium.en` | ~1.5 GB | Best | ~3x slower than small.en. Use for high-stakes recordings if you have CPU headroom. |
 
-Switching models reloads at the start of the next recording.
-Already-recorded sessions are not re-transcribed automatically.
+### Speaker identification pipeline
 
-## Synthesis prompts
+```mermaid
+flowchart TD
+    A[sys.wav] --> B[Segment by voice activity<br/>silero-vad, ~30 ms frames]
+    B --> C[Embed each turn<br/>SpeechBrain ECAPA-TDNN, 192-dim vector]
+    C --> D[Cluster by cosine similarity<br/>greedy agglomerative]
+    D --> E{Match centroid<br/>vs speakers.db<br/>at threshold}
+    E -->|matched| F[Auto-label cluster<br/>with stored name]
+    E -->|no match| G[Label Speaker N<br/>and prompt user]
+    F --> H[Rewrite raw.transcript.md<br/>with real names]
+    G --> H
+    G -. user assigns name .-> I[Save embedding to<br/>speakers.db]
+    I -. next meeting .-> E
+    H --> J[diarization.json<br/>per-cluster mapping<br/>for Review Speakers]
+```
 
-Bundled prompts seed `%APPDATA%\MeetingNotetaker\prompts\` on first
-run:
+The mic channel is always the user; it doesn't go through this
+pipeline and keeps its `{{user_name}}:` / `Me:` rendering.
 
-- `default.md` -- generic meeting (Attendees / Agenda / TL;DR /
-  Decisions / Notes / Action Items / Open Questions / Verbatim Quotes;
-  merges live notes with transcript)
-- `one-on-one.md` -- 1:1 retrospective shape (topics, commitments by
-  side)
-- `standup.md` -- yesterday / today / blockers per speaker
+After Stop, the controller chains:
 
-**Editing existing prompts.** Open Settings (`Ctrl+,`) and click
-**Open Prompts Folder** -- or browse to
-`%APPDATA%\MeetingNotetaker\prompts\` yourself. Edit any `.md` file in
-your favorite text editor and save. Changes are picked up the next
-time you open the Generate Synthesis Prompt dialog (no restart
-needed).
+1. **Final transcription** (the batch pass; rewrites the live
+   transcript with a cleaner version).
+2. **Voice segmentation** on `sys.wav`: silero-vad chops the
+   loopback channel into per-turn voiced spans (typical meeting:
+   30-200 turns). Falls back to webrtcvad and then an energy
+   threshold if silero / torch can't load.
+3. **Embedding**: SpeechBrain's ECAPA-TDNN produces a 192-dim
+   vector per turn. Voiced turns shorter than 1.0 s are skipped
+   because short-clip embeddings are unreliable.
+4. **Clustering**: greedy agglomerative cosine merge collapses
+   turns into per-speaker clusters (Merge threshold tunable).
+5. **Matching**: each cluster centroid is compared against every
+   name in `speakers.db`. Above the threshold, the cluster
+   auto-labels with the stored name.
+6. **Transcript rewrite**: `raw.transcript.md` is rewritten with
+   the resolved names where matched, `Speaker N` fallback where
+   not.
+7. **`diarization.json` saved** alongside the transcript so the
+   Review Speakers walker works on this session forever, even
+   after `sys.wav` is cleaned up.
+8. **Unknown-speaker dialog**: if any cluster didn't match, the
+   Label Unknown Speakers dialog pops with example transcript
+   lines per cluster.
 
-**Adding your own prompts.** Drop any `*.md` file into the prompts
-directory. It appears in the template picker on next open. Filename
-(sans extension) becomes the display name; `my-team-retro.md` shows as
-"My Team Retro".
+### Limits of the diarization
 
-**Placeholders** (any other `{{...}}` text passes through unchanged):
+This is a small CPU-only model running on recorded audio. It is
+good at distinguishing two or three clearly-different voices in a
+quiet meeting. It struggles with:
 
-| Placeholder | What it expands to |
-|---|---|
-| `{{session_title}}` | The session's title |
-| `{{date}}` | The session's creation date (`YYYY-MM-DD HH:MM`) |
-| `{{transcript}}` | The full transcript body. If "Your name" is set, every `[HH:MM:SS] Me: ` line prefix is rewritten to `[HH:MM:SS] <Your name>: ` before substitution, so the LLM sees you by name. |
-| `{{live_notes}}` | The body of the My Notes tab. If the user did not take live notes, expands to `(none -- user did not take live notes)`. |
-| `{{attendees}}` | Comma-joined list of names from the `# Attendees` bullets in My Notes. Empty -> `(none specified)`. |
-| `{{user_name}}` | The value of the "Your name" setting. Empty setting -> `Me`. |
+- **Overlapping speech.** Cross-talk produces a turn with mixed
+  embeddings; the cluster goes somewhere ambiguous.
+- **The same person on different microphones.** A colleague who
+  joins one meeting from a headset and another from a phone
+  speaker may not match across meetings. The match threshold is
+  the knob; loosening it improves recall on this case at the cost
+  of more false matches.
+- **Very short utterances.** A "thanks" or "agreed" turn under
+  half a second gets dropped by the segmenter.
+- **Channel changes.** Different Teams / Zoom audio paths,
+  bluetooth-vs-USB, codec changes, or aggressive noise
+  suppression can shift the embedding enough to miss a match.
 
-**Upgrading.** Bundled prompts get new revisions across releases. If
-you have not edited a template (its on-disk body matches the version
-that shipped with a prior release), the app refreshes it automatically
-on startup. Any prompt you have actually edited is never touched -- it
-stays exactly as you left it. To force a refresh of a customized
-prompt, delete the file and restart; the latest bundled body re-seeds
-on next launch.
+### Tuning diarization thresholds
 
-**Tip:** start from `default.md` as your base when writing a new
-prompt -- the section headings (`# Attendees`, `# Agenda`, `# Action
-Items`, etc.) match the live-notes template, so the LLM's output drops
-into your final notes shape cleanly.
+The two knobs in Settings (default 75% each) control different
+stages of the speaker-identification pipeline.
+
+**Merge threshold** -- governs clustering *within* a single
+meeting:
+
+| Symptom | What to do | Try first |
+|---|---|---|
+| Four people show up as 20+ "Speaker N" clusters. | Lower the merge threshold. | **0.60**, then 0.55 |
+| Two distinct people keep merging into one cluster. | Raise the merge threshold. | **0.80**, then 0.85 |
+
+Over-splitting is the more common failure mode, so try
+**lowering merge first** if unsure.
+
+**Match threshold** -- governs *cross-meeting* recall against
+`speakers.db`:
+
+| Symptom | What to do | Try first |
+|---|---|---|
+| A labeled colleague keeps coming back as "Speaker N". | Lower the match threshold. | **0.70**, then 0.65 |
+| A cluster gets auto-named with the wrong stored speaker. | Raise the match threshold. | **0.80**, then 0.85 |
+
+Both thresholds are saved to `config.toml` and take effect on
+the *next* speaker-identification pass.
+
+## Screen capture
+
+```mermaid
+flowchart TD
+    start([User clicks<br/>Start Screen Capture])
+    popup{First time?}
+    notice[Show privacy notice<br/>once]
+    picker[RegionPicker overlay<br/>frameless, all-monitors]
+    region[Region selected:<br/>QRect in absolute<br/>screen coords]
+    overlay[Show persistent<br/>cyan outline]
+    armed[Capture / Insert<br/>buttons enabled]
+    timer{Auto-capture<br/>enabled?}
+    tick[Every N seconds]
+    grab[mss grab region<br/>save PNG]
+    dhash[Compute dHash]
+    dedup{Hamming distance<br/>< threshold?}
+    delete[Delete PNG]
+    keep[Keep PNG + update<br/>baseline hash]
+    refresh[Refresh Slides tab<br/>+ transcript rail]
+    manual[Manual Capture /<br/>Insert click]
+
+    start --> popup
+    popup -->|yes| notice
+    popup -->|no| picker
+    notice --> picker
+    picker --> region
+    region --> overlay
+    overlay --> armed
+    armed --> timer
+    timer -->|yes| tick
+    tick --> grab
+    grab --> dhash
+    dhash --> dedup
+    dedup -->|yes| delete
+    dedup -->|no| keep
+    manual --> grab
+    keep --> refresh
+```
+
+Screenshots land in `<session>/screenshots/NNNN-YYYYMMDDTHHMMSSZ.png`
+where NNNN is a monotonic sequence number. During playback (or
+when the user clicks a transcript line while paused), the
+Transcript tab swaps to a vertical split (image on top,
+transcript below) with the active image following the
+sticky-latest rule (the most recent screenshot whose offset
+&lt;= current playback position). The split defaults to 70/30 top
+versus bottom; the user can drag the divider and the new ratio
+persists to `config.toml` (`ui.transcript_playback_split_top_pct`).
+
+The **Slides** tab has its own player bar that mirrors the
+Transcript tab's bar; both bars reflect a single AudioPlayer
+state. Clicking a thumbnail in the Slides tab while audio is
+loaded seeks the player to that screenshot's recording-relative
+timestamp.
+
+## Synthesis automation deep-dive
+
+```mermaid
+flowchart TD
+    sv[SessionView<br/>Send to Claude.ai click]
+    main[MainApp<br/>render prompt + open bridge]
+    bridge["Bridge<br/>(TCP loopback, app side)"]
+    nh["Native host<br/>(main.py --native-host)"]
+    ext_bg["Chrome extension<br/>background.js"]
+    ext_cs["Content script<br/>(content/claude.js)"]
+    claude[claude.ai tab]
+    response[Claude response]
+    copy[Copy Button +<br/>Clipboard read]
+
+    sv --> main
+    main -->|SynthesizeRequest| bridge
+    bridge -->|length-prefixed JSON| nh
+    nh -->|stdio| ext_bg
+    ext_bg -->|open tab,<br/>port connect| ext_cs
+    ext_cs --> claude
+    claude --> response
+    response --> copy
+    copy -->|via ClipboardAPI| ext_cs
+    ext_cs -->|SynthesizeResult| ext_bg
+    ext_bg --> nh
+    nh --> bridge
+    bridge --> main
+    main -->|TranscriptStore.save_notes| sv
+```
+
+The Chrome extension is Manifest V3 with a deterministic key
+(`gmnecenhibfigbpldhacjhgmooopeelo`) hard-coded as
+`installer.EXTENSION_ID`. The bundled extension lives at
+`meeting_notetaker/resources/extension/`; the installer copies
+it to `%LOCALAPPDATA%\MeetingNotetaker\automation\extension`
+and registers the native-host manifest in HKCU.
+
+The bridge is a single-peer TCP loopback server. Each app launch
+rotates the handshake token in
+`%LOCALAPPDATA%\MeetingNotetaker\automation\bridge.json` so a
+stale handshake from a crashed prior run can't authenticate.
+
+The content script's response detector uses Claude's stop-button
+toggle to know when generation has finished, then clicks Claude's
+own Copy button and reads the clipboard. This is resilient to
+class-name churn in Claude's DOM and survives most UI updates.
+
+## Audio playback + transcript sync
+
+```mermaid
+flowchart TD
+    on_select[Session selected]
+    state{State<br/>COMPLETE/ERROR?}
+    skip[Don't load player]
+    decode[Decode mic + sys<br/>via PyAV<br/>resample to 16k mono]
+    mix["Mix to float32 buffer<br/>(end-aligned, leading pad)"]
+    ready[Player ready,<br/>total_ms known]
+    click_play[User clicks Play]
+    stream[sounddevice OutputStream<br/>float32, callback-driven]
+    tick[QTimer 100 ms tick]
+    pos[position_changed signal]
+    sv[SessionView]
+    hl[Transcript highlight]
+    bar[Player bar position]
+    img[Playback layout<br/>top image]
+
+    on_select --> state
+    state -->|False| skip
+    state -->|True| decode
+    decode --> mix
+    mix --> ready
+    ready --> click_play
+    click_play --> stream
+    click_play --> tick
+    stream -->|audio out| stream
+    tick --> pos
+    pos --> sv
+    sv --> hl
+    sv --> bar
+    sv --> img
+```
+
+Each stream gets a generation id (monotonic counter) so a queued
+finished_callback from a previously-stopped stream can't tear
+down a newer one. This is the load-bearing piece for click-to-
+seek during playback: `seek_ms` synchronously stops the old
+stream and starts a new one; without the generation check, the
+old stream's queued callback would close the new stream and stop
+the position tick.
+
+On buffer drain, the audio callback raises
+`sounddevice.CallbackStop`, the stream tears down cleanly, and
+the next play() builds a fresh stream from scratch.
 
 ## Storage layout
 
 ```
 %APPDATA%\MeetingNotetaker\
   sessions.db                    # SQLite session + folder metadata (WAL)
-  speakers.db                    # SQLite speaker library (name + centroid + samples)
+  speakers.db                    # SQLite speaker library
   config.toml                    # user settings
   instance.lock                  # single-instance pidfile
   meeting_notetaker.log          # rotating app log
   models\                        # faster-whisper model cache
-  prompts\                       # user-editable synthesis prompts (auto-seeded)
+  prompts\                       # user-editable synthesis prompts
   vocabulary.txt                 # user-editable global hotwords
+  automation\                    # synthesis-automation install state
+    extension\                   # unpacked Chrome extension
+    bridge.json                  # per-launch handshake token
   sessions\
     <session-uuid>\
       raw.transcript.md          # interleaved transcript, source-labeled
-      live_notes.md              # your own running notes (auto-seeded, auto-saved)
-      notes.md                   # latest LLM-generated (merged) notes
-      notes-YYYYMMDD-HHMM.md     # archived prior notes (if any)
+      live_notes.md              # your own running notes
+      notes.md                   # latest LLM-generated notes
+      notes-YYYYMMDD-HHMM.md     # archived prior notes
       diarization.json           # per-cluster speaker mapping + centroids
       metadata.json
-      audio\                     # mic.wav + sys.wav (deleted after transcription
-                                 # unless 'Keep audio' was set for the session)
-    images\                    # images pasted/inserted into live_notes.md
-                               # or notes.md (referenced as images/<name>)
+      audio\                     # mic + sys WAV / Opus / FLAC
+      images\                    # images pasted into live_notes / notes
+      screenshots\               # captured screenshots (NNNN-<ts>Z.png)
 ```
+
+## Performance tuning
+
+If the refinement wait bothers you:
+
+- **Smaller model.** `base.en` is roughly 3x faster than
+  `small.en` for both live and batch passes.
+- **Skip post-Stop refinement.** Settings -> Skip post-Stop
+  refinement = on. No CPU cost after Stop; the live transcript
+  is final.
+- **Tune CT2 manually.** The defaults assume the app should auto-
+  pick threads + workers from your physical core count. If you'd
+  rather drive it yourself, the `CPU threads per worker` +
+  `Parallel workers` settings give you direct control. Total OS
+  threads = `threads * workers`; keep that product at or below
+  your physical core count to avoid oversubscription.
+- **Retain the audio.** Per-session "Keep audio" toggle keeps
+  the source files. If you ever want to re-run Whisper with a
+  different model or settings, the source is there.
+
+Two-source recordings get a free 2x speedup on the refinement
+pass: both sources run in parallel on different CPU cores.
+Single-source recordings (mic only) get no benefit.
+
+## Synthesis prompts
+
+Bundled prompts seed `%APPDATA%\MeetingNotetaker\prompts\` on
+first run:
+
+- `default.md` -- generic meeting (Attendees / Agenda / TL;DR /
+  Decisions / Notes / Action Items / Open Questions / Verbatim
+  Quotes; merges live notes with transcript)
+- `one-on-one.md` -- 1:1 retrospective shape (topics, commitments
+  by side)
+- `standup.md` -- yesterday / today / blockers per speaker
+
+**Adding your own prompts.** Drop any `*.md` file into the
+prompts directory. It appears in the template picker. Filename
+(sans extension) becomes the display name; `my-team-retro.md`
+shows as "My Team Retro".
+
+**Placeholders:**
+
+| Placeholder | What it expands to |
+|---|---|
+| `{{session_title}}` | The session's title |
+| `{{date}}` | The session's creation date (`YYYY-MM-DD HH:MM`) |
+| `{{transcript}}` | The full transcript body. |
+| `{{live_notes}}` | The body of the My Notes tab. |
+| `{{attendees}}` | Comma-joined list of names from `# Attendees` bullets. |
+| `{{user_name}}` | The value of the "Your name" setting. Empty -> `Me`. |
+
+**Upgrading.** Bundled prompts get new revisions across releases.
+If you haven't edited a template (its on-disk body matches the
+version that shipped with a prior release), the app refreshes it
+automatically on startup. Any prompt you've actually edited is
+never touched.
+
+## Paste-target coverage for Copy
+
+The Copy button on the **My Notes** and **Synthesis** tabs puts
+two payloads on the clipboard at once: the raw Markdown source
+(for plain-text editors) and a rendered HTML version with each
+embedded image inlined as a `data:image/...;base64` URI (for
+rich-text paste targets). Different destinations pick different
+sides:
+
+| Destination | Formatting | Images | Notes |
+|---|---|---|---|
+| Word (desktop) | yes | yes | Best target. |
+| OneNote (desktop) | yes | yes | Same as Word. |
+| Outlook (desktop, compose) | yes | yes | Same as Word. |
+| Notion (web) | yes | yes | Notion re-uploads each data: URI to its own CDN on paste. |
+| Outlook Web (compose) | yes | **no** | Microsoft's web sanitizer strips data: URIs. Formatting survives. |
+| Microsoft Teams (desktop, compose) | yes | **no** | Same sanitizer. |
+| Gmail (web compose) | yes | usually no | Browser-paste sanitizer varies. |
+| VS Code / Obsidian / plain editors | -- | -- | Take the Markdown side unchanged. |
+
+The image-loss is by Microsoft's deliberate XSS protection in the
+web-paste pipeline. Workaround: paste the message text first,
+then right-click the image in My Notes preview, **Copy Image**,
+paste into Teams / OWA as a second step.
+
+---
+
+# Reference
 
 ## Updates
 
-The Help menu has **Check for Updates...** (manual) and **Upgrade...**
-(download + rebuild + install in place via pyinstaller). On startup
-the app also runs a silent weekly check against GitHub releases for
-`aarondodd/meeting-notetaker`; if a newer tag exists you will see a
-prompt. Network failures or a restricted release feed degrade to
-silent no-op, so the check never blocks startup.
+The Help menu has **Check for Updates...** (manual) and
+**Upgrade...** (download + rebuild + install in place via
+pyinstaller). On startup the app runs a silent weekly check
+against GitHub releases for `aarondodd/meeting-notetaker`; if a
+newer tag exists you see a prompt.
 
 The Upgrade flow:
 
 1. Downloads the release zipball and extracts it to a temp dir.
-2. Runs `build.ps1` (Windows) or `build.sh` (POSIX) -- the same
-   script you would run for a manual build.
-3. Copies the freshly built `dist/meeting-notetaker.exe` over the
-   running executable. On Windows the running .exe cannot be
-   deleted, but NTFS does allow renaming it; the old binary is
-   renamed to `meeting-notetaker.exe.old` and the new one takes
-   the canonical name.
-4. Offers a **Restart now?** prompt. On Yes, the app launches the
-   new build as a detached subprocess and quits; on No, the user
-   keeps working and picks up the new build on the next manual
-   launch.
-5. On the next startup, the old `.exe.old` sibling is cleaned up
-   automatically.
-
-When running from source (dev mode), there is no installed .exe to
-replace -- the upgrade reports where the new `dist/meeting-notetaker`
-binary was written and leaves it to you.
+2. Runs `build.ps1` (Windows) or `build.sh` (POSIX).
+3. Copies the freshly built `dist/meeting-notetaker.exe` over
+   the running executable. The old binary is renamed to
+   `meeting-notetaker.exe.old`.
+4. Offers a **Restart now?** prompt.
+5. On the next startup, the old `.exe.old` sibling is cleaned
+   up automatically.
 
 ## Network and privacy
 
-The app makes exactly one kind of outbound network call: downloading
-model files from `huggingface.co` on first run (the faster-whisper
-model and the ECAPA-TDNN speaker encoder). After that, no network. All
-other paths (clipboard hand-off, file I/O, transcription, speaker
-identification) are on-device.
+The app makes exactly one kind of outbound network call:
+downloading model files from `huggingface.co` on first run (the
+faster-whisper model and the ECAPA-TDNN speaker encoder). After
+that, no network. All other paths (clipboard hand-off, file I/O,
+transcription, speaker identification, screen capture, playback)
+are on-device.
 
 ### Corporate proxies (Netskope, Zscaler, etc.)
 
-If your workstation routes through a MITM proxy that re-signs TLS, the
-first-run model download will fail with `CERTIFICATE_VERIFY_FAILED`
-even though Edge / Outlook / npm all work. Python's `httpx` (used by
-`huggingface_hub`) does not see the corporate CA -- it has its own
-bundled trust list.
+If your workstation routes through a MITM proxy that re-signs
+TLS, the first-run model download will fail with
+`CERTIFICATE_VERIFY_FAILED` even though Edge / Outlook / npm all
+work. Python's `httpx` (used by `huggingface_hub`) doesn't see
+the corporate CA -- it has its own bundled trust list.
 
-The app ships `truststore` (Windows only, in `requirements.txt`) and
-injects it at startup in `main.py`. `truststore` makes Python's `ssl`
+The app ships `truststore` (Windows only, in `requirements.txt`)
+and injects it at startup. `truststore` makes Python's `ssl`
 module use the OS certificate store, which already trusts the
-corporate CA. **`pip install -r requirements.txt`** is enough; no
-manual CA wrangling needed.
+corporate CA.
 
-If `truststore` is not enough (e.g. the proxy uses pinning, or you are
-on a Python ssl build with weird defaults), pre-stage the models
-offline:
+If `truststore` isn't enough (e.g. the proxy uses pinning),
+pre-stage the models offline:
 
-1. On a machine that can reach `huggingface.co`, download the model
-   files. Easiest: `pip install faster-whisper` in a clean venv and
-   run
+1. On a machine that can reach `huggingface.co`, download the
+   model files. Easiest: `pip install faster-whisper` in a
+   clean venv and run
    `python -c "from faster_whisper import WhisperModel; WhisperModel('small.en')"`,
    then copy the snapshot directory to a thumb drive.
 2. On the work machine, drop the model files into
-   `%APPDATA%\MeetingNotetaker\models\small.en\` (or whichever size).
-   That directory should contain `model.bin`, `config.json`, and
-   either `tokenizer.json` or `vocabulary.txt`.
-3. Start the app. The model manager detects the local snapshot and
-   never calls Hugging Face.
+   `%APPDATA%\MeetingNotetaker\models\small.en\`. That directory
+   should contain `model.bin`, `config.json`, and either
+   `tokenizer.json` or `vocabulary.txt`.
+3. Start the app. The model manager detects the local snapshot
+   and never calls Hugging Face.
 
 You can also set `HF_HUB_OFFLINE=1` in the environment to force
 offline mode against the standard Hugging Face cache layout
-(`models--Systran--faster-whisper-<size>/`). Either approach works.
+(`models--Systran--faster-whisper-<size>/`). Either approach
+works.
 
-The ECAPA-TDNN speaker encoder follows the same pattern; pre-stage its
-`<app_data>/models/ecapa/` directory if you cannot reach Hugging Face
-on the work machine.
+The ECAPA-TDNN speaker encoder follows the same pattern;
+pre-stage its `<app_data>/models/ecapa/` directory if you can't
+reach Hugging Face on the work machine.
 
 ## License
 

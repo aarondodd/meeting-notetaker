@@ -246,31 +246,25 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
     # screenshot harness has to do it manually.
     templates = [t.name for t in prompts_mod.list_templates()]
     win.session_view.set_prompt_templates(templates)
+    from meeting_notetaker.ui.status_indicators import SegmentState
+    base_indicators: dict[str, SegmentState] = {
+        "voice": SegmentState(
+            color="yellow",
+            short_label="Voiceprint",
+            tooltip="No voice sample has been recorded.",
+        ),
+    }
     if automation_enabled:
         win.session_view.set_automation_enabled(True, "claude")
-        # And surface the synthesis status in the status bar.
-        win.set_status_indicators(
-            version=__version__,
-            mic_label="Mic: (System default)",
-            loopback_label="System audio: (System default)",
-            calendar_label="Calendar: off",
-            voice_label="Voice: not enrolled",
-            voice_tooltip="No voice sample has been recorded.",
-            synthesis_label="Synthesis: Chrome running, connected",
-            synthesis_tooltip=(
+        base_indicators["syn"] = SegmentState(
+            color="green",
+            short_label="Syn",
+            tooltip=(
                 "The Meeting Notetaker extension is connected. "
                 "Send is ready to use."
             ),
         )
-    else:
-        win.set_status_indicators(
-            version=__version__,
-            mic_label="Mic: (System default)",
-            loopback_label="System audio: (System default)",
-            calendar_label="Calendar: off",
-            voice_label="Voice: not enrolled",
-            voice_tooltip="No voice sample has been recorded.",
-        )
+    win.set_status_indicators(version=__version__, indicators=base_indicators)
     win.select_session(SESSION_ID)
     win.show()
     QApplication.processEvents()
@@ -283,8 +277,10 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
 
 
 def shot_main_transcript() -> None:
+    # v0.6.5 tab order with the Slides tab landed:
+    # 0 My Notes, 1 Synthesis, 2 Slides, 3 Previous Notes, 4 Transcript.
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(0)
+    win.session_view._tabs.setCurrentIndex(4)
     QApplication.processEvents()
     _grab(win, "01-main-transcript.png", autosize=False)
     win.close()
@@ -292,7 +288,7 @@ def shot_main_transcript() -> None:
 
 def shot_main_my_notes_edit() -> None:
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(1)
+    win.session_view._tabs.setCurrentIndex(0)
     # Force edit mode (template-seeded notes default to preview when populated).
     win.session_view._live_notes_editor.set_preview_mode(False)
     QApplication.processEvents()
@@ -302,7 +298,7 @@ def shot_main_my_notes_edit() -> None:
 
 def shot_main_my_notes_preview() -> None:
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(1)
+    win.session_view._tabs.setCurrentIndex(0)
     win.session_view._live_notes_editor.set_preview_mode(True)
     QApplication.processEvents()
     _grab(win, "03-main-my-notes-preview.png", autosize=False)
@@ -311,7 +307,7 @@ def shot_main_my_notes_preview() -> None:
 
 def shot_main_synthesis() -> None:
     win = _build_main_window()
-    win.session_view._tabs.setCurrentIndex(2)
+    win.session_view._tabs.setCurrentIndex(1)
     # Synthesis defaults to preview mode in set_session; explicit set is a no-op
     # but keeps the assumption in the script obvious.
     win.session_view._notes_view.set_preview_mode(True)

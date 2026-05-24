@@ -4,8 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import bisect
+import re
+
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -13,6 +16,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QPlainTextEdit,
     QVBoxLayout,
@@ -39,14 +43,24 @@ from ..utils.paths import session_dir
 from .attendee_sidebar import AttendeeSidebar
 from .live_notes_widget import LiveNotesWidget
 from .previous_notes_widget import PreviousNotesWidget
+from .scaled_image_label import ScaledImageLabel
+from .screencap_sidebar import ScreencapSidebar
+from .slides_widget import SlidesWidget
+from .transcript_player_bar import TranscriptPlayerBar
+
+
+# How many milliseconds before the clicked transcript line to seek to.
+# Aaron asked for "just before that line's timestamp (~10s)" so the
+# listen-back catches the lead-in. Pulled out so it's easy to tune.
+_TRANSCRIPT_SEEK_LEAD_MS = 10_000
 
 
 class SessionView(QWidget):
     """Right-hand pane shown when a session is selected."""
 
     start_clicked = pyqtSignal(str)               # session_id
-    pause_clicked = pyqtSignal(str)
-    resume_clicked = pyqtSignal(str)
+    # pause_clicked / resume_clicked dropped in v0.6.5 -- the
+    # session recording is now a fixed Start -> Stop block.
     stop_clicked = pyqtSignal(str)
     generate_prompt_clicked = pyqtSignal(str)
     paste_notes_clicked = pyqtSignal(str)
@@ -84,6 +98,28 @@ class SessionView(QWidget):
     # and the post-meeting refiner uses tags to constrain the clusterer.
     tag_speaker_clicked = pyqtSignal(str, str)            # session_id, name
     remove_last_tag_clicked = pyqtSignal(str, str)        # session_id, name
+    # Screen-capture lifecycle. start_screen_capture_clicked carries the
+    # session id; MainApp shows the first-time popup (if needed) and
+    # launches the region picker. stop_screen_capture_clicked tears the
+    # session's capture state down. The two sidebar signals fire from
+    # the My Notes pane's Capture / Insert buttons; both implicitly
+    # operate on the currently-armed region for the active session.
+    start_screen_capture_clicked = pyqtSignal(str)        # session_id
+    stop_screen_capture_clicked = pyqtSignal(str)         # session_id
+    screencap_capture_clicked = pyqtSignal(str)           # session_id
+    screencap_insert_clicked = pyqtSignal(str)            # session_id
+    screencap_auto_toggled = pyqtSignal(str, bool)        # session_id, enabled
+    # Right-click on a Slides thumbnail / full view: delete the file.
+    delete_screenshot_clicked = pyqtSignal(str, Path)     # session_id, path
+    # Transcript-pane playback control. The bar fires these for the
+    # session id MainApp tracks; the seek signal also fires when the
+    # user clicks a transcript line (with the line's start - 10s).
+    transcript_play_clicked = pyqtSignal(str)             # session_id
+    transcript_pause_clicked = pyqtSignal(str)            # session_id
+    transcript_seek_ms_requested = pyqtSignal(str, int)   # session_id, ms
+    # User dragged the Transcript playback splitter; MainApp persists
+    # the new top-pane percentage (10-90) to Config.
+    transcript_playback_split_changed = pyqtSignal(int)   # top_pct
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -111,6 +147,11 @@ class SessionView(QWidget):
         # otherwise -- the launch-on-Send path handles the case
         # where Chrome really isn't up.
         self._synth_connection_state = None  # SynthesisConnectionState, set by app
+        # Screen-capture armed state. True once the user clicked Start
+        # Screen Capture and drew a region; flipped back when they
+        # click Stop or the recording ends. Drives both the toggle
+        # button text and the My Notes sidebar enablement.
+        self._screencap_armed = False
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -146,15 +187,27 @@ class SessionView(QWidget):
         self._start_btn = QPushButton("Start", self)
         self._start_btn.clicked.connect(self._on_start)
         controls.addWidget(self._start_btn)
-        self._pause_btn = QPushButton("Pause", self)
-        self._pause_btn.clicked.connect(self._on_pause)
-        controls.addWidget(self._pause_btn)
-        self._resume_btn = QPushButton("Resume", self)
-        self._resume_btn.clicked.connect(self._on_resume)
-        controls.addWidget(self._resume_btn)
+        # Pause + Resume were removed in v0.6.5 to keep recordings
+        # wall-clock-continuous. With pause, mic.wav and sys.wav
+        # could go out of sync (especially under WASAPI loopback,
+        # which delivers samples idiosyncratically when no audio is
+        # playing). The recording is now a fixed start -> stop block
+        # with all silences / padding preserved.
         self._stop_btn = QPushButton("Stop", self)
         self._stop_btn.clicked.connect(self._on_stop)
         controls.addWidget(self._stop_btn)
+        # Screen-capture toggle. Disabled unless the session is in
+        # RECORDING or PAUSED (set_buttons_for_state drives this); the
+        # button text flips between "Start Screen Capture" and "Stop
+        # Screen Capture" as the user toggles.
+        self._screen_capture_btn = QPushButton("Start Screen Capture", self)
+        self._screen_capture_btn.setToolTip(
+            "Draw a region on screen, then Capture / Insert from the "
+            "My Notes sidebar grabs a screenshot of it. Only available "
+            "while recording."
+        )
+        self._screen_capture_btn.clicked.connect(self._on_screen_capture_toggle)
+        controls.addWidget(self._screen_capture_btn)
         controls.addStretch(1)
         self._retain_checkbox = QCheckBox("Keep audio for this session", self)
         self._retain_checkbox.toggled.connect(self._on_retain_toggled)
@@ -265,15 +318,11 @@ class SessionView(QWidget):
         )
         layout.addWidget(self._synth_banner)
 
-        # Transcript / My Notes / Synthesis / Previous tabs
+        # My Notes / Synthesis / Previous Notes / Transcript. Transcript
+        # is the rightmost tab as of v0.6.5: the user-curated and synthesis
+        # tabs are what people read after a meeting; the raw transcript
+        # is a reference rather than a starting point.
         self._tabs = QTabWidget(self)
-        self._transcript_view = QPlainTextEdit(self)
-        self._transcript_view.setReadOnly(True)
-        self._transcript_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.StyleHint.Monospace)
-        self._transcript_view.setFont(mono)
-        self._tabs.addTab(self._transcript_view, "Transcript")
 
         self._live_notes_editor = LiveNotesWidget(self)
         self._live_notes_editor.setPlaceholderText(
@@ -299,6 +348,21 @@ class SessionView(QWidget):
         self._notes_view.textChanged.connect(self._on_notes_changed)
         self._tabs.addTab(self._notes_view, "Synthesis")
 
+        # Slides: per-session captured screenshots. Thumbnail grid +
+        # full-view nav with right-click Copy / Delete / Open. Sits
+        # between Synthesis and Previous Notes so reference material
+        # is one tab away from both the notes-in-progress and the
+        # synthesis a user is reviewing.
+        self._slides_view = SlidesWidget(self)
+        self._slides_view.delete_requested.connect(self._on_screenshot_delete_requested)
+        # The Slides tab carries its own player bar. Forward its
+        # signals up so MainApp's existing transcript_* handlers wire
+        # one player to both bars.
+        self._slides_view.play_clicked.connect(self._on_slides_play_clicked)
+        self._slides_view.pause_clicked.connect(self._on_slides_pause_clicked)
+        self._slides_view.seek_ms_requested.connect(self._on_slides_seek_requested)
+        self._tabs.addTab(self._slides_view, "Slides")
+
         # Previous Notes: list of archived synthesis versions + a
         # markdown-rendered preview of the selected one, with
         # Restore / Delete actions. Replaces the v0.6.2 plaintext
@@ -312,6 +376,121 @@ class SessionView(QWidget):
         )
         self._tabs.addTab(self._previous_view, "Previous Notes")
 
+        # Transcript pane has two layouts living in a QStackedWidget:
+        #
+        # Idle layout (default + paused):
+        #   transcript editor full-width (click-to-seek + highlight)
+        #
+        # Playback layout (active while audio is playing OR position > 0
+        # with screenshots present):
+        #   QSplitter vertical:
+        #     ScaledImageLabel showing the current screenshot
+        #     transcript editor (re-parented from the idle page)
+        #
+        # The same _ClickableTranscriptView instance lives in both
+        # layouts via re-parenting; that keeps the highlight + scroll
+        # state intact as the layout flips. The player bar sits below
+        # both layouts and is shared too. The vertical splitter's
+        # default split is 70/30 (top/bottom) but the user can drag
+        # the handle; the new percentage is emitted via
+        # transcript_playback_split_changed so MainApp can persist it.
+        transcript_page = QWidget(self)
+        transcript_layout = QVBoxLayout(transcript_page)
+        transcript_layout.setContentsMargins(0, 0, 0, 0)
+        transcript_layout.setSpacing(4)
+
+        self._transcript_view = _ClickableTranscriptView(transcript_page)
+        self._transcript_view.setReadOnly(True)
+        self._transcript_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        self._transcript_view.setFont(mono)
+        self._transcript_view.setPlaceholderText(
+            "Transcription will appear here once the recording is stopped "
+            "and the post-meeting transcription pass has finished.\n\n"
+            "Live transcription is off by default in v0.6.5; toggle it in "
+            "Settings if you'd rather see lines arrive in real time during "
+            "the meeting."
+        )
+        self._transcript_view.line_clicked.connect(self._on_transcript_line_clicked)
+
+        # Idle layout: full-width transcript editor. The editor is
+        # re-parented out into the playback splitter when playback
+        # engages, so the placeholder reserves its slot here.
+        self._transcript_idle_page = QWidget(transcript_page)
+        idle_layout = QVBoxLayout(self._transcript_idle_page)
+        idle_layout.setContentsMargins(0, 0, 0, 0)
+        idle_layout.setSpacing(0)
+        idle_layout.addWidget(self._transcript_view, 1)
+        self._idle_editor_placeholder = QWidget(self._transcript_idle_page)
+        self._idle_editor_placeholder.hide()
+        idle_layout.addWidget(self._idle_editor_placeholder, 0)
+
+        # Playback layout: image on top, transcript below.
+        self._transcript_playback_page = QWidget(transcript_page)
+        playback_layout = QVBoxLayout(self._transcript_playback_page)
+        playback_layout.setContentsMargins(0, 0, 0, 0)
+        playback_layout.setSpacing(0)
+        self._transcript_playback_splitter = QSplitter(
+            Qt.Orientation.Vertical, self._transcript_playback_page,
+        )
+        self._transcript_playback_splitter.setChildrenCollapsible(False)
+        self._playback_image = ScaledImageLabel(self._transcript_playback_splitter)
+        self._transcript_playback_splitter.addWidget(self._playback_image)
+        # The editor is re-parented into this splitter when we swap
+        # to playback layout. We add a placeholder so the splitter's
+        # second slot is reserved; _enter_playback_layout swaps the
+        # real editor in.
+        self._playback_editor_placeholder = QWidget(self._transcript_playback_splitter)
+        self._transcript_playback_splitter.addWidget(self._playback_editor_placeholder)
+        # Stretch factors are a fallback if setSizes hasn't been
+        # called yet (e.g. before the first _enter_playback_layout);
+        # _apply_playback_split_pct does the real proportional sizing.
+        self._transcript_playback_splitter.setStretchFactor(0, 7)
+        self._transcript_playback_splitter.setStretchFactor(1, 3)
+        self._transcript_playback_splitter.splitterMoved.connect(
+            self._on_playback_splitter_moved
+        )
+        # Default top-pct (overridden by config via
+        # set_transcript_playback_split_top_pct from MainApp at startup).
+        self._playback_split_top_pct: int = 70
+        playback_layout.addWidget(self._transcript_playback_splitter, 1)
+
+        self._transcript_layout_stack = QStackedWidget(transcript_page)
+        self._transcript_layout_stack.addWidget(self._transcript_idle_page)
+        self._transcript_layout_stack.addWidget(self._transcript_playback_page)
+        transcript_layout.addWidget(self._transcript_layout_stack, 1)
+
+        self._player_bar = TranscriptPlayerBar(transcript_page)
+        self._player_bar.play_clicked.connect(self._on_player_bar_play_clicked)
+        self._player_bar.pause_clicked.connect(self._on_player_bar_pause_clicked)
+        self._player_bar.seek_ms_requested.connect(self._on_player_bar_seek_requested)
+        transcript_layout.addWidget(self._player_bar, 0)
+        self._tabs.addTab(transcript_page, "Transcript")
+
+        # Per-line timestamp index. Built each time the transcript text
+        # changes; consumed by the position-driven highlight and the
+        # click-to-seek path. Each tuple is (start_ms, block_number).
+        self._transcript_timestamps: list[tuple[int, int]] = []
+        self._current_highlight_block: Optional[int] = None
+        # When the user clicks a transcript line we seek the player
+        # to (line.t_start - 10s) for the lead-in. The position-tick
+        # auto-highlight would then jump to whatever line is being
+        # spoken 10s before the clicked one -- confusing visual
+        # feedback. _pinned_highlight_block holds the clicked block;
+        # _pinned_until_ms is the timestamp at which the auto-highlight
+        # takes over again. Cleared when either fires.
+        self._pinned_highlight_block: Optional[int] = None
+        self._pinned_until_ms: int = 0
+        # Screenshot offsets relative to recording start, sorted
+        # ascending by offset. Populated by MainApp via
+        # set_screenshot_offsets() on session select + after capture /
+        # delete.
+        self._screenshot_offsets: list[tuple[Path, int]] = []
+        # Tracks the currently-shown screenshot in the playback top
+        # pane so we only call set_image_path on actual changes.
+        self._current_playback_screenshot: Optional[Path] = None
+
         # Horizontal container holding the tab widget on the left and the
         # click-to-tag attendee sidebar on the right. The sidebar is
         # hidden by default; visibility is driven by recording state +
@@ -322,13 +501,31 @@ class SessionView(QWidget):
         body_row.setContentsMargins(0, 0, 0, 0)
         body_row.setSpacing(0)
         body_row.addWidget(self._tabs, 1)
-        self._attendee_sidebar = AttendeeSidebar(self)
-        self._attendee_sidebar.setVisible(False)
+        # Right column: screen-capture sidebar stacked above the
+        # attendee-tag sidebar. Both are visible only when My Notes is
+        # the active tab; _refresh_sidebar_visibility flips them as a
+        # group.
+        right_column = QWidget(self)
+        right_column_layout = QVBoxLayout(right_column)
+        right_column_layout.setContentsMargins(0, 0, 0, 0)
+        right_column_layout.setSpacing(0)
+        self._screencap_sidebar = ScreencapSidebar(right_column)
+        self._screencap_sidebar.capture_clicked.connect(self._on_screencap_capture)
+        self._screencap_sidebar.insert_clicked.connect(self._on_screencap_insert)
+        self._screencap_sidebar.auto_capture_toggled.connect(
+            self._on_screencap_auto_toggled
+        )
+        right_column_layout.addWidget(self._screencap_sidebar)
+        self._attendee_sidebar = AttendeeSidebar(right_column)
         self._attendee_sidebar.tag_clicked.connect(self._on_attendee_tag_clicked)
         self._attendee_sidebar.remove_last_requested.connect(
             self._on_attendee_remove_last_clicked
         )
-        body_row.addWidget(self._attendee_sidebar, 0)
+        right_column_layout.addWidget(self._attendee_sidebar)
+        right_column_layout.addStretch(1)
+        self._right_column = right_column
+        self._right_column.setVisible(False)
+        body_row.addWidget(self._right_column, 0)
         layout.addLayout(body_row, 1)
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
@@ -370,6 +567,10 @@ class SessionView(QWidget):
             self._state_label.setText("")
             self._raw_transcript_text = ""
             self._transcript_view.setPlainText("")
+            self._screenshot_offsets = []
+            self._refresh_transcript_timestamps()
+            self.set_player_enabled(False)
+            self._leave_playback_layout()
             self._notes_view.set_session_dir(None)
             self._set_notes_text("")
             self._previous_view.set_session_id("")
@@ -382,12 +583,15 @@ class SessionView(QWidget):
             # Clear sidebar state on session deselect; counts will be
             # re-seeded by the controller on the next select.
             self._attendee_sidebar.set_counts({})
-            self._attendee_sidebar.setVisible(False)
+            self._right_column.setVisible(False)
+            self._slides_view.set_screenshots([])
+            self.set_screencap_armed(False)
             return
         self._title_label.setText(session.title)
         self._state_label.setText(_pretty_state(session.state))
         self._raw_transcript_text = transcript
         self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
+        self._refresh_transcript_timestamps()
         sdir = session_dir(session.id)
         self._notes_view.set_session_dir(sdir)
         self._set_notes_text(notes)
@@ -403,6 +607,14 @@ class SessionView(QWidget):
         self._retain_checkbox.blockSignals(False)
         self._previous_view.set_session_id(session.id)
         self._previous_view.set_archives(previous_notes_paths)
+        # Seed the Slides tab. MainApp also pushes updates here after
+        # each successful capture / insert / delete via
+        # refresh_screenshots() so the grid stays current.
+        self.refresh_screenshots()
+        # Switching to a different session drops any armed capture
+        # state; the region the user drew in one meeting doesn't carry
+        # into another.
+        self.set_screencap_armed(False)
         self._set_buttons_for_state(
             session.state,
             has_transcript=session.has_transcript or bool(transcript.strip()),
@@ -450,18 +662,434 @@ class SessionView(QWidget):
 
     def _refresh_sidebar_visibility(self) -> None:
         """Sidebar shows only while actively recording AND viewing
-        Transcript or My Notes. Hides on Synthesis / Previous Notes
-        even mid-recording -- those tabs are read-only review surfaces."""
+        Transcript or My Notes. Hides on Synthesis / Previous Notes /
+        Slides even mid-recording -- those tabs are read-only review
+        surfaces. The right column wraps both the screencap sidebar
+        and the attendee sidebar; they show / hide together so the
+        column doesn't shrink to just one widget mid-recording."""
         if self._session is None or self._session.state not in (
             STATE_RECORDING, STATE_PAUSED,
         ):
-            self._attendee_sidebar.setVisible(False)
+            self._right_column.setVisible(False)
             return
         current = self._tabs.currentWidget()
         on_transcript_or_notes = current in (
             self._transcript_view, self._live_notes_editor,
         )
-        self._attendee_sidebar.setVisible(on_transcript_or_notes)
+        self._right_column.setVisible(on_transcript_or_notes)
+        # The screencap sidebar belongs to My Notes only; hide it on
+        # the Transcript tab even though the column is shown for the
+        # attendee tag controls.
+        self._screencap_sidebar.setVisible(current is self._live_notes_editor)
+
+    # ---- screen-capture API used by MainApp ------------------------------
+
+    def set_screencap_armed(self, armed: bool) -> None:
+        """Flip the toggle button + sidebar enable state.
+
+        MainApp calls this after the user confirms a region (-> True)
+        or clicks Stop Screen Capture / the recording ends (-> False).
+        Keeping the visible state in one place avoids the toggle button
+        and the sidebar drifting out of sync.
+        """
+        self._screencap_armed = armed
+        self._screencap_sidebar.set_armed(armed)
+        self._screen_capture_btn.setText(
+            "Stop Screen Capture" if armed else "Start Screen Capture"
+        )
+        self._refresh_screencap_button_enabled()
+
+    def is_screencap_armed(self) -> bool:
+        return self._screencap_armed
+
+    def refresh_screenshots(self) -> None:
+        """Reload the Slides tab from disk for the current session."""
+        if self._session is None:
+            self._slides_view.set_screenshots([])
+            return
+        from ..utils.paths import list_screenshots  # noqa: PLC0415
+        self._slides_view.set_screenshots(list_screenshots(self._session.id))
+
+    def insert_screenshot_markdown(self, relative_path: str) -> None:
+        """Drop an image-ref into My Notes at the current cursor.
+
+        Called by MainApp after a successful Insert: the screenshot has
+        landed on disk and the editor needs the markdown link so the
+        Preview shows the captured image inline with the surrounding
+        notes. relative_path is anchored at the session dir so it
+        round-trips through the editor's setSearchPaths.
+        """
+        ref = f"![screenshot]({relative_path})\n"
+        # toPlainText() returns the source-mode text; insert via the
+        # editor's QTextCursor so undo/redo work like a typed paste.
+        editor = self._live_notes_editor._editor  # noqa: SLF001
+        cursor = editor.textCursor()
+        cursor.insertText(ref)
+        editor.setTextCursor(cursor)
+
+    def _on_screen_capture_toggle(self) -> None:
+        if self._session is None:
+            return
+        if self._screencap_armed:
+            self.stop_screen_capture_clicked.emit(self._session.id)
+        else:
+            self.start_screen_capture_clicked.emit(self._session.id)
+
+    def _on_screencap_capture(self) -> None:
+        if self._session is None:
+            return
+        self.screencap_capture_clicked.emit(self._session.id)
+
+    def _on_screencap_insert(self) -> None:
+        if self._session is None:
+            return
+        self.screencap_insert_clicked.emit(self._session.id)
+
+    def _on_screencap_auto_toggled(self, enabled: bool) -> None:
+        if self._session is None:
+            return
+        self.screencap_auto_toggled.emit(self._session.id, enabled)
+
+    def set_screencap_auto_interval(self, seconds: int) -> None:
+        """Push the configured interval (Settings -> auto-capture) into
+        the sidebar's helper text so the user sees 'every Ns'."""
+        self._screencap_sidebar.set_auto_interval_seconds(seconds)
+
+    def _on_screenshot_delete_requested(self, path: Path) -> None:
+        if self._session is None:
+            return
+        self.delete_screenshot_clicked.emit(self._session.id, path)
+
+    def _refresh_screencap_button_enabled(self) -> None:
+        """Enabled only while RECORDING or PAUSED, OR while armed.
+
+        The 'OR armed' branch is the Stop-Screen-Capture-after-recording
+        edge case: if the user hit Stop before disarming, the toggle
+        still needs to be clickable so they can disarm it cleanly.
+        """
+        if self._session is None:
+            self._screen_capture_btn.setEnabled(False)
+            return
+        live = self._session.state in (STATE_RECORDING, STATE_PAUSED)
+        self._screen_capture_btn.setEnabled(live or self._screencap_armed)
+
+    # ---- transcript playback API used by MainApp -------------------------
+
+    def set_player_enabled(self, enabled: bool) -> None:
+        """Master enable for the player bars.
+
+        MainApp calls this with True when the active session has
+        retained audio (the player has something to play) and False
+        otherwise. Forwards to both the Transcript pane's bar AND the
+        Slides tab's bar so a single state controls both surfaces.
+        """
+        self._player_bar.set_enabled_state(enabled)
+        self._slides_view.set_player_enabled(enabled)
+        if not enabled:
+            self._clear_transcript_highlight()
+
+    def set_player_total_ms(self, total_ms: int) -> None:
+        self._player_bar.set_total_ms(total_ms)
+        self._slides_view.set_player_total_ms(total_ms)
+
+    def set_player_position_ms(self, ms: int) -> None:
+        self._player_bar.set_position_ms(ms)
+        self._slides_view.set_player_position_ms(ms)
+        # Highlight the transcript line that owns this timestamp. We
+        # do this on every position update so the highlight follows
+        # playback in real time. Skip when the user is mid-drag --
+        # otherwise the highlight thrashes around the slider thumb.
+        if self._player_bar.is_user_dragging():
+            return
+        self._refresh_transcript_highlight(ms)
+        # Any non-zero position means the user has engaged playback
+        # (played at some point, or click-to-seeked from the
+        # transcript). Show the playback layout so the matching
+        # screenshot is visible for that moment, even when audio
+        # isn't actively playing.
+        if ms > 0 and self._screenshot_offsets:
+            self._enter_playback_layout()
+        # Drive the playback layout's top image off the same position.
+        # In idle layout this is a no-op (the helper short-circuits).
+        self._refresh_playback_image(ms)
+
+    def set_player_is_playing(self, playing: bool) -> None:
+        """Flip the play/stop button labels.
+
+        v0.6.5 update: this no longer drives the layout swap.
+        Pause/Stop keeps the playback layout up so the user still sees
+        the current-position screenshot; the layout reverts only when
+        playback drains naturally (handled in
+        revert_to_idle_layout()) or the session changes.
+        """
+        self._player_bar.set_is_playing(playing)
+        self._slides_view.set_player_is_playing(playing)
+
+    def revert_to_idle_layout(self) -> None:
+        """Force the transcript pane back to the side-rail layout.
+
+        MainApp calls this after natural end-of-playback so the user
+        sees the rail again with the playhead reset to 0. Idempotent
+        if already in idle layout.
+        """
+        self._leave_playback_layout()
+
+    def _on_slides_play_clicked(self) -> None:
+        if self._session is None:
+            return
+        self.transcript_play_clicked.emit(self._session.id)
+
+    def _on_slides_pause_clicked(self) -> None:
+        if self._session is None:
+            return
+        self.transcript_pause_clicked.emit(self._session.id)
+
+    def _on_slides_seek_requested(self, ms: int) -> None:
+        if self._session is None:
+            return
+        self.transcript_seek_ms_requested.emit(self._session.id, int(ms))
+
+    def _on_player_bar_play_clicked(self) -> None:
+        if self._session is None:
+            return
+        self.transcript_play_clicked.emit(self._session.id)
+
+    def _on_player_bar_pause_clicked(self) -> None:
+        if self._session is None:
+            return
+        self.transcript_pause_clicked.emit(self._session.id)
+
+    def _on_player_bar_seek_requested(self, ms: int) -> None:
+        if self._session is None:
+            return
+        self.transcript_seek_ms_requested.emit(self._session.id, int(ms))
+
+    def _on_transcript_line_clicked(self, block_number: int) -> None:
+        if self._session is None:
+            return
+        start_ms = _start_ms_for_block(self._transcript_timestamps, block_number)
+        if start_ms is None:
+            return
+        # Pin the clicked line as the highlight until playback catches
+        # up to its timestamp. Without the pin, the audio seek (10s
+        # earlier) would drag the highlight back to an earlier line,
+        # then walk forward to the clicked one over the next 10s --
+        # confusing feedback for "I clicked here".
+        self._pinned_highlight_block = block_number
+        self._pinned_until_ms = int(start_ms)
+        self._apply_highlight_to_block(block_number, scroll_into_view=True)
+        # Seek a few seconds before the clicked line so the listen-back
+        # catches the lead-in (Aaron's "~10s before that line").
+        target = max(0, int(start_ms) - _TRANSCRIPT_SEEK_LEAD_MS)
+        self.transcript_seek_ms_requested.emit(self._session.id, target)
+
+    def _refresh_transcript_timestamps(self) -> None:
+        """Rebuild the timestamp index from the transcript view text.
+
+        Called whenever set_transcript_text / set_session updates the
+        displayed text. Click-to-seek and the position-driven highlight
+        consume this list.
+        """
+        text = self._transcript_view.toPlainText()
+        self._transcript_timestamps = _parse_transcript_timestamps(text)
+        self._clear_transcript_highlight()
+
+    def _refresh_transcript_highlight(self, position_ms: int) -> None:
+        """Update the highlighted line from the current playback position.
+
+        If the user has clicked a line, the highlight stays pinned to
+        that line until playback reaches the line's timestamp -- so
+        the 10-second seek lead-in doesn't drag the visual focus
+        backward.
+        """
+        # Pinned-block branch: keep showing the clicked line until
+        # playback catches up to it. The +1ms slack avoids a
+        # one-tick flicker right at the boundary.
+        if self._pinned_highlight_block is not None:
+            if position_ms + 1 < self._pinned_until_ms:
+                # Re-apply in case the document changed underneath
+                # us between the click and now.
+                if self._current_highlight_block != self._pinned_highlight_block:
+                    self._apply_highlight_to_block(
+                        self._pinned_highlight_block, scroll_into_view=False,
+                    )
+                return
+            # Pin's expired; fall through to normal auto-highlight.
+            self._pinned_highlight_block = None
+            self._pinned_until_ms = 0
+        block_number = _block_for_position_ms(
+            self._transcript_timestamps, position_ms,
+        )
+        if block_number is None:
+            self._clear_transcript_highlight()
+            return
+        if block_number == self._current_highlight_block:
+            return
+        self._apply_highlight_to_block(block_number, scroll_into_view=True)
+
+    def _apply_highlight_to_block(
+        self, block_number: int, *, scroll_into_view: bool,
+    ) -> None:
+        """Paint the highlight ExtraSelection on the given block.
+
+        Shared between the position-driven path and the user-click
+        path. The ExtraSelection format paints behind the text without
+        disrupting cursor / read-only state.
+        """
+        self._current_highlight_block = block_number
+        from PyQt6.QtWidgets import QTextEdit  # noqa: PLC0415
+        sel = QTextEdit.ExtraSelection()
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor(255, 240, 160))
+        fmt.setProperty(QTextCharFormat.Property.FullWidthSelection, True)
+        sel.format = fmt
+        cursor = QTextCursor(self._transcript_view.document().findBlockByNumber(block_number))
+        cursor.clearSelection()
+        sel.cursor = cursor
+        self._transcript_view.setExtraSelections([sel])
+        if scroll_into_view:
+            view_cursor = self._transcript_view.textCursor()
+            view_cursor.setPosition(cursor.position())
+            self._transcript_view.setTextCursor(view_cursor)
+            self._transcript_view.ensureCursorVisible()
+
+    def _clear_transcript_highlight(self) -> None:
+        self._current_highlight_block = None
+        self._pinned_highlight_block = None
+        self._pinned_until_ms = 0
+        self._transcript_view.setExtraSelections([])
+
+    # ---- screenshots <-> transcript wiring -------------------------------
+
+    def set_screenshot_offsets(self, offsets: list[tuple[Path, int]]) -> None:
+        """Pin the (path, offset_ms) list MainApp computed at session-load.
+
+        Pushes the list to the Slides tab so its position-driven
+        advance + click-to-seek share one source of truth, and
+        refreshes the playback top image against the current player
+        position so a fresh capture surfaces immediately.
+        """
+        self._screenshot_offsets = list(offsets)
+        self._slides_view.set_screenshot_offsets(self._screenshot_offsets)
+        if self._is_in_playback_layout():
+            self._refresh_playback_image(self._player_bar._slider.value())  # noqa: SLF001
+
+    # ---- layout swap (idle <-> playback) ---------------------------------
+
+    def _is_in_playback_layout(self) -> bool:
+        return self._transcript_layout_stack.currentWidget() is self._transcript_playback_page
+
+    def _enter_playback_layout(self) -> None:
+        """Swap the transcript pane into the screenshare-style layout.
+
+        No-op when there are no screenshots for this session -- the
+        layout swap would just produce an empty top pane. Audio still
+        plays in idle layout in that case.
+        """
+        if not self._screenshot_offsets:
+            return  # Stay in idle layout; audio still plays beneath.
+        if self._is_in_playback_layout():
+            return
+        # Move the editor from the idle layout into the playback
+        # splitter. setParent + insertWidget keeps the QPlainTextEdit's
+        # contents + scroll + selection state intact.
+        self._transcript_playback_splitter.insertWidget(1, self._transcript_view)
+        self._playback_editor_placeholder.hide()
+        self._idle_editor_placeholder.show()
+        self._transcript_layout_stack.setCurrentWidget(self._transcript_playback_page)
+        # Apply the configured split AFTER the page is shown, so the
+        # splitter has its final height to compute pixel sizes against.
+        QTimer.singleShot(0, self._apply_playback_split_pct)
+
+    def _leave_playback_layout(self) -> None:
+        if not self._is_in_playback_layout():
+            return
+        # Move the editor back into the idle layout.
+        idle_layout = self._transcript_idle_page.layout()
+        if idle_layout is not None:
+            idle_layout.insertWidget(0, self._transcript_view)
+        self._idle_editor_placeholder.hide()
+        self._playback_editor_placeholder.show()
+        self._transcript_layout_stack.setCurrentWidget(self._transcript_idle_page)
+        self._playback_image.clear_image()
+        self._current_playback_screenshot = None
+
+    def _apply_playback_split_pct(self) -> None:
+        """Resize the playback splitter to match the saved top-pct.
+
+        Reads the splitter's current height and assigns pixel sizes
+        proportionally to the two visible panes (image at index 0,
+        editor at index 1). The placeholder at index 2 is hidden
+        while in playback layout; it stays at 0 so the visible split
+        owns the full height. No-op if the splitter has zero height
+        (parent not yet laid out); the caller defers via
+        QTimer.singleShot(0).
+        """
+        h = self._transcript_playback_splitter.height()
+        if h <= 0:
+            return
+        pct = self._playback_split_top_pct
+        pct = max(10, min(90, pct))
+        top = int(h * pct / 100)
+        bottom = h - top
+        count = self._transcript_playback_splitter.count()
+        sizes = [top, bottom] + [0] * max(0, count - 2)
+        self._transcript_playback_splitter.setSizes(sizes)
+
+    def _on_playback_splitter_moved(self, pos: int, index: int) -> None:
+        """Recompute top-pct from the splitter's first two sizes + emit.
+
+        Only sizes[0] (image) and sizes[1] (editor) count; the
+        placeholder at index 2 stays at 0 in playback layout.
+        """
+        sizes = self._transcript_playback_splitter.sizes()
+        if len(sizes) < 2:
+            return
+        visible_total = sizes[0] + sizes[1]
+        if visible_total <= 0:
+            return
+        pct = int(round(sizes[0] * 100 / visible_total))
+        pct = max(10, min(90, pct))
+        if pct == self._playback_split_top_pct:
+            return
+        self._playback_split_top_pct = pct
+        self.transcript_playback_split_changed.emit(pct)
+
+    def set_transcript_playback_split_top_pct(self, pct: int) -> None:
+        """MainApp pushes the persisted split pct in at startup.
+
+        Applied to the splitter immediately if it's currently in
+        playback layout, otherwise stashed for the next _enter call.
+        """
+        pct = max(10, min(90, pct))
+        self._playback_split_top_pct = pct
+        if self._is_in_playback_layout():
+            self._apply_playback_split_pct()
+
+    def _refresh_playback_image(self, position_ms: int) -> None:
+        """Sticky-image lookup against the screenshot offsets list.
+
+        If the position precedes every screenshot, clear the top
+        pane (Aaron's "if no image is relevant at the start, don't
+        show yet"). Otherwise show the latest screenshot whose
+        offset <= position; the pane stays on that image until the
+        next capture's offset is reached.
+        """
+        if not self._is_in_playback_layout():
+            return
+        from ..screencap.timestamps import current_screenshot_for_position  # noqa: PLC0415
+        match = current_screenshot_for_position(
+            self._screenshot_offsets, position_ms,
+        )
+        if match is None:
+            if self._playback_image.has_image():
+                self._playback_image.clear_image()
+            self._current_playback_screenshot = None
+            return
+        if match == self._current_playback_screenshot:
+            return
+        self._playback_image.set_image_path(match)
+        self._current_playback_screenshot = match
 
     def update_batch_progress(self, pct: int) -> None:
         """Reflect background batch-refinement progress in the state label."""
@@ -485,6 +1113,10 @@ class SessionView(QWidget):
         if self._raw_transcript_text:
             self._raw_transcript_text += "\n"
         self._raw_transcript_text += raw_line
+        # New line means a new candidate timestamp for the click-to-
+        # seek index. Cheap to rebuild on every append (the regex is
+        # one match per line); the index is small.
+        self._refresh_transcript_timestamps()
 
     def append_provisional(self, segment: TranscriptSegment) -> None:
         """Append a provisional segment that may be rewritten when the next overlap arrives."""
@@ -496,6 +1128,7 @@ class SessionView(QWidget):
         """Replace the transcript view's contents. `text` should be the raw on-disk form."""
         self._raw_transcript_text = text
         self._transcript_view.setPlainText(rewrite_user_label(text, self._user_name))
+        self._refresh_transcript_timestamps()
 
     def set_title(self, new_title: str) -> None:
         """Update the displayed session title in place after a rename.
@@ -538,6 +1171,7 @@ class SessionView(QWidget):
         self._transcript_view.setPlainText(
             rewrite_user_label(self._raw_transcript_text, self._user_name)
         )
+        self._refresh_transcript_timestamps()
 
     def set_notes_text(self, text: str) -> None:
         """Replace the Synthesis body. Used by Paste-Response-Back and reload.
@@ -618,14 +1252,6 @@ class SessionView(QWidget):
     def _on_start(self) -> None:
         if self._session:
             self.start_clicked.emit(self._session.id)
-
-    def _on_pause(self) -> None:
-        if self._session:
-            self.pause_clicked.emit(self._session.id)
-
-    def _on_resume(self) -> None:
-        if self._session:
-            self.resume_clicked.emit(self._session.id)
 
     def _on_stop(self) -> None:
         if self._session:
@@ -877,9 +1503,8 @@ class SessionView(QWidget):
 
         has_session = self._session is not None
         self._start_btn.setEnabled(has_session and (is_new or is_complete))
-        self._pause_btn.setEnabled(has_session and is_recording)
-        self._resume_btn.setEnabled(has_session and is_paused)
         self._stop_btn.setEnabled(has_session and (is_recording or is_paused))
+        self._refresh_screencap_button_enabled()
         # Generate/paste are available as soon as a transcript exists. The
         # batch-refinement pass after Stop runs in the background and is
         # explicitly NOT a gate on synthesis -- the live transcript is good
@@ -1072,6 +1697,80 @@ class SessionView(QWidget):
         self.window().statusBar().showMessage(
             f"Exported PDF to {target.name}", 5000
         )
+
+
+_TIMESTAMP_RE = re.compile(r"^\[(\d+):(\d{2}):(\d{2})\]")
+
+
+def _parse_transcript_timestamps(text: str) -> list[tuple[int, int]]:
+    """Return [(start_ms, block_number), ...] for every line whose
+    leading bracket is a HH:MM:SS timestamp.
+
+    Lines without a leading timestamp (status messages, blank lines)
+    are silently skipped; they don't contribute a seek anchor. The
+    list is monotonic in start_ms because the transcript writer
+    emits segments in chronological order; we rely on that to do
+    O(log N) bisect lookups.
+    """
+    out: list[tuple[int, int]] = []
+    for block_number, line in enumerate(text.splitlines()):
+        match = _TIMESTAMP_RE.match(line)
+        if match is None:
+            continue
+        hours, minutes, seconds = (int(g) for g in match.groups())
+        start_ms = ((hours * 3600) + (minutes * 60) + seconds) * 1000
+        out.append((start_ms, block_number))
+    return out
+
+
+def _block_for_position_ms(
+    timestamps: list[tuple[int, int]], position_ms: int,
+) -> Optional[int]:
+    """Return the block number whose timestamp the position falls in.
+
+    Bisect for the rightmost segment whose start_ms <= position_ms.
+    Returns None if the timestamps list is empty or the position
+    precedes every segment.
+    """
+    if not timestamps:
+        return None
+    keys = [t[0] for t in timestamps]
+    idx = bisect.bisect_right(keys, position_ms) - 1
+    if idx < 0:
+        return None
+    return timestamps[idx][1]
+
+
+def _start_ms_for_block(
+    timestamps: list[tuple[int, int]], block_number: int,
+) -> Optional[int]:
+    """Inverse: return the timestamp anchored at this block, or None."""
+    for ms, blk in timestamps:
+        if blk == block_number:
+            return ms
+    return None
+
+
+class _ClickableTranscriptView(QPlainTextEdit):
+    """QPlainTextEdit that emits line_clicked(block_number) on click.
+
+    Distinct from a regular cursor selection: the user clicking a
+    line in the transcript pane is a seek action, not text-selection.
+    We let the parent dispatch the click through the normal
+    mousePressEvent first so the cursor still moves; then emit a
+    signal so the SessionView can compute the seek target.
+    """
+
+    line_clicked = pyqtSignal(int)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        super().mousePressEvent(event)
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        cursor = self.cursorForPosition(event.pos())
+        block = cursor.block()
+        if block.isValid():
+            self.line_clicked.emit(block.blockNumber())
 
 
 def _pretty_state(state: str) -> str:

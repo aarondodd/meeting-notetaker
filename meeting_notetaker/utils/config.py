@@ -4,6 +4,7 @@ Schema (config.toml):
 
     [audio]
     retain_audio_default = false
+    retain_format = "opus"             # opus / flac / wav; format used when retain_audio is True
     vad_enabled = true
     vad_min_silence_ms = 500
     mic_device_name = ""               # empty -> system default; substring match
@@ -11,7 +12,7 @@ Schema (config.toml):
 
     [transcription]
     model_size = "small.en"
-    capture_only_mode = false
+    capture_only_mode = true          # default off for live transcription as of v0.6.5
     skip_batch_refinement = false   # if true, no post-Stop full-recording pass -- live transcript is final
     fast_batch = true               # batch pass uses beam_size=1 (~3x faster). flip off for legal-grade verbatim.
     cpu_threads = 0                 # 0 = auto (cpu_count // num_workers); else fixed value passed to CT2
@@ -61,11 +62,18 @@ from .paths import config_path
 
 VALID_MODEL_SIZES = ("tiny.en", "base.en", "small.en", "medium.en")
 VALID_LLM_TARGETS = ("claude", "copilot")
+VALID_RETAIN_FORMATS = ("opus", "flac", "wav")
 
 
 @dataclass
 class AudioConfig:
     retain_audio_default: bool = False
+    # Saved-recording format for sessions where retain_audio is True.
+    # opus = ~96% size reduction vs WAV, perceptually transparent for
+    # speech. flac = lossless, ~50% reduction. wav = no re-encode, keep
+    # the source file as-is (matches v0.6.4 behavior, kept as an
+    # escape hatch).
+    retain_format: str = "opus"
     vad_enabled: bool = True
     vad_min_silence_ms: int = 500
     mic_device_name: str = ""
@@ -75,7 +83,12 @@ class AudioConfig:
 @dataclass
 class TranscriptionConfig:
     model_size: str = "small.en"
-    capture_only_mode: bool = False
+    # v0.6.5+: default is capture-only (no live transcription pass).
+    # The post-meeting batch transcription on Stop still runs and is
+    # what populates the Transcript tab. Users who want lines arriving
+    # mid-meeting can flip this off in Settings. Existing configs keep
+    # the explicit value they had saved.
+    capture_only_mode: bool = True
     skip_batch_refinement: bool = False
     fast_batch: bool = True
     cpu_threads: int = 0
@@ -101,6 +114,26 @@ class TranscriptionConfig:
 class UiConfig:
     user_name: str = ""
     first_run_complete: bool = False
+    # Flipped to True the first time the user clicks Start Screen
+    # Capture and confirms the privacy-notice popup. Suppresses the
+    # popup on subsequent captures so the workflow doesn't get
+    # interrupted every meeting.
+    screen_capture_first_time_seen: bool = False
+    # Auto-capture: when armed, snapshot the screen-capture region
+    # every N seconds. Captures are deduplicated against the most-
+    # recently-kept image via dHash + Hamming distance; only
+    # captures whose hash differs by more than dedup_threshold bits
+    # are kept. Manual Capture / Insert clicks always keep their
+    # image (no dedup check) and reset the baseline.
+    screen_capture_auto_enabled_default: bool = False
+    screen_capture_auto_interval_sec: int = 30
+    screen_capture_auto_dedup_threshold: int = 10
+    # Transcript pane's playback split: top pane (screenshot) as a
+    # percentage of the total splitter height. Default 70 means the
+    # screenshot gets 70% and the transcript editor gets 30%. The
+    # user can resize the splitter at runtime; SessionView pushes
+    # the new pct back to MainApp which saves it here (debounced).
+    transcript_playback_split_top_pct: int = 70
 
 
 @dataclass
@@ -216,6 +249,11 @@ class Config:
                 f"audio.vad_min_silence_ms must be between 50 and 5000, "
                 f"got {self.audio.vad_min_silence_ms}"
             )
+        if self.audio.retain_format not in VALID_RETAIN_FORMATS:
+            errors.append(
+                f"audio.retain_format must be one of {VALID_RETAIN_FORMATS}, "
+                f"got {self.audio.retain_format!r}"
+            )
         if not (0 <= self.transcription.cpu_threads <= 128):
             errors.append(
                 f"transcription.cpu_threads must be between 0 and 128 (0 = auto), "
@@ -250,6 +288,21 @@ class Config:
             errors.append(
                 f"detection.cooldown_minutes must be between 1 and 120, "
                 f"got {self.detection.cooldown_minutes}"
+            )
+        if not (5 <= self.ui.screen_capture_auto_interval_sec <= 300):
+            errors.append(
+                "ui.screen_capture_auto_interval_sec must be between 5 "
+                f"and 300, got {self.ui.screen_capture_auto_interval_sec}"
+            )
+        if not (0 <= self.ui.screen_capture_auto_dedup_threshold <= 64):
+            errors.append(
+                "ui.screen_capture_auto_dedup_threshold must be between 0 "
+                f"and 64, got {self.ui.screen_capture_auto_dedup_threshold}"
+            )
+        if not (10 <= self.ui.transcript_playback_split_top_pct <= 90):
+            errors.append(
+                "ui.transcript_playback_split_top_pct must be between 10 "
+                f"and 90, got {self.ui.transcript_playback_split_top_pct}"
             )
         if self.synthesis.llm_target not in VALID_LLM_TARGETS:
             errors.append(

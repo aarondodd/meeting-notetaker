@@ -752,6 +752,8 @@ class SessionController(QObject):
                 self.store.update_session(session.id, has_audio=False)
             except OSError:
                 log.exception("audio cleanup failed")
+        else:
+            self._maybe_reencode_retained_audio(session.id)
         self.store.update_session(session.id, state=STATE_COMPLETE)
         session.state = STATE_COMPLETE
         self.state_changed.emit(session.id, STATE_COMPLETE)
@@ -769,6 +771,38 @@ class SessionController(QObject):
         self.batch_progress.emit(session_id, 100)
         self._phase_plans.pop(session_id, None)
         self.status.emit("Transcription complete.")
+
+    def _maybe_reencode_retained_audio(self, session_id: str) -> None:
+        """Re-encode the WAV pair to opus / flac per config.retain_format.
+
+        Only called on the retain_audio=True branch of _finalize_session.
+        Skipped silently when retain_format is 'wav' (the escape hatch
+        that matches v0.6.4 behavior). On encoder failure, the source
+        WAV is kept in place so the user doesn't lose audio to a
+        codec bug -- they get warned via status.emit and that's it.
+        """
+        fmt = self.config.audio.retain_format
+        if fmt == "wav":
+            return
+        audio_dir = session_audio_dir(session_id)
+        mic_wav = audio_dir / "mic.wav"
+        sys_wav = audio_dir / "sys.wav"
+        try:
+            from .audio.encode import encode_pair  # noqa: PLC0415
+            encode_pair(mic_wav, sys_wav, fmt)
+        except ImportError:
+            log.warning(
+                "PyAV not available; keeping WAV recording for session %s",
+                session_id,
+            )
+            self.status.emit(
+                "Audio retained as WAV (compressed encoder unavailable)."
+            )
+        except Exception:
+            log.exception("re-encode failed for session %s", session_id)
+            self.status.emit(
+                f"Audio retained as WAV ({fmt} re-encode failed; see log)."
+            )
 
     def _on_batch_done(
         self,

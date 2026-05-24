@@ -9,9 +9,10 @@ import secrets
 import sys
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from .automation import messages as automation_messages
@@ -49,6 +50,7 @@ from .models.transcript import TranscriptSegment, TranscriptStore
 from .transcription import model_manager
 from .ui.devices_dialog import DevicesDialog
 from .ui.main_window import MainWindow
+from .ui.status_indicators import SegmentState
 from .ui.new_session_dialog import NewSessionDialog
 from .ui.progress import run_with_progress
 from .ui.prompt_dialog import GeneratePromptDialog, PasteNotesDialog
@@ -127,6 +129,32 @@ class MainApp(QObject):
         # Consumed at start_session time, then evicted. Sessions absent from
         # the dict fall back to the global config value.
         self._capture_only_overrides: dict[str, bool] = {}
+        # Per-session screen-capture region in absolute screen coords.
+        # Populated once the user accepts the region picker; cleared on
+        # Stop Screen Capture or when the recording ends. Indexed by
+        # session id so multi-session-in-flight (a v0.6 feature) still
+        # routes captures to the right session.
+        self._screen_capture_regions: dict[str, tuple[int, int, int, int]] = {}
+        # Auto-capture state. Keyed by session id; only present
+        # while auto-capture is armed AND running for that session.
+        # _auto_capture_baseline_hash holds the dHash of the most-
+        # recently-kept screenshot (manual or auto). New auto-captures
+        # compare against it; matches within the threshold get
+        # deleted, mismatches keep the file and update the baseline.
+        self._auto_capture_timers: dict[str, QTimer] = {}
+        self._auto_capture_baseline_hash: dict[str, int] = {}
+        # Persistent on-screen outline showing the armed region. There
+        # is one overlay at a time (only one session captures at a
+        # time); _arm_screen_capture_overlay creates it, _disarm tears
+        # it down.
+        self._armed_region_overlay = None
+        # One AudioPlayer instance, reused across sessions. Lazily
+        # constructed on first use so a workspace without retained
+        # audio never pays the sounddevice / PyAV import cost.
+        self._audio_player = None
+        # Track which session is currently loaded into the player so
+        # we don't reload identical files on every selection.
+        self._player_loaded_session_id: Optional[str] = None
 
         # Synthesis automation bridge. Listens on a loopback port for the
         # Chrome native-messaging host to connect; route inbound result/
@@ -211,6 +239,29 @@ class MainApp(QObject):
 
     def _apply_user_name(self) -> None:
         self.window.session_view.set_user_name(self.config.ui.user_name)
+        # Push the configured auto-capture interval into the sidebar
+        # at startup so the hint text shows the current cadence.
+        self.window.session_view.set_screencap_auto_interval(
+            int(self.config.ui.screen_capture_auto_interval_sec)
+        )
+        # Restore the persisted Transcript-playback split percentage so
+        # the user's preferred ratio applies the first time playback
+        # engages this session.
+        self.window.session_view.set_transcript_playback_split_top_pct(
+            int(self.config.ui.transcript_playback_split_top_pct)
+        )
+
+    def _on_transcript_playback_split_changed(self, pct: int) -> None:
+        """Persist the user's new splitter ratio (debounced)."""
+        self.config.ui.transcript_playback_split_top_pct = int(pct)
+        # Coalesce rapid drag events into one disk write 500 ms after
+        # the last move; starting a running timer just resets it.
+        if not hasattr(self, "_save_split_timer"):
+            self._save_split_timer = QTimer(self)
+            self._save_split_timer.setSingleShot(True)
+            self._save_split_timer.setInterval(500)
+            self._save_split_timer.timeout.connect(self.config.save)
+        self._save_split_timer.start()
 
     def _apply_synthesis_automation(self) -> None:
         """Push the current setting state into the SessionView, swapping
@@ -306,12 +357,18 @@ class MainApp(QObject):
         """
         msg_type = msg.get("type", "")
         request_id = msg.get("request_id", "")
-        log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
+        # Pongs arrive every keep-alive cycle (~25s) and never carry
+        # information beyond "the worker is alive"; logging them at
+        # INFO floods the production log. The Verify-wizard handshake
+        # tracks pongs via a threading.Event so the log line wasn't
+        # load-bearing for correctness either.
         if msg_type == "pong":
+            log.debug("bridge worker: <- pong rid=%s", request_id)
             evt = self._pending_pings.pop(request_id, None)
             if evt is not None:
                 evt.set()
             return
+        log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
         self.bridge_message_received.emit(msg)
 
     def _dispatch_bridge_message(self, msg: dict) -> None:
@@ -786,6 +843,8 @@ class MainApp(QObject):
         self.window.open_outlook_diagnostic_requested.connect(self._on_outlook_diagnostic)
         self.window.open_log_viewer_requested.connect(self._on_log_viewer)
         self.window.open_dependency_check_requested.connect(self._on_dependency_check)
+        self.window.open_about_requested.connect(self._on_about)
+        self.window.open_user_guide_requested.connect(self._on_user_guide)
         self.window.check_for_updates_requested.connect(self._on_check_for_updates)
         self.window.upgrade_requested.connect(self._on_upgrade)
         self.window.quit_requested.connect(self.qt_app.quit)
@@ -793,11 +852,13 @@ class MainApp(QObject):
         self.window.delete_sessions_requested.connect(self._on_delete_sessions)
         self.window.rename_session_requested.connect(self._on_rename_session)
         self.window.edit_session_timestamp_requested.connect(self._on_edit_session_timestamp)
+        self.window.open_recording_requested.connect(self._on_open_recording)
+        self.window.export_recording_requested.connect(self._on_export_recording)
+        self.window.export_video_requested.connect(self._on_export_video)
+        self.window.delete_recording_requested.connect(self._on_delete_recording)
 
         self.tray.open_main_window.connect(self._foreground_window)
         self.tray.new_session_requested.connect(self._on_new_session)
-        self.tray.pause_requested.connect(self.controller.pause_session)
-        self.tray.resume_requested.connect(self.controller.resume_session)
         self.tray.stop_requested.connect(self.controller.stop_session)
         self.tray.settings_requested.connect(self._on_settings)
         self.tray.quit_requested.connect(self.qt_app.quit)
@@ -806,8 +867,6 @@ class MainApp(QObject):
 
         sv = self.window.session_view
         sv.start_clicked.connect(self._on_start_clicked)
-        sv.pause_clicked.connect(lambda _sid: self.controller.pause_session())
-        sv.resume_clicked.connect(lambda _sid: self.controller.resume_session())
         sv.stop_clicked.connect(lambda _sid: self.controller.stop_session())
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
@@ -828,6 +887,23 @@ class MainApp(QObject):
         )
         sv.remove_last_tag_clicked.connect(
             lambda _sid, name: self.controller.remove_last_speaker_tag(name)
+        )
+        # Screen-capture lifecycle. Start launches the region picker;
+        # Stop tears down. Capture / Insert in the sidebar grab the
+        # currently-armed region.
+        sv.start_screen_capture_clicked.connect(self._on_start_screen_capture)
+        sv.stop_screen_capture_clicked.connect(self._on_stop_screen_capture)
+        sv.screencap_capture_clicked.connect(self._on_screencap_capture)
+        sv.screencap_insert_clicked.connect(self._on_screencap_insert)
+        sv.screencap_auto_toggled.connect(self._on_auto_capture_toggled)
+        sv.delete_screenshot_clicked.connect(self._on_delete_screenshot)
+        # Transcript playback wiring. The player bar fires play / pause /
+        # seek; MainApp owns the single AudioPlayer and routes them.
+        sv.transcript_play_clicked.connect(self._on_transcript_play)
+        sv.transcript_pause_clicked.connect(self._on_transcript_pause)
+        sv.transcript_seek_ms_requested.connect(self._on_transcript_seek)
+        sv.transcript_playback_split_changed.connect(
+            self._on_transcript_playback_split_changed
         )
 
         self.controller.state_changed.connect(self._on_session_state_changed)
@@ -870,6 +946,15 @@ class MainApp(QObject):
             previous_notes_paths=store.list_previous_notes(),
             live_notes=live_notes_body,
         )
+        # Load the session's retained audio into the player (if any).
+        # The player bar in the Transcript pane greys out cleanly when
+        # there's nothing on disk; loading itself is a no-op for
+        # already-loaded sessions.
+        self._maybe_load_player_for_session(session_id)
+        # Push the screenshot offset list so the rail + Slides tab
+        # can anchor + auto-advance against this session's recording-
+        # start moment.
+        self._push_screenshot_offsets(session_id)
         # Populate the prompt-template picker with the available
         # templates + restore the session's saved choice.
         templates = [t.name for t in prompts_mod.list_templates()]
@@ -988,10 +1073,34 @@ class MainApp(QObject):
         )
 
     def _on_session_state_changed(self, session_id: str, state: str) -> None:
+        # Invalidate the player's cached load whenever the session
+        # state changes. The audio files on disk may have just been
+        # rewritten (RECORDING -> PROCESSING -> COMPLETE encodes the
+        # WAVs to opus and deletes the WAVs); the cached load is
+        # now stale. _maybe_load_player_for_session, called inside
+        # _on_session_selected, decides whether to reload based on
+        # the new state.
+        if self._player_loaded_session_id == session_id:
+            if self._audio_player is not None:
+                self._audio_player.close()
+            self._player_loaded_session_id = None
         # Update list label + selected view.
         self._refresh_session_list(select=session_id)
         self._on_session_selected(session_id)
         self.tray.set_state(_TRAY_FOR_STATE.get(state, "idle"))
+        # Drop any armed screen-capture region when the recording ends.
+        # The button itself is greyed-out post-recording (the SessionView
+        # gates on RECORDING / PAUSED), but the in-memory region would
+        # otherwise stay until the user re-enters the session.
+        from .models.session import (  # noqa: PLC0415
+            STATE_COMPLETE, STATE_ERROR, STATE_NEW, STATE_PROCESSING,
+        )
+        if state in (STATE_COMPLETE, STATE_ERROR, STATE_NEW, STATE_PROCESSING):
+            if session_id in self._screen_capture_regions:
+                self._screen_capture_regions.pop(session_id, None)
+                self._stop_auto_capture(session_id)
+                self._hide_armed_region_overlay()
+                self.window.session_view.set_screencap_armed(False)
 
     def _on_segment_arrived(self, session_id: str, segment) -> None:
         sv = self.window.session_view
@@ -1470,6 +1579,578 @@ class MainApp(QObject):
             sv.set_created_at(new_created_at_iso)
         self.window.status("Session timestamp updated.", timeout_ms=4000)
 
+    # ---- screen capture ---------------------------------------------------
+
+    def _on_start_screen_capture(self, session_id: str) -> None:
+        """First-time popup -> RegionPicker -> store region + arm SessionView."""
+        if not self.config.ui.screen_capture_first_time_seen:
+            QMessageBox.information(
+                self.window,
+                "Screen capture",
+                "Screen capture works by snapshotting a fixed region you "
+                "draw on screen.\n\n"
+                "ANY content that lands in that rectangle while capture is "
+                "active will be saved -- including windows you move into "
+                "frame after starting, popups, and overlays. Position your "
+                "shared-content window before starting capture, and stop "
+                "capture before showing anything you don't want recorded.\n\n"
+                "Screenshots stay on this machine, alongside the rest of "
+                "the session files. They are never sent to the LLM during "
+                "synthesis.\n\n"
+                "This notice only appears once.",
+            )
+            self.config.ui.screen_capture_first_time_seen = True
+            self.config.save()
+
+        from .screencap.region_picker import RegionPicker  # noqa: PLC0415
+        picker = RegionPicker()
+        rect = picker.exec()
+        if rect is None or rect.width() < 8 or rect.height() < 8:
+            return  # User canceled or drew a degenerate rect.
+        self._screen_capture_regions[session_id] = (
+            rect.x(), rect.y(), rect.width(), rect.height(),
+        )
+        self._show_armed_region_overlay(rect)
+        self.window.session_view.set_screencap_armed(True)
+
+    def _on_stop_screen_capture(self, session_id: str) -> None:
+        self._screen_capture_regions.pop(session_id, None)
+        self._stop_auto_capture(session_id)
+        self._hide_armed_region_overlay()
+        self.window.session_view.set_screencap_armed(False)
+
+    def _show_armed_region_overlay(self, rect) -> None:
+        """Build the persistent outline overlay and show it on top."""
+        self._hide_armed_region_overlay()
+        from .screencap.armed_overlay import ArmedRegionOverlay  # noqa: PLC0415
+        overlay = ArmedRegionOverlay(rect)
+        overlay.show()
+        self._armed_region_overlay = overlay
+
+    def _hide_armed_region_overlay(self) -> None:
+        if self._armed_region_overlay is not None:
+            self._armed_region_overlay.close()
+            self._armed_region_overlay = None
+
+    # ---- auto-capture lifecycle ------------------------------------------
+
+    def _start_auto_capture(self, session_id: str) -> None:
+        """Begin periodic screenshots for an armed session.
+
+        Cadence comes from config.ui.screen_capture_auto_interval_sec.
+        Each tick goes through the dedup gate -- captures whose
+        dHash is within the threshold of the most-recent KEPT image
+        are deleted; only differing captures stick around. Manual
+        Capture / Insert clicks bypass the dedup check and reset
+        the baseline.
+        """
+        if session_id in self._auto_capture_timers:
+            return  # already running
+        if self._screen_capture_regions.get(session_id) is None:
+            log.warning(
+                "auto-capture start requested but no region armed for %s",
+                session_id,
+            )
+            return
+        interval_ms = max(
+            1000,
+            int(self.config.ui.screen_capture_auto_interval_sec * 1000),
+        )
+        timer = QTimer(self)
+        timer.setInterval(interval_ms)
+        timer.timeout.connect(
+            lambda sid=session_id: self._auto_capture_tick(sid),
+        )
+        self._auto_capture_timers[session_id] = timer
+        timer.start()
+        log.info(
+            "auto-capture started for %s (interval=%d ms, threshold=%d bits)",
+            session_id, interval_ms,
+            self.config.ui.screen_capture_auto_dedup_threshold,
+        )
+
+    def _stop_auto_capture(self, session_id: str) -> None:
+        timer = self._auto_capture_timers.pop(session_id, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            log.info("auto-capture stopped for %s", session_id)
+        # Drop the baseline too so the next session starts clean.
+        self._auto_capture_baseline_hash.pop(session_id, None)
+
+    def _on_auto_capture_toggled(self, session_id: str, enabled: bool) -> None:
+        """SessionView pushes the per-session checkbox state here."""
+        if enabled:
+            self._start_auto_capture(session_id)
+        else:
+            self._stop_auto_capture(session_id)
+
+    def _auto_capture_tick(self, session_id: str) -> None:
+        """Periodic auto-capture body. Same as _capture_screenshot but
+        passes the result through the dedup gate."""
+        region = self._screen_capture_regions.get(session_id)
+        if region is None:
+            # Region was disarmed while the timer was pending; stop.
+            self._stop_auto_capture(session_id)
+            return
+        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
+        from .screencap.dedup import dhash_path, is_dedup_match  # noqa: PLC0415
+        from .utils.paths import session_screenshots_dir  # noqa: PLC0415
+        dst_dir = session_screenshots_dir(session_id)
+        saved = capture_region_to_file(region, dst_dir)
+        if saved is None:
+            log.warning("auto-capture: capture_region_to_file returned None")
+            return
+        new_hash = dhash_path(saved)
+        baseline = self._auto_capture_baseline_hash.get(session_id)
+        threshold = int(self.config.ui.screen_capture_auto_dedup_threshold)
+        if new_hash is not None and is_dedup_match(new_hash, baseline, threshold):
+            # Too similar; delete and skip the UI refresh.
+            try:
+                saved.unlink()
+            except OSError:
+                log.exception("auto-capture: failed to unlink dedup %s", saved)
+            return
+        if new_hash is not None:
+            self._auto_capture_baseline_hash[session_id] = new_hash
+        self.window.session_view.refresh_screenshots()
+        self._push_screenshot_offsets(session_id)
+        log.info("auto-capture: kept %s", saved.name)
+
+    def _on_screencap_capture(self, session_id: str) -> None:
+        self._capture_screenshot(session_id, insert=False)
+
+    def _on_screencap_insert(self, session_id: str) -> None:
+        self._capture_screenshot(session_id, insert=True)
+
+    def _capture_screenshot(self, session_id: str, *, insert: bool) -> None:
+        """Shared body for the manual Capture and Insert buttons.
+
+        Manual captures (this path) ALWAYS keep the saved image and
+        update the dedup baseline -- the user explicitly asked for
+        this image so an auto-dedup check would be wrong here. The
+        auto-capture path uses _auto_capture_tick, which goes
+        through the dedup check.
+        """
+        region = self._screen_capture_regions.get(session_id)
+        if region is None:
+            self.window.status(
+                "Screen capture is not armed. Click Start Screen Capture first.",
+                timeout_ms=5000,
+            )
+            return
+        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
+        from .screencap.dedup import dhash_path  # noqa: PLC0415
+        from .utils.paths import session_screenshots_dir  # noqa: PLC0415
+        dst_dir = session_screenshots_dir(session_id)
+        saved = capture_region_to_file(region, dst_dir)
+        if saved is None:
+            self.window.status(
+                "Screen capture failed (see log).", timeout_ms=5000,
+            )
+            return
+        # Update the dedup baseline so the next auto-capture compares
+        # against THIS manual image, not whatever came before.
+        new_hash = dhash_path(saved)
+        if new_hash is not None:
+            self._auto_capture_baseline_hash[session_id] = new_hash
+        self.window.session_view.refresh_screenshots()
+        # Re-push offsets so the new capture anchors into the rail
+        # and shows up as a candidate for the playback-mode auto-
+        # advance.
+        self._push_screenshot_offsets(session_id)
+        if insert:
+            # Relative path anchored at the session dir so the My Notes
+            # preview's setSearchPaths resolves it.
+            relative = f"screenshots/{saved.name}"
+            self.window.session_view.insert_screenshot_markdown(relative)
+        self.window.status(
+            f"Screenshot saved: {saved.name}", timeout_ms=4000,
+        )
+
+    def _on_delete_screenshot(self, session_id: str, path) -> None:
+        try:
+            path.unlink()
+        except OSError:
+            log.exception("could not delete screenshot %s", path)
+            return
+        # Only the active session's SlidesWidget needs refreshing; if
+        # the user has navigated away, the next set_session will pick
+        # up the new state from disk.
+        self.window.session_view.refresh_screenshots()
+        # Re-push offsets so the rail and Slides-tab auto-advance
+        # drop the deleted screenshot from their anchor list.
+        self._push_screenshot_offsets(session_id)
+        self.window.status(
+            f"Deleted screenshot: {path.name}", timeout_ms=4000,
+        )
+
+    # ---- transcript playback ----------------------------------------------
+
+    def _ensure_audio_player(self):
+        """Lazy-build the AudioPlayer + wire its signals into the view."""
+        if self._audio_player is not None:
+            return self._audio_player
+        from .audio.player import AudioPlayer  # noqa: PLC0415
+        player = AudioPlayer(self)
+        player.loaded.connect(self._on_player_loaded)
+        player.load_failed.connect(self._on_player_load_failed)
+        player.position_changed.connect(self._on_player_position_changed)
+        player.playback_finished.connect(self._on_player_finished)
+        self._audio_player = player
+        return player
+
+    def _push_screenshot_offsets(self, session_id: str) -> None:
+        """Compute (path, offset_ms) for every screenshot + push to view.
+
+        Called on session select AND after capture / delete so both
+        the side rail and the Slides tab's auto-advance stay in sync
+        with whatever's on disk.
+        """
+        from .screencap.timestamps import screenshot_offsets  # noqa: PLC0415
+        from .utils.paths import list_screenshots  # noqa: PLC0415
+        session = self.store.get_session(session_id)
+        if session is None:
+            self.window.session_view.set_screenshot_offsets([])
+            return
+        paths = list_screenshots(session_id)
+        offsets = screenshot_offsets(paths, session.started_at)
+        self.window.session_view.set_screenshot_offsets(offsets)
+
+    def _maybe_load_player_for_session(self, session_id: str) -> None:
+        """Load the session's retained audio into the player, if any.
+
+        Only loads when the session is in a terminal state
+        (COMPLETE / ERROR). Mid-recording (RECORDING / PAUSED) the
+        WAVs are growing under us, and during PROCESSING the encoder
+        rewrites them to opus -- in both cases any snapshot we take
+        is stale by the time the user clicks Play. (Aaron's bug:
+        loading during RECORDING produced a 92 ms buffer that stayed
+        cached through to COMPLETE; restarting the app fixed it by
+        forcing a fresh load against the final opus files.)
+        """
+        from .utils.paths import session_audio_files  # noqa: PLC0415
+        # If we're loaded for this session, never reload mid-state-
+        # change unless the state forces an invalidation upstream
+        # (handled in _on_session_state_changed).
+        if self._player_loaded_session_id == session_id:
+            return
+        session = self.store.get_session(session_id)
+        if session is not None and session.state not in (STATE_COMPLETE, STATE_ERROR):
+            # The recording is still in flight (or being encoded).
+            # Keep the player torn down so the bar stays disabled;
+            # the next state transition will trigger a fresh load.
+            if self._audio_player is not None:
+                self._audio_player.close()
+            self._player_loaded_session_id = None
+            self.window.session_view.set_player_enabled(False)
+            return
+        files = session_audio_files(session_id)
+        if not files:
+            if self._audio_player is not None and self._player_loaded_session_id:
+                self._audio_player.close()
+                self._player_loaded_session_id = None
+            self.window.session_view.set_player_enabled(False)
+            return
+        # Separate the mic and sys halves out of the list. The path
+        # helper sorts mic-first-then-sys so we can index, but go
+        # safer and discriminate by stem.
+        mic_path = next((p for p in files if p.stem == "mic"), None)
+        sys_path = next((p for p in files if p.stem == "sys"), None)
+        player = self._ensure_audio_player()
+        try:
+            player.load(mic_path, sys_path)
+        except Exception:
+            log.exception("AudioPlayer.load raised")
+            self.window.session_view.set_player_enabled(False)
+            self._player_loaded_session_id = None
+            return
+        self._player_loaded_session_id = session_id
+
+    def _on_player_loaded(self, total_ms: int) -> None:
+        sv = self.window.session_view
+        sv.set_player_total_ms(total_ms)
+        sv.set_player_position_ms(0)
+        sv.set_player_is_playing(False)
+        sv.set_player_enabled(True)
+
+    def _on_player_load_failed(self, message: str) -> None:
+        self.window.status(message, timeout_ms=5000)
+        self.window.session_view.set_player_enabled(False)
+        self._player_loaded_session_id = None
+
+    def _on_player_position_changed(self, ms: int) -> None:
+        self.window.session_view.set_player_position_ms(int(ms))
+
+    def _on_player_finished(self) -> None:
+        # Natural end-of-playback: revert to the side-rail layout
+        # (per Aaron's "at end of playback, revert to normal view"
+        # spec) and reset the playhead. set_player_position_ms(0)
+        # would re-enter the playback layout in v0.6.5; call the
+        # idle-revert AFTER so the layout stays on idle.
+        sv = self.window.session_view
+        sv.set_player_is_playing(False)
+        sv.set_player_position_ms(0)
+        sv.revert_to_idle_layout()
+
+    def _on_transcript_play(self, _session_id: str) -> None:
+        if self._audio_player is None:
+            return
+        self._audio_player.play()
+        self.window.session_view.set_player_is_playing(True)
+
+    def _on_transcript_pause(self, _session_id: str) -> None:
+        if self._audio_player is None:
+            return
+        self._audio_player.pause()
+        self.window.session_view.set_player_is_playing(False)
+
+    def _on_transcript_seek(self, _session_id: str, ms: int) -> None:
+        if self._audio_player is None:
+            return
+        self._audio_player.seek_ms(int(ms))
+
+    # ---- recording context-menu actions -----------------------------------
+
+    def _on_open_recording(self, session_id: str) -> None:
+        """Launch the OS default media player on the session's recording.
+
+        Tries the mic file first (always present when audio is retained),
+        falls back to whichever exists in session_audio_files(). The
+        user can replay either side from the player's open-file dialog;
+        we just need to give them an entry point.
+        """
+        from PyQt6.QtCore import QUrl  # noqa: PLC0415
+        from PyQt6.QtGui import QDesktopServices  # noqa: PLC0415
+        from .utils.paths import session_audio_files  # noqa: PLC0415
+        files = session_audio_files(session_id)
+        if not files:
+            self.window.status("No recording on disk for this session.", timeout_ms=5000)
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(files[0]))):
+            self.window.status(
+                f"Could not open {files[0].name} (no default player?)",
+                timeout_ms=5000,
+            )
+
+    def _on_export_recording(self, session_id: str) -> None:
+        """Prompt for a destination + format, mix mic+sys, write the file.
+
+        QFileDialog's filter list drives which container the exporter
+        uses. MP3 is the default filter -- it plays natively in every
+        Windows player without codec packs and is the "share this with
+        a colleague" lingua franca. The encode runs on a worker thread
+        with an indeterminate progress dialog so the UI stays
+        responsive on a long meeting (decoding a 1-hour stereo source
+        takes a few seconds on a fast machine).
+        """
+        from PyQt6.QtWidgets import (  # noqa: PLC0415
+            QFileDialog, QMessageBox, QProgressDialog,
+        )
+        from .audio.export import known_extensions  # noqa: PLC0415
+        from .utils.export import default_export_filename  # noqa: PLC0415
+        from .utils.paths import session_audio_files  # noqa: PLC0415
+
+        files = session_audio_files(session_id)
+        if not files:
+            self.window.status(
+                "No recording on disk for this session.", timeout_ms=5000,
+            )
+            return
+        session = self.store.get_session(session_id)
+        title = session.title if session is not None else "session"
+
+        # Build the QFileDialog filter string. MP3 sits first so it's
+        # the default selection -- the common case is "send a colleague
+        # a playable file" and MP3 is the safest pick for that.
+        ext_labels = {
+            ".mp3":  "MP3 -- universal compatibility (*.mp3)",
+            ".flac": "FLAC -- lossless (*.flac)",
+            ".m4a":  "AAC -- broad compatibility (*.m4a)",
+            ".opus": "Opus -- smallest (*.opus)",
+            ".wav":  "WAV -- raw PCM (*.wav)",
+        }
+        filters = ";;".join(ext_labels[e] for e in known_extensions())
+
+        # Suggested filename uses MP3 to match the default filter so
+        # the .mp3 extension is pre-typed; the user can switch the
+        # filter dropdown to change format.
+        suggested = default_export_filename(title, "Audio", ".mp3")
+        suggested_path = str(files[0].parent / suggested)
+        path_str, chosen_filter = QFileDialog.getSaveFileName(
+            self.window,
+            "Export recording",
+            suggested_path,
+            filters,
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        ext_for_filter = next(
+            (ext for ext, label in ext_labels.items() if label == chosen_filter),
+            None,
+        )
+        if ext_for_filter and target.suffix.lower() != ext_for_filter:
+            target = target.with_suffix(ext_for_filter)
+
+        mic_path = next((p for p in files if p.stem == "mic"), None)
+        sys_path = next((p for p in files if p.stem == "sys"), None)
+
+        # Worker thread + indeterminate progress dialog. Indeterminate
+        # (range 0,0) gives a marquee animation since we can't easily
+        # report PyAV encoder progress per-frame across the thread
+        # boundary. The dialog is modal so the user can't interact
+        # with the rest of the app mid-encode (avoiding the
+        # session-deselect-during-encode race).
+        progress = QProgressDialog(
+            f"Exporting {target.name}...",
+            None,  # no Cancel button; PyAV encode isn't cleanly interruptible
+            0, 0, self.window,
+        )
+        progress.setWindowTitle("Export recording")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        progress.setCancelButton(None)
+
+        worker = _AudioExportWorker(mic_path, sys_path, target)
+
+        def on_done(err_msg: str) -> None:
+            progress.cancel()
+            if err_msg:
+                log.error("export_mixed failed: %s", err_msg)
+                QMessageBox.warning(
+                    self.window, "Export recording",
+                    f"Could not export audio: {err_msg}",
+                )
+            else:
+                self.window.status(
+                    f"Exported recording to {target.name}", timeout_ms=5000,
+                )
+            worker.deleteLater()
+
+        worker.finished_with_result.connect(on_done)
+        progress.show()
+        worker.start()
+
+    def _on_export_video(self, session_id: str) -> None:
+        """Render the session as a slideshow MP4 with mixed audio + SRT.
+
+        Builds the screenshot offset list from disk, reads the transcript
+        text, then runs the encode on a worker thread with a determinate
+        progress dialog. PyAV reports per-frame progress out of the
+        encoder so the user sees real movement, not just a marquee.
+        Output is a single MP4 plus a same-named .srt sidecar; the SRT
+        is what makes subtitles toggleable in every standard player
+        without baking them into the video stream.
+        """
+        from PyQt6.QtWidgets import (  # noqa: PLC0415
+            QFileDialog, QMessageBox, QProgressDialog,
+        )
+        from .models.transcript import TranscriptStore  # noqa: PLC0415
+        from .screencap.timestamps import screenshot_offsets  # noqa: PLC0415
+        from .utils.export import default_export_filename  # noqa: PLC0415
+        from .utils.paths import (  # noqa: PLC0415
+            list_screenshots, session_audio_files,
+        )
+
+        files = session_audio_files(session_id)
+        if not files:
+            self.window.status(
+                "No recording on disk for this session.", timeout_ms=5000,
+            )
+            return
+        session = self.store.get_session(session_id)
+        if session is None:
+            self.window.status(
+                "Session metadata missing; cannot export.", timeout_ms=5000,
+            )
+            return
+        title = session.title
+
+        suggested = default_export_filename(title, "Video", ".mp4")
+        suggested_path = str(files[0].parent / suggested)
+        path_str, _ = QFileDialog.getSaveFileName(
+            self.window,
+            "Export session as video",
+            suggested_path,
+            "MP4 video -- H.264 + AAC (*.mp4)",
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        if target.suffix.lower() != ".mp4":
+            target = target.with_suffix(".mp4")
+
+        mic_path = next((p for p in files if p.stem == "mic"), None)
+        sys_path = next((p for p in files if p.stem == "sys"), None)
+        offsets = screenshot_offsets(
+            list_screenshots(session_id), session.started_at,
+        )
+        try:
+            transcript_text = TranscriptStore(session_id).read_transcript()
+        except OSError:
+            log.exception("could not read transcript for %s", session_id)
+            transcript_text = ""
+
+        progress = QProgressDialog(
+            f"Rendering {target.name}...",
+            None,
+            0, 100, self.window,
+        )
+        progress.setWindowTitle("Export session as video")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        progress.setCancelButton(None)
+        progress.setValue(0)
+
+        worker = _VideoExportWorker(
+            mic_path, sys_path, offsets, transcript_text, target,
+        )
+
+        def on_progress(pct: int) -> None:
+            progress.setValue(pct)
+
+        def on_done(err_msg: str) -> None:
+            progress.cancel()
+            if err_msg:
+                log.error("export_video failed: %s", err_msg)
+                QMessageBox.warning(
+                    self.window, "Export session as video",
+                    f"Could not render video: {err_msg}",
+                )
+            else:
+                self.window.status(
+                    f"Exported video to {target.name}", timeout_ms=5000,
+                )
+            worker.deleteLater()
+
+        worker.progress_changed.connect(on_progress)
+        worker.finished_with_result.connect(on_done)
+        progress.show()
+        worker.start()
+
+    def _on_delete_recording(self, session_id: str) -> None:
+        """Delete the session's audio files; keep transcript + notes."""
+        from .utils.paths import session_audio_files  # noqa: PLC0415
+        removed = 0
+        for path in session_audio_files(session_id):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                log.exception("could not unlink recording %s", path)
+        # Flip the on-disk has_audio flag so the session-list audio
+        # column matches reality, and so a future Open in player call
+        # has nothing to look at.
+        self.store.update_session(session_id, has_audio=False)
+        self._refresh_session_list()
+        self.window.status(
+            f"Deleted recording ({removed} file{'s' if removed != 1 else ''}).",
+            timeout_ms=5000,
+        )
+
     # ---- bulk delete -------------------------------------------------------
 
     def _on_delete_sessions(self, session_ids: list[str]) -> None:
@@ -1484,6 +2165,9 @@ class MainApp(QObject):
         removed = self.store.delete_sessions(session_ids)
         self._refresh_session_list()
         self.window.session_view.set_session(None, transcript="", notes="", previous_notes_paths=[])
+        if self._audio_player is not None:
+            self._audio_player.close()
+            self._player_loaded_session_id = None
         self.window.status(f"Deleted {removed} session(s)", timeout_ms=5000)
 
     # ---- settings ---------------------------------------------------------
@@ -1518,6 +2202,25 @@ class MainApp(QObject):
         self._dep_check.raise_()
         self._dep_check.activateWindow()
 
+    def _on_about(self) -> None:
+        from .ui.about_dialog import AboutDialog  # noqa: PLC0415
+        AboutDialog(parent=self.window).exec()
+
+    def _on_user_guide(self) -> None:
+        """Open the GitHub README at the User Guide anchor.
+
+        Keeping the how-to in the README (where mermaid renders) and
+        deep-linking from the app avoids maintaining two copies. The
+        repo's main branch is the source of truth; if the user is on
+        an older build the link still points to the latest docs --
+        appropriate for a how-to-use guide.
+        """
+        from PyQt6.QtCore import QUrl  # noqa: PLC0415
+        from PyQt6.QtGui import QDesktopServices  # noqa: PLC0415
+        QDesktopServices.openUrl(QUrl(
+            "https://github.com/aarondodd/meeting-notetaker#user-guide"
+        ))
+
     def _on_settings(self) -> None:
         dialog = SettingsDialog(
             self.config,
@@ -1541,165 +2244,162 @@ class MainApp(QObject):
         self._apply_audio_monitor_config()
         self._apply_synthesis_automation()
         self._refresh_status_indicators()
+        # Push the new auto-capture interval to the sidebar so the
+        # "every Ns" hint reflects what Settings just saved.
+        self.window.session_view.set_screencap_auto_interval(
+            int(self.config.ui.screen_capture_auto_interval_sec)
+        )
         self.window.status("Settings saved.", timeout_ms=4000)
 
     # ---- status bar indicators -------------------------------------------
 
     def _refresh_status_indicators(self) -> None:
-        """Repopulate the right-side status bar widgets from current state.
+        """Repopulate the right-side status bar pills from current state.
 
         Pulled out so settings-saved, calendar-config-applied, and startup
-        all share one source of truth.
+        all share one source of truth. Each segment computes its own
+        SegmentState (or None to hide); MainWindow paints the dots.
         """
-        mic = self.config.audio.mic_device_name or "(System default)"
-        loopback = self.config.audio.loopback_device_name or "(System default)"
+        indicators: dict[str, SegmentState] = {}
+        cal = self._calendar_segment()
+        if cal is not None:
+            indicators["cal"] = cal
+        voice = self._voice_segment()
+        if voice is not None:
+            indicators["voice"] = voice
+        det = self._detection_segment()
+        if det is not None:
+            indicators["det"] = det
+        syn = self._synthesis_segment()
+        if syn is not None:
+            indicators["syn"] = syn
+        self.window.set_status_indicators(
+            version=__version__,
+            indicators=indicators,
+        )
 
-        # Calendar indicator: combines the user's intent (Watch on/off) with
-        # actual Outlook reachability so the user sees whether the feature
-        # is silently disabled.
+    def _calendar_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the calendar pill, or None when hidden.
+
+        Hidden when the user has the feature off (no point telling them
+        about something they aren't using). Otherwise green=watching,
+        yellow=idle, red=Outlook unavailable.
+        """
         if not self.config.calendar.watch_calendar:
-            cal_label = "Calendar: off"
-            cal_tooltip = (
-                "Outlook calendar watching is disabled. Enable it in Settings "
-                "to be notified when a meeting is about to start."
+            return None
+        if outlook_calendar.is_available():
+            running = (
+                self._calendar_monitor is not None
+                and self._calendar_monitor.is_running()
             )
-        elif outlook_calendar.is_available():
-            running = self._calendar_monitor is not None and self._calendar_monitor.is_running()
             if running:
-                cal_label = "Calendar: watching"
-                cal_tooltip = (
-                    f"Watching Outlook calendar; notifying within "
-                    f"+- {self.config.calendar.window_minutes} min of each "
-                    "meeting start."
+                return SegmentState(
+                    color="green",
+                    short_label="Cal",
+                    tooltip=(
+                        f"Watching Outlook calendar; notifying within "
+                        f"+- {self.config.calendar.window_minutes} min of "
+                        "each meeting start."
+                    ),
                 )
-            else:
-                cal_label = "Calendar: idle"
-                cal_tooltip = (
+            return SegmentState(
+                color="yellow",
+                short_label="Cal",
+                tooltip=(
                     "Calendar watching is enabled but the monitor is not "
                     "running. Try toggling it off and on in Settings."
-                )
-        else:
-            cal_label = "Calendar: Outlook unavailable"
-            cal_tooltip = (
+                ),
+            )
+        return SegmentState(
+            color="red",
+            short_label="Cal",
+            tooltip=(
                 "Calendar watching is enabled, but Outlook (or pywin32) is "
                 "not reachable. Help > Diagnose Outlook... reports which "
                 "step in the chain is failing."
-            )
-
-        speakers_label, speakers_tooltip = self._speakers_indicator()
-        voice_label, voice_tooltip = self._voice_indicator()
-        detect_label, detect_tooltip = self._detection_indicator()
-        synthesis_label, synthesis_tooltip = self._synthesis_indicator()
-        self.window.set_status_indicators(
-            version=__version__,
-            mic_label=f"Mic: {_short_device_label(mic)}",
-            mic_tooltip=f"Microphone device: {mic}",
-            loopback_label=f"System audio: {_short_device_label(loopback)}",
-            loopback_tooltip=f"System audio capture (loopback): {loopback}",
-            calendar_label=cal_label,
-            calendar_tooltip=cal_tooltip,
-            speakers_label=speakers_label,
-            speakers_tooltip=speakers_tooltip,
-            voice_label=voice_label,
-            voice_tooltip=voice_tooltip,
-            detect_label=detect_label,
-            detect_tooltip=detect_tooltip,
-            synthesis_label=synthesis_label,
-            synthesis_tooltip=synthesis_tooltip,
+            ),
         )
 
-    def _synthesis_indicator(self) -> tuple[str, str]:
-        """Status-bar label + tooltip for synthesis automation.
+    def _synthesis_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the synthesis-automation pill, or None.
 
-        Empty when automation is disabled in Settings -- the indicator
-        would be noise for users who don't use the feature. Otherwise
-        shows one of three values based on Chrome process + bridge
-        connection state."""
-        if not self.config.synthesis.automation_enabled:
-            return "", ""
-        return self._synth_state.status_label(), self._synth_state.status_tooltip()
-
-    def _speakers_indicator(self) -> tuple[str, str]:
-        """Return (label, tooltip) for the status-bar speakers segment.
-
-        Hidden (empty label) when speaker ID is disabled or no speakers
-        are stored yet -- "Speakers: 0" would just be noise on a fresh
-        install. The tooltip lists up to 8 stored names so the user can
-        sanity-check the library without opening Settings.
+        Hidden when automation is disabled in Settings. Otherwise the
+        dot color tracks the bridge state: green when the extension is
+        connected, yellow when Chrome is cold (Send will launch it),
+        red when Chrome is up but the extension isn't talking back.
         """
-        if not self.config.speakers.enabled:
-            return "", ""
-        try:
-            store = open_speaker_store()
-            try:
-                records = store.list_all()
-            finally:
-                store.close()
-        except Exception:
-            log.exception("speakers indicator: store unreadable")
-            return "", ""
-        if not records:
-            return "", ""
-        names = [r.name for r in records]
-        preview = ", ".join(names[:8])
-        if len(names) > 8:
-            preview += f" (+{len(names) - 8} more)"
-        tooltip = f"Known speakers ({len(names)}): {preview}"
-        return f"Speakers: {len(names)}", tooltip
+        if not self.config.synthesis.automation_enabled:
+            return None
+        state = self._synth_state
+        return SegmentState(
+            color=state.dot_color(),
+            short_label="Syn",
+            tooltip=state.status_tooltip(),
+        )
 
-    def _detection_indicator(self) -> tuple[str, str]:
-        """Return (label, tooltip) for the ad-hoc-meeting-detect indicator.
+    def _detection_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the ad-hoc-meeting-detect pill, or None.
 
-        Hidden (empty label) when detection is off; surfaces the running /
-        unavailable / idle state to mirror the Calendar indicator pattern.
+        Hidden when detection is off; mirrors the Calendar pill's color
+        encoding for the enabled states.
         """
         if not self.config.detection.enabled:
-            return "", ""
+            return None
         if not audio_session_monitor.is_available():
-            return (
-                "Detect: pycaw unavailable",
-                "Ad-hoc meeting detection is enabled, but pycaw / psutil "
-                "are not importable. Install them in this environment to "
-                "use this feature (Windows wheels)."
+            return SegmentState(
+                color="red",
+                short_label="Det",
+                tooltip=(
+                    "Ad-hoc meeting detection is enabled, but pycaw / "
+                    "psutil are not importable. Install them in this "
+                    "environment to use this feature (Windows wheels)."
+                ),
             )
         running = self._audio_monitor is not None and self._audio_monitor.is_running()
         if running:
             allowlist_size = len(self.config.detection.app_allowlist)
-            return (
-                "Detect: watching",
-                f"Watching system audio for {allowlist_size} known meeting "
-                f"app(s); prompting after audio sustains "
-                f"{self.config.detection.min_duration_sec}s.",
+            return SegmentState(
+                color="green",
+                short_label="Det",
+                tooltip=(
+                    f"Watching system audio for {allowlist_size} known "
+                    f"meeting app(s); prompting after audio sustains "
+                    f"{self.config.detection.min_duration_sec}s."
+                ),
             )
-        return (
-            "Detect: idle",
-            "Ad-hoc meeting detection is enabled but the monitor is not "
-            "running. Try toggling it off and on in Settings.",
+        return SegmentState(
+            color="yellow",
+            short_label="Det",
+            tooltip=(
+                "Ad-hoc meeting detection is enabled but the monitor is "
+                "not running. Try toggling it off and on in Settings."
+            ),
         )
 
-    def _voice_indicator(self) -> tuple[str, str]:
-        """Return (label, tooltip) for the user-voice enrollment indicator.
+    def _voice_segment(self) -> Optional[SegmentState]:
+        """SegmentState for the voiceprint-enrollment pill, or None.
 
         Only surfaces when speaker ID is enabled but no usable voiceprint
-        is on disk -- the goal is to remind the user there's a setup
-        step they haven't completed. A voiceprint recorded under a
-        previous encoder (e.g. Resemblyzer before the v0.5 ECAPA swap)
-        is treated as not enrolled because its dim is incompatible with
-        the current encoder's output; the user must re-record.
+        is on disk. Voiceprints recorded under an older encoder (e.g.
+        Resemblyzer before the v0.5 ECAPA swap) count as not enrolled
+        because their dim is incompatible with the current encoder.
         """
         if not self.config.speakers.enabled:
-            return "", ""
+            return None
         try:
             if user_voiceprint.load() is not None:
-                return "", ""
+                return None
         except Exception:
             log.exception("voice indicator: voiceprint check failed")
-            return "", ""
-        return (
-            "Voice: not enrolled",
-            "No voice sample has been recorded. Settings > Speaker "
-            "Identification > Record voice sample lets the refiner "
-            "tell your microphone from system-audio bleed.",
+            return None
+        return SegmentState(
+            color="yellow",
+            short_label="Voiceprint",
+            tooltip=(
+                "No voice sample has been recorded. Settings > Speaker "
+                "Identification > Record voice sample lets the refiner "
+                "tell your microphone from system-audio bleed."
+            ),
         )
 
     # ---- calendar integration ---------------------------------------------
@@ -2139,14 +2839,65 @@ class MainApp(QObject):
         self.window.activateWindow()
 
 
-_STATUS_DEVICE_TRUNCATE_AT = 36
+class _AudioExportWorker(QThread):
+    """Run audio/export.export_mixed off the GUI thread.
+
+    Emits ``finished_with_result(error_message)`` exactly once: an
+    empty string means success, anything else is the failure reason
+    for the MessageBox.
+    """
+
+    finished_with_result = pyqtSignal(str)
+
+    def __init__(self, mic_path, sys_path, target) -> None:
+        super().__init__()
+        self._mic = mic_path
+        self._sys = sys_path
+        self._target = target
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from .audio.export import export_mixed  # noqa: PLC0415
+            export_mixed(self._mic, self._sys, self._target)
+            self.finished_with_result.emit("")
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
+            self.finished_with_result.emit(str(exc))
 
 
-def _short_device_label(name: str) -> str:
-    """Trim long device names so the status bar doesn't overflow."""
-    if len(name) <= _STATUS_DEVICE_TRUNCATE_AT:
-        return name
-    return name[: _STATUS_DEVICE_TRUNCATE_AT - 1].rstrip() + "..."
+class _VideoExportWorker(QThread):
+    """Run audio/video_export.export_video off the GUI thread.
+
+    Emits ``progress_changed(pct)`` while encoding (0-100) and
+    ``finished_with_result(error_message)`` once at the end. The
+    progress callback fires from the encoder loop, which runs in this
+    thread; Qt marshals the signal back to the GUI thread for the
+    QProgressDialog update.
+    """
+
+    progress_changed = pyqtSignal(int)
+    finished_with_result = pyqtSignal(str)
+
+    def __init__(
+        self, mic_path, sys_path, screenshots, transcript_text, target,
+    ) -> None:
+        super().__init__()
+        self._mic = mic_path
+        self._sys = sys_path
+        self._screenshots = screenshots
+        self._transcript_text = transcript_text
+        self._target = target
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from .audio.video_export import export_video  # noqa: PLC0415
+            export_video(
+                self._mic, self._sys, self._screenshots,
+                self._transcript_text, self._target,
+                progress=self.progress_changed.emit,
+            )
+            self.finished_with_result.emit("")
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
+            self.finished_with_result.emit(str(exc))
 
 
 def _set_windows_app_user_model_id() -> None:

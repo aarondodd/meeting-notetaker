@@ -39,7 +39,15 @@ from ..models.session import (
     Session,
 )
 from ..utils.icons import app_icon
+from ..utils.paths import has_retained_audio
 from .session_view import SessionView
+from .status_indicators import SegmentState, StatusSegment
+
+
+# Status-bar segment keys, in left-to-right display order. v0.6.5
+# drops the informational Mic / Sys pills (no actionable state to
+# show); device names live in Settings now.
+_STATUS_SEGMENT_KEYS = ("cal", "voice", "det", "syn")
 
 
 # Per-state cell content + tooltip for the transcription-state column.
@@ -55,9 +63,10 @@ _STATE_BADGE: dict[str, tuple[str, str]] = {
 }
 
 _COL_AUDIO = 0
-_COL_STATE = 1
-_COL_DATE = 2
-_COL_TITLE = 3
+_COL_SLIDES = 1
+_COL_STATE = 2
+_COL_DATE = 3
+_COL_TITLE = 4
 
 
 class MainWindow(QMainWindow):
@@ -67,12 +76,18 @@ class MainWindow(QMainWindow):
     open_outlook_diagnostic_requested = pyqtSignal()
     open_log_viewer_requested = pyqtSignal()
     open_dependency_check_requested = pyqtSignal()
+    open_about_requested = pyqtSignal()
+    open_user_guide_requested = pyqtSignal()
     check_for_updates_requested = pyqtSignal()
     upgrade_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     delete_sessions_requested = pyqtSignal(list)   # list of session_ids
     rename_session_requested = pyqtSignal(str, str)  # session_id, new_title
     edit_session_timestamp_requested = pyqtSignal(str, str)  # session_id, new_created_at_iso (UTC)
+    open_recording_requested = pyqtSignal(str)     # session_id
+    export_recording_requested = pyqtSignal(str)   # session_id
+    export_video_requested = pyqtSignal(str)       # session_id
+    delete_recording_requested = pyqtSignal(str)   # session_id
     session_selected = pyqtSignal(str)             # session_id
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -113,12 +128,20 @@ class MainWindow(QMainWindow):
         action_depcheck.triggered.connect(self.open_dependency_check_requested.emit)
         debug_menu.addAction(action_depcheck)
         help_menu.addSeparator()
+        action_user_guide = QAction("&User Guide...", self)
+        action_user_guide.triggered.connect(self.open_user_guide_requested.emit)
+        help_menu.addAction(action_user_guide)
+        help_menu.addSeparator()
         action_check_updates = QAction("Check for &Updates...", self)
         action_check_updates.triggered.connect(self.check_for_updates_requested.emit)
         help_menu.addAction(action_check_updates)
         action_upgrade = QAction("&Upgrade...", self)
         action_upgrade.triggered.connect(self.upgrade_requested.emit)
         help_menu.addAction(action_upgrade)
+        help_menu.addSeparator()
+        action_about = QAction("&About Meeting Notetaker...", self)
+        action_about.triggered.connect(self.open_about_requested.emit)
+        help_menu.addAction(action_about)
 
         # Body: splitter
         central = QWidget(self)
@@ -140,7 +163,7 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self._new_btn)
         left_layout.addLayout(header_row)
         self._list = QTreeWidget(left)
-        self._list.setColumnCount(4)
+        self._list.setColumnCount(5)
         self._list.setHeaderHidden(True)
         self._list.setRootIsDecorated(False)
         self._list.setUniformRowHeights(True)
@@ -152,13 +175,16 @@ class MainWindow(QMainWindow):
         rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self._list)
         rename_shortcut.activated.connect(self._rename_selected)
         header = self._list.header()
-        # Audio + state are narrow glyph columns; date is fixed-width
-        # to fit "YYYY-MM-DD HH:MM"; title takes the remaining space.
+        # Audio + slides + state are narrow glyph columns; date is
+        # fixed-width to fit "YYYY-MM-DD HH:MM"; title takes the
+        # remaining space.
         header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_SLIDES, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
         self._list.setColumnWidth(_COL_AUDIO, 28)
+        self._list.setColumnWidth(_COL_SLIDES, 28)
         self._list.setColumnWidth(_COL_STATE, 28)
         self._list.setColumnWidth(_COL_DATE, 110)
         left_layout.addWidget(self._list, 1)
@@ -180,71 +206,52 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
 
-        # Single right-aligned permanent indicator that joins all sub-items
-        # with " | " explicitly. Using one QLabel rather than multiple
-        # addPermanentWidget() calls avoids Qt's Windows-native style
-        # painting a separator line *after* the last permanent widget
-        # (which read as a trailing pipe).
-        self._indicators_label = QLabel("", self)
-        self._indicators_label.setContentsMargins(8, 0, 8, 0)
-        self.statusBar().addPermanentWidget(self._indicators_label)
+        # Right-side indicators: a row of StatusSegment widgets (each is
+        # a painted colored dot + short label + optional payload) plus a
+        # plain "v0.6.4" version label on the left of the row. Painted
+        # dots dodge the Windows emoji-font sizing inconsistency that an
+        # earlier draft using unicode bullets had to work around.
+        self._status_segments_widget = QWidget(self)
+        seg_layout = QHBoxLayout(self._status_segments_widget)
+        seg_layout.setContentsMargins(8, 0, 8, 0)
+        seg_layout.setSpacing(14)
+        self._version_label = QLabel("", self._status_segments_widget)
+        seg_layout.addWidget(self._version_label)
+        self._status_segments: dict[str, StatusSegment] = {}
+        for key in _STATUS_SEGMENT_KEYS:
+            seg = StatusSegment(self._status_segments_widget)
+            seg.hide()  # Hidden until set_status_indicators makes it visible.
+            seg_layout.addWidget(seg)
+            self._status_segments[key] = seg
+        self.statusBar().addPermanentWidget(self._status_segments_widget)
 
     def set_status_indicators(
         self,
         *,
         version: str = "",
-        mic_label: str,
-        mic_tooltip: str = "",
-        loopback_label: str,
-        loopback_tooltip: str = "",
-        calendar_label: str,
-        calendar_tooltip: str = "",
-        speakers_label: str = "",
-        speakers_tooltip: str = "",
-        voice_label: str = "",
-        voice_tooltip: str = "",
-        detect_label: str = "",
-        detect_tooltip: str = "",
-        synthesis_label: str = "",
-        synthesis_tooltip: str = "",
+        indicators: Optional[dict[str, SegmentState]] = None,
     ) -> None:
-        """Update the bottom status bar's right-side indicator string.
+        """Update the right-side status-bar pills.
 
-        Sub-items are joined with " | "; we explicitly avoid trailing
-        the string with a separator. The full per-sub-item tooltip text
-        is joined into a single multi-line tooltip so the user can still
-        hover the indicator to see the long form (the QLabel doesn't
-        expose per-character tooltips).
-
-        `speakers_label`, `voice_label`, and `detect_label` only render
-        when non-empty -- clean installs and not-applicable states leave
-        them out.
+        `indicators` is a dict keyed by segment id (mic, sys, cal, spk,
+        voice, det, syn). Missing keys are treated as visible=False so
+        callers only have to pass entries for segments that should
+        render this update. The version label is always shown on the
+        left of the row.
         """
-        parts: list[str] = []
-        tooltip_parts: list[str] = []
         if version:
-            parts.append(f"v{version}")
-            tooltip_parts.append(f"Running version: v{version}")
-        parts.append(mic_label)
-        tooltip_parts.append(mic_tooltip or mic_label)
-        parts.append(loopback_label)
-        tooltip_parts.append(loopback_tooltip or loopback_label)
-        parts.append(calendar_label)
-        tooltip_parts.append(calendar_tooltip or calendar_label)
-        if speakers_label:
-            parts.append(speakers_label)
-            tooltip_parts.append(speakers_tooltip or speakers_label)
-        if voice_label:
-            parts.append(voice_label)
-            tooltip_parts.append(voice_tooltip or voice_label)
-        if detect_label:
-            parts.append(detect_label)
-            tooltip_parts.append(detect_tooltip or detect_label)
-        if synthesis_label:
-            parts.append(synthesis_label)
-            tooltip_parts.append(synthesis_tooltip or synthesis_label)
-        self._indicators_label.setText(" | ".join(parts))
-        self._indicators_label.setToolTip("\n".join(tooltip_parts))
+            self._version_label.setText(f"v{version}")
+            self._version_label.setToolTip(f"Running version: v{version}")
+            self._version_label.show()
+        else:
+            self._version_label.hide()
+        indicators = indicators or {}
+        for key, segment in self._status_segments.items():
+            state = indicators.get(key)
+            if state is None:
+                segment.hide()
+            else:
+                segment.apply(state)
 
     def set_sessions(self, sessions: Iterable[Session]) -> None:
         self._list.blockSignals(True)
@@ -280,19 +287,33 @@ class MainWindow(QMainWindow):
             if s.has_audio
             else "Audio status: not retained (recording deleted after refinement)"
         )
+        # Camera glyph if any screenshots are on disk for this session.
+        # has_retained_audio mirrors this pattern for audio; we use the
+        # same path helper here.
+        from ..utils.paths import list_screenshots  # noqa: PLC0415
+        has_slides = bool(list_screenshots(s.id))
+        slides_glyph = "📷" if has_slides else ""
+        slides_tooltip = (
+            "Screenshots saved on disk for this session"
+            if has_slides
+            else "No screenshots captured for this session"
+        )
         state_glyph, state_tooltip = _STATE_BADGE.get(s.state, ("", s.state))
         state_tooltip = f"Transcription state: {state_tooltip}"
 
         when, title = _session_date_and_title(s)
         item = QTreeWidgetItem([
             audio_glyph,
+            slides_glyph,
             state_glyph,
             when,
             title,
         ])
         item.setTextAlignment(_COL_AUDIO, Qt.AlignmentFlag.AlignCenter)
+        item.setTextAlignment(_COL_SLIDES, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_STATE, Qt.AlignmentFlag.AlignCenter)
         item.setToolTip(_COL_AUDIO, audio_tooltip)
+        item.setToolTip(_COL_SLIDES, slides_tooltip)
         item.setToolTip(_COL_STATE, state_tooltip)
         item.setData(_COL_TITLE, Qt.ItemDataRole.UserRole, s.id)
         # Stash the full ISO created_at so Edit Timestamp can seed the
@@ -320,14 +341,51 @@ class MainWindow(QMainWindow):
         action_rename.setEnabled(len(selected) == 1)
         action_edit_timestamp = menu.addAction("Edit timestamp...")
         action_edit_timestamp.setEnabled(len(selected) == 1)
+        # Recording actions only make sense on a single session that
+        # actually has audio retained on disk -- check the disk rather
+        # than the session's has_audio flag since the flag could lag
+        # behind a manual delete.
+        single_id = selected[0].data(_COL_TITLE, Qt.ItemDataRole.UserRole) \
+            if len(selected) == 1 else None
+        has_audio = bool(single_id) and has_retained_audio(single_id)
+        action_open_recording = menu.addAction("Open recording in media player")
+        action_open_recording.setEnabled(has_audio)
+        action_export_recording = menu.addAction("Export recording as...")
+        action_export_recording.setEnabled(has_audio)
+        action_export_video = menu.addAction("Export session as video...")
+        action_export_video.setEnabled(has_audio)
+        action_delete_recording = menu.addAction("Delete recording...")
+        action_delete_recording.setEnabled(has_audio)
+        menu.addSeparator()
         action_delete = menu.addAction("Delete...")
         action = menu.exec(self._list.viewport().mapToGlobal(pos))
         if action is action_rename:
             self._rename_selected()
         elif action is action_edit_timestamp:
             self._edit_timestamp_selected()
+        elif action is action_open_recording and single_id:
+            self.open_recording_requested.emit(single_id)
+        elif action is action_export_recording and single_id:
+            self.export_recording_requested.emit(single_id)
+        elif action is action_export_video and single_id:
+            self.export_video_requested.emit(single_id)
+        elif action is action_delete_recording and single_id:
+            self._confirm_delete_recording(single_id)
         elif action is action_delete:
             self._delete_selected()
+
+    def _confirm_delete_recording(self, session_id: str) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "Delete recording",
+            "Delete the saved audio for this session?\n\n"
+            "The transcript and notes are kept. Only the recording "
+            "(mic + system audio files) is removed. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm == QMessageBox.StandardButton.Yes:
+            self.delete_recording_requested.emit(session_id)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
         # Treat any double-click as "rename this session". Other columns

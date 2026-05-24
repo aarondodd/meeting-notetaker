@@ -272,20 +272,29 @@ def fetch_imminent_meetings(window_minutes: int = 5) -> list[MeetingInfo]:
 
 
 def fetch_remaining_today(now: Optional[datetime] = None) -> list[MeetingInfo]:
-    """Return meetings from `now` (default: real now) through end-of-local-day.
+    """Return meetings that haven't yet ended through end-of-local-day.
 
-    Used by the "Pick from Calendar..." button in New Session, which lets
-    the user pre-create a session that will be associated with an upcoming
-    meeting. Returns [] if Outlook is unreachable.
+    Used by the "Pick from Calendar..." button in New Session. Includes
+    meetings already in progress (Aaron's common case: opening the app
+    after a meeting has started) by widening the start of the search to
+    a few hours back, then filtering to items whose end_time > now.
+
+    Returns [] if Outlook is unreachable.
     """
     if now is None:
         now = datetime.now()
+    # Look back far enough to catch any reasonable in-progress meeting
+    # (Outlook restricts by Start, not End, so we need to fetch items
+    # that started before now). 6h is well beyond a normal meeting; the
+    # post-filter trims out anything actually done.
+    lookback_start = now - timedelta(hours=6)
     end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
     if end_of_day < now:
         # Sanity: never happens (microsecond=0 doesn't move things backwards),
         # but guard anyway.
         end_of_day = now
-    return fetch_calendar_range(now, end_of_day)
+    candidates = fetch_calendar_range(lookback_start, end_of_day)
+    return [m for m in candidates if m.end_time > now]
 
 
 def _item_to_info(item) -> MeetingInfo:
