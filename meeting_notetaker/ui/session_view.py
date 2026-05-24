@@ -45,7 +45,6 @@ from .live_notes_widget import LiveNotesWidget
 from .previous_notes_widget import PreviousNotesWidget
 from .scaled_image_label import ScaledImageLabel
 from .screencap_sidebar import ScreencapSidebar
-from .screenshot_rail import ScreenshotRail
 from .slides_widget import SlidesWidget
 from .transcript_player_bar import TranscriptPlayerBar
 
@@ -118,6 +117,9 @@ class SessionView(QWidget):
     transcript_play_clicked = pyqtSignal(str)             # session_id
     transcript_pause_clicked = pyqtSignal(str)            # session_id
     transcript_seek_ms_requested = pyqtSignal(str, int)   # session_id, ms
+    # User dragged the Transcript playback splitter; MainApp persists
+    # the new top-pane percentage (10-90) to Config.
+    transcript_playback_split_changed = pyqtSignal(int)   # top_pct
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -377,11 +379,10 @@ class SessionView(QWidget):
         # Transcript pane has two layouts living in a QStackedWidget:
         #
         # Idle layout (default + paused):
-        #   QSplitter horizontal:
-        #     transcript editor (with click-to-seek + highlight)
-        #     ScreenshotRail (hidden if no screenshots this session)
+        #   transcript editor full-width (click-to-seek + highlight)
         #
-        # Playback layout (active while audio is playing):
+        # Playback layout (active while audio is playing OR position > 0
+        # with screenshots present):
         #   QSplitter vertical:
         #     ScaledImageLabel showing the current screenshot
         #     transcript editor (re-parented from the idle page)
@@ -389,7 +390,10 @@ class SessionView(QWidget):
         # The same _ClickableTranscriptView instance lives in both
         # layouts via re-parenting; that keeps the highlight + scroll
         # state intact as the layout flips. The player bar sits below
-        # both layouts and is shared too.
+        # both layouts and is shared too. The vertical splitter's
+        # default split is 70/30 (top/bottom) but the user can drag
+        # the handle; the new percentage is emitted via
+        # transcript_playback_split_changed so MainApp can persist it.
         transcript_page = QWidget(self)
         transcript_layout = QVBoxLayout(transcript_page)
         transcript_layout.setContentsMargins(0, 0, 0, 0)
@@ -410,26 +414,17 @@ class SessionView(QWidget):
         )
         self._transcript_view.line_clicked.connect(self._on_transcript_line_clicked)
 
-        # Idle layout: editor + side rail.
+        # Idle layout: full-width transcript editor. The editor is
+        # re-parented out into the playback splitter when playback
+        # engages, so the placeholder reserves its slot here.
         self._transcript_idle_page = QWidget(transcript_page)
-        idle_layout = QHBoxLayout(self._transcript_idle_page)
+        idle_layout = QVBoxLayout(self._transcript_idle_page)
         idle_layout.setContentsMargins(0, 0, 0, 0)
         idle_layout.setSpacing(0)
-        self._transcript_idle_splitter = QSplitter(
-            Qt.Orientation.Horizontal, self._transcript_idle_page,
-        )
-        self._transcript_idle_splitter.setChildrenCollapsible(False)
-        self._transcript_idle_splitter.addWidget(self._transcript_view)
-        self._screenshot_rail = ScreenshotRail(self._transcript_idle_splitter)
-        self._screenshot_rail.set_transcript_view(self._transcript_view)
-        self._screenshot_rail.delete_requested.connect(
-            self._on_screenshot_delete_requested
-        )
-        self._screenshot_rail.setVisible(False)  # Off until any anchors arrive.
-        self._transcript_idle_splitter.addWidget(self._screenshot_rail)
-        self._transcript_idle_splitter.setStretchFactor(0, 3)
-        self._transcript_idle_splitter.setStretchFactor(1, 0)
-        idle_layout.addWidget(self._transcript_idle_splitter, 1)
+        idle_layout.addWidget(self._transcript_view, 1)
+        self._idle_editor_placeholder = QWidget(self._transcript_idle_page)
+        self._idle_editor_placeholder.hide()
+        idle_layout.addWidget(self._idle_editor_placeholder, 0)
 
         # Playback layout: image on top, transcript below.
         self._transcript_playback_page = QWidget(transcript_page)
@@ -448,8 +443,17 @@ class SessionView(QWidget):
         # real editor in.
         self._playback_editor_placeholder = QWidget(self._transcript_playback_splitter)
         self._transcript_playback_splitter.addWidget(self._playback_editor_placeholder)
-        self._transcript_playback_splitter.setStretchFactor(0, 3)
-        self._transcript_playback_splitter.setStretchFactor(1, 2)
+        # Stretch factors are a fallback if setSizes hasn't been
+        # called yet (e.g. before the first _enter_playback_layout);
+        # _apply_playback_split_pct does the real proportional sizing.
+        self._transcript_playback_splitter.setStretchFactor(0, 7)
+        self._transcript_playback_splitter.setStretchFactor(1, 3)
+        self._transcript_playback_splitter.splitterMoved.connect(
+            self._on_playback_splitter_moved
+        )
+        # Default top-pct (overridden by config via
+        # set_transcript_playback_split_top_pct from MainApp at startup).
+        self._playback_split_top_pct: int = 70
         playback_layout.addWidget(self._transcript_playback_splitter, 1)
 
         self._transcript_layout_stack = QStackedWidget(transcript_page)
@@ -883,16 +887,12 @@ class SessionView(QWidget):
         """Rebuild the timestamp index from the transcript view text.
 
         Called whenever set_transcript_text / set_session updates the
-        displayed text. Click-to-seek, position-driven highlight, and
-        the screenshot rail all consume this list (transcript blocks
-        are where the rail anchors thumbnails).
+        displayed text. Click-to-seek and the position-driven highlight
+        consume this list.
         """
         text = self._transcript_view.toPlainText()
         self._transcript_timestamps = _parse_transcript_timestamps(text)
         self._clear_transcript_highlight()
-        # Rail anchors depend on the timestamp list -- a re-parse means
-        # a re-anchor.
-        self._refresh_screenshot_rail()
 
     def _refresh_transcript_highlight(self, position_ms: int) -> None:
         """Update the highlighted line from the current playback position.
@@ -964,33 +964,15 @@ class SessionView(QWidget):
     def set_screenshot_offsets(self, offsets: list[tuple[Path, int]]) -> None:
         """Pin the (path, offset_ms) list MainApp computed at session-load.
 
-        Triggers a rebuild of the side rail, pushes the same list to
-        the Slides tab so its position-driven advance + click-to-seek
-        share one source of truth, and refreshes the playback top
-        image against the current player position.
+        Pushes the list to the Slides tab so its position-driven
+        advance + click-to-seek share one source of truth, and
+        refreshes the playback top image against the current player
+        position so a fresh capture surfaces immediately.
         """
         self._screenshot_offsets = list(offsets)
         self._slides_view.set_screenshot_offsets(self._screenshot_offsets)
-        self._refresh_screenshot_rail()
-        # If we're in playback layout, refresh the top image against
-        # the player's current position so a fresh capture surfaces
-        # immediately.
         if self._is_in_playback_layout():
             self._refresh_playback_image(self._player_bar._slider.value())  # noqa: SLF001
-
-    def _refresh_screenshot_rail(self) -> None:
-        """Recompute the screenshot -> block anchors and push to the rail."""
-        if not self._screenshot_offsets or not self._transcript_timestamps:
-            self._screenshot_rail.set_anchors([])
-            self._screenshot_rail.setVisible(False)
-            return
-        from ..screencap.timestamps import match_screenshots_to_blocks  # noqa: PLC0415
-        anchors = match_screenshots_to_blocks(
-            self._screenshot_offsets,
-            self._transcript_timestamps,
-        )
-        self._screenshot_rail.set_anchors(anchors)
-        self._screenshot_rail.setVisible(bool(anchors))
 
     # ---- layout swap (idle <-> playback) ---------------------------------
 
@@ -1008,22 +990,81 @@ class SessionView(QWidget):
             return  # Stay in idle layout; audio still plays beneath.
         if self._is_in_playback_layout():
             return
-        # Move the editor from the idle splitter into the playback
-        # splitter. setParent + addWidget keeps the QPlainTextEdit's
+        # Move the editor from the idle layout into the playback
+        # splitter. setParent + insertWidget keeps the QPlainTextEdit's
         # contents + scroll + selection state intact.
         self._transcript_playback_splitter.insertWidget(1, self._transcript_view)
         self._playback_editor_placeholder.hide()
+        self._idle_editor_placeholder.show()
         self._transcript_layout_stack.setCurrentWidget(self._transcript_playback_page)
+        # Apply the configured split AFTER the page is shown, so the
+        # splitter has its final height to compute pixel sizes against.
+        QTimer.singleShot(0, self._apply_playback_split_pct)
 
     def _leave_playback_layout(self) -> None:
         if not self._is_in_playback_layout():
             return
-        # Move the editor back into the idle splitter.
-        self._transcript_idle_splitter.insertWidget(0, self._transcript_view)
+        # Move the editor back into the idle layout.
+        idle_layout = self._transcript_idle_page.layout()
+        if idle_layout is not None:
+            idle_layout.insertWidget(0, self._transcript_view)
+        self._idle_editor_placeholder.hide()
         self._playback_editor_placeholder.show()
         self._transcript_layout_stack.setCurrentWidget(self._transcript_idle_page)
         self._playback_image.clear_image()
         self._current_playback_screenshot = None
+
+    def _apply_playback_split_pct(self) -> None:
+        """Resize the playback splitter to match the saved top-pct.
+
+        Reads the splitter's current height and assigns pixel sizes
+        proportionally to the two visible panes (image at index 0,
+        editor at index 1). The placeholder at index 2 is hidden
+        while in playback layout; it stays at 0 so the visible split
+        owns the full height. No-op if the splitter has zero height
+        (parent not yet laid out); the caller defers via
+        QTimer.singleShot(0).
+        """
+        h = self._transcript_playback_splitter.height()
+        if h <= 0:
+            return
+        pct = self._playback_split_top_pct
+        pct = max(10, min(90, pct))
+        top = int(h * pct / 100)
+        bottom = h - top
+        count = self._transcript_playback_splitter.count()
+        sizes = [top, bottom] + [0] * max(0, count - 2)
+        self._transcript_playback_splitter.setSizes(sizes)
+
+    def _on_playback_splitter_moved(self, pos: int, index: int) -> None:
+        """Recompute top-pct from the splitter's first two sizes + emit.
+
+        Only sizes[0] (image) and sizes[1] (editor) count; the
+        placeholder at index 2 stays at 0 in playback layout.
+        """
+        sizes = self._transcript_playback_splitter.sizes()
+        if len(sizes) < 2:
+            return
+        visible_total = sizes[0] + sizes[1]
+        if visible_total <= 0:
+            return
+        pct = int(round(sizes[0] * 100 / visible_total))
+        pct = max(10, min(90, pct))
+        if pct == self._playback_split_top_pct:
+            return
+        self._playback_split_top_pct = pct
+        self.transcript_playback_split_changed.emit(pct)
+
+    def set_transcript_playback_split_top_pct(self, pct: int) -> None:
+        """MainApp pushes the persisted split pct in at startup.
+
+        Applied to the splitter immediately if it's currently in
+        playback layout, otherwise stashed for the next _enter call.
+        """
+        pct = max(10, min(90, pct))
+        self._playback_split_top_pct = pct
+        if self._is_in_playback_layout():
+            self._apply_playback_split_pct()
 
     def _refresh_playback_image(self, position_ms: int) -> None:
         """Sticky-image lookup against the screenshot offsets list.

@@ -128,6 +128,12 @@ class UiConfig:
     screen_capture_auto_enabled_default: bool = False
     screen_capture_auto_interval_sec: int = 30
     screen_capture_auto_dedup_threshold: int = 10
+    # Transcript pane's playback split: top pane (screenshot) as a
+    # percentage of the total splitter height. Default 70 means the
+    # screenshot gets 70% and the transcript editor gets 30%. The
+    # user can resize the splitter at runtime; SessionView pushes
+    # the new pct back to MainApp which saves it here (debounced).
+    transcript_playback_split_top_pct: int = 70
 
 
 @dataclass
@@ -292,6 +298,11 @@ class Config:
             errors.append(
                 "ui.screen_capture_auto_dedup_threshold must be between 0 "
                 f"and 64, got {self.ui.screen_capture_auto_dedup_threshold}"
+            )
+        if not (10 <= self.ui.transcript_playback_split_top_pct <= 90):
+            errors.append(
+                "ui.transcript_playback_split_top_pct must be between 10 "
+                f"and 90, got {self.ui.transcript_playback_split_top_pct}"
             )
         if self.synthesis.llm_target not in VALID_LLM_TARGETS:
             errors.append(

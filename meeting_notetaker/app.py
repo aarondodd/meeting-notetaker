@@ -244,6 +244,24 @@ class MainApp(QObject):
         self.window.session_view.set_screencap_auto_interval(
             int(self.config.ui.screen_capture_auto_interval_sec)
         )
+        # Restore the persisted Transcript-playback split percentage so
+        # the user's preferred ratio applies the first time playback
+        # engages this session.
+        self.window.session_view.set_transcript_playback_split_top_pct(
+            int(self.config.ui.transcript_playback_split_top_pct)
+        )
+
+    def _on_transcript_playback_split_changed(self, pct: int) -> None:
+        """Persist the user's new splitter ratio (debounced)."""
+        self.config.ui.transcript_playback_split_top_pct = int(pct)
+        # Coalesce rapid drag events into one disk write 500 ms after
+        # the last move; starting a running timer just resets it.
+        if not hasattr(self, "_save_split_timer"):
+            self._save_split_timer = QTimer(self)
+            self._save_split_timer.setSingleShot(True)
+            self._save_split_timer.setInterval(500)
+            self._save_split_timer.timeout.connect(self.config.save)
+        self._save_split_timer.start()
 
     def _apply_synthesis_automation(self) -> None:
         """Push the current setting state into the SessionView, swapping
@@ -884,6 +902,9 @@ class MainApp(QObject):
         sv.transcript_play_clicked.connect(self._on_transcript_play)
         sv.transcript_pause_clicked.connect(self._on_transcript_pause)
         sv.transcript_seek_ms_requested.connect(self._on_transcript_seek)
+        sv.transcript_playback_split_changed.connect(
+            self._on_transcript_playback_split_changed
+        )
 
         self.controller.state_changed.connect(self._on_session_state_changed)
         self.controller.segment_arrived.connect(self._on_segment_arrived)

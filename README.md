@@ -288,12 +288,15 @@ scrubber + time-readout bar at the bottom.
 - **Stop** -- pause where you are. The next Play resumes from
   the same spot.
 
-If the session also has captured screenshots, hitting Play swaps
-the Transcript tab to a screenshare-style layout: the matching
-screenshot shows up top, the transcript scrolls below. As
-playback crosses each captured screenshot's recording-relative
-timestamp, the top image updates. Pausing or stopping reverts to
-the normal side-by-side layout (transcript + thumbnail rail).
+If the session also has captured screenshots, hitting Play (or
+clicking any transcript line while paused) swaps the Transcript
+tab to a screenshare-style layout: the matching screenshot shows
+up top, the transcript scrolls below. As playback crosses each
+captured screenshot's recording-relative timestamp, the top image
+updates. The split defaults to 70% screenshot / 30% transcript;
+drag the divider to resize and the new ratio is remembered for
+future sessions. Pausing keeps the layout up; only natural end of
+playback returns to the full-width transcript view.
 
 The Slides tab also gets its own Play bar that drives the same
 player.
@@ -804,13 +807,14 @@ flowchart TD
 ```
 
 Screenshots land in `<session>/screenshots/NNNN-YYYYMMDDTHHMMSSZ.png`
-where NNNN is a monotonic sequence number. The Transcript tab's
-side rail anchors each thumbnail to the transcript line whose
-timestamp is closest to the screenshot's recording-relative
-offset. During playback, the Transcript tab swaps to a vertical
-split (image on top, transcript below) with the active image
-following the sticky-latest rule (the most recent screenshot
-whose offset <= current playback position).
+where NNNN is a monotonic sequence number. During playback (or
+when the user clicks a transcript line while paused), the
+Transcript tab swaps to a vertical split (image on top,
+transcript below) with the active image following the
+sticky-latest rule (the most recent screenshot whose offset
+&lt;= current playback position). The split defaults to 70/30 top
+versus bottom; the user can drag the divider and the new ratio
+persists to `config.toml` (`ui.transcript_playback_split_top_pct`).
 
 The **Slides** tab has its own player bar that mirrors the
 Transcript tab's bar; both bars reflect a single AudioPlayer

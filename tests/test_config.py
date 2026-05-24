@@ -253,6 +253,32 @@ def test_auto_capture_dedup_threshold_validation(isolated_data_dir):
     assert any("screen_capture_auto_dedup_threshold" in e for e in errors)
 
 
+def test_transcript_playback_split_defaults_seventy(isolated_data_dir):
+    """Default split puts 70% on the top (screenshot) pane."""
+    cfg = Config()
+    assert cfg.ui.transcript_playback_split_top_pct == 70
+
+
+def test_transcript_playback_split_round_trip(isolated_data_dir):
+    cfg = Config()
+    cfg.ui.transcript_playback_split_top_pct = 55
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.ui.transcript_playback_split_top_pct == 55
+
+
+def test_transcript_playback_split_validation(isolated_data_dir):
+    cfg = Config()
+    cfg.ui.transcript_playback_split_top_pct = 5
+    errors = cfg.validate()
+    assert any("transcript_playback_split_top_pct" in e for e in errors)
+    cfg.ui.transcript_playback_split_top_pct = 95
+    errors = cfg.validate()
+    assert any("transcript_playback_split_top_pct" in e for e in errors)
+    cfg.ui.transcript_playback_split_top_pct = 50
+    assert not any("transcript_playback_split_top_pct" in e for e in cfg.validate())
+
+
 def test_screen_capture_first_time_seen_defaults_false(isolated_data_dir):
     """Fresh installs have NOT seen the screen-capture notice. The first
     Start Screen Capture click shows the popup, then flips this to True
