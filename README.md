@@ -56,6 +56,14 @@ leaves the machine; no API key required.
   screenshot.
 - **Export recording** to MP3 / FLAC / AAC / Opus / WAV (mixed
   mic + sys, single file) via right-click on the session list.
+- **Export session as video.** Right-click a session to render an
+  MP4 slideshow: H.264 1080p / 30 fps video, AAC mono audio,
+  letterboxed screenshots that advance at their captured timestamps,
+  plus a sidecar SRT subtitle file built from the transcript
+  (toggleable on or off in any standard player).
+- **Transcript playback layout** defaults to 70% screenshot / 30%
+  transcript when playing; drag the divider to resize and the new
+  ratio is remembered for future sessions.
 - **Clipboard-mediated synthesis** (default) **or Chrome-extension
   automation** that drives Claude.ai end-to-end for you.
 - **Speaker identification** using SpeechBrain ECAPA-TDNN
@@ -313,6 +321,15 @@ list:
   WAV. Both source streams (mic + sys) are mixed into a single
   file at the chosen format. An indeterminate progress dialog
   shows while encoding runs in a worker thread.
+- **Export session as video...** -- renders an MP4 slideshow with
+  the mixed audio + screenshots flipping at their captured
+  timestamps. H.264 1080p / 30 fps video, AAC mono audio, black
+  frames before the first screenshot, letterbox bars to preserve
+  aspect ratio. A matching `.srt` sidecar carries the transcript
+  as toggleable subtitles -- every standard player auto-loads the
+  SRT and lets the viewer turn subtitles on or off; delete the
+  SRT if you'd rather share the MP4 alone. A determinate progress
+  dialog tracks per-frame encode progress.
 - **Delete recording...** -- removes the audio files but keeps
   the transcript + notes.
 
@@ -953,10 +970,12 @@ If the refinement wait bothers you:
 - **Skip post-Stop refinement.** Settings -> Skip post-Stop
   refinement = on. No CPU cost after Stop; the live transcript
   is final.
-- **Tune CT2 manually.** If your CPU isn't 12 cores or you have
-  an unusual workload, the `CPU threads per worker` + `Parallel
-  workers` settings give you direct control. Total OS threads =
-  `threads * workers`; keep <= physical core count.
+- **Tune CT2 manually.** The defaults assume the app should auto-
+  pick threads + workers from your physical core count. If you'd
+  rather drive it yourself, the `CPU threads per worker` +
+  `Parallel workers` settings give you direct control. Total OS
+  threads = `threads * workers`; keep that product at or below
+  your physical core count to avoid oversubscription.
 - **Retain the audio.** Per-session "Keep audio" toggle keeps
   the source files. If you ever want to re-run Whisper with a
   different model or settings, the source is there.
