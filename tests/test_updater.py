@@ -1,9 +1,12 @@
 """Unit tests for the GitHub-releases updater.
 
 Covers everything that can be exercised without an actual network round
-trip: version parsing/comparison, the weekly-interval gate, and the
-last-check timestamp persistence. The HTTP call itself is exercised
-indirectly via monkeypatching urlopen on get_latest_release.
+trip or actually running an installer: version parsing, the weekly-
+interval gate, the last-check timestamp persistence, asset selection
+from a release payload, and the upgrade() flow (with the network and
+subprocess calls mocked out). The end-to-end installer launch is
+inherently Windows-only and is not exercised in CI; the unit boundaries
+verify everything up to subprocess.Popen.
 """
 from __future__ import annotations
 
@@ -116,7 +119,6 @@ def test_should_check_within_week_returns_false(tmp_path: Path):
     path = tmp_path / "last.txt"
     base = datetime(2026, 5, 17, 12, 0)
     updater.record_version_check(when=base, now_path=path)
-    # Three days later -- still within the weekly window.
     later = base + timedelta(days=3)
     assert updater.should_check_for_updates(now=later, last_check_path=path) is False
 
@@ -133,8 +135,6 @@ def test_check_for_updates_respects_interval_returns_none(tmp_path: Path):
     path = tmp_path / "last.txt"
     base = datetime(2026, 5, 17, 12, 0)
     updater.record_version_check(when=base, now_path=path)
-    # Within the week -- no network call should happen because the gate
-    # returns None first.
     result = updater.check_for_updates(
         now=base + timedelta(days=1), last_check_path=path
     )
@@ -146,8 +146,6 @@ def test_check_for_updates_stamps_when_interval_elapsed(tmp_path: Path, monkeypa
     base = datetime(2026, 5, 1, 12, 0)
     updater.record_version_check(when=base, now_path=path)
     later = base + timedelta(days=10)
-    # Force get_latest_release to return None so the function exits cleanly
-    # without HTTP I/O but still records the new timestamp.
     monkeypatch.setattr(updater, "get_latest_release", lambda **kwargs: None)
     updater.check_for_updates(now=later, last_check_path=path)
     assert updater.get_last_version_check(path) == later
@@ -156,51 +154,79 @@ def test_check_for_updates_stamps_when_interval_elapsed(tmp_path: Path, monkeypa
 # ---- get_latest_release ----------------------------------------------------
 
 
-def test_get_latest_release_success(monkeypatch):
-    payload = {
-        "tag_name": "v0.5.0",
-        "zipball_url": "https://api.github.com/zip",
-        "html_url": "https://github.com/aarondodd/meeting-notetaker/releases/tag/v0.5.0",
-        "body": "Notes...",
+def _fake_release_payload(version: str = "0.6.6", with_installer: bool = True) -> dict:
+    """Mimic the post-strip dict shape that get_latest_release returns to upgrade().
+
+    get_latest_release() does `tag_name = data["tag_name"].lstrip("vV")` before
+    returning, so callers downstream see "0.6.6" not "v0.6.6". Reflect that
+    here so tests assert on the same shape upgrade() actually sees.
+    """
+    assets = []
+    if with_installer:
+        assets.append({
+            "name": f"meeting-notetaker-setup-{version}.exe",
+            "browser_download_url": (
+                f"https://github.com/aarondodd/meeting-notetaker/releases/download/"
+                f"v{version}/meeting-notetaker-setup-{version}.exe"
+            ),
+        })
+        assets.append({
+            "name": "meeting-notetaker.exe",
+            "browser_download_url": (
+                f"https://github.com/aarondodd/meeting-notetaker/releases/download/"
+                f"v{version}/meeting-notetaker.exe"
+            ),
+        })
+    return {
+        "tag_name": version,
+        "html_url": f"https://github.com/aarondodd/meeting-notetaker/releases/tag/v{version}",
+        "body": "Release notes...",
+        "assets": assets,
     }
+
+
+def _stub_urlopen(monkeypatch, payload_or_exc):
     fake_resp = MagicMock()
-    fake_resp.read.return_value = json.dumps(payload).encode("utf-8")
+    if isinstance(payload_or_exc, Exception):
+        def raiser(req, timeout=30):
+            raise payload_or_exc
+        monkeypatch.setattr(updater.urllib.request, "urlopen", raiser)
+        return
+    fake_resp.read.return_value = json.dumps(payload_or_exc).encode("utf-8")
     fake_resp.__enter__ = lambda self: self
     fake_resp.__exit__ = lambda self, *a: None
-    monkeypatch.setattr(updater.urllib.request, "urlopen", lambda req, timeout=30: fake_resp)
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen", lambda req, timeout=30: fake_resp
+    )
+
+
+def test_get_latest_release_success(monkeypatch):
+    _stub_urlopen(monkeypatch, _fake_release_payload("0.6.6"))
     result = updater.get_latest_release(owner="aarondodd", repo="meeting-notetaker")
     assert result is not None
-    assert result["tag_name"] == "0.5.0"
-    assert result["zipball_url"] == "https://api.github.com/zip"
+    assert result["tag_name"] == "0.6.6"
+    assert isinstance(result["assets"], list)
+    assert len(result["assets"]) == 2
 
 
 def test_get_latest_release_404(monkeypatch):
     from urllib.error import HTTPError
-
-    def fake_urlopen(req, timeout=30):
-        raise HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b""))
-
-    monkeypatch.setattr(updater.urllib.request, "urlopen", fake_urlopen)
+    _stub_urlopen(
+        monkeypatch,
+        HTTPError("https://x", 404, "Not Found", {}, io.BytesIO(b"")),
+    )
     assert updater.get_latest_release() is None
 
 
 def test_get_latest_release_network_error(monkeypatch):
     from urllib.error import URLError
-
-    def fake_urlopen(req, timeout=30):
-        raise URLError("connection refused")
-
-    monkeypatch.setattr(updater.urllib.request, "urlopen", fake_urlopen)
+    _stub_urlopen(monkeypatch, URLError("connection refused"))
     assert updater.get_latest_release() is None
 
 
-def test_get_latest_release_missing_fields(monkeypatch):
-    fake_resp = MagicMock()
-    fake_resp.read.return_value = json.dumps({"tag_name": "0.5.0"}).encode("utf-8")
-    fake_resp.__enter__ = lambda self: self
-    fake_resp.__exit__ = lambda self, *a: None
-    monkeypatch.setattr(updater.urllib.request, "urlopen", lambda req, timeout=30: fake_resp)
-    # Missing zipball_url -- should treat as no-release-available.
+def test_get_latest_release_missing_tag(monkeypatch):
+    """Without tag_name we can't tell if there's an update -- treat as no release."""
+    _stub_urlopen(monkeypatch, {"assets": [], "html_url": "", "body": ""})
     assert updater.get_latest_release() is None
 
 
@@ -209,8 +235,55 @@ def test_get_latest_release_invalid_json(monkeypatch):
     fake_resp.read.return_value = b"not json"
     fake_resp.__enter__ = lambda self: self
     fake_resp.__exit__ = lambda self, *a: None
-    monkeypatch.setattr(updater.urllib.request, "urlopen", lambda req, timeout=30: fake_resp)
+    monkeypatch.setattr(
+        updater.urllib.request, "urlopen", lambda req, timeout=30: fake_resp
+    )
     assert updater.get_latest_release() is None
+
+
+# ---- get_installer_asset ---------------------------------------------------
+
+
+def test_get_installer_asset_picks_setup_exe():
+    release = _fake_release_payload("0.6.6")
+    asset = updater.get_installer_asset(release)
+    assert asset is not None
+    version, url = asset
+    assert version == "0.6.6"
+    assert url.endswith("meeting-notetaker-setup-0.6.6.exe")
+
+
+def test_get_installer_asset_ignores_portable_exe():
+    """A release attaching only meeting-notetaker.exe (no setup-) returns None."""
+    release = {
+        "tag_name": "0.6.6",
+        "assets": [{
+            "name": "meeting-notetaker.exe",
+            "browser_download_url": "https://x/meeting-notetaker.exe",
+        }],
+    }
+    assert updater.get_installer_asset(release) is None
+
+
+def test_get_installer_asset_missing_when_no_assets():
+    release = _fake_release_payload("0.6.6", with_installer=False)
+    # The fake_payload helper still adds the portable .exe; strip it.
+    release["assets"] = []
+    assert updater.get_installer_asset(release) is None
+
+
+def test_get_installer_asset_handles_version_suffixes():
+    """Pre-release tags (e.g. 0.7.0-rc1) still match the asset pattern."""
+    release = {
+        "tag_name": "0.7.0-rc1",
+        "assets": [{
+            "name": "meeting-notetaker-setup-0.7.0-rc1.exe",
+            "browser_download_url": "https://x/setup-0.7.0-rc1.exe",
+        }],
+    }
+    asset = updater.get_installer_asset(release)
+    assert asset is not None
+    assert asset[0] == "0.7.0-rc1"
 
 
 # ---- check_for_updates end-to-end ------------------------------------------
@@ -223,7 +296,7 @@ def test_check_for_updates_returns_tuple_when_newer(tmp_path: Path, monkeypatch)
         "get_latest_release",
         lambda **kwargs: {
             "tag_name": "99.0.0",
-            "zipball_url": "x",
+            "assets": [],
             "html_url": "",
             "body": "",
         },
@@ -242,7 +315,7 @@ def test_check_for_updates_returns_none_when_same(tmp_path: Path, monkeypatch):
         "get_latest_release",
         lambda **kwargs: {
             "tag_name": updater.__version__,
-            "zipball_url": "x",
+            "assets": [],
             "html_url": "",
             "body": "",
         },
@@ -250,7 +323,7 @@ def test_check_for_updates_returns_none_when_same(tmp_path: Path, monkeypatch):
     assert updater.check_for_updates(last_check_path=path) is None
 
 
-# --------- in-place install ---------------------------------------------------
+# ---- is_frozen / current_exe_path -----------------------------------------
 
 
 def test_is_frozen_false_normally(monkeypatch):
@@ -269,109 +342,166 @@ def test_current_exe_path_none_when_not_frozen(monkeypatch):
     assert updater.current_exe_path() is None
 
 
-def test_old_exe_path_appends_old_suffix(tmp_path: Path):
-    target = tmp_path / "meeting-notetaker.exe"
-    assert updater.old_exe_path(target) == tmp_path / "meeting-notetaker.exe.old"
-
-    posix_target = tmp_path / "meeting-notetaker"
-    assert updater.old_exe_path(posix_target) == tmp_path / "meeting-notetaker.old"
+# ---- launch_installer ------------------------------------------------------
 
 
-def test_find_built_exe_in_dist(tmp_path: Path, monkeypatch):
-    # Simulate POSIX behavior for the binary name regardless of host.
-    monkeypatch.setattr(updater.platform, "system", lambda: "Linux")
-    (tmp_path / "dist").mkdir()
-    exe = tmp_path / "dist" / "meeting-notetaker"
-    exe.write_bytes(b"\x7fELF stub")
-    assert updater.find_built_exe(tmp_path) == exe
+def test_launch_installer_missing_file_returns_failure(tmp_path: Path):
+    ok, msg = updater.launch_installer(tmp_path / "does-not-exist.exe")
+    assert not ok
+    assert "not found" in msg.lower()
 
 
-def test_find_built_exe_in_wrapped_dir(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(updater.platform, "system", lambda: "Linux")
-    inner = tmp_path / "aarondodd-meeting-notetaker-abc1234"
-    (inner / "dist").mkdir(parents=True)
-    exe = inner / "dist" / "meeting-notetaker"
-    exe.write_bytes(b"stub")
-    # find_built_exe walks rglob; depth-limited search finds it.
-    assert updater.find_built_exe(tmp_path) == exe
+def test_launch_installer_passes_silent_flags(tmp_path: Path, monkeypatch):
+    installer = tmp_path / "fake-installer.exe"
+    installer.write_bytes(b"MZ stub")  # exists; we won't actually run it
+    captured: dict = {}
 
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return MagicMock()
 
-def test_find_built_exe_returns_none_when_missing(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(updater.platform, "system", lambda: "Linux")
-    assert updater.find_built_exe(tmp_path) is None
-
-
-def test_find_built_exe_windows_name(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(updater.platform, "system", lambda: "Windows")
-    (tmp_path / "dist").mkdir()
-    win_exe = tmp_path / "dist" / "meeting-notetaker.exe"
-    win_exe.write_bytes(b"MZ stub")
-    assert updater.find_built_exe(tmp_path) == win_exe
-
-
-def test_install_in_place_replaces_target(tmp_path: Path):
-    target = tmp_path / "meeting-notetaker"
-    target.write_bytes(b"OLD")
-    new_exe = tmp_path / "dist" / "meeting-notetaker"
-    new_exe.parent.mkdir()
-    new_exe.write_bytes(b"NEW")
-
-    ok, msg = updater.install_in_place(new_exe, target)
-    assert ok, msg
-    assert target.read_bytes() == b"NEW"
-    backup = updater.old_exe_path(target)
-    assert backup.exists()
-    assert backup.read_bytes() == b"OLD"
-
-
-def test_install_in_place_overwrites_leftover_backup(tmp_path: Path):
-    """A stale .old from a previous run should not block a new install."""
-    target = tmp_path / "meeting-notetaker"
-    target.write_bytes(b"CURRENT")
-    backup = updater.old_exe_path(target)
-    backup.write_bytes(b"STALE")
-    new_exe = tmp_path / "new"
-    new_exe.write_bytes(b"NEW")
-
-    ok, _msg = updater.install_in_place(new_exe, target)
+    monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
+    ok, _msg = updater.launch_installer(installer)
     assert ok
-    assert target.read_bytes() == b"NEW"
-    assert backup.read_bytes() == b"CURRENT"  # current was rotated in
+    # The .exe path is the first arg, then the silent flags.
+    assert captured["cmd"][0] == str(installer)
+    assert "/SILENT" in captured["cmd"]
+    assert "/SUPPRESSMSGBOXES" in captured["cmd"]
+    assert "/NORESTART" in captured["cmd"]
 
 
-def test_install_in_place_missing_new_exe(tmp_path: Path):
-    target = tmp_path / "meeting-notetaker"
-    target.write_bytes(b"OLD")
-    ok, msg = updater.install_in_place(tmp_path / "does-not-exist", target)
+def test_launch_installer_handles_oserror(tmp_path: Path, monkeypatch):
+    installer = tmp_path / "fake-installer.exe"
+    installer.write_bytes(b"MZ stub")
+
+    def fake_popen(cmd, **kwargs):
+        raise OSError("EACCES")
+
+    monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
+    ok, msg = updater.launch_installer(installer)
     assert not ok
-    assert "New executable not found" in msg
-    # Target untouched.
-    assert target.read_bytes() == b"OLD"
+    assert "Could not launch installer" in msg
 
 
-def test_install_in_place_missing_target(tmp_path: Path):
-    new_exe = tmp_path / "new"
-    new_exe.write_bytes(b"NEW")
-    ok, msg = updater.install_in_place(new_exe, tmp_path / "missing-target")
-    assert not ok
-    assert "Target executable not found" in msg
+# ---- upgrade() end-to-end --------------------------------------------------
 
 
-def test_cleanup_old_exe_removes_backup(tmp_path: Path):
-    target = tmp_path / "meeting-notetaker"
-    backup = updater.old_exe_path(target)
-    backup.write_bytes(b"stale")
-    assert updater.cleanup_old_exe(target) is True
-    assert not backup.exists()
-
-
-def test_cleanup_old_exe_returns_false_when_nothing_to_do(tmp_path: Path):
-    target = tmp_path / "meeting-notetaker"
-    assert updater.cleanup_old_exe(target) is False
-
-
-def test_cleanup_old_exe_skips_when_not_frozen(monkeypatch):
+def test_upgrade_source_build_returns_guidance_without_network(monkeypatch):
+    """Running from source (not frozen) short-circuits before any network call."""
     monkeypatch.delattr(updater.sys, "frozen", raising=False)
-    # No `target` arg -> uses current_exe_path() -> returns None when
-    # not frozen, so cleanup is a no-op.
-    assert updater.cleanup_old_exe() is False
+
+    # If get_latest_release got called we'd notice -- replace it with a
+    # raiser so the test fails loudly if the short-circuit is missing.
+    def must_not_call(**kwargs):
+        raise AssertionError("get_latest_release should not be called from a source build")
+
+    monkeypatch.setattr(updater, "get_latest_release", must_not_call)
+    ok, msg = updater.upgrade()
+    assert not ok
+    assert "running from source" in msg
+    assert "build.ps1" in msg or "rebuild" in msg
+
+
+def test_upgrade_no_network_returns_failure(monkeypatch):
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(updater, "get_latest_release", lambda **kwargs: None)
+    ok, msg = updater.upgrade()
+    assert not ok
+    assert "Could not fetch" in msg
+
+
+def test_upgrade_already_latest_returns_success(monkeypatch):
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        updater,
+        "get_latest_release",
+        lambda **kwargs: {
+            "tag_name": updater.__version__,
+            "assets": [],
+            "html_url": "",
+            "body": "",
+        },
+    )
+    ok, msg = updater.upgrade()
+    assert ok
+    assert "Already on the latest" in msg
+
+
+def test_upgrade_no_installer_asset_returns_failure(monkeypatch):
+    """A new release with no installer asset surfaces a clear error."""
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        updater,
+        "get_latest_release",
+        lambda **kwargs: {
+            "tag_name": "99.0.0",
+            "assets": [],
+            "html_url": "",
+            "body": "",
+        },
+    )
+    ok, msg = updater.upgrade()
+    assert not ok
+    assert "no installer asset" in msg
+    assert "99.0.0" in msg
+
+
+def test_upgrade_download_failure_surfaces(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        updater, "get_latest_release", lambda **kwargs: _fake_release_payload("99.0.0")
+    )
+    monkeypatch.setattr(updater, "updates_dir", lambda: tmp_path)
+    monkeypatch.setattr(updater, "download_release", lambda url, dest: False)
+    ok, msg = updater.upgrade()
+    assert not ok
+    assert "Failed to download" in msg
+
+
+def test_upgrade_happy_path_launches_installer(monkeypatch, tmp_path: Path):
+    """Fetch -> download -> launch returns success and calls the launcher."""
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        updater, "get_latest_release", lambda **kwargs: _fake_release_payload("99.0.0")
+    )
+    monkeypatch.setattr(updater, "updates_dir", lambda: tmp_path)
+
+    def fake_download(url, dest):
+        Path(dest).write_bytes(b"MZ stub")
+        return True
+
+    monkeypatch.setattr(updater, "download_release", fake_download)
+
+    launched: list = []
+
+    def fake_launch(path):
+        launched.append(path)
+        return True, f"Launched {Path(path).name}"
+
+    monkeypatch.setattr(updater, "launch_installer", fake_launch)
+
+    stages: list = []
+    ok, msg = updater.upgrade(progress_callback=lambda stage, m: stages.append(stage))
+    assert ok, msg
+    assert "Installer for 99.0.0 has been launched" in msg
+    # Stages walked through fetch -> download -> launch -> done.
+    assert stages == ["fetch", "download", "launch", "done"]
+    # Installer file was written + handed to the launcher.
+    assert len(launched) == 1
+    assert launched[0].name == "meeting-notetaker-setup-99.0.0.exe"
+
+
+def test_upgrade_progress_callback_optional(monkeypatch, tmp_path: Path):
+    """Callers omitting progress_callback should still work end-to-end."""
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        updater, "get_latest_release", lambda **kwargs: _fake_release_payload("99.0.0")
+    )
+    monkeypatch.setattr(updater, "updates_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        updater, "download_release", lambda url, dest: Path(dest).write_bytes(b"x") or True
+    )
+    monkeypatch.setattr(updater, "launch_installer", lambda p: (True, ""))
+    ok, _msg = updater.upgrade()
+    assert ok

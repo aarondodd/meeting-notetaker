@@ -41,6 +41,14 @@ PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayName=Meeting Notetaker {#AppVersion}
 UninstallDisplayIcon={app}\meeting-notetaker.exe
 MinVersion=10.0.17763
+; CloseApplications + RestartApplications make Windows Restart Manager
+; close the running meeting-notetaker.exe before the install, then
+; relaunch it after. Required for the in-app self-updater (utils/
+; updater.py) which downloads this same installer and runs it silently;
+; without these directives a silent upgrade would fail with "file in use"
+; when the existing install is being replaced.
+CloseApplications=yes
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

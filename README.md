@@ -75,7 +75,9 @@ leaves the machine; no API key required.
   image paste, and merge-into-synthesis.
 - **PDF export + printing** with embedded images preserved.
 - **Crash-resilient** + **self-updating** (weekly GitHub release
-  check + one-click rebuild).
+  check + Help > Upgrade downloads and silently runs the latest
+  installer for installer-managed installs; source / portable
+  installs are told to upgrade via the user's own workflow).
 
 ## Why this exists
 

@@ -1,38 +1,43 @@
-"""GitHub-releases-based update checker + in-place upgrade.
+"""GitHub-releases-based update checker + installer-driven upgrade.
+
+The bundled .exe distributed via Meeting Notetaker's Inno Setup installer
+self-updates by downloading the latest release's installer asset and
+re-running it silently. Inno Setup's stable AppId means the running
+install gets upgraded in place; the CloseApplications +
+RestartApplications directives in installer.iss handle "the app is
+currently running" via Windows Restart Manager and relaunch the app
+once the install completes.
 
 On a successful check the latest release is fetched from:
 
     https://api.github.com/repos/<owner>/<repo>/releases/latest
 
 If the response tag_name parses to a higher version tuple than the
-bundled __version__, the offer is surfaced and -- on accept -- the
-source zipball is downloaded, extracted, and build.ps1 (Windows) or
-build.sh (POSIX) is invoked to drive pyinstaller. The freshly built
-executable is then copied over the currently running .exe via the
-NTFS rename-while-running trick: the old binary becomes <name>.old
-and the new one takes its place. A subsequent startup cleans the
-.old file up.
+bundled __version__, the offer is surfaced. On accept, the matching
+`meeting-notetaker-setup-X.Y.Z.exe` asset is downloaded to
+`%APPDATA%\\MeetingNotetaker\\updates\\`, launched with `/SILENT
+/SUPPRESSMSGBOXES`, and this process exits to let Restart Manager close
+us before the installer touches the .exe.
 
-Failures are deliberately swallowed and reported back as "no update
-available" rather than raising:
+Failures degrade silently (return False or None):
 - Repo is private and the request is unauthenticated -> 404
 - A corporate proxy / MITM appliance rejects the call -> URLError
 - DNS is sandboxed
-None of those should crash the host app.
+- The release exists but has no installer asset attached (CI didn't run)
+
+Running from source (not frozen) returns a "use your own update workflow"
+message rather than trying to launch an installer.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
-import platform
+import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.request
-import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -44,12 +49,19 @@ from .paths import app_data_dir
 log = logging.getLogger(__name__)
 
 
-CHECK_INTERVAL_DAYS = 7  # Weekly auto-check; same cadence as progman-py.
+CHECK_INTERVAL_DAYS = 7  # Weekly auto-check.
 
 DEFAULT_GITHUB_OWNER = "aarondodd"
 DEFAULT_GITHUB_REPO = "meeting-notetaker"
 
 USER_AGENT = f"meeting-notetaker/{__version__}"
+
+# Filename pattern produced by .github/workflows/release.yml +
+# installer.iss. The version capture is used to verify the asset matches
+# the release tag.
+INSTALLER_ASSET_PATTERN = re.compile(
+    r"^meeting-notetaker-setup-(?P<version>[\w.+-]+)\.exe$"
+)
 
 
 # --------- last-check persistence ------------------------------------------
@@ -138,9 +150,9 @@ def get_latest_release(
 ) -> Optional[Dict[str, Any]]:
     """Fetch the latest release from GitHub. Returns dict on success, else None.
 
-    Returned dict shape: {"tag_name": "0.5.0", "zipball_url": "..."}.
-    Returns None on any network/parse failure -- private-repo 404
-    included. Callers should treat None as "no update available".
+    Returned dict shape: {"tag_name": "0.5.0", "assets": [...], ...}.
+    Returns None on any network/parse failure -- 404 included. Callers
+    should treat None as "no update available".
     """
     url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
     request = urllib.request.Request(url)
@@ -153,15 +165,35 @@ def get_latest_release(
         return None
 
     tag = data.get("tag_name", "")
-    zipball = data.get("zipball_url", "")
-    if not tag or not zipball:
+    if not tag:
         return None
     return {
         "tag_name": tag.lstrip("vV"),
-        "zipball_url": zipball,
+        "assets": data.get("assets", []),
         "html_url": data.get("html_url", ""),
         "body": data.get("body", ""),
     }
+
+
+def get_installer_asset(release: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Locate the meeting-notetaker-setup-X.Y.Z.exe asset on a release.
+
+    Returns (version, browser_download_url) on success, None if the
+    release has no installer asset attached. This happens when:
+      - The release was created manually without running the workflow.
+      - The workflow failed before the upload step.
+      - Someone is testing against an old release predating v0.6.6.
+    """
+    for asset in release.get("assets", []):
+        name = asset.get("name", "")
+        match = INSTALLER_ASSET_PATTERN.match(name)
+        if not match:
+            continue
+        url = asset.get("browser_download_url", "")
+        if not url:
+            continue
+        return (match.group("version"), url)
+    return None
 
 
 def check_for_updates(
@@ -188,94 +220,20 @@ def check_for_updates(
     return None
 
 
-# --------- download + build -------------------------------------------------
+# --------- download + install -----------------------------------------------
 
 
-def download_release(zipball_url: str, dest_path: Path) -> bool:
-    """Stream the release zipball to dest_path. Returns True on success."""
-    request = urllib.request.Request(zipball_url)
+def download_release(url: str, dest_path: Path) -> bool:
+    """Stream a release asset to dest_path. Returns True on success."""
+    request = urllib.request.Request(url)
     request.add_header("User-Agent", USER_AGENT)
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=300) as response:
             with open(dest_path, "wb") as f:
                 shutil.copyfileobj(response, f)
         return True
     except (urllib.error.URLError, urllib.error.HTTPError, OSError):
         return False
-
-
-def extract_archive(zip_path: Path, extract_dir: Path) -> Optional[Path]:
-    """Extract the zipball; returns the top-level source directory."""
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
-    except (zipfile.BadZipFile, OSError):
-        return None
-    entries = list(extract_dir.iterdir())
-    if len(entries) == 1 and entries[0].is_dir():
-        return entries[0]
-    return extract_dir
-
-
-def find_build_script(source_dir: Path) -> Optional[Path]:
-    """Locate build.ps1 (Windows) or build.sh (POSIX) within source_dir."""
-    script_name = "build.ps1" if platform.system() == "Windows" else "build.sh"
-    direct = source_dir / script_name
-    if direct.exists():
-        return direct
-    # Scan up to two levels deep in case the zipball wraps in another folder.
-    for candidate in source_dir.rglob(script_name):
-        depth = len(candidate.relative_to(source_dir).parts)
-        if depth <= 3:
-            return candidate
-    return None
-
-
-def run_build_script(
-    script_path: Path, *, output_callback: Optional[Callable[[str], None]] = None
-) -> Tuple[bool, str]:
-    """Invoke the build script (which calls pyinstaller). Streams stdout/stderr."""
-    if platform.system() == "Windows":
-        shell_cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File"]
-    else:
-        shell_cmd = ["bash"]
-        try:
-            os.chmod(script_path, 0o755)
-        except OSError:
-            pass
-
-    output_lines: list[str] = []
-    try:
-        process = subprocess.Popen(
-            shell_cmd + [str(script_path)],
-            cwd=str(script_path.parent),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.rstrip("\n\r")
-            output_lines.append(line)
-            if output_callback:
-                output_callback(line)
-        process.wait()
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"Could not run build script: {exc}"
-
-    joined = "\n".join(output_lines)
-    if process.returncode == 0:
-        return True, joined
-    return False, f"Build failed with exit code {process.returncode}\n\n{joined}"
-
-
-# --------- in-place install -------------------------------------------------
-
-
-def _exe_filename() -> str:
-    """Filename of the bundled executable for this platform."""
-    return "meeting-notetaker.exe" if platform.system() == "Windows" else "meeting-notetaker"
 
 
 def is_frozen() -> bool:
@@ -287,9 +245,8 @@ def current_exe_path() -> Optional[Path]:
     """Path to the currently running bundled executable, or None.
 
     Returns None when running from source (sys.executable would point
-    at the python interpreter), so callers can skip the in-place
-    install and surface a "your dev install built a fresh dist/" message
-    instead.
+    at the python interpreter), so callers can skip the installer
+    launch and surface a "use your own update workflow" message instead.
     """
     if not is_frozen():
         return None
@@ -302,105 +259,57 @@ def current_exe_path() -> Optional[Path]:
     return None
 
 
-def find_built_exe(source_dir: Path) -> Optional[Path]:
-    """Locate the freshly built executable under source_dir/dist/.
+def updates_dir() -> Path:
+    """Per-user directory where downloaded installer .exes are cached.
 
-    Walks at most three levels deep so a zipball that wraps the project
-    in an extra folder still resolves. Returns the first match by name.
+    Lives under app_data_dir() so Inno Setup's silent invocation can
+    read it after the host app has exited (Windows temp cleanup runs
+    later and would race the install otherwise).
     """
-    target_name = _exe_filename()
-    dist = source_dir / "dist"
-    if dist.exists():
-        direct = dist / target_name
-        if direct.exists():
-            return direct
-    for candidate in source_dir.rglob(target_name):
-        try:
-            depth = len(candidate.relative_to(source_dir).parts)
-        except ValueError:
-            continue
-        if depth <= 4 and candidate.is_file():
-            return candidate
-    return None
-
-
-def old_exe_path(target: Path) -> Path:
-    """Sibling path the running .exe gets renamed to during an install."""
-    return target.with_suffix(target.suffix + ".old")
-
-
-def install_in_place(new_exe: Path, target: Path) -> Tuple[bool, str]:
-    """Replace `target` with `new_exe` in place.
-
-    On Windows, the running .exe cannot be deleted while in use, but
-    NTFS does allow renaming it. The standard pattern is:
-
-      1. Move any leftover <target>.old out of the way.
-      2. Rename current target -> target.old (frees the canonical path).
-      3. Copy new_exe over target.
-      4. On next launch, cleanup_old_exe removes <target>.old.
-
-    Returns (ok, message). On failure, attempts to undo step 2 so the
-    running install isn't left in a half-replaced state.
-    """
-    new_exe = Path(new_exe)
-    target = Path(target)
-    if not new_exe.exists() or not new_exe.is_file():
-        return False, f"New executable not found at {new_exe}."
-    if not target.exists():
-        return False, f"Target executable not found at {target}."
-
-    backup = old_exe_path(target)
-    if backup.exists():
-        try:
-            backup.unlink()
-        except OSError:
-            # The previous .old is still locked (rare); leave it for
-            # the next launch's cleanup. Rename below will overwrite
-            # only if Python's os.rename allows it on this OS; otherwise
-            # we fall through and the rename fails cleanly.
-            pass
-
+    path = app_data_dir() / "updates"
     try:
-        os.rename(target, backup)
-    except OSError as exc:
-        return False, f"Could not rename current executable: {exc}"
-
-    try:
-        shutil.copy2(new_exe, target)
-    except OSError as exc:
-        # Try to roll back so the user is left with a working install.
-        try:
-            if not target.exists():
-                os.rename(backup, target)
-        except OSError:
-            pass
-        return False, f"Could not copy new executable into place: {exc}"
-
-    return True, f"Installed {new_exe.name} in place at {target}."
-
-
-def cleanup_old_exe(target: Optional[Path] = None) -> bool:
-    """Delete the .old sibling left by a previous install_in_place().
-
-    Returns True if a stale .old existed and was removed; False if
-    there was nothing to clean or the removal failed (we just retry on
-    the next launch).
-    """
-    if target is None:
-        current = current_exe_path()
-        if current is None:
-            return False
-        target = current
-    backup = old_exe_path(target)
-    if not backup.exists():
-        return False
-    try:
-        backup.unlink()
-        return True
+        path.mkdir(parents=True, exist_ok=True)
     except OSError:
-        log.debug("could not remove stale %s; will retry on next launch", backup)
-        return False
+        pass
+    return path
+
+
+def launch_installer(installer_path: Path) -> Tuple[bool, str]:
+    """Spawn the installer with silent flags and return immediately.
+
+    The installer runs detached so its lifetime survives this process
+    exiting. /SILENT suppresses the wizard UI; /SUPPRESSMSGBOXES
+    auto-confirms any prompts. /NORESTART tells Inno Setup not to
+    request a Windows reboot even if it normally would -- our installer
+    never sets that flag, but pass it defensively.
+
+    Inno Setup's CloseApplications=yes + RestartApplications=yes (in
+    installer.iss) handle the "app is currently running" case via
+    Restart Manager and relaunch the app after install.
+    """
+    if not installer_path.exists():
+        return False, f"Installer not found at {installer_path}."
+    cmd = [
+        str(installer_path),
+        "/SILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+    ]
+    kwargs: Dict[str, Any] = {}
+    if sys.platform.startswith("win"):
+        # DETACHED_PROCESS so the child doesn't inherit our console
+        # handles; CREATE_NEW_PROCESS_GROUP so a Ctrl-C in a parent
+        # terminal doesn't kill it.
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        kwargs["close_fds"] = True
+    try:
+        subprocess.Popen(cmd, **kwargs)
+    except OSError as exc:
+        return False, f"Could not launch installer: {exc}"
+    return True, f"Installer launched: {installer_path.name}"
 
 
 def upgrade(
@@ -409,85 +318,72 @@ def upgrade(
     repo: str = DEFAULT_GITHUB_REPO,
     progress_callback: Optional[Callable[[str, str], None]] = None,
 ) -> Tuple[bool, str]:
-    """End-to-end upgrade: fetch -> verify -> download -> extract -> build -> install.
+    """End-to-end upgrade: fetch -> find installer -> download -> launch silently.
 
     progress_callback receives (stage, message) tuples; stages are:
-      'fetch', 'download', 'extract', 'build', 'build_output',
-      'install', 'done'.
-    The 'build_output' stage receives a line of stdout/stderr per call
-    so the UI can stream it into a text view; everything else is a
-    status update for a label.
+    'fetch', 'download', 'launch', 'done'.
 
-    When running from a pyinstaller bundle, the freshly built exe is
-    installed over the running one via install_in_place. When running
-    from source, the dist/ path is reported and the caller is expected
-    to copy the build out manually.
+    Returns (True, msg) when the installer has been launched and the
+    caller should close the app to let Restart Manager + Inno Setup take
+    over. Returns (False, msg) for any failure (no network, no asset,
+    download failed, launch failed).
+
+    Running from source (not pyinstaller-frozen) returns
+    (False, msg) with guidance to upgrade via the user's own workflow
+    (git pull + rebuild). There's no installed .exe to upgrade in that
+    case and silently kicking off a system-wide install would be
+    surprising behavior.
     """
     def notify(stage: str, message: str) -> None:
         if progress_callback:
             progress_callback(stage, message)
 
+    if not is_frozen():
+        return False, (
+            "This Meeting Notetaker is running from source, not from the "
+            "Inno Setup installer. The built-in updater only upgrades "
+            "installer-managed installs.\n\n"
+            "To update a source / portable build, use your own workflow "
+            "(for example: git pull + .\\build.ps1, or re-download a "
+            "portable .exe from the Releases page)."
+        )
+
     notify("fetch", "Checking GitHub for the latest release...")
     release = get_latest_release(owner=owner, repo=repo)
     if release is None:
-        return False, "Could not fetch release information (check network / private repo)."
+        return False, "Could not fetch release information (check network connectivity)."
 
     remote_version = release["tag_name"]
     if not is_newer_version(remote_version, __version__):
         return True, f"Already on the latest version ({__version__})."
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        zip_path = tmp_path / "release.zip"
-        extract_dir = tmp_path / "src"
-        extract_dir.mkdir()
+    asset = get_installer_asset(release)
+    if asset is None:
+        return False, (
+            f"Release {remote_version} exists but has no installer asset "
+            f"attached (expected `meeting-notetaker-setup-{remote_version}.exe`). "
+            "The release workflow may have failed; check "
+            f"https://github.com/{owner}/{repo}/releases."
+        )
+    asset_version, asset_url = asset
 
-        notify("download", f"Downloading release {remote_version}...")
-        if not download_release(release["zipball_url"], zip_path):
-            return False, "Failed to download release zipball."
+    download_dir = updates_dir()
+    installer_path = download_dir / f"meeting-notetaker-setup-{asset_version}.exe"
 
-        notify("extract", "Extracting archive...")
-        source_dir = extract_archive(zip_path, extract_dir)
-        if source_dir is None:
-            return False, "Failed to extract release archive."
+    notify("download", f"Downloading installer for {remote_version}...")
+    if not download_release(asset_url, installer_path):
+        return False, "Failed to download installer."
 
-        script = find_build_script(source_dir)
-        if script is None:
-            return False, "Could not find build.ps1 / build.sh in the release archive."
+    notify("launch", f"Launching installer for {remote_version}...")
+    ok_launch, launch_msg = launch_installer(installer_path)
+    if not ok_launch:
+        return False, launch_msg + f"\n\nDownloaded installer: {installer_path}"
 
-        notify("build", f"Running {script.name}...")
-        ok, build_output = run_build_script(script, output_callback=lambda line: notify("build_output", line))
-        if not ok:
-            return False, f"Build failed:\n{build_output}"
-
-        # Locate the freshly built executable. The build script writes
-        # to <source_dir>/dist/<name>{,.exe}; if the zipball wrapped
-        # the project in an extra folder, find_built_exe walks down.
-        built = find_built_exe(source_dir)
-        if built is None:
-            return False, (
-                "Build succeeded but the new executable could not be found "
-                f"under {source_dir / 'dist'}."
-            )
-
-        target = current_exe_path()
-        if target is None:
-            # Running from source -- there's no installed exe to replace.
-            # Report where the new build is so the user can move it
-            # into place manually.
-            return True, (
-                f"Built {built.name} for {remote_version}, but this Python "
-                "process is running from source -- there is no installed "
-                "executable to replace.\n\nNew build: " + str(built)
-            )
-
-        notify("install", f"Installing {built.name} in place...")
-        ok_install, install_msg = install_in_place(built, target)
-        if not ok_install:
-            return False, install_msg + f"\n\nNew build is at: {built}"
-
-    notify("done", f"Upgraded {__version__} -> {remote_version}.")
+    notify("done", f"Installer launched for {remote_version}.")
     return True, (
-        f"Upgraded to {remote_version} in place at {target}.\n\n"
-        "Restart the app to load the new build."
+        f"Installer for {remote_version} has been launched silently. "
+        "Meeting Notetaker will close shortly; Windows Restart Manager "
+        "handles the upgrade and relaunches the app when the install "
+        "completes.\n\n"
+        f"Downloaded to: {installer_path}"
     )
