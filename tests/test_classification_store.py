@@ -134,70 +134,198 @@ def test_normalize_title_strips_dates_and_weekdays():
 # People
 
 
-def test_get_or_create_person_case_insensitive(store):
-    a = store.get_or_create_person("Alice Smith")
-    b = store.get_or_create_person("alice smith")
+def test_get_or_create_contact_finds_by_alias(store):
+    """Phase 2 rename: People -> Contacts (with aliases).
+    get_or_create_contact_by_name dedupes case-insensitively via
+    the auto-seeded display_name alias."""
+    a = store.get_or_create_contact_by_name("Alice Smith")
+    b = store.get_or_create_contact_by_name("alice smith")
     assert a.id == b.id
     assert b.display_name == "Alice Smith"
 
 
-def test_add_session_person_then_lookup(store):
-    alice = store.get_or_create_person("Alice")
-    store.add_session_person("s1", alice.id, source=SOURCE_MANUAL)
-    people = store.people_for_session("s1")
-    assert len(people) == 1 and people[0].person.display_name == "Alice"
-    assert people[0].source == SOURCE_MANUAL
+def test_add_session_contact_then_lookup(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("s1", alice.id, source=SOURCE_MANUAL)
+    contacts = store.contacts_for_session("s1")
+    assert len(contacts) == 1
+    assert contacts[0].contact.display_name == "Alice"
+    assert contacts[0].source == SOURCE_MANUAL
 
 
-def test_add_session_person_idempotent(store):
-    alice = store.get_or_create_person("Alice")
-    store.add_session_person("s1", alice.id)
-    store.add_session_person("s1", alice.id)
-    assert len(store.people_for_session("s1")) == 1
+def test_add_session_contact_idempotent(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("s1", alice.id)
+    store.add_session_contact("s1", alice.id)
+    assert len(store.contacts_for_session("s1")) == 1
 
 
-def test_remove_session_person_drops_link(store):
-    alice = store.get_or_create_person("Alice")
-    store.add_session_person("s1", alice.id)
-    store.remove_session_person("s1", alice.id)
-    assert store.people_for_session("s1") == []
+def test_remove_session_contact_drops_link(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("s1", alice.id)
+    store.remove_session_contact("s1", alice.id)
+    assert store.contacts_for_session("s1") == []
 
 
-def test_rename_person_propagates_via_id(store):
-    alice = store.get_or_create_person("Alice")
-    store.add_session_person("s1", alice.id)
-    store.rename_person(alice.id, "Alice Smith")
-    people = store.people_for_session("s1")
-    assert people[0].person.display_name == "Alice Smith"
+def test_rename_contact_propagates_via_id_and_keeps_old_as_alias(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("s1", alice.id)
+    store.rename_contact(alice.id, "Alice Smith")
+    contacts = store.contacts_for_session("s1")
+    assert contacts[0].contact.display_name == "Alice Smith"
+    # Phase 2 contract: the old name stays as an alias so transcripts
+    # mentioning "Alice" still resolve to her.
+    aliases = {a.alias for a in store.list_aliases(alice.id)}
+    assert "Alice" in aliases
+    assert "Alice Smith" in aliases
 
 
-def test_sync_session_people_preserves_other_source_links(store):
-    """Diarization-derived and manually-added people must survive
-    a # Attendees list sync (which only owns the attendee_list
-    source rows)."""
-    a = store.get_or_create_person("Alice")
-    b = store.get_or_create_person("Bob")
-    c = store.get_or_create_person("Carol")
-    store.add_session_person("s1", a.id, source=SOURCE_ATTENDEE_LIST)
-    store.add_session_person("s1", b.id, source=SOURCE_DIARIZATION)
-    store.add_session_person("s1", c.id, source=SOURCE_MANUAL)
-    # User edits # Attendees to ["Dave"] -- Alice goes away,
-    # Bob+Carol stay (different source).
-    store.sync_session_people("s1", ["Dave"])
-    names = {p.person.display_name for p in store.people_for_session("s1")}
+def test_replace_session_attendee_contacts_preserves_other_sources(store):
+    """Diarization-derived + manually-added contacts must survive
+    a # Attendees list sync (which owns only attendee_list-source
+    rows)."""
+    a = store.create_contact("Alice")
+    b = store.create_contact("Bob")
+    c = store.create_contact("Carol")
+    d = store.create_contact("Dave")
+    store.add_session_contact("s1", a.id, source=SOURCE_ATTENDEE_LIST)
+    store.add_session_contact("s1", b.id, source=SOURCE_DIARIZATION)
+    store.add_session_contact("s1", c.id, source=SOURCE_MANUAL)
+    # User edits attendees so only Dave remains; Alice (attendee_list
+    # source) goes; Bob (diarization) + Carol (manual) stay.
+    store.replace_session_attendee_contacts("s1", [d.id])
+    names = {sc.contact.display_name for sc in store.contacts_for_session("s1")}
     assert names == {"Bob", "Carol", "Dave"}
 
 
-def test_sync_session_people_dedups_within_attendees(store):
-    store.sync_session_people("s1", ["Alice", "alice", "ALICE"])
-    assert len(store.people_for_session("s1")) == 1
+def test_session_ids_for_contact_lists_sessions(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("a", alice.id)
+    store.add_session_contact("b", alice.id)
+    assert sorted(store.session_ids_for_contact(alice.id)) == ["a", "b"]
 
 
-def test_session_ids_for_person_lists_sessions(store):
-    alice = store.get_or_create_person("Alice")
-    store.add_session_person("a", alice.id)
-    store.add_session_person("b", alice.id)
-    assert sorted(store.session_ids_for_person(alice.id)) == ["a", "b"]
+# ---- aliases ----
+
+
+def test_create_contact_seeds_name_alias(store):
+    c = store.create_contact("Bob Smith")
+    aliases = store.list_aliases(c.id)
+    assert any(a.alias == "Bob Smith" and a.kind == "name" for a in aliases)
+
+
+def test_find_contacts_by_alias_unique_match(store):
+    bob = store.create_contact("Bob Smith")
+    store.add_alias(bob.id, "BS", kind="short")
+    store.add_alias(bob.id, "bsmith@corp.com", kind="email")
+    assert store.find_contact_by_alias("BS").id == bob.id
+    assert store.find_contact_by_alias("bsmith@corp.com", kind="email").id == bob.id
+
+
+def test_find_contacts_by_alias_no_match_returns_empty(store):
+    assert store.find_contacts_by_alias("nobody") == []
+
+
+def test_find_contact_by_alias_case_insensitive(store):
+    bob = store.create_contact("Bob Smith")
+    store.add_alias(bob.id, "BS", kind="short")
+    assert store.find_contact_by_alias("bs").id == bob.id
+    assert store.find_contact_by_alias("Bs").id == bob.id
+
+
+def test_alias_can_be_shared_across_contacts(store):
+    """Per-contact uniqueness on (alias, kind) -- the SAME short
+    alias 'AB' can belong to multiple Contacts (e.g. "Alice
+    Bauer" and "Andrew Brown"). Smart resolution treats the
+    shared alias as ambiguous at match time and surfaces both as
+    suggested merges in the Address Book."""
+    a = store.create_contact("Alice")
+    b = store.create_contact("Bob")
+    store.add_alias(a.id, "AB", kind="short")
+    # Adding the same alias to a different contact is allowed.
+    store.add_alias(b.id, "AB", kind="short")
+    # find_contacts_by_alias returns both -- callers handle the
+    # multi-match case via the resolver's ambiguity branch.
+    matches = store.find_contacts_by_alias("AB")
+    assert {c.id for c in matches} == {a.id, b.id}
+
+
+def test_alias_collision_on_same_contact_is_noop(store):
+    bob = store.create_contact("Bob")
+    store.add_alias(bob.id, "B", kind="short")
+    # Adding the same alias to the same contact silently no-ops.
+    result = store.add_alias(bob.id, "B", kind="short")
+    assert result is None
+    # And only one alias row exists.
+    aliases = [a for a in store.list_aliases(bob.id) if a.kind == "short"]
+    assert len(aliases) == 1
+
+
+def test_merge_contacts_moves_aliases_and_links(store):
+    src = store.create_contact("Bob")
+    dst = store.create_contact("Bob Smith")
+    store.add_alias(src.id, "B", kind="short")
+    store.add_session_contact("s1", src.id, source=SOURCE_MANUAL)
+    store.add_session_contact("s2", dst.id, source=SOURCE_MANUAL)
+    store.merge_contacts(src.id, dst.id)
+    # src is gone; dst has both sessions + the "B" alias.
+    assert store.get_contact(src.id) is None
+    sessions = sorted(store.session_ids_for_contact(dst.id))
+    assert sessions == ["s1", "s2"]
+    aliases = {a.alias for a in store.list_aliases(dst.id)}
+    assert "B" in aliases
+    # The source's display_name lands as a merged_from alias on dst.
+    assert "Bob" in aliases
+
+
+def test_merge_contacts_handles_session_collision(store):
+    """When both src + dst are on the same session, the merged
+    target keeps a single row (no PK conflict)."""
+    src = store.create_contact("Bob")
+    dst = store.create_contact("Bob Smith")
+    store.add_session_contact("s1", src.id, source=SOURCE_DIARIZATION)
+    store.add_session_contact("s1", dst.id, source=SOURCE_MANUAL)
+    store.merge_contacts(src.id, dst.id)
+    contacts = store.contacts_for_session("s1")
+    assert len(contacts) == 1
+    assert contacts[0].contact.id == dst.id
+
+
+def test_delete_contact_cascades(store):
+    bob = store.create_contact("Bob")
+    store.add_alias(bob.id, "B", kind="short")
+    store.add_session_contact("s1", bob.id)
+    store.delete_contact(bob.id)
+    assert store.get_contact(bob.id) is None
+    assert store.contacts_for_session("s1") == []
+    assert store.list_aliases(bob.id) == []
+
+
+def test_list_contacts_in_use_excludes_orphans(store):
+    used = store.create_contact("Used")
+    store.create_contact("Orphan")
+    store.add_session_contact("s1", used.id)
+    names = [c.display_name for c in store.list_contacts_in_use()]
+    assert "Used" in names
+    assert "Orphan" not in names
+
+
+def test_list_orphan_contacts_returns_unlinked(store):
+    store.create_contact("Orphan")
+    used = store.create_contact("Used")
+    store.add_session_contact("s1", used.id)
+    orphans = store.list_orphan_contacts()
+    assert {c.display_name for c in orphans} == {"Orphan"}
+
+
+def test_delete_orphan_contacts_returns_count(store):
+    store.create_contact("Orphan A")
+    store.create_contact("Orphan B")
+    used = store.create_contact("Used")
+    store.add_session_contact("s1", used.id)
+    assert store.delete_orphan_contacts() == 2
+    assert store.list_orphan_contacts() == []
+    assert store.get_contact(used.id) is not None
 
 
 # ----------------------------------------------------------------------
@@ -211,14 +339,14 @@ def test_get_or_create_topic_case_insensitive(store):
     assert b.name == "MDM"   # canonical preserved
 
 
-def test_session_ids_for_person_lists_sessions_dedup(store):
-    """Adding the same person to multiple sessions, in_use filters
+def test_session_ids_for_contact_lists_sessions_dedup(store):
+    """Adding the same contact to multiple sessions; in_use filters
     rely on this method via the navigator's session-list filter."""
-    bob = store.get_or_create_person("Bob")
-    store.add_session_person("a", bob.id)
-    store.add_session_person("b", bob.id)
-    store.add_session_person("a", bob.id)  # idempotent dup
-    assert sorted(store.session_ids_for_person(bob.id)) == ["a", "b"]
+    bob = store.create_contact("Bob")
+    store.add_session_contact("a", bob.id)
+    store.add_session_contact("b", bob.id)
+    store.add_session_contact("a", bob.id)  # idempotent dup
+    assert sorted(store.session_ids_for_contact(bob.id)) == ["a", "b"]
 
 
 def test_add_session_topic_then_lookup(store):
@@ -309,14 +437,14 @@ def test_remove_session_drops_all_associations(store):
     """Session deletion cleanup -- the FK doesn't cascade across
     databases, so the explicit hook has to do it."""
     series = store.get_or_create_series("S")
-    alice = store.get_or_create_person("Alice")
+    alice = store.create_contact("Alice")
     topic = store.get_or_create_topic("MDM")
     store.assign_series("s1", series.id)
-    store.add_session_person("s1", alice.id)
+    store.add_session_contact("s1", alice.id)
     store.add_session_topic("s1", topic.id, accepted=True)
     store.remove_session("s1")
     assert store.series_for_session("s1") is None
-    assert store.people_for_session("s1") == []
+    assert store.contacts_for_session("s1") == []
     assert store.topics_for_session("s1") == []
 
 
@@ -346,11 +474,11 @@ def test_list_series_in_use_recovers_after_unassign(store):
     assert not any(s.name == "Sometimes" for s in store.list_series_in_use())
 
 
-def test_list_people_in_use_excludes_unlinked_people(store):
-    alice = store.get_or_create_person("Alice")
-    store.get_or_create_person("Bob")  # no session_people row
-    store.add_session_person("s1", alice.id)
-    names = [p.display_name for p in store.list_people_in_use()]
+def test_list_contacts_in_use_excludes_unlinked(store):
+    alice = store.create_contact("Alice")
+    store.create_contact("Bob")  # no session_contacts row
+    store.add_session_contact("s1", alice.id)
+    names = [c.display_name for c in store.list_contacts_in_use()]
     assert "Alice" in names
     assert "Bob" not in names
 
@@ -387,12 +515,12 @@ def test_list_topics_in_use_promotes_after_user_accepts(store):
 
 def test_classification_for_session_aggregates_all_three(store):
     series = store.get_or_create_series("Sync")
-    alice = store.get_or_create_person("Alice")
+    alice = store.create_contact("Alice")
     topic = store.get_or_create_topic("MDM")
     store.assign_series("s1", series.id)
-    store.add_session_person("s1", alice.id)
+    store.add_session_contact("s1", alice.id)
     store.add_session_topic("s1", topic.id, accepted=True)
     cls = store.classification_for_session("s1")
     assert cls.series.name == "Sync"
-    assert [p.person.display_name for p in cls.people] == ["Alice"]
+    assert [sc.contact.display_name for sc in cls.contacts] == ["Alice"]
     assert [t.topic.name for t in cls.topics] == ["MDM"]

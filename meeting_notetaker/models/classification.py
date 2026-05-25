@@ -1,4 +1,4 @@
-"""Session classification: Series, People, Topics.
+"""Session classification: Series, Topics, and Contacts (formerly People).
 
 Adds three orthogonal classification dimensions to each session:
 
@@ -6,28 +6,38 @@ Adds three orthogonal classification dimensions to each session:
   most one series (or NULL = unfiled). Auto-derived from the title
   for repeat meetings ("Platform Team Sync 2026-05-24" matches an
   existing "Platform Team Sync" series).
-* **People** (M:N) -- the human participants associated with a
-  session. Auto-populated from the `# Attendees` bulleted list in
-  My Notes; user can add/remove from the session view's chips row.
+* **Contacts / People** (M:N) -- the human participants associated
+  with a session. Auto-populated from the `# Attendees` bulleted
+  list in My Notes; UI surface in the chips bar still labels them
+  "People" because that's the per-session role. The underlying
+  entity is a Contact in the unified Address Book (see
+  meeting_notetaker.diarization.store for the speaker-side
+  contact_id link).
 * **Topics** (M:N) -- free-form themes/technologies/projects
   discussed. Auto-extracted from the synthesis output by a
-  deterministic extractor (no LLM round-trip per the issue's design
-  constraint). User can accept/reject the auto-suggestions.
+  deterministic extractor (no LLM round-trip per the issue's
+  design constraint). User can accept/reject the auto-suggestions.
 
-All three live in a sibling SQLite at `<app_data>/classification.db`
-so the existing `sessions.db` schema stays untouched. A session's
-series_id is stored here too rather than ALTERing sessions.sessions,
-keeping migration-back-compat trivial (just delete classification.db).
+All three live in a sibling SQLite at `<app_data>/classification.db`.
 
-The store has no foreign keys back to sessions.db -- a deleted
-session leaves orphan rows that the periodic cleanup pass (called
-on every list_*) sweeps lazily. Cheap and avoids cross-DB joins.
+## Why Contacts (vs the previous Person table)
+
+PR #27 first cut had a `people` table where each Person was a
+display_name string -- the same human surfacing as "Bob" in one
+meeting and "Bob Smith" in another would create two unrelated
+rows. v0.7.0 follow-up (issue #28) introduces a Contact entity
+with alias matching: typing "BS" in attendees resolves to the
+Bob Smith contact via a stored alias, and renaming a Contact
+propagates everywhere it's referenced (sessions, speaker store).
+
+The old people / session_people tables are dropped entirely;
+classification.db schema is incompatible with prior versions
+(delete the file before launching this build).
 """
 from __future__ import annotations
 
 import re
 import sqlite3
-from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
@@ -41,6 +51,17 @@ SOURCE_ATTENDEE_LIST = "attendee_list"
 SOURCE_DIARIZATION = "diarization"
 SOURCE_MANUAL = "manual"
 SOURCE_AUTO = "auto"
+SOURCE_CALENDAR = "calendar"
+SOURCE_MERGED_FROM = "merged_from"
+
+ALIAS_KIND_NAME = "name"
+ALIAS_KIND_SHORT = "short"
+ALIAS_KIND_INITIAL = "initial"
+ALIAS_KIND_EMAIL = "email"
+ALL_ALIAS_KINDS = (
+    ALIAS_KIND_NAME, ALIAS_KIND_SHORT,
+    ALIAS_KIND_INITIAL, ALIAS_KIND_EMAIL,
+)
 
 
 SCHEMA = """
@@ -51,12 +72,35 @@ CREATE TABLE IF NOT EXISTS series (
     created_at                    TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS people (
+CREATE TABLE IF NOT EXISTS contacts (
     id            INTEGER PRIMARY KEY,
-    display_name  TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    email         TEXT,
+    display_name  TEXT NOT NULL,
+    notes         TEXT DEFAULT '',
     created_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS contact_aliases (
+    id          INTEGER PRIMARY KEY,
+    contact_id  INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+    alias       TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+-- Per-contact uniqueness on (alias, kind) only -- the SAME alias
+-- string can belong to multiple Contacts. "BS" might be a short
+-- alias for both Bob Smith AND Brenda Saunders; the resolver
+-- handles that ambiguity by creating a new Contact + surfacing the
+-- candidates via suggested merges, so the user resolves
+-- affirmatively in the Address Book rather than the system silently
+-- picking the wrong one.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_contact_alias_kind
+    ON contact_aliases(contact_id, alias COLLATE NOCASE, kind);
+CREATE INDEX IF NOT EXISTS idx_aliases_lookup
+    ON contact_aliases(alias COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_aliases_contact
+    ON contact_aliases(contact_id);
 
 CREATE TABLE IF NOT EXISTS topics (
     id          INTEGER PRIMARY KEY,
@@ -69,11 +113,11 @@ CREATE TABLE IF NOT EXISTS session_series (
     series_id   INTEGER NOT NULL REFERENCES series(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS session_people (
+CREATE TABLE IF NOT EXISTS session_contacts (
     session_id  TEXT NOT NULL,
-    person_id   INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    contact_id  INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
     source      TEXT NOT NULL,
-    PRIMARY KEY (session_id, person_id)
+    PRIMARY KEY (session_id, contact_id)
 );
 
 CREATE TABLE IF NOT EXISTS session_topics (
@@ -84,9 +128,12 @@ CREATE TABLE IF NOT EXISTS session_topics (
     PRIMARY KEY (session_id, topic_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_session_people_person ON session_people(person_id);
-CREATE INDEX IF NOT EXISTS idx_session_topics_topic ON session_topics(topic_id);
-CREATE INDEX IF NOT EXISTS idx_session_series_series ON session_series(series_id);
+CREATE INDEX IF NOT EXISTS idx_session_contacts_contact
+    ON session_contacts(contact_id);
+CREATE INDEX IF NOT EXISTS idx_session_topics_topic
+    ON session_topics(topic_id);
+CREATE INDEX IF NOT EXISTS idx_session_series_series
+    ON session_series(series_id);
 """
 
 
@@ -99,10 +146,20 @@ class Series:
 
 
 @dataclass
-class Person:
+class Contact:
     id: int
     display_name: str
-    email: Optional[str] = None
+    notes: str = ""
+    created_at: str = ""
+
+
+@dataclass
+class ContactAlias:
+    id: int
+    contact_id: int
+    alias: str
+    kind: str
+    source: str
     created_at: str = ""
 
 
@@ -115,29 +172,28 @@ class Topic:
 
 @dataclass
 class SessionTopic:
-    """A topic association for one session.
-
-    `accepted` distinguishes user-confirmed associations from
-    auto-suggestions still in the suggestion bucket. The UI surfaces
-    suggestions separately from confirmed chips; this flag is the
-    discriminator.
-    """
     topic: Topic
-    source: str            # SOURCE_AUTO | SOURCE_MANUAL
+    source: str
     accepted: bool
 
 
 @dataclass
-class SessionPerson:
-    person: Person
-    source: str            # SOURCE_ATTENDEE_LIST | SOURCE_DIARIZATION | SOURCE_MANUAL
+class SessionContact:
+    """Per-session attendee record.
+
+    `source` says how the link was established (attendee_list /
+    diarization / manual / calendar / merged_from); the underlying
+    Contact is the master identity.
+    """
+    contact: Contact
+    source: str
 
 
 @dataclass
 class SessionClassification:
     """Aggregate view -- everything a session view's chips need."""
     series: Optional[Series] = None
-    people: list[SessionPerson] = field(default_factory=list)
+    contacts: list[SessionContact] = field(default_factory=list)
     topics: list[SessionTopic] = field(default_factory=list)
 
 
@@ -146,13 +202,12 @@ def utc_now_iso() -> str:
 
 
 def db_path() -> Path:
-    """`<app_data>/classification.db` -- co-resident with sessions /
-    speakers / search."""
     return app_data_dir() / "classification.db"
 
 
 class ClassificationStore:
-    """SQLite-backed CRUD over the three classification dimensions."""
+    """SQLite-backed CRUD over the four classification dimensions
+    (Series, Contacts, Topics, plus the session_* link tables)."""
 
     def __init__(self, path: Optional[Path] = None) -> None:
         self.path = path or db_path()
@@ -171,8 +226,9 @@ class ClassificationStore:
     def __exit__(self, *exc_info) -> None:
         self.close()
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Series
+    # ==================================================================
 
     def get_or_create_series(
         self,
@@ -180,8 +236,6 @@ class ClassificationStore:
         *,
         outlook_recurring_master_id: Optional[str] = None,
     ) -> Series:
-        """Find by exact (case-insensitive) name or create. Returns
-        the canonical Series with whatever id ended up in the table."""
         name = name.strip()
         if not name:
             raise ValueError("series name cannot be empty")
@@ -214,13 +268,6 @@ class ClassificationStore:
         *,
         threshold: float = 0.8,
     ) -> Optional[Series]:
-        """Fuzzy-match a session title against known series names.
-
-        Used at session-creation time to auto-link a recurring
-        meeting whose title varies session-to-session ("Platform
-        Team Sync 2026-05-24" -> series "Platform Team Sync").
-        Returns the best-matching series above `threshold`, or None.
-        """
         normalized_title = _normalize_title(title)
         if not normalized_title:
             return None
@@ -233,8 +280,6 @@ class ClassificationStore:
             score = SequenceMatcher(
                 None, normalized_title, normalized_name,
             ).ratio()
-            # Also accept the series-name-as-substring case (works
-            # well for templated titles like "Platform Team Sync -- weekly").
             if normalized_name in normalized_title:
                 score = max(score, 0.95)
             if score > best_score:
@@ -253,8 +298,6 @@ class ClassificationStore:
         )
 
     def merge_series(self, source_id: int, target_id: int) -> None:
-        """Reassign every session of `source_id` to `target_id`, then
-        delete `source_id`. No-op when source == target."""
         if source_id == target_id:
             return
         self._conn.execute(
@@ -264,8 +307,6 @@ class ClassificationStore:
         self._conn.execute("DELETE FROM series WHERE id = ?", (source_id,))
 
     def delete_series(self, series_id: int) -> None:
-        """Drops the series and all session_series rows for it via
-        the ON DELETE CASCADE foreign key."""
         self._conn.execute("DELETE FROM series WHERE id = ?", (series_id,))
 
     def list_series(self) -> list[Series]:
@@ -275,14 +316,6 @@ class ClassificationStore:
         return [_row_to_series(r) for r in rows]
 
     def list_series_in_use(self) -> list[Series]:
-        """Series that have at least one session assigned to them.
-
-        Drives the navigator's By-Series pulldown -- there's no point
-        offering a filter value that returns zero sessions. The
-        chips-bar's Change Series picker still uses list_series()
-        so a user can re-assign a session to a known-but-currently-
-        unused series.
-        """
         rows = self._conn.execute(
             """SELECT s.* FROM series s
                WHERE EXISTS (
@@ -321,134 +354,390 @@ class ClassificationStore:
         ).fetchall()
         return [r["session_id"] for r in rows]
 
-    # ------------------------------------------------------------------
-    # People
+    # ==================================================================
+    # Contacts + aliases
+    # ==================================================================
 
-    def get_or_create_person(
+    def create_contact(
         self,
         display_name: str,
         *,
-        email: Optional[str] = None,
-    ) -> Person:
-        display_name = display_name.strip()
+        notes: str = "",
+        initial_alias_source: str = SOURCE_MANUAL,
+    ) -> Contact:
+        """Create a Contact and seed it with one `name`-kind alias
+        for the display name (so `find_by_alias` finds it).
+
+        Use `get_or_create_contact_by_name` when you want
+        find-or-create semantics; this is the raw create.
+        """
+        display_name = (display_name or "").strip()
         if not display_name:
-            raise ValueError("person display_name cannot be empty")
-        row = self._conn.execute(
-            "SELECT * FROM people WHERE display_name = ? COLLATE NOCASE",
-            (display_name,),
-        ).fetchone()
-        if row:
-            return _row_to_person(row)
+            raise ValueError("contact display_name cannot be empty")
         when = utc_now_iso()
         cur = self._conn.execute(
-            "INSERT INTO people (display_name, email, created_at) VALUES (?, ?, ?)",
-            (display_name, email, when),
+            "INSERT INTO contacts (display_name, notes, created_at) VALUES (?, ?, ?)",
+            (display_name, notes, when),
         )
-        return Person(
-            id=cur.lastrowid,
-            display_name=display_name,
-            email=email,
-            created_at=when,
+        contact_id = cur.lastrowid
+        self._insert_alias_row(
+            contact_id, display_name, ALIAS_KIND_NAME,
+            initial_alias_source, when,
         )
-
-    def rename_person(self, person_id: int, new_name: str) -> None:
-        new_name = new_name.strip()
-        if not new_name:
-            raise ValueError("new person name cannot be empty")
-        self._conn.execute(
-            "UPDATE people SET display_name = ? WHERE id = ?", (new_name, person_id),
+        return Contact(
+            id=contact_id, display_name=display_name,
+            notes=notes, created_at=when,
         )
 
-    def list_people(self) -> list[Person]:
-        rows = self._conn.execute(
-            "SELECT * FROM people ORDER BY display_name COLLATE NOCASE"
-        ).fetchall()
-        return [_row_to_person(r) for r in rows]
+    def get_contact(self, contact_id: int) -> Optional[Contact]:
+        row = self._conn.execute(
+            "SELECT * FROM contacts WHERE id = ?", (contact_id,),
+        ).fetchone()
+        return _row_to_contact(row) if row else None
 
-    def list_people_in_use(self) -> list[Person]:
-        """People associated with at least one session.
+    def find_contact_by_alias(
+        self,
+        alias: str,
+        *,
+        kind: Optional[str] = None,
+    ) -> Optional[Contact]:
+        """Single-result alias lookup. None when zero or multiple
+        Contacts match (the caller uses find_contacts_by_alias to
+        get the list for a disambiguation prompt)."""
+        matches = self.find_contacts_by_alias(alias, kind=kind)
+        return matches[0] if len(matches) == 1 else None
 
-        Drives the navigator's By-Person pulldown. Chips-bar
-        pickers use list_people() so a user can re-link a person
-        whose only session was deleted (without losing their name
-        from the global catalog).
+    def find_contacts_by_alias(
+        self,
+        alias: str,
+        *,
+        kind: Optional[str] = None,
+    ) -> list[Contact]:
+        """All Contacts whose aliases include `alias` (case-insensitive).
+
+        Pass `kind` to constrain ('email', 'name', etc.); None
+        searches every alias kind.
         """
-        rows = self._conn.execute(
-            """SELECT p.* FROM people p
-               WHERE EXISTS (
-                   SELECT 1 FROM session_people sp
-                   WHERE sp.person_id = p.id
-               )
-               ORDER BY p.display_name COLLATE NOCASE"""
-        ).fetchall()
-        return [_row_to_person(r) for r in rows]
+        alias = (alias or "").strip()
+        if not alias:
+            return []
+        if kind:
+            sql = (
+                "SELECT DISTINCT c.* FROM contacts c "
+                "JOIN contact_aliases a ON a.contact_id = c.id "
+                "WHERE a.alias = ? COLLATE NOCASE AND a.kind = ? "
+                "ORDER BY c.display_name COLLATE NOCASE"
+            )
+            params = (alias, kind)
+        else:
+            sql = (
+                "SELECT DISTINCT c.* FROM contacts c "
+                "JOIN contact_aliases a ON a.contact_id = c.id "
+                "WHERE a.alias = ? COLLATE NOCASE "
+                "ORDER BY c.display_name COLLATE NOCASE"
+            )
+            params = (alias,)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_contact(r) for r in rows]
 
-    def add_session_person(
+    def get_or_create_contact_by_name(
+        self,
+        name: str,
+        *,
+        source: str = SOURCE_MANUAL,
+    ) -> Contact:
+        """Find by exact alias hit OR by display_name; create if
+        neither matches. Used by callers that have a single name
+        with no ambiguity worry (manual chip-bar add, calendar
+        seed where the email lookup already filtered)."""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("contact name cannot be empty")
+        existing = self.find_contacts_by_alias(name)
+        if existing:
+            # Prefer exact display_name match if any, else the first.
+            for c in existing:
+                if c.display_name.casefold() == name.casefold():
+                    return c
+            return existing[0]
+        return self.create_contact(name, initial_alias_source=source)
+
+    def rename_contact(self, contact_id: int, new_name: str) -> None:
+        """Update the Contact's display_name AND ensure the new name
+        is a `name`-kind alias so future lookups by the new name
+        succeed.
+
+        The old display_name remains as an alias by design -- the
+        old form might still appear in transcripts/notes and we
+        want those mentions to keep resolving. Caller can remove
+        the old name explicitly via remove_alias if they really
+        want to.
+        """
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ValueError("new contact name cannot be empty")
+        self._conn.execute(
+            "UPDATE contacts SET display_name = ? WHERE id = ?",
+            (new_name, contact_id),
+        )
+        # Ensure the new name is also reachable as a name-alias.
+        self.add_alias(contact_id, new_name, kind=ALIAS_KIND_NAME, source=SOURCE_MANUAL)
+
+    def update_contact_notes(self, contact_id: int, notes: str) -> None:
+        self._conn.execute(
+            "UPDATE contacts SET notes = ? WHERE id = ?", (notes, contact_id),
+        )
+
+    def merge_contacts(self, source_id: int, target_id: int) -> None:
+        """Reassign every alias + session link from source -> target,
+        merge notes, drop source. PK collisions on session_contacts
+        are merged (target's source kept; source's row deleted).
+
+        After the merge, an alias rows record the prior identity by
+        adding the source's display_name as a 'merged_from'-source
+        alias on the target. The user can clean these up via
+        remove_alias if desired.
+        """
+        if source_id == target_id:
+            return
+        source = self.get_contact(source_id)
+        target = self.get_contact(target_id)
+        if source is None or target is None:
+            return
+        # Drop conflicting session_contacts rows on source side first
+        # so the UPDATE doesn't trip the PK.
+        self._conn.execute(
+            """DELETE FROM session_contacts
+               WHERE contact_id = ?
+                 AND session_id IN (
+                     SELECT session_id FROM session_contacts WHERE contact_id = ?
+                 )""",
+            (source_id, target_id),
+        )
+        self._conn.execute(
+            "UPDATE session_contacts SET contact_id = ? WHERE contact_id = ?",
+            (target_id, source_id),
+        )
+        # Move aliases. Collisions go silently -- (alias, kind) is
+        # globally unique. The source's display_name lands as a
+        # merged_from alias if it isn't already an alias of target.
+        when = utc_now_iso()
+        if not self._alias_exists(target_id, source.display_name, ALIAS_KIND_NAME):
+            try:
+                self._insert_alias_row(
+                    target_id, source.display_name, ALIAS_KIND_NAME,
+                    SOURCE_MERGED_FROM, when,
+                )
+            except sqlite3.IntegrityError:
+                pass
+        # Aliases that don't collide come along.
+        self._conn.execute(
+            """UPDATE OR IGNORE contact_aliases
+               SET contact_id = ?
+               WHERE contact_id = ?""",
+            (target_id, source_id),
+        )
+        # Notes: append if target lacks them.
+        if source.notes and not target.notes:
+            self.update_contact_notes(target_id, source.notes)
+        elif source.notes and source.notes not in target.notes:
+            merged_notes = (target.notes + "\n\n" + source.notes).strip()
+            self.update_contact_notes(target_id, merged_notes)
+        # CASCADE drops residual source alias rows.
+        self._conn.execute("DELETE FROM contacts WHERE id = ?", (source_id,))
+
+    def delete_contact(self, contact_id: int) -> None:
+        """CASCADE removes the Contact's aliases + session_contacts rows."""
+        self._conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+
+    def list_contacts(self) -> list[Contact]:
+        rows = self._conn.execute(
+            "SELECT * FROM contacts ORDER BY display_name COLLATE NOCASE"
+        ).fetchall()
+        return [_row_to_contact(r) for r in rows]
+
+    def list_contacts_in_use(self) -> list[Contact]:
+        rows = self._conn.execute(
+            """SELECT c.* FROM contacts c
+               WHERE EXISTS (
+                   SELECT 1 FROM session_contacts sc
+                   WHERE sc.contact_id = c.id
+               )
+               ORDER BY c.display_name COLLATE NOCASE"""
+        ).fetchall()
+        return [_row_to_contact(r) for r in rows]
+
+    def list_orphan_contacts(self) -> list[Contact]:
+        """Contacts with zero session_contacts rows. Drives the
+        Address Book "delete orphans" affordance."""
+        rows = self._conn.execute(
+            """SELECT c.* FROM contacts c
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM session_contacts sc
+                   WHERE sc.contact_id = c.id
+               )
+               ORDER BY c.display_name COLLATE NOCASE"""
+        ).fetchall()
+        return [_row_to_contact(r) for r in rows]
+
+    def session_count_for_contact(self, contact_id: int) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM session_contacts WHERE contact_id = ?",
+            (contact_id,),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    # ---- aliases ----
+    def list_aliases(self, contact_id: int) -> list[ContactAlias]:
+        rows = self._conn.execute(
+            """SELECT * FROM contact_aliases WHERE contact_id = ?
+               ORDER BY kind, alias COLLATE NOCASE""",
+            (contact_id,),
+        ).fetchall()
+        return [_row_to_alias(r) for r in rows]
+
+    def add_alias(
+        self,
+        contact_id: int,
+        alias: str,
+        *,
+        kind: str = ALIAS_KIND_NAME,
+        source: str = SOURCE_MANUAL,
+    ) -> Optional[ContactAlias]:
+        """Insert an alias if THIS contact doesn't already have it.
+
+        (alias, kind) uniqueness is per-contact, not global -- "BS"
+        as a short alias can belong to multiple Contacts. Callers
+        who care about cross-contact collisions check
+        find_contacts_by_alias first; the resolver explicitly wants
+        to allow shared aliases so it can detect ambiguity at
+        match time.
+
+        Returns the new row on insert, None when this contact
+        already had the alias (silent dedupe).
+        """
+        alias = (alias or "").strip()
+        if not alias:
+            return None
+        if kind not in ALL_ALIAS_KINDS:
+            raise ValueError(f"unknown alias kind: {kind!r}")
+        existing = self._conn.execute(
+            "SELECT 1 FROM contact_aliases WHERE contact_id = ? "
+            "AND alias = ? COLLATE NOCASE AND kind = ?",
+            (contact_id, alias, kind),
+        ).fetchone()
+        if existing is not None:
+            return None  # same contact already has it; no-op
+        when = utc_now_iso()
+        return self._insert_alias_row(contact_id, alias, kind, source, when)
+
+    def _insert_alias_row(
+        self, contact_id: int, alias: str, kind: str, source: str, when: str,
+    ) -> ContactAlias:
+        cur = self._conn.execute(
+            "INSERT INTO contact_aliases (contact_id, alias, kind, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (contact_id, alias, kind, source, when),
+        )
+        return ContactAlias(
+            id=cur.lastrowid, contact_id=contact_id,
+            alias=alias, kind=kind, source=source, created_at=when,
+        )
+
+    def _alias_exists(self, contact_id: int, alias: str, kind: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM contact_aliases WHERE contact_id = ? "
+            "AND alias = ? COLLATE NOCASE AND kind = ?",
+            (contact_id, alias, kind),
+        ).fetchone()
+        return row is not None
+
+    def remove_alias(self, alias_id: int) -> None:
+        self._conn.execute("DELETE FROM contact_aliases WHERE id = ?", (alias_id,))
+
+    def remove_alias_by_text(
+        self,
+        contact_id: int,
+        alias: str,
+        *,
+        kind: Optional[str] = None,
+    ) -> int:
+        if kind:
+            cur = self._conn.execute(
+                "DELETE FROM contact_aliases WHERE contact_id = ? "
+                "AND alias = ? COLLATE NOCASE AND kind = ?",
+                (contact_id, alias, kind),
+            )
+        else:
+            cur = self._conn.execute(
+                "DELETE FROM contact_aliases WHERE contact_id = ? "
+                "AND alias = ? COLLATE NOCASE",
+                (contact_id, alias),
+            )
+        return cur.rowcount or 0
+
+    # ---- session-level links (the "People" association on a session) ----
+    def add_session_contact(
         self,
         session_id: str,
-        person_id: int,
+        contact_id: int,
         *,
         source: str = SOURCE_MANUAL,
     ) -> None:
         self._conn.execute(
-            "INSERT INTO session_people (session_id, person_id, source) VALUES (?, ?, ?)"
-            " ON CONFLICT(session_id, person_id) DO NOTHING",
-            (session_id, person_id, source),
+            "INSERT INTO session_contacts (session_id, contact_id, source) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id, contact_id) DO NOTHING",
+            (session_id, contact_id, source),
         )
 
-    def remove_session_person(self, session_id: str, person_id: int) -> None:
+    def remove_session_contact(self, session_id: str, contact_id: int) -> None:
         self._conn.execute(
-            "DELETE FROM session_people WHERE session_id = ? AND person_id = ?",
-            (session_id, person_id),
+            "DELETE FROM session_contacts WHERE session_id = ? AND contact_id = ?",
+            (session_id, contact_id),
         )
 
-    def people_for_session(self, session_id: str) -> list[SessionPerson]:
+    def contacts_for_session(self, session_id: str) -> list[SessionContact]:
         rows = self._conn.execute(
-            """SELECT p.*, sp.source as link_source
-               FROM people p
-               JOIN session_people sp ON sp.person_id = p.id
-               WHERE sp.session_id = ?
-               ORDER BY p.display_name COLLATE NOCASE""",
+            """SELECT c.*, sc.source as link_source
+               FROM contacts c
+               JOIN session_contacts sc ON sc.contact_id = c.id
+               WHERE sc.session_id = ?
+               ORDER BY c.display_name COLLATE NOCASE""",
             (session_id,),
         ).fetchall()
         return [
-            SessionPerson(person=_row_to_person(r), source=r["link_source"])
+            SessionContact(contact=_row_to_contact(r), source=r["link_source"])
             for r in rows
         ]
 
-    def session_ids_for_person(self, person_id: int) -> list[str]:
+    def session_ids_for_contact(self, contact_id: int) -> list[str]:
         rows = self._conn.execute(
-            "SELECT session_id FROM session_people WHERE person_id = ? ORDER BY session_id",
-            (person_id,),
+            "SELECT session_id FROM session_contacts WHERE contact_id = ? ORDER BY session_id",
+            (contact_id,),
         ).fetchall()
         return [r["session_id"] for r in rows]
 
-    def sync_session_people(
+    def replace_session_attendee_contacts(
         self,
         session_id: str,
-        attendee_names: Iterable[str],
-        *,
-        source: str = SOURCE_ATTENDEE_LIST,
+        contact_ids: Iterable[int],
     ) -> None:
-        """Replace the session's attendee-sourced people with the
-        given list. Preserves manual / diarization entries untouched.
-
-        Called after every save_live_notes -- the # Attendees list
-        is the source of truth for which people are in the meeting.
-        """
-        names = [n.strip() for n in attendee_names if n and n.strip()]
-        # Drop only rows of this source for this session; keep manual
-        # / diarization-derived associations.
+        """Replace the session's attendee_list-sourced links with the
+        given Contact ids. Preserves manual / diarization / merged
+        links untouched -- only attendee_list-source rows are
+        rewritten."""
+        ids = list(contact_ids)
         self._conn.execute(
-            "DELETE FROM session_people WHERE session_id = ? AND source = ?",
-            (session_id, source),
+            "DELETE FROM session_contacts WHERE session_id = ? AND source = ?",
+            (session_id, SOURCE_ATTENDEE_LIST),
         )
-        for name in names:
-            person = self.get_or_create_person(name)
-            self.add_session_person(session_id, person.id, source=source)
+        for cid in ids:
+            self.add_session_contact(session_id, cid, source=SOURCE_ATTENDEE_LIST)
 
-    # ------------------------------------------------------------------
-    # Topics
+    # ==================================================================
+    # Topics  --  unchanged shape; merge_topics fixed for accepted-loss
+    # ==================================================================
 
     def get_or_create_topic(self, name: str) -> Topic:
         name = name.strip()
@@ -475,24 +764,58 @@ class ClassificationStore:
         )
 
     def merge_topics(self, source_id: int, target_id: int) -> None:
-        """Reassign every session_topics row of source_id to target_id,
-        then delete the source topic. ON CONFLICT skips duplicates
-        (a session that had both topics keeps only target after the
-        merge)."""
+        """Move every session_topics row of source to target.
+
+        Conflict-safe: when both source + target are already linked
+        to the same session, the merged row's `accepted` becomes the
+        MAX of the two (so a user's prior Accept is never silently
+        lost), and the source ('manual' beats 'auto') wins ties.
+        This was the bug in the first cut where UPDATE OR IGNORE
+        would drop the source row -- losing accepted=True if the
+        source was accepted and the target was a suggestion.
+        """
         if source_id == target_id:
             return
+        # Find collisions (sessions linked to BOTH).
+        collisions = self._conn.execute(
+            """SELECT a.session_id,
+                      a.source   AS src_source,
+                      a.accepted AS src_accepted,
+                      b.source   AS dst_source,
+                      b.accepted AS dst_accepted
+               FROM session_topics a
+               JOIN session_topics b
+                 ON a.session_id = b.session_id
+               WHERE a.topic_id = ? AND b.topic_id = ?""",
+            (source_id, target_id),
+        ).fetchall()
+        for row in collisions:
+            new_accepted = max(int(row["src_accepted"]), int(row["dst_accepted"]))
+            new_source = (
+                SOURCE_MANUAL
+                if SOURCE_MANUAL in (row["src_source"], row["dst_source"])
+                else row["dst_source"]
+            )
+            self._conn.execute(
+                "UPDATE session_topics SET accepted = ?, source = ? "
+                "WHERE session_id = ? AND topic_id = ?",
+                (new_accepted, new_source, row["session_id"], target_id),
+            )
+            self._conn.execute(
+                "DELETE FROM session_topics "
+                "WHERE session_id = ? AND topic_id = ?",
+                (row["session_id"], source_id),
+            )
+        # The rest move cleanly (no collision left after the above).
         self._conn.execute(
-            """UPDATE OR IGNORE session_topics
-               SET topic_id = ?
-               WHERE topic_id = ?""",
+            "UPDATE session_topics SET topic_id = ? WHERE topic_id = ?",
             (target_id, source_id),
         )
-        # Any rows that hit the unique conflict above stayed pointed
-        # at source_id; clean them up.
-        self._conn.execute(
-            "DELETE FROM session_topics WHERE topic_id = ?", (source_id,),
-        )
         self._conn.execute("DELETE FROM topics WHERE id = ?", (source_id,))
+
+    def delete_topic(self, topic_id: int) -> None:
+        """CASCADE removes the topic's session_topics rows."""
+        self._conn.execute("DELETE FROM topics WHERE id = ?", (topic_id,))
 
     def list_topics(self) -> list[Topic]:
         rows = self._conn.execute(
@@ -501,18 +824,6 @@ class ClassificationStore:
         return [_row_to_topic(r) for r in rows]
 
     def list_topics_in_use(self) -> list[Topic]:
-        """Topics that have at least one ACCEPTED session association.
-
-        Filters out:
-        * Topics with no session_topics rows at all (orphans).
-        * Topics that exist only as auto-suggestions (accepted=0) --
-          those shouldn't drive the navigator because
-          session_ids_for_topic only returns accepted associations
-          and would always return the empty list for them.
-
-        Chips-bar Add Topic picker uses list_topics() so the user can
-        re-add a previously-rejected topic via the dropdown.
-        """
         rows = self._conn.execute(
             """SELECT t.* FROM topics t
                WHERE EXISTS (
@@ -522,6 +833,30 @@ class ClassificationStore:
                ORDER BY t.name COLLATE NOCASE"""
         ).fetchall()
         return [_row_to_topic(r) for r in rows]
+
+    def list_orphan_topics(self) -> list[Topic]:
+        """Topics with zero session_topics rows (accepted OR not).
+        Drives bulk-delete in Manage Topics."""
+        rows = self._conn.execute(
+            """SELECT t.* FROM topics t
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM session_topics st
+                   WHERE st.topic_id = t.id
+               )
+               ORDER BY t.name COLLATE NOCASE"""
+        ).fetchall()
+        return [_row_to_topic(r) for r in rows]
+
+    def session_count_for_topic(self, topic_id: int, *, accepted_only: bool = True) -> int:
+        if accepted_only:
+            sql = (
+                "SELECT COUNT(*) AS n FROM session_topics "
+                "WHERE topic_id = ? AND accepted = 1"
+            )
+        else:
+            sql = "SELECT COUNT(*) AS n FROM session_topics WHERE topic_id = ?"
+        row = self._conn.execute(sql, (topic_id,)).fetchone()
+        return int(row["n"]) if row else 0
 
     def topics_for_session(
         self,
@@ -582,37 +917,20 @@ class ClassificationStore:
         )
 
     def set_topic_accepted(
-        self,
-        session_id: str,
-        topic_id: int,
-        accepted: bool,
+        self, session_id: str, topic_id: int, accepted: bool,
     ) -> None:
         self._conn.execute(
-            """UPDATE session_topics SET accepted = ?
-               WHERE session_id = ? AND topic_id = ?""",
+            "UPDATE session_topics SET accepted = ? WHERE session_id = ? AND topic_id = ?",
             (int(accepted), session_id, topic_id),
         )
 
     def replace_session_topic_suggestions(
-        self,
-        session_id: str,
-        topic_names: Iterable[str],
+        self, session_id: str, topic_names: Iterable[str],
     ) -> None:
-        """Drop the session's auto / unaccepted topic rows and replace
-        with the new suggestion list (also unaccepted).
-
-        Preserves user-confirmed (accepted=1) topics, manual links,
-        and any other-source links. Called after every save_notes
-        with a fresh extraction.
-        """
-        # Step 1: drop only unaccepted auto-suggestions for this
-        # session. Anything the user has accepted stays.
         self._conn.execute(
-            """DELETE FROM session_topics
-               WHERE session_id = ? AND source = ? AND accepted = 0""",
+            "DELETE FROM session_topics WHERE session_id = ? AND source = ? AND accepted = 0",
             (session_id, SOURCE_AUTO),
         )
-        # Step 2: insert the fresh suggestion set.
         for name in topic_names:
             if not name or not name.strip():
                 continue
@@ -621,32 +939,45 @@ class ClassificationStore:
                 session_id, topic.id, source=SOURCE_AUTO, accepted=False,
             )
 
-    # ------------------------------------------------------------------
-    # Aggregate
+    # ==================================================================
+    # Aggregate + cleanup
+    # ==================================================================
 
     def classification_for_session(self, session_id: str) -> SessionClassification:
         return SessionClassification(
             series=self.series_for_session(session_id),
-            people=self.people_for_session(session_id),
+            contacts=self.contacts_for_session(session_id),
             topics=self.topics_for_session(session_id),
         )
 
     def remove_session(self, session_id: str) -> None:
         """Drop every classification association for a session.
 
-        Called when a session is deleted; the FK CASCADEs would
-        handle session_people and session_topics IF those FKs
-        pointed at sessions.sessions, but they don't (cross-DB).
-        Explicit cleanup keeps the store tidy."""
+        Called when a session is deleted from sessions.db. The
+        Contacts / Topics / Series themselves are kept (orphans are
+        managed via Address Book / Manage Classification UIs).
+        """
         self._conn.execute(
             "DELETE FROM session_series WHERE session_id = ?", (session_id,),
         )
         self._conn.execute(
-            "DELETE FROM session_people WHERE session_id = ?", (session_id,),
+            "DELETE FROM session_contacts WHERE session_id = ?", (session_id,),
         )
         self._conn.execute(
             "DELETE FROM session_topics WHERE session_id = ?", (session_id,),
         )
+
+    def delete_orphan_contacts(self) -> int:
+        ids = [c.id for c in self.list_orphan_contacts()]
+        for cid in ids:
+            self.delete_contact(cid)
+        return len(ids)
+
+    def delete_orphan_topics(self) -> int:
+        ids = [t.id for t in self.list_orphan_topics()]
+        for tid in ids:
+            self.delete_topic(tid)
+        return len(ids)
 
 
 # ----------------------------------------------------------------------
@@ -662,11 +993,22 @@ def _row_to_series(row: sqlite3.Row) -> Series:
     )
 
 
-def _row_to_person(row: sqlite3.Row) -> Person:
-    return Person(
+def _row_to_contact(row: sqlite3.Row) -> Contact:
+    return Contact(
         id=row["id"],
         display_name=row["display_name"],
-        email=row["email"],
+        notes=row["notes"] if "notes" in row.keys() else "",
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_alias(row: sqlite3.Row) -> ContactAlias:
+    return ContactAlias(
+        id=row["id"],
+        contact_id=row["contact_id"],
+        alias=row["alias"],
+        kind=row["kind"],
+        source=row["source"],
         created_at=row["created_at"],
     )
 
@@ -684,8 +1026,6 @@ def _row_to_topic(row: sqlite3.Row) -> Topic:
 
 
 _TITLE_NORMALIZE_RE = re.compile(r"\s+")
-# Tokens stripped from titles when fuzzy-matching to a series name:
-# day-of-week, ordinal dates, year suffixes, weekly/biweekly markers.
 _TITLE_STRIP_TOKENS_RE = re.compile(
     r"\b(?:"
     r"\d{4}-\d{2}-\d{2}"
@@ -700,14 +1040,6 @@ _TITLE_STRIP_TOKENS_RE = re.compile(
 
 
 def _normalize_title(s: str) -> str:
-    """Lowercase + strip date/weekday markers + collapse whitespace.
-
-    Lets the fuzzy series-matcher treat
-    "Platform Team Sync 2026-05-24" and "Platform Team Sync -- Tuesday"
-    as the same underlying series.
-    """
     s = _TITLE_STRIP_TOKENS_RE.sub(" ", s.lower())
     s = _TITLE_NORMALIZE_RE.sub(" ", s).strip()
-    # Drop leading / trailing punctuation noise left over after
-    # the strip pass.
     return s.strip(" -:|()[]")

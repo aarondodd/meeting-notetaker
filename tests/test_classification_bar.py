@@ -27,10 +27,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from meeting_notetaker.models.classification import (  # noqa: E402
-    Person,
+    Contact,
     Series,
     SessionClassification,
-    SessionPerson,
+    SessionContact,
     SessionTopic,
     Topic,
 )
@@ -45,11 +45,17 @@ def qt_app():
 def _make_classification(*, n_people: int, n_topics: int,
                          n_suggestions: int = 0,
                          series_name: str = "") -> SessionClassification:
+    """Build a SessionClassification.
+
+    Argument names keep the "n_people" / "people" wording because
+    the per-session role is still "People" in the UI; underlying
+    entity is Contact post-Phase 2.
+    """
     return SessionClassification(
         series=(Series(id=1, name=series_name) if series_name else None),
-        people=[
-            SessionPerson(
-                person=Person(id=i, display_name=f"Person {i:02d}"),
+        contacts=[
+            SessionContact(
+                contact=Contact(id=i, display_name=f"Person {i:02d}"),
                 source="manual",
             )
             for i in range(n_people)

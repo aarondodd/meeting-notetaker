@@ -129,6 +129,8 @@ class MainWindow(QMainWindow):
     session_selected = pyqtSignal(str)             # session_id
     session_list_sort_changed = pyqtSignal(str)    # one of VALID_SESSION_LIST_SORTS
     manage_series_requested = pyqtSignal()
+    manage_classification_requested = pyqtSignal()
+    address_book_requested = pyqtSignal()
     classification_filter_changed = pyqtSignal(str, object)
     # view (str -- one of VIEW_*), value_id (Optional[int]); emitted by
     # the navigator when the user picks a different filter.
@@ -164,13 +166,23 @@ class MainWindow(QMainWindow):
         action_settings.setShortcut("Ctrl+,")
         action_settings.triggered.connect(self.open_settings_requested.emit)
         file_menu.addAction(action_settings)
-        # Series catalog editor: rename / merge / delete. People +
-        # Topics get a similar surface as follow-ups; Series is the
-        # most-asked-for since the navigator's "By Series" filter is
-        # the primary use-case the user iterates on by hand.
-        action_manage_series = QAction("&Manage Series...", self)
-        action_manage_series.triggered.connect(self.manage_series_requested.emit)
-        file_menu.addAction(action_manage_series)
+        # Phase 2: catalog editors. Manage Classification covers
+        # Series + Topics (tabbed); Address Book covers Contacts
+        # (formerly People) -- separated because Contacts also link
+        # to the Speaker store and have alias / merge-suggestion
+        # surfaces the simpler Series/Topics tabs don't need.
+        action_manage_classification = QAction(
+            "&Manage Classification...", self,
+        )
+        action_manage_classification.triggered.connect(
+            self.manage_classification_requested.emit,
+        )
+        file_menu.addAction(action_manage_classification)
+        action_address_book = QAction("&Address Book...", self)
+        action_address_book.triggered.connect(
+            self.address_book_requested.emit,
+        )
+        file_menu.addAction(action_address_book)
         file_menu.addSeparator()
         action_quit = QAction("&Quit", self)
         action_quit.setShortcut("Ctrl+Q")

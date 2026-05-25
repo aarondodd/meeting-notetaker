@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..models.classification import SessionClassification, SessionTopic
+from ..models.classification import SessionClassification
 
 
 class ClassificationBar(QWidget):
@@ -195,7 +195,10 @@ class ClassificationBar(QWidget):
                 "type a new name."
             )
         # People count.
-        n_people = len(self._classification.people)
+        # People-count label -- underlying entity is now Contact
+        # (issue #28) but the UI string stays "People" because
+        # that's the per-session role.
+        n_people = len(self._classification.contacts)
         self._people_btn.setText(
             f"People ({n_people})" if n_people else "People"
         )
@@ -218,20 +221,20 @@ class ClassificationBar(QWidget):
         add_action = QAction("+ Add Person...", menu)
         add_action.triggered.connect(self._on_add_person)
         menu.addAction(add_action)
-        if not self._classification.people:
+        if not self._classification.contacts:
             empty = QAction("(no people)", menu)
             empty.setEnabled(False)
             menu.addSeparator()
             menu.addAction(empty)
             return
         menu.addSeparator()
-        for sp in self._classification.people:
-            pid = sp.person.id
-            label = f"x  {sp.person.display_name}"
+        for sc in self._classification.contacts:
+            cid = sc.contact.id
+            label = f"x  {sc.contact.display_name}"
             act = QAction(label, menu)
             act.setToolTip("Remove this person from the session")
             act.triggered.connect(
-                lambda _checked=False, pid=pid: self._emit_remove_person(pid)
+                lambda _checked=False, cid=cid: self._emit_remove_person(cid)
             )
             menu.addAction(act)
 
@@ -316,8 +319,8 @@ class ClassificationBar(QWidget):
         if not self._session_id:
             return
         already_on_session = {
-            sp.person.display_name.casefold()
-            for sp in self._classification.people
+            sc.contact.display_name.casefold()
+            for sc in self._classification.contacts
         }
         items = [
             name for name in sorted(self._known_people)

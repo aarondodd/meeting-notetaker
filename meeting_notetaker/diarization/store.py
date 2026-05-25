@@ -47,6 +47,11 @@ class SpeakerRecord:
     created_at: str
     last_seen_at: str
     notes: str = ""
+    # v0.7.0 Phase 2: links to the unified Contact in
+    # classification.db. None for legacy / un-migrated rows; the
+    # MainApp-level migration on first launch links every existing
+    # speaker to a Contact (creating one if no alias match exists).
+    contact_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -90,9 +95,29 @@ class SpeakerStore:
                 )
                 """
             )
+            # v0.7.0 Phase 2: additive contact_id column for the
+            # unified Address Book linkage. ALTER TABLE ADD COLUMN
+            # is idempotent only via the "column exists" check
+            # below -- ALTER COLUMN itself raises on second run.
+            self._ensure_contact_id_column(conn)
             conn.commit()
             self._conn = conn
         return self._conn
+
+    @staticmethod
+    def _ensure_contact_id_column(conn: sqlite3.Connection) -> None:
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(speakers)").fetchall()
+        }
+        if "contact_id" not in cols:
+            conn.execute(
+                "ALTER TABLE speakers ADD COLUMN contact_id INTEGER"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_speakers_contact "
+                "ON speakers(contact_id)"
+            )
 
     def close(self) -> None:
         if self._conn is not None:
@@ -221,6 +246,81 @@ class SpeakerStore:
         conn.commit()
         return cur.rowcount
 
+    def set_contact_id(self, name: str, contact_id: Optional[int]) -> bool:
+        """Link / unlink a speaker row to a Contact in classification.db.
+
+        Returns True when a row was updated. None unlinks. The link
+        is a plain integer (no cross-DB FK in SQLite); the
+        MainApp-level migration + Address Book UI keep the two
+        sides in sync.
+        """
+        conn = self._connect()
+        cur = conn.execute(
+            "UPDATE speakers SET contact_id = ? WHERE name = ?",
+            (contact_id, name),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    def list_unlinked(self) -> list[SpeakerRecord]:
+        """Speakers without a contact_id. Drives the launch-time
+        migration pass."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM speakers WHERE contact_id IS NULL "
+            "ORDER BY name ASC"
+        ).fetchall()
+        return [self._record_from_row(r) for r in rows]
+
+    def merge(self, source_name: str, target_name: str) -> Optional[SpeakerRecord]:
+        """Combine two speakers' voice samples + drop the source.
+
+        Centroid math: weighted average of the two stored centroids
+        by their sample counts. sample_count becomes the sum. notes
+        concatenate (target's first, then source's) with a separator.
+
+        Returns the post-merge target record, or None when either
+        name doesn't exist. No-op when source == target.
+
+        Embedding-dim mismatch (e.g. legacy entries from a different
+        encoder) raises ValueError because the centroid math
+        wouldn't be meaningful across vector spaces.
+        """
+        if source_name == target_name:
+            return self.get_by_name(target_name)
+        source = self.get_by_name(source_name)
+        target = self.get_by_name(target_name)
+        if source is None or target is None:
+            return None
+        if source.embedding.shape[0] != target.embedding.shape[0]:
+            raise ValueError(
+                f"cannot merge speakers with different embedding dims: "
+                f"{source.name}={source.embedding.shape[0]} vs "
+                f"{target.name}={target.embedding.shape[0]}"
+            )
+        new_count = source.sample_count + target.sample_count
+        new_centroid = (
+            target.embedding * target.sample_count
+            + source.embedding * source.sample_count
+        ) / new_count
+        merged_notes = target.notes
+        if source.notes and source.notes not in target.notes:
+            merged_notes = (
+                target.notes + ("\n\n" if target.notes else "") + source.notes
+            ).strip()
+        # upsert handles existing-row update; then drop the source.
+        result = self.upsert(
+            target_name, new_centroid,
+            sample_count=new_count, notes=merged_notes,
+        )
+        # Preserve target's contact_id if set; fall back to source's
+        # if target was unlinked but source carried one.
+        contact_id = target.contact_id or source.contact_id
+        if contact_id is not None:
+            self.set_contact_id(target_name, contact_id)
+        self.forget(source_name)
+        return self.get_by_name(target_name) or result
+
     # ---- matching ----
 
     def match(
@@ -267,6 +367,13 @@ class SpeakerStore:
                 f"speaker '{row['name']}' embedding length mismatch "
                 f"(stored {row['embedding_dim']}, decoded {emb.size})"
             )
+        # contact_id may be absent on legacy rows during the
+        # transition window (column was added Phase 2; sqlite
+        # PRAGMA-checked add).
+        try:
+            contact_id = row["contact_id"]
+        except (KeyError, IndexError):
+            contact_id = None
         return SpeakerRecord(
             id=int(row["id"]),
             name=row["name"],
@@ -275,6 +382,7 @@ class SpeakerStore:
             created_at=row["created_at"],
             last_seen_at=row["last_seen_at"],
             notes=row["notes"] or "",
+            contact_id=int(contact_id) if contact_id is not None else None,
         )
 
 

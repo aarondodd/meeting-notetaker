@@ -55,14 +55,19 @@ from .models.classification import (
     SOURCE_MANUAL,
     SessionClassification,
 )
+from .utils.contact_resolution import (
+    display_name_for_email,
+    resolve_attendees_batch,
+)
 from .models.highlights import HighlightSet, HighlightsStore
 from .models.search_index import SearchIndex
 from .ui.classification_navigator import (
     VIEW_ALL, VIEW_BY_SERIES, VIEW_BY_PERSON, VIEW_BY_TOPIC,
 )
+from .ui.address_book_dialog import AddressBookDialog
 from .ui.devices_dialog import DevicesDialog
 from .ui.main_window import MainWindow
-from .ui.manage_series_dialog import ManageSeriesDialog
+from .ui.manage_classification_dialog import ManageClassificationDialog
 from .ui.search_dialog import SearchDialog, SessionSummary
 from .ui.status_indicators import SegmentState
 from .ui.new_session_dialog import NewSessionDialog
@@ -245,6 +250,16 @@ class MainApp(QObject):
         except Exception:
             log.exception("ClassificationStore open failed; chips disabled this session")
             self.classification = None
+        # Phase 2 migration: link existing SpeakerStore rows to
+        # Contacts in the classification store. Runs once per launch
+        # (cheap when there's nothing to link). A failure here is
+        # logged but non-fatal -- the user can re-trigger via Help
+        # > Debug if it skipped a batch.
+        if self.classification is not None:
+            try:
+                self._migrate_speakers_to_contacts()
+            except Exception:
+                log.exception("speakers -> contacts migration failed")
         self._classification_filter_view: str = VIEW_ALL
         self._classification_filter_value: Optional[int] = None
         self._search_dialog: Optional[SearchDialog] = None
@@ -971,6 +986,10 @@ class MainApp(QObject):
             self._on_classification_filter_changed
         )
         self.window.manage_series_requested.connect(self._on_manage_series)
+        self.window.manage_classification_requested.connect(
+            self._on_manage_classification,
+        )
+        self.window.address_book_requested.connect(self._on_address_book)
         # SessionView -> classification chip mutations
         sv = self.window.session_view
         sv.add_topic_requested.connect(self._on_add_topic_requested)
@@ -1083,7 +1102,8 @@ class MainApp(QObject):
                     self._classification_filter_value
                 ))
             elif self._classification_filter_view == VIEW_BY_PERSON:
-                allowed = set(self.classification.session_ids_for_person(
+                # "By Person" -- backed by Contacts post-Phase 2.
+                allowed = set(self.classification.session_ids_for_contact(
                     self._classification_filter_value
                 ))
             elif self._classification_filter_view == VIEW_BY_TOPIC:
@@ -1119,9 +1139,10 @@ class MainApp(QObject):
                 (s.id, s.name)
                 for s in self.classification.list_series_in_use()
             ]
+            # People navigator entries -- backed by Contacts.
             nav_people = [
-                (p.id, p.display_name)
-                for p in self.classification.list_people_in_use()
+                (c.id, c.display_name)
+                for c in self.classification.list_contacts_in_use()
             ]
             nav_topics = [
                 (t.id, t.name)
@@ -1134,7 +1155,7 @@ class MainApp(QObject):
             # they previously used on another session even if it's
             # currently unassigned everywhere.
             full_series_rows = self.classification.list_series()
-            full_people_rows = self.classification.list_people()
+            full_people_rows = self.classification.list_contacts()
             full_topic_rows = self.classification.list_topics()
             self.window.session_view.set_classification_known_lists(
                 series=[s.name for s in full_series_rows],
@@ -1264,7 +1285,20 @@ class MainApp(QObject):
     def _seed_live_notes_from_meeting(
         self, session_id: str, info: MeetingInfo
     ) -> None:
-        attendee_names = [a.display for a in info.attendees if a.display]
+        """Seed My Notes with the calendar invite's attendees + body.
+
+        Phase 2 enhancement: for attendees that only carry an email
+        (no display name), try to resolve via Contact email aliases.
+        Hit -> seed the canonical Contact display_name instead of
+        the raw email. Miss -> register the email as a stub Contact
+        + email alias so future invites with that email resolve
+        cleanly.
+        """
+        attendee_names: list[str] = []
+        for a in info.attendees:
+            chosen = self._resolve_calendar_attendee_display(a)
+            if chosen:
+                attendee_names.append(chosen)
         try:
             TranscriptStore(session_id).save_live_notes(
                 seed_body_with_calendar(
@@ -1273,6 +1307,46 @@ class MainApp(QObject):
             )
         except OSError:
             log.exception("failed to seed live notes from calendar")
+
+    def _resolve_calendar_attendee_display(self, attendee) -> str:
+        """Pick the best display string for one calendar attendee.
+
+        Order of preference:
+        1. Attendee.name (if present) -- the calendar already had
+           a friendly name; use it as-is.
+        2. Email alias hit in Contacts -- use the Contact's
+           canonical display_name.
+        3. Stub-create a Contact named after the email local-part,
+           register the email as an alias, use the local-part.
+        4. Whatever attendee.display falls back to (raw email or
+           "(unknown)").
+        """
+        # Step 1: explicit name.
+        name = (getattr(attendee, "name", "") or "").strip()
+        if name:
+            return name
+        # Step 2 + 3: email-driven resolution.
+        email = (getattr(attendee, "email", "") or "").strip()
+        if email and self.classification is not None:
+            try:
+                from .utils.contact_resolution import (  # noqa: PLC0415
+                    display_name_for_email, resolve_attendee_email,
+                )
+                hit = display_name_for_email(self.classification, email)
+                if hit:
+                    return hit
+                # Stub-create so the next invite resolves silently.
+                result = resolve_attendee_email(
+                    self.classification, email,
+                )
+                if result is not None:
+                    return result.contact.display_name
+            except Exception:
+                log.exception(
+                    "calendar email resolution failed for %r", email,
+                )
+        # Step 4: fall back to the existing display logic.
+        return getattr(attendee, "display", "") or email or ""
 
     def _align_created_at_to_meeting(
         self, session_id: str, info: MeetingInfo
@@ -2646,6 +2720,57 @@ class MainApp(QObject):
 
     # ---- classification -----------------------------------------------------
 
+    def _migrate_speakers_to_contacts(self) -> None:
+        """Link every existing SpeakerStore row to a Contact.
+
+        Runs once at launch (cheap when there's nothing to link).
+        For each speaker without a contact_id:
+        * Unique Contact alias hit on the speaker's name -> link.
+        * No match -> create a new Contact named after the speaker,
+          with the speaker's name as a `name`-kind alias sourced
+          from `diarization`.
+        * Multiple matches -> create a new Contact rather than
+          guess; the Address Book's suggested-merges surface lets
+          the user pick later.
+
+        Idempotent: a second run is a no-op since speakers gain
+        contact_id on first link.
+        """
+        if self.classification is None:
+            return
+        from .models.classification import (  # noqa: PLC0415
+            ALIAS_KIND_NAME, SOURCE_DIARIZATION,
+        )
+        speaker_store = open_speaker_store()
+        try:
+            unlinked = speaker_store.list_unlinked()
+            for speaker in unlinked:
+                name = (speaker.name or "").strip()
+                if not name:
+                    continue
+                matches = self.classification.find_contacts_by_alias(name)
+                if len(matches) == 1:
+                    contact = matches[0]
+                elif not matches:
+                    contact = self.classification.create_contact(
+                        name, initial_alias_source=SOURCE_DIARIZATION,
+                    )
+                else:
+                    # Ambiguous -- create a new Contact; suggested
+                    # merges in Address Book will surface the
+                    # collision.
+                    contact = self.classification.create_contact(
+                        name, initial_alias_source=SOURCE_DIARIZATION,
+                    )
+                speaker_store.set_contact_id(name, contact.id)
+            if unlinked:
+                log.info(
+                    "speakers -> contacts migration linked %d speaker(s)",
+                    len(unlinked),
+                )
+        finally:
+            speaker_store.close()
+
     def _auto_link_series_for_new_session(self, session_id: str, title: str) -> None:
         """Best-effort: fuzzy-match the title against known series + link.
 
@@ -2664,15 +2789,30 @@ class MainApp(QObject):
             log.exception("series auto-link failed for %s", session_id)
 
     def _sync_attendees_to_people(self, session_id: str, body: str) -> None:
-        """Mirror the live notes' # Attendees list into People for this
-        session. Source=attendee_list so re-syncs don't overwrite
-        manually added or diarization-derived associations."""
+        """Mirror the live notes' # Attendees list into the session's
+        Contact links.
+
+        Resolution is smart (issue #28): each typed name routes through
+        resolve_attendees_batch which:
+        * Unique alias match -> link to existing Contact, register
+          the typed form as a `name` alias if new.
+        * No match -> create new Contact.
+        * Ambiguous -> create new Contact AND surface the conflict
+          via the Address Book's suggested-merges section so the
+          user can resolve deliberately.
+
+        The hot path stays modal-free; ambiguity prompts wait for an
+        explicit Address Book visit.
+        """
         if self.classification is None:
             return
         try:
             names = parse_attendees(body or "")
-            self.classification.sync_session_people(
-                session_id, names, source=SOURCE_ATTENDEE_LIST,
+            contacts = resolve_attendees_batch(
+                self.classification, names, source=SOURCE_ATTENDEE_LIST,
+            )
+            self.classification.replace_session_attendee_contacts(
+                session_id, [c.id for c in contacts],
             )
         except Exception:
             log.exception("attendee sync failed for %s", session_id)
@@ -2703,7 +2843,7 @@ class MainApp(QObject):
             # added. A "Bob" surfacing in this synthesis because
             # he was mentioned in a different meeting still gets
             # suppressed.
-            for person in self.classification.list_people():
+            for person in self.classification.list_contacts():
                 name = (person.display_name or "").strip()
                 if not name:
                     continue
@@ -2739,26 +2879,56 @@ class MainApp(QObject):
             log.exception("topic extraction failed for %s", session_id)
 
     def _on_manage_series(self) -> None:
-        """File > Manage Series. Modal dialog over the
-        ClassificationStore; on close, refresh both the navigator
-        pulldown (in-use list may have shrunk after a merge/delete)
-        and the chips bar (full catalog likewise). Affected
-        sessions whose series_id was just dropped get reloaded so
-        their chips bar series shows "(none)"."""
+        """Legacy menu entry (kept for back-compat). Opens the
+        full Manage Classification dialog (Series + Topics tabs)
+        landing on the Series tab."""
+        self._on_manage_classification(initial_tab="series")
+
+    def _on_manage_classification(
+        self, _checked: bool = False, *, initial_tab: str = "series",
+    ) -> None:
+        """File > Manage Classification. Tabbed dialog (Series +
+        Topics) over the ClassificationStore. People moved to the
+        Address Book in Phase 2 -- see _on_address_book."""
         if self.classification is None:
             QMessageBox.warning(
-                self.window, "Manage Series",
-                "Series store unavailable. See log for details.",
+                self.window, "Manage Classification",
+                "Classification store unavailable. See log for details.",
             )
             return
-        dialog = ManageSeriesDialog(self.classification, parent=self.window)
+        dialog = ManageClassificationDialog(
+            self.classification, parent=self.window,
+        )
+        if initial_tab == "topics":
+            dialog._tabs.setCurrentIndex(1)  # noqa: SLF001
         dialog.exec()
-        # Refresh navigator + chips bar so the user sees the
-        # post-edit state without restarting.
         self._refresh_session_list()
-        # If a session is loaded, repaint its classification chips
-        # so any series change (merge target / deleted source ->
-        # unfiled) is visible.
+        sv = self.window.session_view
+        if sv._session is not None:
+            self._refresh_session_classification(sv._session.id)
+
+    def _on_address_book(self) -> None:
+        """File > Address Book. Manages Contacts (the master
+        identity behind People + Speakers). On close, refresh
+        navigator + chips bar + the speakers manage dialog (if
+        open) won't auto-refresh -- it's typically closed before
+        reaching here."""
+        if self.classification is None:
+            QMessageBox.warning(
+                self.window, "Address Book",
+                "Classification store unavailable. See log for details.",
+            )
+            return
+        speaker_store = open_speaker_store()
+        try:
+            dialog = AddressBookDialog(
+                self.classification, parent=self.window,
+                speaker_store=speaker_store,
+            )
+            dialog.exec()
+        finally:
+            speaker_store.close()
+        self._refresh_session_list()
         sv = self.window.session_view
         if sv._session is not None:
             self._refresh_session_classification(sv._session.id)
@@ -2807,10 +2977,18 @@ class MainApp(QObject):
         if self.classification is None or not name:
             return
         try:
-            person = self.classification.get_or_create_person(name)
-            self.classification.add_session_person(
-                session_id, person.id, source=SOURCE_MANUAL,
+            # Manual chip-bar add: same smart resolution as the
+            # attendee-sync path so a typed "BS" hits the Bob Smith
+            # Contact via its alias rather than creating a new
+            # "BS" Contact.
+            from .utils.contact_resolution import resolve_attendee_text  # noqa: PLC0415
+            result = resolve_attendee_text(
+                self.classification, name, source=SOURCE_MANUAL,
             )
+            if result is not None:
+                self.classification.add_session_contact(
+                    session_id, result.contact.id, source=SOURCE_MANUAL,
+                )
         except Exception:
             log.exception("add_person failed for %s/%s", session_id, name)
         self._refresh_session_classification(session_id)
@@ -2820,7 +2998,7 @@ class MainApp(QObject):
         if self.classification is None:
             return
         try:
-            self.classification.remove_session_person(session_id, person_id)
+            self.classification.remove_session_contact(session_id, person_id)
         except Exception:
             log.exception("remove_person failed for %s/%s", session_id, person_id)
         self._refresh_session_classification(session_id)
@@ -2955,6 +3133,7 @@ class MainApp(QObject):
             self.config,
             parent=self.window,
             ping_extension=self._ping_extension,
+            classification_store=self.classification,
         )
         accepted = dialog.exec() == dialog.DialogCode.Accepted
         # The Manage Speakers sub-dialog can mutate the store regardless

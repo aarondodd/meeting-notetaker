@@ -13,12 +13,15 @@ leaves the machine; no API key required.
 > transcription, synthesis, screen capture, retained-audio playback +
 > export, and transcript-synchronized playback all working. v0.7.0
 > adds within-tab `Ctrl+F` find + cross-session full-text search
-> (`Ctrl+Shift+F`), per-session classification (series / people /
-> topics with a filter pulldown above the session list and a compact
-> popup-menu bar on each session), File > Manage Series for
-> renaming / merging / deleting series, sortable session-list
-> columns with persisted window + splitter geometry, and highlight
-> markers with MP4 / audio export.
+> (`Ctrl+Shift+F`), per-session classification (series / topics with
+> a filter pulldown above the session list and a compact popup-menu
+> bar on each session), File > Manage Classification for renaming /
+> merging / deleting series + topics, a unified File > Address Book
+> that ties Session People to Speaker voices via Contact aliases (so
+> typing "BS" in attendees resolves to Bob Smith and propagates to
+> voice recognition), sortable session-list columns with persisted
+> window + splitter geometry, and highlight markers with MP4 / audio
+> export.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -55,21 +58,45 @@ leaves the machine; no API key required.
   Next/Prev navigation, case + whole-word toggles.
 - **Session classification:** every session has a Series (recurring
   meeting), People (auto-populated from the My Notes `# Attendees`
-  list), and Topics (deterministic extractor over the synthesis
-  output -- no LLM round-trip). A compact bar above the tabs shows
-  *Series: \<name\>* | *People (N)* | *Topics (N, M suggested)*; each
-  count opens a popup menu with the full list + Add / Remove /
-  Accept actions. The window width stays constant regardless of
+  list, resolved to unified Contacts), and Topics (deterministic
+  extractor over the synthesis output -- no LLM round-trip). A
+  compact bar above the tabs shows
+  *Series: \<name\>* | *People (N)* | *Topics (N, M suggested)*;
+  each count opens a popup menu with the full list + Add / Remove
+  / Accept actions. The window width stays constant regardless of
   how many people or topics a session accumulates.
 - **Filter pulldown** above the session list: **All / By Series /
   By Person / By Topic**. The value combo lists only "in-use"
   values (no zero-result options) and preserves your selection
   across classification refreshes.
-- **File > Manage Series**: rename, merge (move every session of
-  series A into series B then delete A), or delete a series. The
-  deleted-series case leaves the affected sessions' notes /
-  transcripts / audio untouched; only the `series_id` association
-  is cleared.
+- **Unified Address Book** (File > Address Book...): every Session
+  Person and every labeled Speaker is a reference to one Contact.
+  Add aliases ("BS", "bsmith@corp.com") on a Contact and typing
+  any of them in attendees resolves silently; voice recognition
+  finds the same Contact across meetings. The Address Book
+  surfaces suggested merges when two Contacts look like duplicates
+  (shared alias, name-token subset, or low edit distance), bulk-
+  deletes orphans, and lets you rename / merge / delete Contacts.
+- **Smart attendee resolution:** typing a name routes through a
+  silent matcher -- unique alias hit links to the existing
+  Contact, no hit creates a new one, ambiguous matches create a
+  new Contact and flag both candidates in the Address Book's
+  suggested-merges section so you resolve the conflict
+  deliberately rather than via a typing-time modal.
+- **Calendar email rewrite:** when a calendar invite carries an
+  attendee by email only, the seed flow looks up an email alias
+  on Contacts; hits surface the Contact's friendly display name in
+  the seeded `# Attendees` list. Misses create a stub Contact
+  named after the email's local-part with the email registered as
+  an alias for future hits.
+- **File > Manage Classification**: tabbed dialog (Series + Topics)
+  for renaming, merging, and deleting catalog entries. The Topics
+  tab includes a "Cleanup orphans" button that bulk-removes
+  topics with zero session associations.
+- **Manage Speakers** gains a Merge action (combines two voice
+  records' samples + centroids + drops the source) and a
+  Contact-link column showing the unified Contact behind each
+  voice.
 - **Session list reorder + sort:** columns now appear as
   Date | Title | Audio | Slides | State. Date and Title headers
   click to sort ascending / descending, and the choice persists
