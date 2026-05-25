@@ -62,6 +62,7 @@ from .ui.classification_navigator import (
 )
 from .ui.devices_dialog import DevicesDialog
 from .ui.main_window import MainWindow
+from .ui.manage_series_dialog import ManageSeriesDialog
 from .ui.search_dialog import SearchDialog, SessionSummary
 from .ui.status_indicators import SegmentState
 from .ui.new_session_dialog import NewSessionDialog
@@ -969,6 +970,7 @@ class MainApp(QObject):
         self.window.classification_filter_changed.connect(
             self._on_classification_filter_changed
         )
+        self.window.manage_series_requested.connect(self._on_manage_series)
         # SessionView -> classification chip mutations
         sv = self.window.session_view
         sv.add_topic_requested.connect(self._on_add_topic_requested)
@@ -2735,6 +2737,31 @@ class MainApp(QObject):
             )
         except Exception:
             log.exception("topic extraction failed for %s", session_id)
+
+    def _on_manage_series(self) -> None:
+        """File > Manage Series. Modal dialog over the
+        ClassificationStore; on close, refresh both the navigator
+        pulldown (in-use list may have shrunk after a merge/delete)
+        and the chips bar (full catalog likewise). Affected
+        sessions whose series_id was just dropped get reloaded so
+        their chips bar series shows "(none)"."""
+        if self.classification is None:
+            QMessageBox.warning(
+                self.window, "Manage Series",
+                "Series store unavailable. See log for details.",
+            )
+            return
+        dialog = ManageSeriesDialog(self.classification, parent=self.window)
+        dialog.exec()
+        # Refresh navigator + chips bar so the user sees the
+        # post-edit state without restarting.
+        self._refresh_session_list()
+        # If a session is loaded, repaint its classification chips
+        # so any series change (merge target / deleted source ->
+        # unfiled) is visible.
+        sv = self.window.session_view
+        if sv._session is not None:
+            self._refresh_session_classification(sv._session.id)
 
     def _on_classification_filter_changed(self, view: str, value_id) -> None:
         self._classification_filter_view = view

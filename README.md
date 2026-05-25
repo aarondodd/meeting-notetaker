@@ -11,12 +11,14 @@ leaves the machine; no API key required.
 
 > **Status:** v0.7.0 (in development). End-to-end capture,
 > transcription, synthesis, screen capture, retained-audio playback +
-> export, and transcript-synchronized playback all working.
-> v0.7.0 adds within-tab Ctrl+F find + cross-session full-text search
-> (Ctrl+Shift+F), per-session classification (series / people / topics
-> chips + filter pulldown), reorderable + sortable session list
-> columns, and highlight markers with MP4/audio export. Performance
-> tuning is ongoing.
+> export, and transcript-synchronized playback all working. v0.7.0
+> adds within-tab `Ctrl+F` find + cross-session full-text search
+> (`Ctrl+Shift+F`), per-session classification (series / people /
+> topics with a filter pulldown above the session list and a compact
+> popup-menu bar on each session), File > Manage Series for
+> renaming / merging / deleting series, sortable session-list
+> columns with persisted window + splitter geometry, and highlight
+> markers with MP4 / audio export.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -42,25 +44,47 @@ leaves the machine; no API key required.
 
 ## What's new in v0.7.0
 
-- **Cross-session full-text search** (`Ctrl+Shift+F`) over the
-  transcript, My Notes, Synthesis, and Previous Notes tabs of every
-  session. Backed by SQLite FTS5, indexed on save with a 30s catch-up
-  scan. Help > Debug > Rebuild Search Index for cold starts.
-- **Within-tab find** (`Ctrl+F`) on every text tab: incremental
-  search, Next/Prev navigation, case + whole-word toggles.
+- **Cross-session full-text search** (`Ctrl+Shift+F`, or the
+  **Search** button in the session-list header) over the
+  Transcript, My Notes, Synthesis, and Previous Notes tabs of
+  every session. Backed by SQLite FTS5, indexed on save with a
+  30s catch-up scan. **Help > Debug > Rebuild Search Index** for
+  cold starts.
+- **Within-tab find** (`Ctrl+F`, or the **Find...** button in the
+  session view) on every text tab: incremental highlight,
+  Next/Prev navigation, case + whole-word toggles.
 - **Session classification:** every session has a Series (recurring
-  meeting), People (auto-pulled from My Notes' `# Attendees`), and
-  Topics (deterministic extractor over the synthesis output -- no
-  LLM). Chips bar at the top of the session view; filter pulldown
-  above the session list (All / By Series / By Person / By Topic).
-- **Session list reorder + sort:** columns now appear as Date | Title
-  | Audio | Slides | State; the Date and Title headers click to
-  sort ascending / descending and the choice persists across launches.
+  meeting), People (auto-populated from the My Notes `# Attendees`
+  list), and Topics (deterministic extractor over the synthesis
+  output -- no LLM round-trip). A compact bar above the tabs shows
+  *Series: \<name\>* | *People (N)* | *Topics (N, M suggested)*; each
+  count opens a popup menu with the full list + Add / Remove /
+  Accept actions. The window width stays constant regardless of
+  how many people or topics a session accumulates.
+- **Filter pulldown** above the session list: **All / By Series /
+  By Person / By Topic**. The value combo lists only "in-use"
+  values (no zero-result options) and preserves your selection
+  across classification refreshes.
+- **File > Manage Series**: rename, merge (move every session of
+  series A into series B then delete A), or delete a series. The
+  deleted-series case leaves the affected sessions' notes /
+  transcripts / audio untouched; only the `series_id` association
+  is cleared.
+- **Session list reorder + sort:** columns now appear as
+  Date | Title | Audio | Slides | State. Date and Title headers
+  click to sort ascending / descending, and the choice persists
+  across launches.
+- **Persisted window + splitter geometry:** the main window's size
+  and the horizontal split between the session list and session
+  view survive a relaunch.
 - **Highlight markers + export:** mark interesting moments via the
-  Start/End toggle below the playback scrubber, optionally title
-  each one, then export an MP4 (with 2-second title + jump
-  interstitials) or audio file (MP3/FLAC/AAC/Opus/WAV with short
-  silent gaps) of just the highlights.
+  Start / End toggle below the playback scrubber, optionally
+  title each one, then export an MP4 (with an initial
+  session-title slide carrying *"Recorded on YYYY-MM-DD HH:MM"*,
+  per-highlight 2-second title cards, and 2-second
+  *"Jumping to MM:SS"* cards between consecutive highlights) or
+  an audio file (MP3 / FLAC / AAC / Opus / WAV with short silent
+  gaps) of just the highlights.
 
 ## What's in v0.6.5
 
