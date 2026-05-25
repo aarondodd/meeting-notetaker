@@ -98,25 +98,27 @@ def plan_highlight_timeline(
     title_interstitial_ms: int = DEFAULT_TITLE_INTERSTITIAL_MS,
     jump_interstitial_ms: int = DEFAULT_JUMP_INTERSTITIAL_MS,
     audio_gap_ms: int = DEFAULT_AUDIO_GAP_MS,
-    title_subtitle: str = "",
+    session_title: str = "",
+    session_subtitle: str = "",
 ) -> List[TimelineSegment]:
     """Build the segment plan for a highlight export.
 
-    `mode = 'video'` produces title + jump interstitials separating
-    the highlights as the issue specifies. `mode = 'audio'`
-    produces just the highlights, with a short silent gap between
-    them (no on-screen text to read). Both modes return the
-    segments in playback order.
+    `mode = 'video'` produces an initial session-title card +
+    per-highlight title cards + jump cards. `mode = 'audio'`
+    produces just the highlights with short silent gaps between
+    them (no surface to render text on -- session-title /
+    subtitle kwargs are ignored). Both modes return the segments
+    in playback order.
 
-    Highlights are auto-sorted by their `start_ms` so the planner
-    accepts an unsorted input -- the bar widget keeps them in
-    insertion order on disk, but the export expects time order.
+    Highlights are auto-sorted by their `start_ms`.
 
-    `title_subtitle` is rendered on title cards as a second line
-    below the main title (e.g. "Recorded on 2026-05-24 14:30").
-    Per Aaron's spec for the video export: anchors the highlights
-    to when the meeting actually happened so a viewer who pulls up
-    the file weeks later has the context up-front.
+    `session_title` (non-empty + video mode only) prepends a
+    one-shot 2s title card to the output. Its `label` is the
+    session title; its `subtitle` is `session_subtitle` (typically
+    "Recorded on YYYY-MM-DD HH:MM" via
+    format_recorded_on_subtitle). Per-highlight title cards do
+    NOT carry the subtitle -- the session-level context appears
+    once at the top of the file, not before each highlight.
     """
     if mode not in {"video", "audio"}:
         raise ValueError(f"unknown mode {mode!r} (use 'video' or 'audio')")
@@ -128,18 +130,31 @@ def plan_highlight_timeline(
 
     out: List[TimelineSegment] = []
     cursor = 0
+
+    # Prepend the session-title card if requested and the format
+    # supports text overlays.
+    if mode == "video" and session_title.strip():
+        out.append(TimelineSegment(
+            kind=SEGMENT_TITLE,
+            duration_ms=title_interstitial_ms,
+            output_start_ms=cursor,
+            label=session_title.strip(),
+            subtitle=session_subtitle,
+            source_highlight_index=-1,
+        ))
+        cursor += title_interstitial_ms
+
     for n, (orig_idx, h) in enumerate(ordered):
         if mode == "video":
-            # Title card before every highlight (including the
-            # first -- the first one's title gives the viewer context
-            # at t=0).
+            # Per-highlight title card. Plain title only -- the
+            # session-level "Recorded on" lives on the initial
+            # card above, not repeated per highlight.
             title_text = h.title or f"Highlight {orig_idx + 1}"
             out.append(TimelineSegment(
                 kind=SEGMENT_TITLE,
                 duration_ms=title_interstitial_ms,
                 output_start_ms=cursor,
                 label=title_text,
-                subtitle=title_subtitle,
             ))
             cursor += title_interstitial_ms
         elif n > 0:
@@ -394,6 +409,7 @@ def export_highlights_video(
     *,
     title_interstitial_ms: int = DEFAULT_TITLE_INTERSTITIAL_MS,
     jump_interstitial_ms: int = DEFAULT_JUMP_INTERSTITIAL_MS,
+    session_title: str = "",
     session_started_at_iso: str = "",
     progress: Optional[Callable[[int], None]] = None,
 ) -> None:
@@ -404,9 +420,13 @@ def export_highlights_video(
     consecutive highlights. SRT sidecar is generated against the
     new (output) timeline so subtitles align with the cuts.
 
-    `session_started_at_iso` (UTC ISO from the SessionStore) feeds
-    the "Recorded on <date/time>" subtitle that appears below
-    each highlight title. Empty string suppresses the subtitle.
+    When `session_title` is non-empty, prepends a single 2s
+    session-title card at the very beginning of the output with
+    the session's title and a "Recorded on YYYY-MM-DD HH:MM"
+    subtitle derived from `session_started_at_iso` (UTC ISO from
+    the SessionStore). Empty session_title suppresses the initial
+    card entirely; per-highlight title cards always render
+    regardless.
 
     Mirrors export_video's encoder configuration (1920x1080 / 30fps
     H.264 + AAC mono); the only structural difference is the
@@ -422,13 +442,14 @@ def export_highlights_video(
     )
     from ..screencap.timestamps import current_screenshot_for_position
 
-    title_subtitle = format_recorded_on_subtitle(session_started_at_iso)
+    session_subtitle = format_recorded_on_subtitle(session_started_at_iso)
     plan = plan_highlight_timeline(
         highlights,
         mode="video",
         title_interstitial_ms=title_interstitial_ms,
         jump_interstitial_ms=jump_interstitial_ms,
-        title_subtitle=title_subtitle,
+        session_title=session_title,
+        session_subtitle=session_subtitle,
     )
     if not plan:
         raise ValueError("no highlights to export")

@@ -505,46 +505,84 @@ def test_format_recorded_on_subtitle_empty_or_garbage_returns_empty():
     assert format_recorded_on_subtitle(None) == ""  # defensive
 
 
-def test_plan_propagates_title_subtitle_to_title_segments_only():
-    """The subtitle goes on title cards. Jump cards and highlight
-    segments must NOT carry it -- the planner is the right place to
-    enforce that so downstream renderers don't have to special-case."""
-    h1 = Highlight(0, 5_000, "First")
+def test_plan_prepends_session_title_card_with_subtitle():
+    """A session_title + session_subtitle produce exactly one
+    additional title card at output_ms=0 carrying both. Per-highlight
+    cards stay subtitle-free (the session-level context lives on the
+    initial card, not repeated)."""
+    h1 = Highlight(10_000, 15_000, "First")
     h2 = Highlight(20_000, 25_000, "Second")
     plan = plan_highlight_timeline(
         [h1, h2], mode="video",
-        title_subtitle="Recorded on 2026-05-24 14:30",
+        session_title="Platform Team Sync",
+        session_subtitle="Recorded on 2026-05-24 14:30",
     )
     titles = [s for s in plan if s.kind == SEGMENT_TITLE]
-    jumps = [s for s in plan if s.kind == SEGMENT_JUMP]
-    highlights = [s for s in plan if s.kind == SEGMENT_HIGHLIGHT]
-    assert len(titles) == 2
-    assert all(t.subtitle == "Recorded on 2026-05-24 14:30" for t in titles)
-    assert all(j.subtitle == "" for j in jumps)
-    assert all(h.subtitle == "" for h in highlights)
+    # 1 session-level card + 2 per-highlight cards = 3 title segments.
+    assert len(titles) == 3
+    # First title card is the session card -- at output_ms=0.
+    assert titles[0].label == "Platform Team Sync"
+    assert titles[0].subtitle == "Recorded on 2026-05-24 14:30"
+    assert titles[0].output_start_ms == 0
+    # Subsequent per-highlight titles carry no subtitle.
+    assert all(t.subtitle == "" for t in titles[1:])
+    assert titles[1].label == "First"
+    assert titles[2].label == "Second"
 
 
-def test_plan_audio_mode_ignores_subtitle():
-    """Audio export has no surface to render text on; the subtitle
-    kwarg is harmless but should produce empty subtitle fields on
-    the planned segments."""
+def test_plan_omits_session_title_card_when_blank(qt_app=None):
+    """No session_title -> back to the old behavior: just per-highlight
+    titles, no initial card."""
+    plan = plan_highlight_timeline(
+        [Highlight(0, 5_000, "Just one")], mode="video",
+        session_subtitle="ignored without title",
+    )
+    titles = [s for s in plan if s.kind == SEGMENT_TITLE]
+    # Exactly one title card: the per-highlight one.
+    assert len(titles) == 1
+    assert titles[0].label == "Just one"
+    assert titles[0].subtitle == ""
+
+
+def test_plan_session_title_card_pushes_first_highlight_back_2s():
+    """Initial card consumes title_interstitial_ms before the first
+    highlight starts -- the highlight's per-card title now starts
+    at 2s + 2s = 4s into the output (initial title + its own title)."""
+    plan = plan_highlight_timeline(
+        [Highlight(0, 5_000, "First")], mode="video",
+        title_interstitial_ms=2_000,
+        session_title="Session",
+        session_subtitle="Subtitle",
+    )
+    titles = [s for s in plan if s.kind == SEGMENT_TITLE]
+    assert titles[0].output_start_ms == 0     # session card
+    assert titles[1].output_start_ms == 2000  # per-highlight title at +2s
+
+
+def test_plan_audio_mode_ignores_session_title():
+    """Audio export has no text surface; session_title kwarg is
+    harmless but no initial card lands in the plan."""
     plan = plan_highlight_timeline(
         [Highlight(0, 1000)], mode="audio",
-        title_subtitle="ignored",
+        session_title="Should not appear",
+        session_subtitle="Either",
     )
-    # Audio mode has no title segments at all -- the subtitle has
-    # nowhere to land.
+    # Audio mode produces zero title segments period.
+    assert all(s.kind != SEGMENT_TITLE for s in plan)
     assert all(s.subtitle == "" for s in plan)
 
 
-def test_plan_default_subtitle_is_empty():
-    """Backwards-compat: callers that don't pass title_subtitle
-    must get the same plan they got before the kwarg existed."""
+def test_plan_default_session_title_is_empty():
+    """Backwards-compat: callers that don't pass session_title get
+    the same plan they got before the kwarg existed (no initial
+    card)."""
     plan = plan_highlight_timeline(
         [Highlight(0, 1000, "x")], mode="video",
     )
     titles = [s for s in plan if s.kind == SEGMENT_TITLE]
-    assert titles
+    # Exactly one title -- the per-highlight one; no session card.
+    assert len(titles) == 1
+    assert titles[0].label == "x"
     assert all(t.subtitle == "" for t in titles)
 
 

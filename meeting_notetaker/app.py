@@ -2406,16 +2406,17 @@ class MainApp(QObject):
 
         if highlight_mode == "highlights":
             highlights = self._session_highlights(session_id).sorted_by_start()
-            # Pass session.started_at so the title interstitials can
-            # carry a "Recorded on YYYY-MM-DD HH:MM" subtitle line
-            # under each highlight title. Empty string when the
-            # session was never recorded -- defensive; a session
-            # with highlights but no recording is structurally
-            # impossible but cheap to handle.
+            # Pass session.title + session.started_at so the export
+            # can prepend an initial session-title card carrying
+            # the title on line 1 and "Recorded on YYYY-MM-DD HH:MM"
+            # on line 2. Falls back to created_at when the session
+            # was never recorded -- structurally impossible to have
+            # highlights without a recording, but cheap to guard.
             started_at_iso = session.started_at or session.created_at or ""
             worker = _HighlightVideoExportWorker(
                 mic_path, sys_path, offsets, transcript_text,
                 highlights, target,
+                session_title=session.title,
                 session_started_at_iso=started_at_iso,
             )
         else:
@@ -3625,6 +3626,7 @@ class _HighlightVideoExportWorker(QThread):
         self, mic_path, sys_path, screenshots, transcript_text,
         highlights, target,
         *,
+        session_title: str = "",
         session_started_at_iso: str = "",
     ) -> None:
         super().__init__()
@@ -3634,6 +3636,7 @@ class _HighlightVideoExportWorker(QThread):
         self._transcript_text = transcript_text
         self._highlights = highlights
         self._target = target
+        self._session_title = session_title
         self._session_started_at_iso = session_started_at_iso
 
     def run(self) -> None:  # type: ignore[override]
@@ -3642,6 +3645,7 @@ class _HighlightVideoExportWorker(QThread):
             export_highlights_video(
                 self._mic, self._sys, self._screenshots,
                 self._transcript_text, self._highlights, self._target,
+                session_title=self._session_title,
                 session_started_at_iso=self._session_started_at_iso,
                 progress=self.progress_changed.emit,
             )
