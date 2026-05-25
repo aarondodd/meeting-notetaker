@@ -324,6 +324,79 @@ def shot_main_previous_notes() -> None:
     win.close()
 
 
+def shot_main_attachments() -> None:
+    """Attachments tab populated with two sample files so the list
+    + preview-pane layout is visible. The first item is a small
+    text file we render via the in-pane plaintext viewer; the
+    second is a PDF so the right-hand pane shows the PDF viewer
+    affordance. Both files live in the session's attachments_dir
+    via the regular AttachmentsStore.add_file path so the on-disk
+    + sidecar JSON layout matches production exactly."""
+    from meeting_notetaker.models.attachments import AttachmentsStore
+
+    # Build a couple of source files in a tmp scratch area, then
+    # add them to the session store BEFORE the main window builds
+    # so AttachmentsTab.set_session() picks them up on its first
+    # refresh. Using AttachmentsStore.add_file gives us the real
+    # copy-then-record code path; the on-disk + sidecar JSON
+    # layout matches production exactly.
+    import tempfile
+
+    store = AttachmentsStore(SESSION_ID)
+    scratch = Path(tempfile.mkdtemp(prefix="mtn-screenshots-attach-"))
+    try:
+        # 1: a readable plaintext file -- preview pane shows it inline.
+        agenda = scratch / "Agenda - Q3 Platform Sync.txt"
+        agenda.write_text(
+            "Q3 Platform Sync -- Agenda\n"
+            "----------------------------\n\n"
+            "1. Ingest pipeline migration -- status + remaining\n"
+            "   open questions.\n"
+            "2. Backfill window: scope + downtime tolerance.\n"
+            "3. Risk review: error-budget impact, rollback path.\n"
+            "4. Owners + next checkpoints.\n",
+            encoding="utf-8",
+        )
+        store.add_file(agenda)
+
+        # 2: a minimal PDF (built via QPdfWriter) so the preview-
+        # pane dispatch lands on PdfPreviewWidget. QPdfDocument is
+        # available in the dev venv but won't render content on the
+        # offscreen platform; the UI affordance is what we want
+        # readers to see.
+        from PyQt6.QtCore import QSize  # noqa: PLC0415
+        from PyQt6.QtGui import QPageSize, QPainter, QPdfWriter  # noqa: PLC0415
+
+        deck = scratch / "Migration design - v3.pdf"
+        writer = QPdfWriter(str(deck))
+        writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        writer.setResolution(72)
+        painter = QPainter(writer)
+        painter.drawText(72, 72, "Migration design v3")
+        painter.drawText(72, 110, "Q3 Platform Sync")
+        painter.end()
+        store.add_file(deck)
+
+        # Now build the window. MainApp normally calls
+        # attachments_tab.set_session() on selection; the harness
+        # bypasses MainApp, so wire it up manually.
+        win = _build_main_window()
+        tab = win.session_view.attachments_tab()
+        tab.set_session(SESSION_ID)
+        win.session_view._tabs.setCurrentIndex(5)
+        QApplication.processEvents()
+        # Select the PDF row so the right-hand preview pane shows
+        # something non-empty.
+        if tab._list.count() > 1:
+            tab._list.setCurrentRow(1)
+        QApplication.processEvents()
+        _grab(win, "17-main-attachments.png", autosize=False)
+        win.close()
+    finally:
+        import shutil
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def shot_new_session() -> None:
     # allow_calendar_pick=False keeps the dialog compact and consistent on
     # Linux where Outlook is unavailable anyway.
@@ -597,6 +670,7 @@ def main() -> int:
     shot_main_my_notes_preview()
     shot_main_synthesis()
     shot_main_previous_notes()
+    shot_main_attachments()
     shot_new_session()
     shot_settings()
     shot_generate_prompt()

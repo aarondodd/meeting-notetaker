@@ -124,6 +124,9 @@ leaves the machine; no API key required.
   and cache the result** so subsequent previews of the same file
   are instant. Calendar-derived sessions auto-import any attached
   files from the Outlook invite.
+
+  ![Attachments tab](docs/screenshots/17-main-attachments.png)
+
 - **Export full session:** right-click a session and choose
   *Export full session...* to bundle everything into a single
   ZIP: PDFs of My Notes + Synthesis, plain-text transcript, MP3
