@@ -67,7 +67,27 @@ def test_default_filename_empty_session_title_falls_back():
 # build_session_package -- mocked heavies
 
 
+def _stub_pdf(tmp_path: Path, name: str) -> Path:
+    """Pre-rendered PDF stub. The orchestrator no longer renders
+    PDFs itself; the caller hands in paths to already-rendered
+    files (so the heavy QTextDocument.print() stays on the main
+    thread)."""
+    p = tmp_path / "pdfs" / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f"PDF placeholder: {name}", encoding="utf-8")
+    return p
+
+
 def _stub_options(tmp_path: Path, **overrides) -> PackageOptions:
+    # Default to stub PDFs unless the caller explicitly opts out.
+    if "notes_pdf_path" in overrides:
+        notes_pdf = overrides["notes_pdf_path"]
+    else:
+        notes_pdf = _stub_pdf(tmp_path, "my-notes.pdf")
+    if "synthesis_pdf_path" in overrides:
+        synthesis_pdf = overrides["synthesis_pdf_path"]
+    else:
+        synthesis_pdf = _stub_pdf(tmp_path, "synthesis.pdf")
     return PackageOptions(
         session_id="sess-a",
         session_title=overrides.get("session_title", "Test"),
@@ -80,8 +100,8 @@ def _stub_options(tmp_path: Path, **overrides) -> PackageOptions:
         transcript_text=overrides.get(
             "transcript_text", "[00:00:01] Speaker: hello.\n",
         ),
-        notes_md=overrides.get("notes_md", "# Notes\nbody"),
-        synthesis_md=overrides.get("synthesis_md", "# Synthesis\nbody"),
+        notes_pdf_path=notes_pdf,
+        synthesis_pdf_path=synthesis_pdf,
         attachments=overrides.get("attachments", []),
         highlights=overrides.get("highlights", []),
         highlights_mode=overrides.get(
@@ -93,10 +113,8 @@ def _stub_options(tmp_path: Path, **overrides) -> PackageOptions:
 @pytest.fixture
 def patched_heavies():
     """Stub the encoder calls so the orchestrator focuses on its
-    own glue logic, not on actually running PyAV / PyQt PDF write."""
+    own glue logic, not on actually running PyAV."""
     with patch(
-        "meeting_notetaker.utils.export_package._render_markdown_to_pdf"
-    ) as render_pdf, patch(
         "meeting_notetaker.utils.export_package._export_full_audio"
     ) as full_audio, patch(
         "meeting_notetaker.utils.export_package._export_highlights_audio"
@@ -105,12 +123,6 @@ def patched_heavies():
     ) as full_video, patch(
         "meeting_notetaker.utils.export_package._export_highlights_video"
     ) as hl_video:
-        # Make the PDF stub actually write a placeholder file so
-        # zipfile has something to compress.
-        def _write_pdf_stub(body, dst, *, title):
-            Path(dst).write_text(f"PDF placeholder for {title}", encoding="utf-8")
-        render_pdf.side_effect = _write_pdf_stub
-
         def _write_audio_stub(mic, sys_, dst, progress):
             Path(dst).write_bytes(b"fake mp3")
             progress(100)
@@ -135,7 +147,6 @@ def patched_heavies():
         hl_video.side_effect = _write_hl_video_stub
 
         yield {
-            "render_pdf": render_pdf,
             "full_audio": full_audio,
             "hl_audio": hl_audio,
             "full_video": full_video,
@@ -163,8 +174,9 @@ def test_build_zip_with_only_notes(tmp_path, patched_heavies):
 
 
 def test_build_zip_with_audio_and_screenshots(tmp_path, patched_heavies):
-    """When mic + screenshots are present, audio.mp3 + video.mp4
-    should both land in audio/."""
+    """When mic + screenshots are present, audio.mp3 lands in
+    audio/ and video.mp4 lands in video/ (bug fix: previously
+    they were both under audio/)."""
     mic = tmp_path / "mic.wav"
     mic.write_bytes(b"fake wav")
     shot = tmp_path / "0001.png"
@@ -180,7 +192,9 @@ def test_build_zip_with_audio_and_screenshots(tmp_path, patched_heavies):
     with zipfile.ZipFile(dst) as zf:
         names = set(zf.namelist())
     assert "audio/recording.mp3" in names
-    assert "audio/recording.mp4" in names
+    assert "video/recording.mp4" in names
+    # Regression: video must NOT be under audio/.
+    assert "audio/recording.mp4" not in names
     assert "screenshots/0001.png" in names
 
 
@@ -194,7 +208,8 @@ def test_build_zip_skips_video_when_no_screenshots(tmp_path, patched_heavies):
     with zipfile.ZipFile(dst) as zf:
         names = set(zf.namelist())
     assert "audio/recording.mp3" in names
-    assert "audio/recording.mp4" not in names
+    # video/ dir not created at all when there are no screenshots.
+    assert not any(n.startswith("video/") for n in names)
 
 
 def test_highlights_only_mode_skips_full(tmp_path, patched_heavies):
@@ -220,10 +235,10 @@ def test_highlights_only_mode_skips_full(tmp_path, patched_heavies):
     with zipfile.ZipFile(dst) as zf:
         names = set(zf.namelist())
     assert "audio/highlights.mp3" in names
-    assert "audio/highlights.mp4" in names
+    assert "video/highlights.mp4" in names
     # No full recording in highlights-only mode.
     assert "audio/recording.mp3" not in names
-    assert "audio/recording.mp4" not in names
+    assert "video/recording.mp4" not in names
 
 
 def test_both_mode_emits_full_and_highlights(tmp_path, patched_heavies):
@@ -245,9 +260,9 @@ def test_both_mode_emits_full_and_highlights(tmp_path, patched_heavies):
     with zipfile.ZipFile(dst) as zf:
         names = set(zf.namelist())
     assert "audio/recording.mp3" in names
-    assert "audio/recording.mp4" in names
+    assert "video/recording.mp4" in names
     assert "audio/highlights.mp3" in names
-    assert "audio/highlights.mp4" in names
+    assert "video/highlights.mp4" in names
 
 
 def test_attachments_land_under_attachments_dir(tmp_path, patched_heavies):
@@ -292,13 +307,15 @@ def test_progress_reaches_100(tmp_path, patched_heavies):
 def test_partial_archive_removed_on_failure(tmp_path, monkeypatch):
     """If something raises mid-pipeline, the dst zip (if any was
     written) is deleted so the user doesn't see a junk archive."""
-    options = _stub_options(tmp_path)
+    mic = tmp_path / "mic.wav"
+    mic.write_bytes(b"fake wav")
+    options = _stub_options(tmp_path, mic_path=mic)
     dst = tmp_path / "out.zip"
 
     def _boom(*_a, **_kw):
         raise RuntimeError("intentional test failure")
     monkeypatch.setattr(
-        "meeting_notetaker.utils.export_package._render_markdown_to_pdf",
+        "meeting_notetaker.utils.export_package._export_full_audio",
         _boom,
     )
     with pytest.raises(RuntimeError):

@@ -32,7 +32,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QDesktopServices,
@@ -51,6 +51,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -63,6 +64,10 @@ from ..models.attachments import (
     AttachmentsStore,
     SOURCE_DROP,
     SOURCE_MANUAL,
+)
+from ..utils.office_preview import (
+    convert_office_to_pdf,
+    is_office_extension,
 )
 from .attachment_preview import AttachmentPreview
 
@@ -179,21 +184,71 @@ class AttachmentsTab(QWidget):
         *,
         source: str = SOURCE_MANUAL,
     ) -> int:
-        """Add multiple files in one batch + refresh. Returns the
-        count successfully imported."""
+        """Add multiple files in one batch + refresh.
+
+        v0.7.0 UX tweak: when any of the files is an Office
+        document, the conversion-to-PDF preview is pre-generated
+        immediately (rather than on the user's first preview click)
+        so the preview pane is ready when they click. A modal
+        progress dialog shows "Attaching..." with an animated
+        progress bar while this runs.
+
+        Non-Office files are processed synchronously and quickly
+        (just a file copy); the dialog appears briefly and closes.
+        Office files extend the wait for the COM round-trip.
+        """
         if self._store is None:
             return 0
-        added = 0
-        for p in paths:
-            try:
-                self._store.add_file(Path(p), source=source)
-                added += 1
-            except (FileNotFoundError, ValueError):
-                continue
+        clean_paths = [Path(p) for p in paths if Path(p).exists()]
+        if not clean_paths:
+            return 0
+        # Run the import on a worker thread with a modal progress
+        # dialog so the user has feedback during Office conversion
+        # (which can take 1-2s per file on a cold Word/Excel start).
+        worker = _AttachmentImportWorker(
+            self._session_id, clean_paths, source,
+        )
+        progress = QProgressDialog(
+            self._attaching_message(clean_paths),
+            None, 0, 100, self,
+        )
+        progress.setWindowTitle("Attaching")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setCancelButton(None)
+        progress.setValue(0)
+
+        results: dict[str, object] = {"added": 0}
+
+        def _on_progress(pct: int) -> None:
+            progress.setValue(pct)
+
+        def _on_done(added: int) -> None:
+            results["added"] = added
+            progress.close()
+            worker.deleteLater()
+
+        worker.progress_changed.connect(_on_progress)
+        worker.finished_with_count.connect(_on_done)
+        progress.show()
+        worker.start()
+        # Block on the QProgressDialog by spinning the event loop.
+        # exec() returns when progress.close() is called in
+        # _on_done. The dialog has no Cancel button so this is a
+        # determinate wait.
+        progress.exec()
+        added = int(results["added"])
         if added:
             self._refresh_list()
             self.attachments_changed.emit(self._session_id)
         return added
+
+    @staticmethod
+    def _attaching_message(paths: list[Path]) -> str:
+        if len(paths) == 1:
+            return f"Attaching {paths[0].name}..."
+        return f"Attaching {len(paths)} files..."
 
     def splitter_state_base64(self) -> str:
         """Serialize the outer splitter state so MainApp can persist
@@ -396,6 +451,69 @@ class AttachmentsTab(QWidget):
         self._store.delete(rec.id)
         self._refresh_list()
         self.attachments_changed.emit(self._session_id)
+
+
+class _AttachmentImportWorker(QThread):
+    """Off-UI-thread copy + Office-preview pre-generation.
+
+    Walks the source paths, copies each into the AttachmentsStore,
+    then for Office types runs convert_office_to_pdf so the cache
+    is warm when the user clicks the preview. Reports cumulative
+    progress (0..100) across the batch.
+
+    Progress weighting: copy is fast vs. conversion, so we treat
+    the copy as 20% of each file's slot and the optional Office
+    conversion as 80%. Files that aren't Office finish their slot
+    at 20% instantly (the worker fast-forwards the remaining 80%).
+    """
+
+    progress_changed = pyqtSignal(int)
+    finished_with_count = pyqtSignal(int)
+
+    def __init__(
+        self, session_id: str, paths: list[Path], source: str,
+    ) -> None:
+        super().__init__()
+        self._session_id = session_id
+        self._paths = list(paths)
+        self._source = source
+
+    def run(self) -> None:  # type: ignore[override]
+        store = AttachmentsStore(self._session_id)
+        added = 0
+        total = len(self._paths)
+        if total == 0:
+            self.progress_changed.emit(100)
+            self.finished_with_count.emit(0)
+            return
+        for idx, p in enumerate(self._paths):
+            slot_start = int(idx * 100 / total)
+            slot_end = int((idx + 1) * 100 / total)
+            # 20% of the slot for the file copy.
+            copy_target = slot_start + int((slot_end - slot_start) * 0.2)
+            try:
+                store.add_file(p, source=self._source)
+                added += 1
+            except (FileNotFoundError, ValueError):
+                # Skip; advance progress so the bar still moves.
+                self.progress_changed.emit(slot_end)
+                continue
+            self.progress_changed.emit(copy_target)
+            # If Office, run the conversion now so the preview cache
+            # is warm by the time the user clicks the file. Failures
+            # are swallowed (the preview pane will run the
+            # conversion lazily on click if needed; this is a
+            # warm-cache optimization, not a correctness step).
+            ext = p.suffix.lower().lstrip(".")
+            if is_office_extension(ext):
+                try:
+                    convert_office_to_pdf(p)
+                except Exception:
+                    pass
+            self.progress_changed.emit(slot_end)
+        # Always end at 100 so the dialog can autodismiss cleanly.
+        self.progress_changed.emit(100)
+        self.finished_with_count.emit(added)
 
 
 def _format_size(n: int) -> str:

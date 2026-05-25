@@ -63,18 +63,22 @@ _STATE_BADGE: dict[str, tuple[str, str]] = {
     STATE_ERROR:      ("❌", "Error -- partial transcript may exist"),
 }
 
-# Session list column order (v0.7.0+): the human-relevant columns
-# (Date + Title) lead so the eye can scan them first; the narrow
-# indicator glyphs (Audio retained / Screenshots present / pipeline
-# state) trail. Sortable columns are Date and Title only -- clicking
-# any of the three indicator columns snaps back to the active sort.
+# Session list column order: human-relevant columns (Date + Title)
+# lead; narrow indicator glyphs trail. Sortable columns are Date
+# and Title only -- clicking any indicator column snaps back to
+# the active sort. Indicator order matches the chronology of the
+# session lifecycle: audio captured -> screen captures taken ->
+# attachments added -> processing state.
 _COL_DATE = 0
 _COL_TITLE = 1
 _COL_AUDIO = 2
 _COL_SLIDES = 3
-_COL_STATE = 4
+_COL_ATTACHMENTS = 4
+_COL_STATE = 5
 
-_INDICATOR_COLUMNS = (_COL_AUDIO, _COL_SLIDES, _COL_STATE)
+_INDICATOR_COLUMNS = (
+    _COL_AUDIO, _COL_SLIDES, _COL_ATTACHMENTS, _COL_STATE,
+)
 
 
 # Sort-spec serialization. Stored verbatim in config.toml under
@@ -264,12 +268,12 @@ class MainWindow(QMainWindow):
         self._navigator = ClassificationNavigator(left)
         left_layout.addWidget(self._navigator)
         self._list = QTreeWidget(left)
-        self._list.setColumnCount(5)
-        # v0.7.0: header is visible so Date + Title can be clicked to
-        # sort. Indicator columns (Audio / Slides / State) carry no
-        # text -- their headers stay blank but are still focusable so
-        # the column boundary can be dragged.
-        self._list.setHeaderLabels(["Date", "Title", "", "", ""])
+        self._list.setColumnCount(6)
+        # Header is visible so Date + Title can be clicked to sort.
+        # Indicator columns (Audio / Slides / Attachments / State)
+        # carry no header text -- their headers stay blank but are
+        # still focusable so the column boundary can be dragged.
+        self._list.setHeaderLabels(["Date", "Title", "", "", "", ""])
         self._list.setHeaderHidden(False)
         self._list.setRootIsDecorated(False)
         self._list.setUniformRowHeights(True)
@@ -300,10 +304,12 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_SLIDES, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_ATTACHMENTS, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
         self._list.setColumnWidth(_COL_DATE, 150)
         self._list.setColumnWidth(_COL_AUDIO, 28)
         self._list.setColumnWidth(_COL_SLIDES, 28)
+        self._list.setColumnWidth(_COL_ATTACHMENTS, 28)
         self._list.setColumnWidth(_COL_STATE, 28)
         # Indicator-column headers are blank text but still get
         # informative tooltips so users learn the glyph meaning by
@@ -315,6 +321,10 @@ class MainWindow(QMainWindow):
         header.model().setHeaderData(
             _COL_SLIDES, Qt.Orientation.Horizontal,
             "Screenshots captured for this session", Qt.ItemDataRole.ToolTipRole,
+        )
+        header.model().setHeaderData(
+            _COL_ATTACHMENTS, Qt.Orientation.Horizontal,
+            "Attachments stored with this session", Qt.ItemDataRole.ToolTipRole,
         )
         header.model().setHeaderData(
             _COL_STATE, Qt.Orientation.Horizontal,
@@ -574,9 +584,7 @@ class MainWindow(QMainWindow):
             else "Audio status: not retained (recording deleted after refinement)"
         )
         # Camera glyph if any screenshots are on disk for this session.
-        # has_retained_audio mirrors this pattern for audio; we use the
-        # same path helper here.
-        from ..utils.paths import list_screenshots  # noqa: PLC0415
+        from ..utils.paths import has_attachments, list_screenshots  # noqa: PLC0415
         has_slides = bool(list_screenshots(s.id))
         slides_glyph = "📷" if has_slides else ""
         slides_tooltip = (
@@ -584,23 +592,34 @@ class MainWindow(QMainWindow):
             if has_slides
             else "No screenshots captured for this session"
         )
+        # Paperclip if the session has any attachments on disk.
+        # Cheap iterdir check -- avoids a sidecar parse per row.
+        has_attached = has_attachments(s.id)
+        attachments_glyph = "📎" if has_attached else ""
+        attachments_tooltip = (
+            "Attachments stored with this session"
+            if has_attached
+            else "No attachments stored with this session"
+        )
         state_glyph, state_tooltip = _STATE_BADGE.get(s.state, ("", s.state))
         state_tooltip = f"Transcription state: {state_tooltip}"
 
         when, title = _session_date_and_title(s)
-        # v0.7.0 column order: Date | Title | Audio | Slides | State.
         item = QTreeWidgetItem([
             when,
             title,
             audio_glyph,
             slides_glyph,
+            attachments_glyph,
             state_glyph,
         ])
         item.setTextAlignment(_COL_AUDIO, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_SLIDES, Qt.AlignmentFlag.AlignCenter)
+        item.setTextAlignment(_COL_ATTACHMENTS, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_STATE, Qt.AlignmentFlag.AlignCenter)
         item.setToolTip(_COL_AUDIO, audio_tooltip)
         item.setToolTip(_COL_SLIDES, slides_tooltip)
+        item.setToolTip(_COL_ATTACHMENTS, attachments_tooltip)
         item.setToolTip(_COL_STATE, state_tooltip)
         item.setData(_COL_TITLE, Qt.ItemDataRole.UserRole, s.id)
         # Stash the full ISO created_at so Edit Timestamp can seed the

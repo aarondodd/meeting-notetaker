@@ -29,6 +29,7 @@ from meeting_notetaker.ui.main_window import (  # noqa: E402
     _COL_TITLE,
     _COL_AUDIO,
     _COL_SLIDES,
+    _COL_ATTACHMENTS,
     _COL_STATE,
     _DEFAULT_SORT_SPEC,
     _column_order_to_sort_spec,
@@ -53,7 +54,8 @@ def test_column_order_matches_visible_layout():
     assert _COL_TITLE == 1
     assert _COL_AUDIO == 2
     assert _COL_SLIDES == 3
-    assert _COL_STATE == 4
+    assert _COL_ATTACHMENTS == 4
+    assert _COL_STATE == 5
 
 
 @pytest.mark.parametrize(
@@ -94,7 +96,7 @@ def test_column_order_to_sort_spec_known_columns(column, order, expected):
     assert _column_order_to_sort_spec(column, order) == expected
 
 
-@pytest.mark.parametrize("indicator_column", [_COL_AUDIO, _COL_SLIDES, _COL_STATE])
+@pytest.mark.parametrize("indicator_column", [_COL_AUDIO, _COL_SLIDES, _COL_ATTACHMENTS, _COL_STATE])
 def test_column_order_to_sort_spec_indicator_columns_return_default(
     indicator_column,
 ):
@@ -177,7 +179,7 @@ def test_each_indicator_column_is_fixed_28px(qt_app):
     from PyQt6.QtWidgets import QHeaderView
     from meeting_notetaker.ui.main_window import (
         MainWindow,
-        _COL_AUDIO, _COL_SLIDES, _COL_STATE,
+        _COL_AUDIO, _COL_SLIDES, _COL_ATTACHMENTS, _COL_STATE,
     )
     win = MainWindow()
     try:
@@ -274,7 +276,7 @@ def test_title_is_the_only_column_set_to_stretch(qt_app):
     from PyQt6.QtWidgets import QHeaderView
     from meeting_notetaker.ui.main_window import (
         MainWindow,
-        _COL_DATE, _COL_TITLE, _COL_AUDIO, _COL_SLIDES, _COL_STATE,
+        _COL_DATE, _COL_TITLE, _COL_AUDIO, _COL_SLIDES, _COL_ATTACHMENTS, _COL_STATE,
     )
     win = MainWindow()
     try:

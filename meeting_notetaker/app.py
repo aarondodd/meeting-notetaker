@@ -2563,6 +2563,9 @@ class MainApp(QObject):
         exist), all attachments, and all screenshots. When highlights
         exist, prompts once for Full / Highlights-only / Both.
         """
+        import tempfile  # noqa: PLC0415
+        from datetime import datetime  # noqa: PLC0415
+
         from PyQt6.QtWidgets import (  # noqa: PLC0415
             QFileDialog, QMessageBox, QProgressDialog,
         )
@@ -2576,9 +2579,10 @@ class MainApp(QObject):
             HIGHLIGHTS_MODE_HIGHLIGHTS,
             PackageOptions,
             default_package_filename,
+            render_session_pdf,
         )
         from .utils.paths import (  # noqa: PLC0415
-            list_screenshots, session_audio_files,
+            list_screenshots, session_audio_files, session_dir,
         )
 
         session = self.store.get_session(session_id)
@@ -2681,6 +2685,48 @@ class MainApp(QObject):
         except Exception:
             log.exception("attachments enumerate failed for %s", session_id)
 
+        # Pre-render the two PDFs on the main thread (Bug fix):
+        # QTextDocument + QPrinter are GUI classes; cross-thread use
+        # produced spurious dialog flashes after the worker finished
+        # and the PDFs themselves rendered with the wrong font size
+        # vs. the in-app Export PDF button. Doing the render here
+        # uses the same PrintTextDocument path the user sees in the
+        # in-app Export PDF and keeps everything on the main thread.
+        pdf_temp_dir = Path(tempfile.mkdtemp(prefix="mtn-export-pdfs-"))
+        session_when = None
+        try:
+            session_when = datetime.fromisoformat(
+                (session.created_at or "").replace("Z", "+00:00")
+            ).astimezone()
+        except ValueError:
+            session_when = None
+        sdir = session_dir(session_id)
+        notes_pdf_path = None
+        synthesis_pdf_path = None
+        try:
+            if notes_md.strip():
+                notes_pdf_path = pdf_temp_dir / "my-notes.pdf"
+                render_session_pdf(
+                    notes_md,
+                    dst=notes_pdf_path,
+                    base_dir=sdir,
+                    session_title=session.title or "session",
+                    tab_label="My Notes",
+                    session_date=session_when,
+                )
+            if synthesis_md.strip():
+                synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
+                render_session_pdf(
+                    synthesis_md,
+                    dst=synthesis_pdf_path,
+                    base_dir=sdir,
+                    session_title=session.title or "session",
+                    tab_label="Synthesis",
+                    session_date=session_when,
+                )
+        except Exception:
+            log.exception("PDF pre-render failed for %s", session_id)
+
         options = PackageOptions(
             session_id=session_id,
             session_title=session.title or "session",
@@ -2689,8 +2735,8 @@ class MainApp(QObject):
             sys_path=sys_path,
             screenshots=screenshots,
             transcript_text=transcript_text,
-            notes_md=notes_md,
-            synthesis_md=synthesis_md,
+            notes_pdf_path=notes_pdf_path,
+            synthesis_pdf_path=synthesis_pdf_path,
             attachments=attachments_pairs,
             highlights=highlights,
             highlights_mode=highlights_mode,
@@ -2702,8 +2748,11 @@ class MainApp(QObject):
         )
         progress.setWindowTitle("Export full session")
         progress.setMinimumDuration(0)
-        progress.setAutoClose(True)
-        progress.setAutoReset(True)
+        # setAutoClose + setAutoReset together caused stuttering on
+        # 100 (close + reset + setValue updates). Manage closing
+        # explicitly in on_done.
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
         progress.setCancelButton(None)
         progress.setValue(0)
 
@@ -2713,7 +2762,20 @@ class MainApp(QObject):
             progress.setValue(pct)
 
         def on_done(err_msg: str) -> None:
-            progress.cancel()
+            # Close the dialog before showing any follow-up message
+            # so we never have two top-level QDialogs visible at the
+            # same time (cause of the 'multiple flashing dialogs'
+            # bug Aaron caught -- combining autoClose + autoReset
+            # with an immediate post-close QMessageBox produced
+            # transient ghost windows).
+            progress.close()
+            # Clean up the temp PDF dir; it's cheap to keep but
+            # we're disciplined about temp leaks.
+            try:
+                import shutil
+                shutil.rmtree(pdf_temp_dir, ignore_errors=True)
+            except Exception:
+                pass
             if err_msg:
                 log.error("export_package failed: %s", err_msg)
                 QMessageBox.warning(

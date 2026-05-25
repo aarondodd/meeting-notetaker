@@ -69,9 +69,15 @@ _PHASE_WEIGHTS: dict[str, int] = {
 class PackageOptions:
     """All the inputs the orchestrator needs in one place.
 
-    `notes_md` / `synthesis_md` / `transcript_text` are the source
-    strings the PDFs are built from. None = skip that artifact
-    (e.g. session never produced a synthesis).
+    PDF rendering happens on the MAIN THREAD before the worker
+    launches (QTextDocument.print() isn't worker-thread safe;
+    cross-thread use caused dialog-flash glitches and visual
+    regressions during testing). The orchestrator gets pre-
+    rendered PDF paths and just copies them into the ZIP.
+
+    `notes_pdf_path` / `synthesis_pdf_path` may be None to skip
+    the corresponding entry (e.g. session never produced a
+    synthesis).
     """
     session_id: str
     session_title: str
@@ -80,8 +86,8 @@ class PackageOptions:
     sys_path: Optional[Path]
     screenshots: list  # list[tuple[Path, int]]  -- (path, offset_ms)
     transcript_text: str
-    notes_md: str
-    synthesis_md: str
+    notes_pdf_path: Optional[Path]
+    synthesis_pdf_path: Optional[Path]
     attachments: list  # list[(Path, display_name)]
     highlights: list  # list[Highlight] -- empty when none
     highlights_mode: str = HIGHLIGHTS_MODE_FULL
@@ -121,19 +127,16 @@ def build_session_package(
             if inner >= 100:
                 completed = min(100, completed + weight)
 
-        # ---- PDFs ----
-        if options.notes_md:
-            _render_markdown_to_pdf(
-                options.notes_md,
-                work_dir / "my-notes.pdf",
-                title=f"{options.session_title} -- My Notes",
-            )
+        # ---- PDFs (pre-rendered on main thread; we just copy in) ----
+        if options.notes_pdf_path and options.notes_pdf_path.exists():
+            shutil.copy2(options.notes_pdf_path, work_dir / "my-notes.pdf")
         step("my_notes_pdf")
-        if options.synthesis_md:
-            _render_markdown_to_pdf(
-                options.synthesis_md,
-                work_dir / "synthesis.pdf",
-                title=f"{options.session_title} -- Synthesis",
+        if (
+            options.synthesis_pdf_path
+            and options.synthesis_pdf_path.exists()
+        ):
+            shutil.copy2(
+                options.synthesis_pdf_path, work_dir / "synthesis.pdf",
             )
         step("synthesis_pdf")
 
@@ -144,8 +147,11 @@ def build_session_package(
         step("transcript_txt")
 
         # ---- Audio + video ----
+        # Bug fix: audio/ holds MP3 only; video/ holds MP4 + SRT.
+        # Previously both lived under audio/ which was misleading.
         audio_dir = work_dir / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
+        video_dir = work_dir / "video"
 
         sources_exist = bool(
             (options.mic_path and options.mic_path.exists()) or
@@ -182,20 +188,22 @@ def build_session_package(
             step("audio_highlights")
 
         if sources_exist and screenshots_exist and emit_full:
+            video_dir.mkdir(parents=True, exist_ok=True)
             _export_full_video(
                 options.mic_path, options.sys_path,
                 options.screenshots, options.transcript_text,
-                audio_dir / "recording.mp4",
+                video_dir / "recording.mp4",
                 lambda p: step("video_full", p),
             )
         else:
             step("video_full")
 
         if sources_exist and screenshots_exist and emit_highlights:
+            video_dir.mkdir(parents=True, exist_ok=True)
             _export_highlights_video(
                 options.mic_path, options.sys_path,
                 options.screenshots, options.transcript_text,
-                options.highlights, audio_dir / "highlights.mp4",
+                options.highlights, video_dir / "highlights.mp4",
                 session_title=options.session_title,
                 session_started_at_iso=options.session_started_at_iso,
                 progress=lambda p: step("video_highlights", p),
@@ -252,34 +260,55 @@ def build_session_package(
 # Per-artifact helpers
 
 
-def _render_markdown_to_pdf(body: str, dst: Path, *, title: str) -> None:
-    """Render a markdown string to a PDF at `dst`.
+def render_session_pdf(
+    markdown_body: str,
+    *,
+    dst: Path,
+    base_dir: Path,
+    session_title: str,
+    tab_label: str,
+    session_date,
+) -> Path:
+    """Render a session-tab markdown body to a PDF on the MAIN
+    THREAD.
 
-    Uses QTextDocument.setMarkdown + QPdfWriter so output matches
-    the in-app preview (same setMarkdown path that powers the
-    My Notes / Synthesis preview tabs).
+    Uses the same PrintTextDocument + QPrinter path the in-app
+    "Export PDF" button uses, so the export-package PDFs match
+    the visual fidelity the user already sees there. Critically,
+    callers MUST invoke this on the main thread -- QTextDocument
+    + QPrinter are GUI classes and cross-thread use causes Qt to
+    surface dialog warnings (the "dialogs flashing after export"
+    bug Aaron reported).
+
+    Returns `dst`. The PDF file at `dst` is overwritten if it
+    exists. `base_dir` is the session dir so relative `images/...`
+    refs in the markdown resolve correctly.
+
+    Wrapped here (vs. exposing the print helpers individually) so
+    the export package has a single entry point + tests can stub
+    one function.
     """
-    from PyQt6.QtCore import QMarginsF, QSizeF, Qt
-    from PyQt6.QtGui import QPageLayout, QPageSize, QPdfWriter, QTextDocument
+    from PyQt6.QtPrintSupport import QPrinter
 
-    doc = QTextDocument()
-    doc.setMarkdown(body or "")
-    # Prepend an H1 with the session title for the PDF top-of-page
-    # context. Concatenating into the markdown source is simpler
-    # than munging the document afterwards.
-    doc_with_title = QTextDocument()
-    doc_with_title.setMarkdown(
-        f"# {title}\n\n{body or ''}"
+    from ..ui.print_document import PrintTextDocument
+    from .export import build_print_markdown
+
+    printable = build_print_markdown(
+        session_title=session_title,
+        tab_label=tab_label,
+        session_date=session_date,
+        body=markdown_body or "",
     )
+    doc = PrintTextDocument(Path(base_dir))
+    doc.setMarkdown(printable)
 
-    writer = QPdfWriter(str(dst))
-    writer.setPageSize(QPageSize(QPageSize.PageSizeId.Letter))
-    writer.setPageMargins(QMarginsF(36, 36, 36, 36))  # 0.5in
-    writer.setResolution(300)
-    doc_with_title.setPageSize(QSizeF(
-        writer.pageLayout().paintRectPixels(writer.resolution()).size()
-    ))
-    doc_with_title.print(writer)
+    printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+    printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+    printer.setOutputFileName(str(dst))
+    printer.setDocName(f"{session_title} -- {tab_label}")
+    doc.clamp_images_to_printer(printer)
+    doc.print(printer)
+    return dst
 
 
 def _export_full_audio(mic, sys_, dst: Path, progress) -> None:
