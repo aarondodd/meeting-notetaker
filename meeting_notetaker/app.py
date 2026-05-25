@@ -1359,9 +1359,23 @@ class MainApp(QObject):
         user even reaches the Attachments tab. If they click an
         Office attachment before conversion completes, the
         preview pane's existing 'Converting...' flow handles it.
+
+        Uses threading.Thread (not QThread) because this is pure
+        fire-and-forget background work: no Qt signals, no UI
+        updates, no lifetime tracking. The earlier QThread version
+        crashed with 'QThread: Destroyed while thread is still
+        running' when the deleteLater queued from finished raced
+        ahead of Qt's internal isRunning() cleanup. convert_office_
+        to_pdf does its own pythoncom.CoInitialize per call, so
+        it's safe to run from a non-Qt thread.
         """
+        import threading  # noqa: PLC0415
+
         from .models.attachments import AttachmentsStore  # noqa: PLC0415
-        from .utils.office_preview import is_office_extension  # noqa: PLC0415
+        from .utils.office_preview import (  # noqa: PLC0415
+            convert_office_to_pdf,
+            is_office_extension,
+        )
 
         try:
             store = AttachmentsStore(session_id)
@@ -1375,18 +1389,23 @@ class MainApp(QObject):
                     office_paths.append(p)
             if not office_paths:
                 return
-            worker = _OfficeBackgroundPreconvertWorker(office_paths)
-            # Keep a reference so the QThread isn't gc'd before it
-            # finishes. Self-cleanup on finish.
-            if not hasattr(self, "_background_workers"):
-                self._background_workers = []
-            self._background_workers.append(worker)
-            worker.finished.connect(
-                lambda w=worker: self._background_workers.remove(w)
-                if w in self._background_workers else None
+
+            def _run() -> None:
+                for p in office_paths:
+                    try:
+                        convert_office_to_pdf(p)
+                    except Exception:
+                        log.exception(
+                            "background Office pre-convert failed for %s",
+                            p,
+                        )
+
+            thread = threading.Thread(
+                target=_run,
+                name=f"office-preconvert-{session_id[:8]}",
+                daemon=True,
             )
-            worker.finished.connect(worker.deleteLater)
-            worker.start()
+            thread.start()
             log.info(
                 "spawned background Office pre-convert for %d file(s) in %s",
                 len(office_paths), session_id,
@@ -4186,31 +4205,6 @@ class _HighlightVideoExportWorker(QThread):
             self.finished_with_result.emit("")
         except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
-
-
-class _OfficeBackgroundPreconvertWorker(QThread):
-    """Fire-and-forget Office-to-PDF pre-conversion.
-
-    Used after calendar attachments land in a session: silently
-    walks the Office files and warms the conversion cache so the
-    user's first preview click is instant. No progress reporting
-    -- this runs in the background while the user is doing other
-    things.
-    """
-
-    def __init__(self, paths) -> None:
-        super().__init__()
-        self._paths = list(paths)
-
-    def run(self) -> None:  # type: ignore[override]
-        from .utils.office_preview import convert_office_to_pdf  # noqa: PLC0415
-        for p in self._paths:
-            try:
-                convert_office_to_pdf(p)
-            except Exception:
-                log.exception(
-                    "background Office pre-convert failed for %s", p,
-                )
 
 
 class _ExportPackageWorker(QThread):
