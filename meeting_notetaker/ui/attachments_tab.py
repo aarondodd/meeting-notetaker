@@ -448,7 +448,32 @@ class AttachmentsTab(QWidget):
             return
         if self._store is None:
             return
-        self._store.delete(rec.id)
+        # Bug fix: clear the preview FIRST so the QPdfDocument /
+        # ScaledImageLabel / etc. release their file handle.
+        # Without this, Windows refuses the unlink with
+        # PermissionError [WinError 32] because QPdfView is still
+        # holding the PDF open via QPdfDocument.
+        self._preview.clear()
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+        try:
+            self._store.delete(rec.id)
+        except PermissionError:
+            # Qt sometimes needs another event-loop tick to fully
+            # release file handles. Retry once before giving up.
+            QApplication.processEvents()
+            try:
+                self._store.delete(rec.id)
+            except PermissionError as exc:
+                QMessageBox.warning(
+                    self, "Delete attachment",
+                    "Could not delete the file -- it may still be "
+                    "open in another application.\n\n"
+                    f"{exc}",
+                )
+                # Refresh anyway so the list doesn't show stale state.
+                self._refresh_list()
+                return
         self._refresh_list()
         self.attachments_changed.emit(self._session_id)
 
@@ -492,7 +517,7 @@ class _AttachmentImportWorker(QThread):
             # 20% of the slot for the file copy.
             copy_target = slot_start + int((slot_end - slot_start) * 0.2)
             try:
-                store.add_file(p, source=self._source)
+                rec = store.add_file(p, source=self._source)
                 added += 1
             except (FileNotFoundError, ValueError):
                 # Skip; advance progress so the bar still moves.
@@ -500,14 +525,18 @@ class _AttachmentImportWorker(QThread):
                 continue
             self.progress_changed.emit(copy_target)
             # If Office, run the conversion now so the preview cache
-            # is warm by the time the user clicks the file. Failures
-            # are swallowed (the preview pane will run the
-            # conversion lazily on click if needed; this is a
-            # warm-cache optimization, not a correctness step).
+            # is warm by the time the user clicks the file.
+            # CRITICAL: convert the STORED path (inside
+            # attachments_dir), not the source path. The cache key
+            # is (path, mtime, size); the preview pane will look up
+            # by the stored path on click, so converting the
+            # source-side path doesn't warm the right cache entry.
             ext = p.suffix.lower().lstrip(".")
             if is_office_extension(ext):
                 try:
-                    convert_office_to_pdf(p)
+                    stored_path = store.file_path(rec.id)
+                    if stored_path is not None:
+                        convert_office_to_pdf(stored_path)
                 except Exception:
                     pass
             self.progress_changed.emit(slot_end)

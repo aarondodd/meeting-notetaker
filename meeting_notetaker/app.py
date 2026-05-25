@@ -1336,10 +1336,66 @@ class MainApp(QObject):
                             log.exception(
                                 "calendar attachment import failed for %s", p,
                             )
+                    # Bug fix: pre-convert Office attachments to PDF
+                    # in the background so previews are warm by the
+                    # time the user clicks them. Manual adds get the
+                    # same treatment via AttachmentsTab's progress-
+                    # dialog worker; calendar adds happen during
+                    # session creation without a dialog, so we run
+                    # silently in the background.
+                    self._spawn_background_office_preconvert(session_id)
             except Exception:
                 log.exception(
                     "calendar attachment pull failed for %s", session_id,
                 )
+
+    def _spawn_background_office_preconvert(self, session_id: str) -> None:
+        """Scan the session's attachments for Office files and run
+        COM conversion silently on a background thread. Pre-warms
+        the office_preview cache so the user's first click on each
+        attachment shows the preview instantly.
+
+        No progress dialog: this typically completes before the
+        user even reaches the Attachments tab. If they click an
+        Office attachment before conversion completes, the
+        preview pane's existing 'Converting...' flow handles it.
+        """
+        from .models.attachments import AttachmentsStore  # noqa: PLC0415
+        from .utils.office_preview import is_office_extension  # noqa: PLC0415
+
+        try:
+            store = AttachmentsStore(session_id)
+            office_paths: list = []
+            for rec in store.list():
+                ext = Path(rec.stored_name).suffix.lower().lstrip(".")
+                if not is_office_extension(ext):
+                    continue
+                p = store.file_path(rec.id)
+                if p is not None:
+                    office_paths.append(p)
+            if not office_paths:
+                return
+            worker = _OfficeBackgroundPreconvertWorker(office_paths)
+            # Keep a reference so the QThread isn't gc'd before it
+            # finishes. Self-cleanup on finish.
+            if not hasattr(self, "_background_workers"):
+                self._background_workers = []
+            self._background_workers.append(worker)
+            worker.finished.connect(
+                lambda w=worker: self._background_workers.remove(w)
+                if w in self._background_workers else None
+            )
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+            log.info(
+                "spawned background Office pre-convert for %d file(s) in %s",
+                len(office_paths), session_id,
+            )
+        except Exception:
+            log.exception(
+                "background Office pre-convert spawn failed for %s",
+                session_id,
+            )
 
     def _resolve_calendar_attendee_display(self, attendee) -> str:
         """Pick the best display string for one calendar attendee.
@@ -4130,6 +4186,31 @@ class _HighlightVideoExportWorker(QThread):
             self.finished_with_result.emit("")
         except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
+
+
+class _OfficeBackgroundPreconvertWorker(QThread):
+    """Fire-and-forget Office-to-PDF pre-conversion.
+
+    Used after calendar attachments land in a session: silently
+    walks the Office files and warms the conversion cache so the
+    user's first preview click is instant. No progress reporting
+    -- this runs in the background while the user is doing other
+    things.
+    """
+
+    def __init__(self, paths) -> None:
+        super().__init__()
+        self._paths = list(paths)
+
+    def run(self) -> None:  # type: ignore[override]
+        from .utils.office_preview import convert_office_to_pdf  # noqa: PLC0415
+        for p in self._paths:
+            try:
+                convert_office_to_pdf(p)
+            except Exception:
+                log.exception(
+                    "background Office pre-convert failed for %s", p,
+                )
 
 
 class _ExportPackageWorker(QThread):
