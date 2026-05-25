@@ -151,6 +151,39 @@ NoiseNoise NoiseNoise.
     assert out.index("SignalKafka") < out.index("NoiseNoise")
 
 
+def test_extra_stopword_match_is_case_insensitive():
+    """Aaron reported the extractor surfacing first names that
+    MainApp had passed as stopwords -- root cause was the lower-
+    case stopword "alice" not matching the upper-case "Alice" in
+    the body. Case-insensitive comparison fixes it."""
+    body = "Alice mentioned the project. Alice's plan is solid. Alice."
+    out = extract_topics(body, extra_stopwords=["alice"])
+    assert "Alice" not in out
+
+
+def test_extra_stopword_match_is_case_insensitive_reverse():
+    """And in the other direction -- a Title-case stopword
+    suppresses a lowercase body mention."""
+    body = "When mdm gets rolled out, mdm phase 3 starts. mdm."
+    out = extract_topics(body, extra_stopwords=["MDM"])
+    assert all(t.upper() != "MDM" for t in out)
+
+
+def test_stopword_suppresses_first_name_even_with_many_mentions():
+    """The headline behavior MainApp depends on for issue #24's
+    name-noise fix -- many mentions of a known person's first name
+    don't surface as a topic even though the count would normally
+    qualify."""
+    body = (
+        "Bob said the MDM rollout is on track. Bob followed up "
+        "with Bob's notes from the last meeting. Bob suggested..."
+    )
+    out = extract_topics(body, extra_stopwords=["Bob"])
+    assert "Bob" not in out
+    # And the real topic still survives.
+    assert "MDM" in out
+
+
 def test_min_noun_occurrences_configurable():
     """Use a word that isn't in the curated stopword list -- 'Topic'
     is, since meeting-note structure markers like '## Topic' would

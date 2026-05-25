@@ -211,6 +211,16 @@ def test_get_or_create_topic_case_insensitive(store):
     assert b.name == "MDM"   # canonical preserved
 
 
+def test_session_ids_for_person_lists_sessions_dedup(store):
+    """Adding the same person to multiple sessions, in_use filters
+    rely on this method via the navigator's session-list filter."""
+    bob = store.get_or_create_person("Bob")
+    store.add_session_person("a", bob.id)
+    store.add_session_person("b", bob.id)
+    store.add_session_person("a", bob.id)  # idempotent dup
+    assert sorted(store.session_ids_for_person(bob.id)) == ["a", "b"]
+
+
 def test_add_session_topic_then_lookup(store):
     mdm = store.get_or_create_topic("MDM")
     store.add_session_topic("s1", mdm.id, source=SOURCE_MANUAL, accepted=True)
@@ -308,6 +318,71 @@ def test_remove_session_drops_all_associations(store):
     assert store.series_for_session("s1") is None
     assert store.people_for_session("s1") == []
     assert store.topics_for_session("s1") == []
+
+
+# ----------------------------------------------------------------------
+# In-use list variants (v0.7.0 follow-up). The navigator only offers
+# values that have at least one session association -- empty options
+# would just waste clicks.
+
+
+def test_list_series_in_use_excludes_orphans(store):
+    used = store.get_or_create_series("Used")
+    store.get_or_create_series("Orphan")  # never assigned
+    store.assign_series("s1", used.id)
+    names = [s.name for s in store.list_series_in_use()]
+    assert "Used" in names
+    assert "Orphan" not in names
+    # Full list still carries both -- chips bar uses that for
+    # re-link affordances.
+    assert {s.name for s in store.list_series()} == {"Used", "Orphan"}
+
+
+def test_list_series_in_use_recovers_after_unassign(store):
+    series = store.get_or_create_series("Sometimes")
+    store.assign_series("s1", series.id)
+    assert any(s.name == "Sometimes" for s in store.list_series_in_use())
+    store.assign_series("s1", None)
+    assert not any(s.name == "Sometimes" for s in store.list_series_in_use())
+
+
+def test_list_people_in_use_excludes_unlinked_people(store):
+    alice = store.get_or_create_person("Alice")
+    store.get_or_create_person("Bob")  # no session_people row
+    store.add_session_person("s1", alice.id)
+    names = [p.display_name for p in store.list_people_in_use()]
+    assert "Alice" in names
+    assert "Bob" not in names
+
+
+def test_list_topics_in_use_excludes_orphans_and_suggestion_only(store):
+    """Three states matter:
+       - Topic with accepted=1 association  -> in use
+       - Topic with only accepted=0 (suggestion) associations -> NOT in use
+         (session_ids_for_topic only returns accepted rows -> filter
+         would always return empty)
+       - Topic with no associations at all -> NOT in use
+    """
+    accepted = store.get_or_create_topic("Accepted")
+    suggestion_only = store.get_or_create_topic("SuggestionOnly")
+    orphan = store.get_or_create_topic("Orphan")
+    store.add_session_topic("s1", accepted.id, accepted=True)
+    store.add_session_topic("s1", suggestion_only.id, source="auto", accepted=False)
+    # orphan has no add_session_topic call
+    names = [t.name for t in store.list_topics_in_use()]
+    assert "Accepted" in names
+    assert "SuggestionOnly" not in names
+    assert "Orphan" not in names
+
+
+def test_list_topics_in_use_promotes_after_user_accepts(store):
+    """A suggestion-only topic becomes 'in use' once the user accepts
+    it (set_topic_accepted(True))."""
+    topic = store.get_or_create_topic("Pending")
+    store.add_session_topic("s1", topic.id, source="auto", accepted=False)
+    assert "Pending" not in {t.name for t in store.list_topics_in_use()}
+    store.set_topic_accepted("s1", topic.id, True)
+    assert "Pending" in {t.name for t in store.list_topics_in_use()}
 
 
 def test_classification_for_session_aggregates_all_three(store):

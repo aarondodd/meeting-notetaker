@@ -274,6 +274,25 @@ class ClassificationStore:
         ).fetchall()
         return [_row_to_series(r) for r in rows]
 
+    def list_series_in_use(self) -> list[Series]:
+        """Series that have at least one session assigned to them.
+
+        Drives the navigator's By-Series pulldown -- there's no point
+        offering a filter value that returns zero sessions. The
+        chips-bar's Change Series picker still uses list_series()
+        so a user can re-assign a session to a known-but-currently-
+        unused series.
+        """
+        rows = self._conn.execute(
+            """SELECT s.* FROM series s
+               WHERE EXISTS (
+                   SELECT 1 FROM session_series ss
+                   WHERE ss.series_id = s.id
+               )
+               ORDER BY s.name COLLATE NOCASE"""
+        ).fetchall()
+        return [_row_to_series(r) for r in rows]
+
     def assign_series(self, session_id: str, series_id: Optional[int]) -> None:
         if series_id is None:
             self._conn.execute(
@@ -343,6 +362,24 @@ class ClassificationStore:
     def list_people(self) -> list[Person]:
         rows = self._conn.execute(
             "SELECT * FROM people ORDER BY display_name COLLATE NOCASE"
+        ).fetchall()
+        return [_row_to_person(r) for r in rows]
+
+    def list_people_in_use(self) -> list[Person]:
+        """People associated with at least one session.
+
+        Drives the navigator's By-Person pulldown. Chips-bar
+        pickers use list_people() so a user can re-link a person
+        whose only session was deleted (without losing their name
+        from the global catalog).
+        """
+        rows = self._conn.execute(
+            """SELECT p.* FROM people p
+               WHERE EXISTS (
+                   SELECT 1 FROM session_people sp
+                   WHERE sp.person_id = p.id
+               )
+               ORDER BY p.display_name COLLATE NOCASE"""
         ).fetchall()
         return [_row_to_person(r) for r in rows]
 
@@ -460,6 +497,29 @@ class ClassificationStore:
     def list_topics(self) -> list[Topic]:
         rows = self._conn.execute(
             "SELECT * FROM topics ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        return [_row_to_topic(r) for r in rows]
+
+    def list_topics_in_use(self) -> list[Topic]:
+        """Topics that have at least one ACCEPTED session association.
+
+        Filters out:
+        * Topics with no session_topics rows at all (orphans).
+        * Topics that exist only as auto-suggestions (accepted=0) --
+          those shouldn't drive the navigator because
+          session_ids_for_topic only returns accepted associations
+          and would always return the empty list for them.
+
+        Chips-bar Add Topic picker uses list_topics() so the user can
+        re-add a previously-rejected topic via the dropdown.
+        """
+        rows = self._conn.execute(
+            """SELECT t.* FROM topics t
+               WHERE EXISTS (
+                   SELECT 1 FROM session_topics st
+                   WHERE st.topic_id = t.id AND st.accepted = 1
+               )
+               ORDER BY t.name COLLATE NOCASE"""
         ).fetchall()
         return [_row_to_topic(r) for r in rows]
 

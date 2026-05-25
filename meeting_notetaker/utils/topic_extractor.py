@@ -101,16 +101,24 @@ def extract_topics(
     capitalization it had in the input.
 
     `extra_stopwords` lets MainApp inject a per-session ignore list
-    (e.g. the user's own name + the attendee names already captured
-    as People, so they don't double-surface as a topic).
+    (the user's own name + every known person's name + every
+    attendee name + name tokens, so first-name mentions of people
+    don't double-surface as topic suggestions). Matching is
+    case-insensitive: "alice" in stopwords suppresses "Alice" /
+    "ALICE" / "alice" alike.
     """
     if not body:
         return []
-    stopwords = set(_TITLE_STOPWORDS)
+    # Stopwords stored lowercased; _credit lowercases tokens before
+    # comparison. Case-insensitive lookup is the right call here --
+    # a meeting note that mentions "ALICE" in title case shouldn't
+    # surface as a topic just because the MainApp stopword list
+    # carried it as "Alice".
+    stopwords = {s.lower() for s in _TITLE_STOPWORDS}
     if extra_stopwords:
         for word in extra_stopwords:
             if word:
-                stopwords.add(word.strip())
+                stopwords.add(word.strip().lower())
 
     # Counter keyed on lowercased form for dedup; first-seen
     # canonical capitalization preserved separately. OrderedDict
@@ -148,12 +156,18 @@ def extract_topics(
     noun_counts: Counter[str] = Counter()
     for match in _CAP_NOUN_RE.finditer(prose_body):
         token = match.group(0)
-        if token in stopwords:
+        if token.lower() in stopwords:
             continue
         noun_counts[token.lower()] += 1
         # Remember the first capitalization seen.
         display.setdefault(token.lower(), token)
     for key, count in noun_counts.items():
+        # The lowered key is the comparison form (so stopwords from
+        # extra_stopwords like "alice" suppress a "Alice" that
+        # squeaked past the per-token check above through
+        # display.setdefault -- defense in depth).
+        if key in stopwords:
+            continue
         if count >= min_noun_occurrences:
             scores[key] += count   # base score = occurrences
 
@@ -185,18 +199,23 @@ def _credit(
     Tokens are stored in the counter keyed by lowercased form so
     "MDM" and "mdm" collapse cleanly; display capitalization is
     decided by first sighting (the file's canonical form).
+
+    Stopword check is case-insensitive: extract_topics lowercases
+    the stopword set on entry, and we lower the candidate before
+    comparing so "Alice" matches a "alice" stopword and vice
+    versa.
     """
     token = raw_token.strip()
     if not token:
         return
-    if token in stopwords:
+    if token.lower() in stopwords:
         return
     # Defensive: drop trailing punctuation a regex might have left
     # behind (rare with the configured patterns but cheap to guard).
     token = token.rstrip(".,;:!?")
     if len(token) < 2:
         return
-    if token in stopwords:
+    if token.lower() in stopwords:
         return
     key = token.lower()
     scores[key] += weight

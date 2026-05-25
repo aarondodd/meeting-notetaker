@@ -1099,27 +1099,45 @@ class MainApp(QObject):
         """Re-populate the navigator combo + chips-bar pickers with
         current series / people / topics. Cheap (sub-millisecond at
         any realistic store size) so we run it on every list
-        refresh rather than tracking dirty bits."""
+        refresh rather than tracking dirty bits.
+
+        Two different lists power the two surfaces:
+
+        * Navigator (filter pulldown) -- in-use only. Offering a
+          value that returns zero sessions wastes a click.
+        * Chips bar (Add/Change pickers) -- full catalog. The user
+          might re-link a session to a known-but-currently-orphan
+          series/person/topic.
+        """
         if self.classification is None:
             return
         try:
-            series_rows = self.classification.list_series()
-            people_rows = self.classification.list_people()
-            topic_rows = self.classification.list_topics()
-            series = [(s.id, s.name) for s in series_rows]
-            people = [(p.id, p.display_name) for p in people_rows]
-            topics = [(t.id, t.name) for t in topic_rows]
+            # Navigator: in-use only (EXISTS-filtered server-side).
+            nav_series = [
+                (s.id, s.name)
+                for s in self.classification.list_series_in_use()
+            ]
+            nav_people = [
+                (p.id, p.display_name)
+                for p in self.classification.list_people_in_use()
+            ]
+            nav_topics = [
+                (t.id, t.name)
+                for t in self.classification.list_topics_in_use()
+            ]
             self.window.set_classification_choices(
-                series=series, people=people, topics=topics,
+                series=nav_series, people=nav_people, topics=nav_topics,
             )
-            # Same lists -- name-only -- power the chips bar's
-            # dropdown+text combo. ClassificationBar reads these on
-            # button click so a stale push between clicks just shows
-            # slightly old options for one click.
+            # Chips bar: full catalog so the user can pick a topic
+            # they previously used on another session even if it's
+            # currently unassigned everywhere.
+            full_series_rows = self.classification.list_series()
+            full_people_rows = self.classification.list_people()
+            full_topic_rows = self.classification.list_topics()
             self.window.session_view.set_classification_known_lists(
-                series=[s.name for s in series_rows],
-                people=[p.display_name for p in people_rows],
-                topics=[t.name for t in topic_rows],
+                series=[s.name for s in full_series_rows],
+                people=[p.display_name for p in full_people_rows],
+                topics=[t.name for t in full_topic_rows],
             )
         except Exception:
             log.exception("classification refresh failed")
@@ -2662,16 +2680,55 @@ class MainApp(QObject):
 
         Already-accepted topics survive the replace; only previously-
         unaccepted auto-suggestions get refreshed.
+
+        Stopword strategy: tokenize every known person's display
+        name AND this session's parsed attendees, adding every
+        token (>= 2 chars) to the stopword set. Names usually
+        appear in synthesis text by first name alone -- "Alice
+        said..." rather than "Alice Smith said..." -- so just
+        passing display_names misses the noise. Catches first,
+        middle, last names alike. Case-insensitive comparison is
+        done inside extract_topics so we don't need to pre-fold
+        case here.
         """
         if self.classification is None:
             return
         try:
-            # Exclude already-known people's names from topic
-            # suggestions so attendees don't double-surface as
-            # topics.
-            people = self.classification.people_for_session(session_id)
-            stopwords = [p.person.display_name for p in people]
-            suggestions = extract_topics(body or "", extra_stopwords=stopwords)
+            stopwords: set[str] = set()
+            # Every known person (across all sessions, not just
+            # this one) gets their full name + every name token
+            # added. A "Bob" surfacing in this synthesis because
+            # he was mentioned in a different meeting still gets
+            # suppressed.
+            for person in self.classification.list_people():
+                name = (person.display_name or "").strip()
+                if not name:
+                    continue
+                stopwords.add(name)
+                for tok in name.split():
+                    if len(tok) >= 2:
+                        stopwords.add(tok)
+            # Also pull from this session's live-notes attendees in
+            # case some haven't made it into the people store yet
+            # (e.g. typed but the live_notes save hasn't fired the
+            # attendee sync this cycle).
+            try:
+                live = TranscriptStore(session_id).read_live_notes()
+                for name in parse_attendees(live or ""):
+                    name = (name or "").strip()
+                    if not name:
+                        continue
+                    stopwords.add(name)
+                    for tok in name.split():
+                        if len(tok) >= 2:
+                            stopwords.add(tok)
+            except Exception:
+                log.exception(
+                    "attendee read for stopword build failed for %s", session_id,
+                )
+            suggestions = extract_topics(
+                body or "", extra_stopwords=stopwords,
+            )
             self.classification.replace_session_topic_suggestions(
                 session_id, suggestions,
             )

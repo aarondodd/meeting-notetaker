@@ -122,7 +122,9 @@ class ClassificationNavigator(QWidget):
 
     # ---- internals ----
     def _on_view_changed(self, _idx: int) -> None:
-        self._update_value_combo()
+        # Switching views always wipes the value selection -- a
+        # series_id has no meaning under By-Person, etc.
+        self._update_value_combo(preserve_selection=False)
         self._emit()
 
     def _on_value_changed(self, _idx: int) -> None:
@@ -130,10 +132,27 @@ class ClassificationNavigator(QWidget):
             return
         self._emit()
 
-    def _update_value_combo(self) -> None:
+    def _update_value_combo(self, *, preserve_selection: bool = True) -> None:
         """Refresh the second combo's contents based on the active
-        view. Done under signal-suppression so the resulting auto-
-        select doesn't fire an extra emit."""
+        view.
+
+        `preserve_selection=True` (the default and the case for any
+        set_series/set_people/set_topics push from MainApp) snapshots
+        the currently-selected value_id before clearing and restores
+        it if it still exists in the new items list. Otherwise the
+        user's "I'm filtering by topic MDM" gets silently reset to
+        index 0 every time MainApp pushes a fresh choices list
+        (which happens on every session selection / classification
+        mutation).
+
+        `preserve_selection=False` is used when the view itself
+        changed; the previous value_id has no meaning under the
+        new view, so the combo starts fresh.
+
+        Always runs under signal suppression so neither the clear()
+        nor the re-select fires a spurious filter_changed.
+        """
+        prev_value_id = self._current_value_id() if preserve_selection else None
         self._suppress_emit = True
         try:
             self._value_combo.clear()
@@ -150,6 +169,15 @@ class ClassificationNavigator(QWidget):
             else:
                 self._value_combo.addItem("(invalid view)", None)
                 self._value_combo.setEnabled(False)
+            # Restore the prior selection if it survived the refresh.
+            # Otherwise the combo stays at index 0 (placeholder)
+            # which is the right behavior when the previously-
+            # selected value is no longer available.
+            if prev_value_id is not None:
+                for i in range(self._value_combo.count()):
+                    if self._value_combo.itemData(i) == prev_value_id:
+                        self._value_combo.setCurrentIndex(i)
+                        break
         finally:
             self._suppress_emit = False
 
