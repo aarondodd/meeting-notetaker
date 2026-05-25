@@ -245,7 +245,9 @@ class AttachmentPreview(QWidget):
         worker.conversion_done.connect(
             lambda pdf, src=path: self._on_office_converted(src, pdf)
         )
-        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(
+            lambda w=worker: _safe_cleanup_qthread(w)
+        )
         self._office_worker = worker
         worker.start()
 
@@ -309,6 +311,7 @@ class _OfficeConversionWorker(QThread):
 
     def __init__(self, src_path: Path) -> None:
         super().__init__()
+        self.setObjectName("OfficeConversionWorker")
         self._src_path = src_path
 
     def run(self) -> None:  # type: ignore[override]
@@ -318,6 +321,22 @@ class _OfficeConversionWorker(QThread):
             log.exception("Office conversion worker crashed")
             pdf = None
         self.conversion_done.emit(pdf)
+
+
+def _safe_cleanup_qthread(worker: QThread) -> None:
+    """Join then schedule deletion.
+
+    The bare ``finished.connect(deleteLater)`` pattern races: the
+    finished signal is emitted from inside QThread's run wrapper
+    before the OS thread is joined, so the queued deleteLater can
+    run while isRunning() is still True, triggering 'QThread:
+    Destroyed while thread is still running' (and a crash on
+    Windows under load). wait() blocks the caller until the OS
+    thread joins -- at this point run() has already returned, so
+    it's effectively instant.
+    """
+    worker.wait()
+    worker.deleteLater()
 
 
 def _format_size(n: int) -> str:
