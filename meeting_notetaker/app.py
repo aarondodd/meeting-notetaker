@@ -978,6 +978,7 @@ class MainApp(QObject):
         self.window.open_recording_requested.connect(self._on_open_recording)
         self.window.export_recording_requested.connect(self._on_export_recording)
         self.window.export_video_requested.connect(self._on_export_video)
+        self.window.export_package_requested.connect(self._on_export_package)
         self.window.delete_recording_requested.connect(self._on_delete_recording)
         self.window.session_list_sort_changed.connect(self._on_session_list_sort_changed)
         self.window.open_search_requested.connect(self._on_open_search)
@@ -1239,6 +1240,11 @@ class MainApp(QObject):
             except Exception:
                 total_ms = 0
         self.window.session_view.set_session_highlights(total_ms, highlights)
+        # Issue #29: Attachments tab pulls the per-session list.
+        try:
+            self.window.session_view.attachments_tab().set_session(session_id)
+        except Exception:
+            log.exception("attachments tab failed to load for %s", session_id)
 
     def _refresh_session_classification(self, session_id: str) -> None:
         """Re-read + repaint the chips bar for the given session.
@@ -1293,6 +1299,9 @@ class MainApp(QObject):
         the raw email. Miss -> register the email as a stub Contact
         + email alias so future invites with that email resolve
         cleanly.
+
+        Issue #29: also pull file attachments off the MeetingItem
+        and stash them in the session's AttachmentsStore.
         """
         attendee_names: list[str] = []
         for a in info.attendees:
@@ -1307,6 +1316,30 @@ class MainApp(QObject):
             )
         except OSError:
             log.exception("failed to seed live notes from calendar")
+        # Pull calendar attachments (issue #29). Off-Windows / no
+        # pywin32 -> pull_attachments_to_temp returns []. Errors
+        # during save are logged + swallowed; the session is still
+        # usable without the attachments.
+        if info.attachments:
+            try:
+                from .integrations.outlook_calendar import pull_attachments_to_temp  # noqa: PLC0415
+                from .models.attachments import (  # noqa: PLC0415
+                    AttachmentsStore, SOURCE_CALENDAR,
+                )
+                tmp_paths = pull_attachments_to_temp(info.entry_id)
+                if tmp_paths:
+                    store = AttachmentsStore(session_id)
+                    for p in tmp_paths:
+                        try:
+                            store.add_file(p, source=SOURCE_CALENDAR)
+                        except Exception:
+                            log.exception(
+                                "calendar attachment import failed for %s", p,
+                            )
+            except Exception:
+                log.exception(
+                    "calendar attachment pull failed for %s", session_id,
+                )
 
     def _resolve_calendar_attendee_display(self, attendee) -> str:
         """Pick the best display string for one calendar attendee.
@@ -2514,6 +2547,183 @@ class MainApp(QObject):
             else:
                 self.window.status(
                     f"Exported video to {target.name}", timeout_ms=5000,
+                )
+            worker.deleteLater()
+
+        worker.progress_changed.connect(on_progress)
+        worker.finished_with_result.connect(on_done)
+        progress.show()
+        worker.start()
+
+    def _on_export_package(self, session_id: str) -> None:
+        """Full-session ZIP export (issue #30).
+
+        Builds an archive containing PDFs of My Notes + Synthesis,
+        plaintext transcript, MP3 audio, MP4 video (if screenshots
+        exist), all attachments, and all screenshots. When highlights
+        exist, prompts once for Full / Highlights-only / Both.
+        """
+        from PyQt6.QtWidgets import (  # noqa: PLC0415
+            QFileDialog, QMessageBox, QProgressDialog,
+        )
+        from .models.attachments import AttachmentsStore  # noqa: PLC0415
+        from .models.highlights import HighlightsStore  # noqa: PLC0415
+        from .models.transcript import TranscriptStore  # noqa: PLC0415
+        from .screencap.timestamps import screenshot_offsets  # noqa: PLC0415
+        from .utils.export_package import (  # noqa: PLC0415
+            HIGHLIGHTS_MODE_BOTH,
+            HIGHLIGHTS_MODE_FULL,
+            HIGHLIGHTS_MODE_HIGHLIGHTS,
+            PackageOptions,
+            default_package_filename,
+        )
+        from .utils.paths import (  # noqa: PLC0415
+            list_screenshots, session_audio_files,
+        )
+
+        session = self.store.get_session(session_id)
+        if session is None:
+            return
+
+        # Pre-flight: ask about highlights mode when applicable.
+        highlights = []
+        try:
+            highlights = HighlightsStore(session_id).load().sorted_by_start()
+        except Exception:
+            highlights = []
+        if highlights:
+            dialog = QMessageBox(self.window)
+            dialog.setWindowTitle("Export full session")
+            dialog.setText(
+                f"This session has {len(highlights)} highlight(s). For "
+                "the audio + video files, export:"
+            )
+            full_btn = dialog.addButton(
+                "Full recording only", QMessageBox.ButtonRole.AcceptRole,
+            )
+            high_btn = dialog.addButton(
+                "Highlights only", QMessageBox.ButtonRole.AcceptRole,
+            )
+            both_btn = dialog.addButton(
+                "Both", QMessageBox.ButtonRole.AcceptRole,
+            )
+            cancel_btn = dialog.addButton(QMessageBox.StandardButton.Cancel)
+            dialog.setDefaultButton(both_btn)
+            dialog.exec()
+            clicked = dialog.clickedButton()
+            if clicked is cancel_btn:
+                return
+            elif clicked is full_btn:
+                highlights_mode = HIGHLIGHTS_MODE_FULL
+            elif clicked is high_btn:
+                highlights_mode = HIGHLIGHTS_MODE_HIGHLIGHTS
+            else:
+                highlights_mode = HIGHLIGHTS_MODE_BOTH
+        else:
+            highlights_mode = HIGHLIGHTS_MODE_FULL
+
+        # Save dialog with suggested filename.
+        suggested = default_package_filename(
+            session.title or "session",
+            session.started_at or session.created_at or "",
+        )
+        suggested_path = str(Path.home() / "Documents" / suggested)
+        path_str, _ = QFileDialog.getSaveFileName(
+            self.window, "Export full session",
+            suggested_path,
+            "ZIP archive (*.zip)",
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        if target.suffix.lower() != ".zip":
+            target = target.with_suffix(".zip")
+
+        # Gather inputs.
+        store = TranscriptStore(session_id)
+        notes_md = ""
+        synthesis_md = ""
+        transcript_text = ""
+        try:
+            notes_md = store.read_live_notes()
+        except OSError:
+            log.exception("notes read failed for %s", session_id)
+        try:
+            synthesis_md = store.read_notes()
+        except OSError:
+            log.exception("synthesis read failed for %s", session_id)
+        try:
+            transcript_text = store.read_transcript()
+        except OSError:
+            log.exception("transcript read failed for %s", session_id)
+
+        audio_files = session_audio_files(session_id)
+        mic_path = next(
+            (p for p in audio_files if p.stem == "mic"), None,
+        )
+        sys_path = next(
+            (p for p in audio_files if p.stem == "sys"), None,
+        )
+        screenshots = screenshot_offsets(
+            list_screenshots(session_id), session.started_at or "",
+        )
+
+        # Attachments -- copy the file + display name pairs into the
+        # orchestrator. The display name lands as the on-disk
+        # filename in the package, with FS-safe normalization.
+        attachments_pairs: list[tuple[Path, str]] = []
+        try:
+            attach_store = AttachmentsStore(session_id)
+            for rec in attach_store.list():
+                path = attach_store.file_path(rec.id)
+                if path is not None:
+                    attachments_pairs.append((path, rec.display_name))
+        except Exception:
+            log.exception("attachments enumerate failed for %s", session_id)
+
+        options = PackageOptions(
+            session_id=session_id,
+            session_title=session.title or "session",
+            session_started_at_iso=session.started_at or session.created_at or "",
+            mic_path=mic_path,
+            sys_path=sys_path,
+            screenshots=screenshots,
+            transcript_text=transcript_text,
+            notes_md=notes_md,
+            synthesis_md=synthesis_md,
+            attachments=attachments_pairs,
+            highlights=highlights,
+            highlights_mode=highlights_mode,
+        )
+
+        # Worker thread with determinate progress.
+        progress = QProgressDialog(
+            f"Building {target.name}...", None, 0, 100, self.window,
+        )
+        progress.setWindowTitle("Export full session")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        progress.setCancelButton(None)
+        progress.setValue(0)
+
+        worker = _ExportPackageWorker(options, target)
+
+        def on_progress(pct: int) -> None:
+            progress.setValue(pct)
+
+        def on_done(err_msg: str) -> None:
+            progress.cancel()
+            if err_msg:
+                log.error("export_package failed: %s", err_msg)
+                QMessageBox.warning(
+                    self.window, "Export full session",
+                    f"Could not build the export package:\n\n{err_msg}",
+                )
+            else:
+                self.window.status(
+                    f"Exported full session to {target.name}",
+                    timeout_ms=5000,
                 )
             worker.deleteLater()
 
@@ -3853,6 +4063,29 @@ class _HighlightVideoExportWorker(QThread):
                 self._transcript_text, self._highlights, self._target,
                 session_title=self._session_title,
                 session_started_at_iso=self._session_started_at_iso,
+                progress=self.progress_changed.emit,
+            )
+            self.finished_with_result.emit("")
+        except Exception as exc:  # noqa: BLE001
+            self.finished_with_result.emit(str(exc))
+
+
+class _ExportPackageWorker(QThread):
+    """Run utils.export_package.build_session_package off the GUI thread."""
+
+    progress_changed = pyqtSignal(int)
+    finished_with_result = pyqtSignal(str)
+
+    def __init__(self, options, target_path) -> None:
+        super().__init__()
+        self._options = options
+        self._target = target_path
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from .utils.export_package import build_session_package  # noqa: PLC0415
+            build_session_package(
+                self._options, self._target,
                 progress=self.progress_changed.emit,
             )
             self.finished_with_result.emit("")

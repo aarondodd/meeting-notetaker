@@ -125,6 +125,7 @@ class MainWindow(QMainWindow):
     open_recording_requested = pyqtSignal(str)     # session_id
     export_recording_requested = pyqtSignal(str)   # session_id
     export_video_requested = pyqtSignal(str)       # session_id
+    export_package_requested = pyqtSignal(str)     # session_id (issue #30)
     delete_recording_requested = pyqtSignal(str)   # session_id
     session_selected = pyqtSignal(str)             # session_id
     session_list_sort_changed = pyqtSignal(str)    # one of VALID_SESSION_LIST_SORTS
@@ -640,6 +641,11 @@ class MainWindow(QMainWindow):
         action_export_recording.setEnabled(has_audio)
         action_export_video = menu.addAction("Export session as video...")
         action_export_video.setEnabled(has_audio)
+        # Issue #30: full-session ZIP export. Always available
+        # when a single session is selected -- the orchestrator
+        # handles missing-audio / missing-screenshots gracefully.
+        action_export_package = menu.addAction("Export full session...")
+        action_export_package.setEnabled(bool(single_id))
         action_delete_recording = menu.addAction("Delete recording...")
         action_delete_recording.setEnabled(has_audio)
         menu.addSeparator()
@@ -655,6 +661,8 @@ class MainWindow(QMainWindow):
             self.export_recording_requested.emit(single_id)
         elif action is action_export_video and single_id:
             self.export_video_requested.emit(single_id)
+        elif action is action_export_package and single_id:
+            self.export_package_requested.emit(single_id)
         elif action is action_delete_recording and single_id:
             self._confirm_delete_recording(single_id)
         elif action is action_delete:

@@ -41,6 +41,7 @@ from ..models.transcript import (
 from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
 from ..models.highlights import HighlightSet
+from .attachments_tab import AttachmentsTab
 from .attendee_sidebar import AttendeeSidebar
 from .classification_bar import ClassificationBar
 from .find_bar import FindBar
@@ -113,6 +114,10 @@ class SessionView(QWidget):
     # Highlight bar mutations (v0.7.0+). The bar carries the whole
     # HighlightSet to keep the signal-fired writes atomic.
     highlights_changed = pyqtSignal(str, object)          # session_id, HighlightSet
+    # Attachments tab forwards (issue #29) -- MainApp persists +
+    # refreshes derived state on change.
+    attachments_changed = pyqtSignal(str)                 # session_id
+    attachments_split_changed = pyqtSignal(str)           # session_id, base64 splitter state forwarded via signal
     # Screen-capture lifecycle. start_screen_capture_clicked carries the
     # session id; MainApp shows the first-time popup (if needed) and
     # launches the region picker. stop_screen_capture_clicked tears the
@@ -512,6 +517,13 @@ class SessionView(QWidget):
         self._highlight_bar.highlights_changed.connect(self._on_highlights_changed)
         transcript_layout.addWidget(self._highlight_bar, 0)
         self._tabs.addTab(transcript_page, "Transcript")
+        # Attachments tab (issue #29): per-session file attach +
+        # preview. Added after Transcript per the spec.
+        self._attachments_tab = AttachmentsTab(self)
+        self._attachments_tab.attachments_changed.connect(
+            self._on_attachments_changed,
+        )
+        self._tabs.addTab(self._attachments_tab, "Attachments")
 
         # Per-line timestamp index. Built each time the transcript text
         # changes; consumed by the position-driven highlight and the
@@ -1563,6 +1575,14 @@ class SessionView(QWidget):
             "notes": "Synthesis",
             "previous": "Previous Notes",
         }.get(tab_id or "", "")
+
+    def attachments_tab(self) -> AttachmentsTab:
+        return self._attachments_tab
+
+    def _on_attachments_changed(self, session_id: str) -> None:
+        # Forward upward; MainApp may want to update an indicator
+        # on the session list (e.g. paperclip glyph).
+        self.attachments_changed.emit(session_id)
 
     def set_session_highlights(
         self,

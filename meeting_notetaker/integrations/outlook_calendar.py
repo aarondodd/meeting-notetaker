@@ -48,6 +48,20 @@ class CalendarAttendee:
 
 
 @dataclass
+class CalendarAttachment:
+    """An attachment carried on the calendar invite (issue #29).
+
+    `display_name` is the friendly name from Outlook (usually the
+    source filename when the inviter dropped a file in).
+    `local_path` is set after `pull_attachments_to_temp` saves it
+    out; None for the metadata-only read path.
+    """
+    display_name: str
+    size: int = 0
+    local_path: Optional[Path] = None
+
+
+@dataclass
 class MeetingInfo:
     entry_id: str
     subject: str
@@ -56,6 +70,7 @@ class MeetingInfo:
     attendees: list[CalendarAttendee] = field(default_factory=list)
     body: str = ""
     location: str = ""
+    attachments: list[CalendarAttachment] = field(default_factory=list)
 
 
 # ---- pure helpers (testable without pywin32) -------------------------------
@@ -312,6 +327,32 @@ def _item_to_info(item) -> MeetingInfo:
 
     body = sanitize_body(str(getattr(item, "Body", "") or ""))
 
+    # Metadata-only walk of attachments. We don't save them to disk
+    # here -- that's expensive (file copies) and only useful when the
+    # caller actually picks this meeting. pull_attachments_to_temp
+    # handles the save step at session-creation time.
+    attachments: list[CalendarAttachment] = []
+    try:
+        for a in item.Attachments:
+            # Type 1 = olByValue (a file we can SaveAsFile).
+            # Other types (olByReference, olEmbeddeditem, olOLE) are
+            # not directly extractable, so we skip them here.
+            atype = int(getattr(a, "Type", 0) or 0)
+            if atype != 1:
+                continue
+            attachments.append(
+                CalendarAttachment(
+                    display_name=str(
+                        getattr(a, "DisplayName", "") or
+                        getattr(a, "FileName", "") or
+                        "attachment"
+                    ).strip(),
+                    size=int(getattr(a, "Size", 0) or 0),
+                )
+            )
+    except Exception:
+        log.debug("attachments parse failed", exc_info=True)
+
     return MeetingInfo(
         entry_id=str(item.EntryID),
         subject=str(item.Subject or "(no subject)"),
@@ -320,7 +361,67 @@ def _item_to_info(item) -> MeetingInfo:
         attendees=attendees,
         body=body,
         location=str(getattr(item, "Location", "") or "").strip(),
+        attachments=attachments,
     )
+
+
+def pull_attachments_to_temp(entry_id: str) -> list[Path]:
+    """Save every file-type attachment on the given MeetingItem to
+    a temp directory; return the resulting paths.
+
+    Used after the user picks a calendar entry to create a session
+    from -- the caller (`_seed_live_notes_from_meeting`) hands these
+    paths to AttachmentsStore.add_file. Files in the temp dir are
+    NOT cleaned up here; AttachmentsStore.add_file copies them into
+    the session dir and the tempdir's contents become orphaned but
+    harmless (they'll get swept on next boot).
+
+    Returns [] on any failure (Outlook unreachable, EntryID
+    missing, no file-type attachments).
+    """
+    if not is_available():
+        return []
+    try:
+        import tempfile
+        import win32com.client
+    except ImportError:
+        return []
+    out: list[Path] = []
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        item = namespace.GetItemFromID(entry_id)
+        if item is None:
+            return []
+        temp_dir = Path(tempfile.mkdtemp(prefix="mtn-cal-"))
+        for a in item.Attachments:
+            try:
+                atype = int(getattr(a, "Type", 0) or 0)
+            except Exception:
+                atype = 0
+            if atype != 1:
+                continue
+            name = str(
+                getattr(a, "FileName", "") or
+                getattr(a, "DisplayName", "") or
+                "attachment"
+            ).strip()
+            if not name:
+                continue
+            safe = "".join(c for c in name if c not in "\\/:*?\"<>|\r\n\t").strip()
+            if not safe:
+                continue
+            dst = temp_dir / safe
+            try:
+                a.SaveAsFile(str(dst))
+            except Exception:
+                log.exception("Outlook SaveAsFile failed for %s", name)
+                continue
+            if dst.exists():
+                out.append(dst)
+    except Exception:
+        log.exception("pull_attachments_to_temp failed for %s", entry_id)
+    return out
 
 
 def _pywintype_to_datetime(pwt) -> datetime:

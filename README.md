@@ -112,6 +112,26 @@ leaves the machine; no API key required.
   *"Jumping to MM:SS"* cards between consecutive highlights) or
   an audio file (MP3 / FLAC / AAC / Opus / WAV with short silent
   gaps) of just the highlights.
+- **Attachments tab:** per-session file attach + inline preview.
+  Click **Add file...** or drag-drop anywhere on the tab; files
+  are copied into the session folder (originals untouched). Right-
+  click any attachment for Rename / Save as / Open externally /
+  Delete. Preview pane dispatches by file type: images render
+  inline, plain text / markdown / source code show in a viewer,
+  audio plays via the existing player bar, PDFs use Qt's built-in
+  PDF viewer, and **Office documents (.docx, .xlsx, .pptx)
+  convert via Word/Excel/PowerPoint COM to PDF on first preview
+  and cache the result** so subsequent previews of the same file
+  are instant. Calendar-derived sessions auto-import any attached
+  files from the Outlook invite.
+- **Export full session:** right-click a session and choose
+  *Export full session...* to bundle everything into a single
+  ZIP: PDFs of My Notes + Synthesis, plain-text transcript, MP3
+  audio, MP4 video (if screenshots present), every attachment,
+  every screen capture. When highlights exist you pick once
+  between Full / Highlights-only / Both for the audio + video
+  files. Suggested filename uses the session timestamp + title
+  so files sort chronologically in Explorer.
 
 ## What's in v0.6.5
 
