@@ -37,6 +37,22 @@ from PyQt6.QtWidgets import QApplication, QTextBrowser, QWidget
 _VIEWPORT_PADDING = 16
 
 
+_PREVIEW_STYLESHEET = """
+h1 { margin-top: 22px; margin-bottom: 12px; }
+h2 { margin-top: 18px; margin-bottom: 10px; }
+h3 { margin-top: 16px; margin-bottom: 8px; }
+h4 { margin-top: 14px; margin-bottom: 6px; }
+h5 { margin-top: 12px; margin-bottom: 6px; }
+h6 { margin-top: 10px; margin-bottom: 6px; }
+p  { margin-top: 8px;  margin-bottom: 8px; line-height: 140%; }
+li { margin-top: 2px;  margin-bottom: 4px; }
+ul { margin-top: 6px;  margin-bottom: 8px; }
+ol { margin-top: 6px;  margin-bottom: 8px; }
+blockquote { margin-top: 10px; margin-bottom: 10px; }
+pre { margin-top: 10px; margin-bottom: 10px; }
+"""
+
+
 class MarkdownPreview(QTextBrowser):
     """QTextBrowser with image-aware context menu + viewport-width clamping."""
 
@@ -44,6 +60,12 @@ class MarkdownPreview(QTextBrowser):
         super().__init__(parent)
         self.setOpenExternalLinks(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.DefaultContextMenu)
+        # v0.7.0 tweak #6: heading/paragraph CSS spacing so the
+        # preview reads less compactly. setDefaultStyleSheet must
+        # land on the QTextDocument BEFORE any setMarkdown /
+        # setHtml call -- Qt applies the sheet at render time and
+        # caches results, so order matters.
+        self.document().setDefaultStyleSheet(_PREVIEW_STYLESHEET)
 
     # ------------------------------------------------------------------
     # Public API

@@ -40,6 +40,7 @@ from ..utils.images import (
     save_qimage,
 )
 from .markdown_preview import MarkdownPreview
+from .preview_with_toc import PreviewWithToc
 
 
 class _MarkdownEditor(QPlainTextEdit):
@@ -85,7 +86,12 @@ class LiveNotesWidget(QWidget):
         self._editor.textChanged.connect(self.textChanged.emit)
         self._editor.image_pasted.connect(self._on_image_pasted)
 
-        self._preview = MarkdownPreview(self)
+        # v0.7.0 tweak #7: My Notes + Synthesis preview gains a
+        # clickable table-of-contents sidebar on the right. The
+        # PreviewWithToc wrapper exposes the same setMarkdown /
+        # setSearchPaths / setPlaceholderText API as MarkdownPreview
+        # so the rest of this widget doesn't need to know.
+        self._preview = PreviewWithToc(self)
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self._editor)   # index 0
@@ -115,11 +121,15 @@ class LiveNotesWidget(QWidget):
     def find_target(self) -> QWidget:
         """Return the active widget for Ctrl+F to bind to.
 
-        Edit mode -> the QPlainTextEdit; Preview mode -> the
-        QTextBrowser. Both inherit `.find()` so FindBar's text
-        navigation works uniformly across the two states.
+        Edit mode -> the QPlainTextEdit. Preview mode -> the inner
+        MarkdownPreview (PreviewWithToc.find_target() unwraps past
+        the TOC sidebar so Ctrl+F lands on the text, not the
+        heading list).
         """
-        return self._stack.currentWidget()
+        current = self._stack.currentWidget()
+        if hasattr(current, "find_target") and current is not self._editor:
+            return current.find_target()
+        return current
 
     def is_in_preview(self) -> bool:
         return self._stack.currentWidget() is self._preview

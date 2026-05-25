@@ -199,18 +199,20 @@ class SessionView(QWidget):
 
         # Transport row
         controls = QHBoxLayout()
-        self._start_btn = QPushButton("Start", self)
-        self._start_btn.clicked.connect(self._on_start)
-        controls.addWidget(self._start_btn)
+        # v0.7.0 UI tweak: one button that toggles between Start /
+        # Stop based on session state. Matches the convention used
+        # elsewhere (the Screen Capture button does the same).
+        # Disabled when the session already has a recording on disk
+        # to prevent the user from accidentally overwriting it.
+        self._record_btn = QPushButton("Start Recording", self)
+        self._record_btn.clicked.connect(self._on_record_toggle)
+        controls.addWidget(self._record_btn)
         # Pause + Resume were removed in v0.6.5 to keep recordings
         # wall-clock-continuous. With pause, mic.wav and sys.wav
         # could go out of sync (especially under WASAPI loopback,
         # which delivers samples idiosyncratically when no audio is
         # playing). The recording is now a fixed start -> stop block
         # with all silences / padding preserved.
-        self._stop_btn = QPushButton("Stop", self)
-        self._stop_btn.clicked.connect(self._on_stop)
-        controls.addWidget(self._stop_btn)
         # Screen-capture toggle. Disabled unless the session is in
         # RECORDING or PAUSED (set_buttons_for_state drives this); the
         # button text flips between "Start Screen Capture" and "Stop
@@ -223,10 +225,16 @@ class SessionView(QWidget):
         )
         self._screen_capture_btn.clicked.connect(self._on_screen_capture_toggle)
         controls.addWidget(self._screen_capture_btn)
-        controls.addStretch(1)
         self._retain_checkbox = QCheckBox("Keep audio for this session", self)
         self._retain_checkbox.toggled.connect(self._on_retain_toggled)
         controls.addWidget(self._retain_checkbox)
+        controls.addStretch(1)
+        # v0.7.0 tweak #8: classification chips/buttons live on the
+        # control row, to the right of Start/Screen Capture. The bar
+        # widget itself is constructed later in __init__; we insert
+        # a placeholder slot here and the actual addWidget call lives
+        # right after construction.
+        self._classification_bar_slot = controls
         layout.addLayout(controls)
 
         # Synthesis row
@@ -386,7 +394,12 @@ class SessionView(QWidget):
         self._slides_view.play_clicked.connect(self._on_slides_play_clicked)
         self._slides_view.pause_clicked.connect(self._on_slides_pause_clicked)
         self._slides_view.seek_ms_requested.connect(self._on_slides_seek_requested)
-        self._tabs.addTab(self._slides_view, "Slides")
+        # Tab labelled "Screen Captures" for consistency with the
+        # "Start Screen Capture" button + the screencap_sidebar UI.
+        # Internal references in code still say "slides" (slot name,
+        # _slides_view widget) -- that's just shorthand; the
+        # user-facing string is what matters.
+        self._tabs.addTab(self._slides_view, "Screen Captures")
 
         # Previous Notes: list of archived synthesis versions + a
         # markdown-rendered preview of the selected one, with
@@ -564,14 +577,14 @@ class SessionView(QWidget):
         # and the find bar so it's always visible regardless of
         # which tab is active. Mutations bubble up to MainApp via
         # the *_requested signals.
-        # NOTE: We add it AFTER body_row in code order but the body
-        # took stretch=1 in addLayout so the bar lands BELOW the
-        # body in painted order. To keep the chips visible above
-        # the tabs as the issue intended, we re-insert at index 0
-        # of the outer layout (single insert is cheaper than
-        # reshuffling the body code).
+        # v0.7.0 tweak #8: the classification bar (Series / People /
+        # Topics) sits on the controls row, to the right of the
+        # Start Recording + Screen Capture buttons. Saves a row of
+        # vertical real estate and groups all session-level
+        # affordances together. controls.addStretch was added at the
+        # top of __init__ to push the bar to the right edge.
         self._classification_bar = ClassificationBar(self)
-        layout.insertWidget(0, self._classification_bar)
+        self._classification_bar_slot.addWidget(self._classification_bar)
         # Within-tab find bar (Ctrl+F). Hidden by default; the
         # `Ctrl+F` shortcut wires _open_find_bar() to attach it to
         # whichever text widget is in the active tab. Sits at the
@@ -1326,6 +1339,18 @@ class SessionView(QWidget):
         if self._session:
             self.stop_clicked.emit(self._session.id)
 
+    def _on_record_toggle(self) -> None:
+        """Single button that toggles Start <-> Stop based on session
+        state. _set_buttons_for_state keeps the label + enabled
+        state in sync; this handler just dispatches the right
+        signal."""
+        if self._session is None:
+            return
+        if self._session.state in (STATE_RECORDING, STATE_PAUSED):
+            self.stop_clicked.emit(self._session.id)
+        else:
+            self.start_clicked.emit(self._session.id)
+
     def _on_generate_prompt(self) -> None:
         if self._session:
             self.generate_prompt_clicked.emit(self._session.id)
@@ -1691,8 +1716,37 @@ class SessionView(QWidget):
         is_complete = state in (STATE_COMPLETE, STATE_ERROR)
 
         has_session = self._session is not None
-        self._start_btn.setEnabled(has_session and (is_new or is_complete))
-        self._stop_btn.setEnabled(has_session and (is_recording or is_paused))
+        # Single Record button that toggles Start <-> Stop based on
+        # state. Disabled when the session already has retained audio
+        # on disk so the user can't accidentally overwrite a finished
+        # recording. The session_view doesn't know the audio path
+        # directly so we re-check via has_retained_audio.
+        if is_recording or is_paused:
+            self._record_btn.setText("Stop Recording")
+            self._record_btn.setEnabled(has_session)
+        else:
+            self._record_btn.setText("Start Recording")
+            existing_recording = False
+            if has_session:
+                from ..utils.paths import has_retained_audio  # noqa: PLC0415
+                try:
+                    existing_recording = has_retained_audio(self._session.id)
+                except Exception:
+                    existing_recording = False
+            self._record_btn.setEnabled(
+                has_session and (is_new or is_complete) and not existing_recording
+            )
+            if existing_recording:
+                self._record_btn.setToolTip(
+                    "This session already has an audio recording on "
+                    "disk. Delete the recording (right-click in the "
+                    "session list -> Delete recording) before starting "
+                    "a new one."
+                )
+            else:
+                self._record_btn.setToolTip(
+                    "Start capturing mic + system audio for this session."
+                )
         self._refresh_screencap_button_enabled()
         # Generate/paste are available as soon as a transcript exists. The
         # batch-refinement pass after Stop runs in the background and is
@@ -1963,12 +2017,18 @@ class _ClickableTranscriptView(QPlainTextEdit):
 
 
 def _pretty_state(state: str) -> str:
+    # The state-label is the small text to the right of the session
+    # title. "Complete" was visual noise -- the session-list status
+    # column already shows the green dot for completed sessions, so
+    # the label string only carries weight DURING active work. Empty
+    # string for STATE_COMPLETE / STATE_NEW lets the label collapse
+    # to no horizontal footprint when nothing's happening.
     pretty = {
-        STATE_NEW: "New",
+        STATE_NEW: "",
         STATE_RECORDING: "Recording",
         STATE_PAUSED: "Paused",
         STATE_PROCESSING: "Refining transcript -- you can synthesize now",
-        STATE_COMPLETE: "Complete",
+        STATE_COMPLETE: "",
         STATE_ERROR: "Error",
     }
     return pretty.get(state, state.title())
