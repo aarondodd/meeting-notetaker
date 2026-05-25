@@ -2506,6 +2506,17 @@ class MainApp(QObject):
                 self.window.status(
                     f"Exported recording to {target.name}", timeout_ms=5000,
                 )
+            # wait() before deleteLater() closes a PyQt race: the
+            # finished_with_result signal is emitted from run() but
+            # the OS thread isn't guaranteed to be joined yet when
+            # the queued slot fires on the main thread. If we call
+            # deleteLater() while isRunning() is still True, Qt's
+            # destructor (when it runs at the next event loop tick)
+            # logs "QThread: Destroyed while thread '...' is still
+            # running" and the process can crash. wait() blocks the
+            # main thread for at most a few ms (the worker already
+            # returned from run()) and guarantees the join.
+            worker.wait()
             worker.deleteLater()
 
         worker.finished_with_result.connect(on_done)
@@ -2623,6 +2634,7 @@ class MainApp(QObject):
                 self.window.status(
                     f"Exported video to {target.name}", timeout_ms=5000,
                 )
+            worker.wait()  # see comment in _on_export_mixed_audio
             worker.deleteLater()
 
         worker.progress_changed.connect(on_progress)
@@ -2862,6 +2874,7 @@ class MainApp(QObject):
                     f"Exported full session to {target.name}",
                     timeout_ms=5000,
                 )
+            worker.wait()  # see comment in _on_export_mixed_audio
             worker.deleteLater()
 
         worker.progress_changed.connect(on_progress)
@@ -4091,6 +4104,7 @@ class _AudioExportWorker(QThread):
 
     def __init__(self, mic_path, sys_path, target) -> None:
         super().__init__()
+        self.setObjectName("AudioExportWorker")
         self._mic = mic_path
         self._sys = sys_path
         self._target = target
@@ -4121,6 +4135,7 @@ class _VideoExportWorker(QThread):
         self, mic_path, sys_path, screenshots, transcript_text, target,
     ) -> None:
         super().__init__()
+        self.setObjectName("VideoExportWorker")
         self._mic = mic_path
         self._sys = sys_path
         self._screenshots = screenshots
@@ -4152,6 +4167,7 @@ class _HighlightAudioExportWorker(QThread):
 
     def __init__(self, mic_path, sys_path, highlights, target) -> None:
         super().__init__()
+        self.setObjectName("HighlightAudioExportWorker")
         self._mic = mic_path
         self._sys = sys_path
         self._highlights = highlights
@@ -4183,6 +4199,7 @@ class _HighlightVideoExportWorker(QThread):
         session_started_at_iso: str = "",
     ) -> None:
         super().__init__()
+        self.setObjectName("HighlightVideoExportWorker")
         self._mic = mic_path
         self._sys = sys_path
         self._screenshots = screenshots
@@ -4215,6 +4232,7 @@ class _ExportPackageWorker(QThread):
 
     def __init__(self, options, target_path) -> None:
         super().__init__()
+        self.setObjectName("ExportPackageWorker")
         self._options = options
         self._target = target_path
 

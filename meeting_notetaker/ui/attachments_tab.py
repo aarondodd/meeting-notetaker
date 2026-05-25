@@ -227,7 +227,14 @@ class AttachmentsTab(QWidget):
         def _on_done(added: int) -> None:
             results["added"] = added
             progress.close()
-            worker.deleteLater()
+            # Deliberately DON'T call worker.deleteLater() here.
+            # finished_with_count is emitted from inside run(), so
+            # the OS thread is not yet joined when this slot fires.
+            # Deferring cleanup to after progress.exec() returns +
+            # an explicit wait() avoids 'QThread: Destroyed while
+            # thread is still running' under cross-session load
+            # (Aaron saw a crash when an export on session A was
+            # running while attaching to session B).
 
         worker.progress_changed.connect(_on_progress)
         worker.finished_with_count.connect(_on_done)
@@ -238,6 +245,12 @@ class AttachmentsTab(QWidget):
         # _on_done. The dialog has no Cancel button so this is a
         # determinate wait.
         progress.exec()
+        # Now that the dialog is closed, drain the worker. wait()
+        # blocks the main thread for at most a few ms because run()
+        # has already returned (we got finished_with_count above);
+        # this just joins the OS thread before scheduling deletion.
+        worker.wait()
+        worker.deleteLater()
         added = int(results["added"])
         if added:
             self._refresh_list()
@@ -480,6 +493,7 @@ class _AttachmentImportWorker(QThread):
         self, session_id: str, paths: list[Path], source: str,
     ) -> None:
         super().__init__()
+        self.setObjectName("AttachmentImportWorker")
         self._session_id = session_id
         self._paths = list(paths)
         self._source = source
