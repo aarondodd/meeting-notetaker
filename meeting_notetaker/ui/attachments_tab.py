@@ -448,32 +448,13 @@ class AttachmentsTab(QWidget):
             return
         if self._store is None:
             return
-        # Bug fix: clear the preview FIRST so the QPdfDocument /
-        # ScaledImageLabel / etc. release their file handle.
-        # Without this, Windows refuses the unlink with
-        # PermissionError [WinError 32] because QPdfView is still
-        # holding the PDF open via QPdfDocument.
+        # Clear the preview first so the right pane doesn't keep
+        # showing a now-deleted file. The actual file-handle release
+        # is handled by PdfPreviewWidget loading from an in-memory
+        # buffer rather than a file path -- without that, Windows
+        # refused the unlink with PermissionError [WinError 32].
         self._preview.clear()
-        from PyQt6.QtWidgets import QApplication
-        QApplication.processEvents()
-        try:
-            self._store.delete(rec.id)
-        except PermissionError:
-            # Qt sometimes needs another event-loop tick to fully
-            # release file handles. Retry once before giving up.
-            QApplication.processEvents()
-            try:
-                self._store.delete(rec.id)
-            except PermissionError as exc:
-                QMessageBox.warning(
-                    self, "Delete attachment",
-                    "Could not delete the file -- it may still be "
-                    "open in another application.\n\n"
-                    f"{exc}",
-                )
-                # Refresh anyway so the list doesn't show stale state.
-                self._refresh_list()
-                return
+        self._store.delete(rec.id)
         self._refresh_list()
         self.attachments_changed.emit(self._session_id)
 

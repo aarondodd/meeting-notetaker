@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 
@@ -60,6 +60,15 @@ class PdfPreviewWidget(QWidget):
                 pass
             layout.addWidget(self._view, 1)
             self._fallback_label: Optional[QLabel] = None
+            # Backing buffer for the currently-loaded document. We
+            # load PDFs from an in-memory QBuffer rather than a file
+            # path so Qt never holds a Windows file handle on the
+            # on-disk attachment -- without that, deleting an
+            # attachment while it's open in the preview pane fails
+            # with WinError 32 (file in use) and QPdfDocument.close()
+            # doesn't synchronously release the handle.
+            self._buffer: Optional[QBuffer] = None
+            self._buffer_data: Optional[QByteArray] = None
         else:
             self._doc = None
             self._view = None
@@ -78,7 +87,17 @@ class PdfPreviewWidget(QWidget):
         return QTPDF_AVAILABLE
 
     def load(self, path: Path) -> bool:
-        """Load a PDF file. Returns True on success."""
+        """Load a PDF file. Returns True on success.
+
+        Reads the file into a QBuffer and hands that to QPdfDocument
+        instead of passing the path string. That keeps Qt off the
+        filesystem entirely -- the OS handle closes the moment
+        read_bytes() returns, so a later unlink on the same path
+        works regardless of whether the preview is still showing
+        the document. Trade-off: the whole PDF lives in RAM while
+        previewed, which is fine for the few-MB attachments this
+        tab handles.
+        """
         if not QTPDF_AVAILABLE or self._doc is None:
             return False
         path = Path(path)
@@ -86,19 +105,42 @@ class PdfPreviewWidget(QWidget):
             self.clear()
             return False
         try:
-            status = self._doc.load(str(path))
-        except Exception:
+            raw = path.read_bytes()
+        except OSError:
             return False
-        # QPdfDocument.Status.Ready / Status.Error in newer Qt; older
-        # builds return an int that's non-zero on error.
+        # Tear down any previous buffer first so the old QByteArray
+        # can be released and a fresh QBuffer owns the new bytes.
+        self._release_buffer()
+        self._buffer_data = QByteArray(raw)
+        self._buffer = QBuffer(self)
+        self._buffer.setData(self._buffer_data)
+        if not self._buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+            self._release_buffer()
+            return False
+        try:
+            self._doc.load(self._buffer)
+        except Exception:
+            self._release_buffer()
+            return False
+        # The QIODevice overload of QPdfDocument.load() returns None
+        # (it's effectively a void function), so we have to ask the
+        # document for its current status rather than trust the
+        # return value. Status.Ready means the load completed; we
+        # treat anything else -- Error, Loading, Unloading -- as a
+        # failure for the purposes of the preview pane.
         try:
             from PyQt6.QtPdf import QPdfDocument as _QPD
-            ready = (status == _QPD.Error.None_)
+            ready = (self._doc.status() == _QPD.Status.Ready)
         except (ImportError, AttributeError):
-            ready = bool(status == 0) or (
-                getattr(self._doc, "status", lambda: None)()
-                in (0, None)
-            )
+            ready = bool(self._doc.pageCount() > 0)
+        if not ready:
+            # Failed loads still get the buffer torn down so the
+            # widget doesn't hold the bytes for a doc we can't show.
+            try:
+                self._doc.close()
+            except Exception:
+                pass
+            self._release_buffer()
         return bool(ready)
 
     def clear(self) -> None:
@@ -107,3 +149,21 @@ class PdfPreviewWidget(QWidget):
                 self._doc.close()
             except Exception:
                 pass
+        self._release_buffer()
+
+    def _release_buffer(self) -> None:
+        """Tear down the in-memory backing for the prior load.
+
+        QPdfDocument.close() doesn't always release its reference to
+        the QIODevice synchronously, so we close the buffer ourselves
+        and drop both Python-side references. The next event-loop
+        tick lets Qt finish any pending cleanup.
+        """
+        if self._buffer is not None:
+            try:
+                if self._buffer.isOpen():
+                    self._buffer.close()
+            except Exception:
+                pass
+            self._buffer = None
+        self._buffer_data = None
