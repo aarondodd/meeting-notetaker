@@ -40,7 +40,12 @@ from ..models.transcript import (
 )
 from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
+from ..models.highlights import HighlightSet
+from .attachments_tab import AttachmentsTab
 from .attendee_sidebar import AttendeeSidebar
+from .classification_bar import ClassificationBar
+from .find_bar import FindBar
+from .highlight_bar import HighlightBar
 from .live_notes_widget import LiveNotesWidget
 from .previous_notes_widget import PreviousNotesWidget
 from .scaled_image_label import ScaledImageLabel
@@ -98,6 +103,21 @@ class SessionView(QWidget):
     # and the post-meeting refiner uses tags to constrain the clusterer.
     tag_speaker_clicked = pyqtSignal(str, str)            # session_id, name
     remove_last_tag_clicked = pyqtSignal(str, str)        # session_id, name
+    # Classification chip-row signals (v0.7.0+); MainApp persists the
+    # mutations via ClassificationStore + repaints the bar.
+    add_topic_requested = pyqtSignal(str, str)            # session_id, name
+    remove_topic_requested = pyqtSignal(str, int)         # session_id, topic_id
+    accept_topic_requested = pyqtSignal(str, int)         # session_id, topic_id
+    add_person_requested = pyqtSignal(str, str)           # session_id, name
+    remove_person_requested = pyqtSignal(str, int)        # session_id, person_id
+    set_series_requested = pyqtSignal(str, str)           # session_id, series_name ("" clears)
+    # Highlight bar mutations (v0.7.0+). The bar carries the whole
+    # HighlightSet to keep the signal-fired writes atomic.
+    highlights_changed = pyqtSignal(str, object)          # session_id, HighlightSet
+    # Attachments tab forwards (issue #29) -- MainApp persists +
+    # refreshes derived state on change.
+    attachments_changed = pyqtSignal(str)                 # session_id
+    attachments_split_changed = pyqtSignal(str)           # session_id, base64 splitter state forwarded via signal
     # Screen-capture lifecycle. start_screen_capture_clicked carries the
     # session id; MainApp shows the first-time popup (if needed) and
     # launches the region picker. stop_screen_capture_clicked tears the
@@ -184,18 +204,20 @@ class SessionView(QWidget):
 
         # Transport row
         controls = QHBoxLayout()
-        self._start_btn = QPushButton("Start", self)
-        self._start_btn.clicked.connect(self._on_start)
-        controls.addWidget(self._start_btn)
+        # v0.7.0 UI tweak: one button that toggles between Start /
+        # Stop based on session state. Matches the convention used
+        # elsewhere (the Screen Capture button does the same).
+        # Disabled when the session already has a recording on disk
+        # to prevent the user from accidentally overwriting it.
+        self._record_btn = QPushButton("Start Recording", self)
+        self._record_btn.clicked.connect(self._on_record_toggle)
+        controls.addWidget(self._record_btn)
         # Pause + Resume were removed in v0.6.5 to keep recordings
         # wall-clock-continuous. With pause, mic.wav and sys.wav
         # could go out of sync (especially under WASAPI loopback,
         # which delivers samples idiosyncratically when no audio is
         # playing). The recording is now a fixed start -> stop block
         # with all silences / padding preserved.
-        self._stop_btn = QPushButton("Stop", self)
-        self._stop_btn.clicked.connect(self._on_stop)
-        controls.addWidget(self._stop_btn)
         # Screen-capture toggle. Disabled unless the session is in
         # RECORDING or PAUSED (set_buttons_for_state drives this); the
         # button text flips between "Start Screen Capture" and "Stop
@@ -208,10 +230,16 @@ class SessionView(QWidget):
         )
         self._screen_capture_btn.clicked.connect(self._on_screen_capture_toggle)
         controls.addWidget(self._screen_capture_btn)
-        controls.addStretch(1)
         self._retain_checkbox = QCheckBox("Keep audio for this session", self)
         self._retain_checkbox.toggled.connect(self._on_retain_toggled)
         controls.addWidget(self._retain_checkbox)
+        controls.addStretch(1)
+        # v0.7.0 tweak #8: classification chips/buttons live on the
+        # control row, to the right of Start/Screen Capture. The bar
+        # widget itself is constructed later in __init__; we insert
+        # a placeholder slot here and the actual addWidget call lives
+        # right after construction.
+        self._classification_bar_slot = controls
         layout.addLayout(controls)
 
         # Synthesis row
@@ -265,6 +293,16 @@ class SessionView(QWidget):
         )
         self._copy_btn.clicked.connect(self._on_copy_active_tab)
         synthesis.addWidget(self._copy_btn)
+        # Find-in-tab. Mirrors the Ctrl+F shortcut so a mouse-only
+        # user has a visible affordance. Wired directly to the
+        # same handler; if the active tab has no searchable text
+        # (Slides) the handler no-ops cleanly.
+        self._find_btn = QPushButton("Find...", self)
+        self._find_btn.setToolTip(
+            "Search within the active tab (Ctrl+F)"
+        )
+        self._find_btn.clicked.connect(self._open_find_bar)
+        synthesis.addWidget(self._find_btn)
         self._print_btn = QPushButton("Print...", self)
         self._print_btn.setToolTip(
             "Send the active tab (My Notes or Synthesis) to a physical "
@@ -361,7 +399,12 @@ class SessionView(QWidget):
         self._slides_view.play_clicked.connect(self._on_slides_play_clicked)
         self._slides_view.pause_clicked.connect(self._on_slides_pause_clicked)
         self._slides_view.seek_ms_requested.connect(self._on_slides_seek_requested)
-        self._tabs.addTab(self._slides_view, "Slides")
+        # Tab labelled "Screen Captures" for consistency with the
+        # "Start Screen Capture" button + the screencap_sidebar UI.
+        # Internal references in code still say "slides" (slot name,
+        # _slides_view widget) -- that's just shorthand; the
+        # user-facing string is what matters.
+        self._tabs.addTab(self._slides_view, "Screen Captures")
 
         # Previous Notes: list of archived synthesis versions + a
         # markdown-rendered preview of the selected one, with
@@ -466,7 +509,21 @@ class SessionView(QWidget):
         self._player_bar.pause_clicked.connect(self._on_player_bar_pause_clicked)
         self._player_bar.seek_ms_requested.connect(self._on_player_bar_seek_requested)
         transcript_layout.addWidget(self._player_bar, 0)
+        # v0.7.0 highlight bar: shaded markers + Start/End toggle +
+        # Clear All. Sits directly under the player bar so the
+        # markers align with the scrubber visually. Mutations
+        # bubble up via highlights_changed for MainApp to persist.
+        self._highlight_bar = HighlightBar(transcript_page)
+        self._highlight_bar.highlights_changed.connect(self._on_highlights_changed)
+        transcript_layout.addWidget(self._highlight_bar, 0)
         self._tabs.addTab(transcript_page, "Transcript")
+        # Attachments tab (issue #29): per-session file attach +
+        # preview. Added after Transcript per the spec.
+        self._attachments_tab = AttachmentsTab(self)
+        self._attachments_tab.attachments_changed.connect(
+            self._on_attachments_changed,
+        )
+        self._tabs.addTab(self._attachments_tab, "Attachments")
 
         # Per-line timestamp index. Built each time the transcript text
         # changes; consumed by the position-driven highlight and the
@@ -527,7 +584,41 @@ class SessionView(QWidget):
         self._right_column.setVisible(False)
         body_row.addWidget(self._right_column, 0)
         layout.addLayout(body_row, 1)
+        # Classification bar (v0.7.0+): series + people + topics
+        # chips for the active session. Slots in between body_row
+        # and the find bar so it's always visible regardless of
+        # which tab is active. Mutations bubble up to MainApp via
+        # the *_requested signals.
+        # v0.7.0 tweak #8: the classification bar (Series / People /
+        # Topics) sits on the controls row, to the right of the
+        # Start Recording + Screen Capture buttons. Saves a row of
+        # vertical real estate and groups all session-level
+        # affordances together. controls.addStretch was added at the
+        # top of __init__ to push the bar to the right edge.
+        self._classification_bar = ClassificationBar(self)
+        self._classification_bar_slot.addWidget(self._classification_bar)
+        # Within-tab find bar (Ctrl+F). Hidden by default; the
+        # `Ctrl+F` shortcut wires _open_find_bar() to attach it to
+        # whichever text widget is in the active tab. Sits at the
+        # bottom of the SessionView so it spans the body width.
+        self._find_bar = FindBar(self)
+        layout.addWidget(self._find_bar)
+        # The shortcut is scoped to this widget so it doesn't fire
+        # when focus is in the session list (Ctrl+F there is reserved
+        # by the system).
+        from PyQt6.QtGui import QShortcut, QKeySequence  # noqa: PLC0415
+        find_shortcut = QShortcut(QKeySequence.StandardKey.Find, self)
+        find_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        find_shortcut.activated.connect(self._open_find_bar)
+
         self._tabs.currentChanged.connect(self._on_tab_changed)
+        # Re-emit classification bar signals upward unchanged.
+        self._classification_bar.add_topic_requested.connect(self.add_topic_requested.emit)
+        self._classification_bar.remove_topic_requested.connect(self.remove_topic_requested.emit)
+        self._classification_bar.accept_topic_requested.connect(self.accept_topic_requested.emit)
+        self._classification_bar.add_person_requested.connect(self.add_person_requested.emit)
+        self._classification_bar.remove_person_requested.connect(self.remove_person_requested.emit)
+        self._classification_bar.set_series_requested.connect(self.set_series_requested.emit)
 
         self._set_buttons_for_state(STATE_NEW, has_transcript=False, has_notes=False)
         self.set_session(None, transcript="", notes="", previous_notes_paths=[])
@@ -791,10 +882,13 @@ class SessionView(QWidget):
     def set_player_total_ms(self, total_ms: int) -> None:
         self._player_bar.set_total_ms(total_ms)
         self._slides_view.set_player_total_ms(total_ms)
+        # Highlight bar uses the same time axis as the scrubber.
+        self._highlight_bar.set_total_ms(total_ms)
 
     def set_player_position_ms(self, ms: int) -> None:
         self._player_bar.set_position_ms(ms)
         self._slides_view.set_player_position_ms(ms)
+        self._highlight_bar.set_player_position(ms)
         # Highlight the transcript line that owns this timestamp. We
         # do this on every position update so the highlight follows
         # playback in real time. Skip when the user is mid-drag --
@@ -1257,6 +1351,18 @@ class SessionView(QWidget):
         if self._session:
             self.stop_clicked.emit(self._session.id)
 
+    def _on_record_toggle(self) -> None:
+        """Single button that toggles Start <-> Stop based on session
+        state. _set_buttons_for_state keeps the label + enabled
+        state in sync; this handler just dispatches the right
+        signal."""
+        if self._session is None:
+            return
+        if self._session.state in (STATE_RECORDING, STATE_PAUSED):
+            self.stop_clicked.emit(self._session.id)
+        else:
+            self.start_clicked.emit(self._session.id)
+
     def _on_generate_prompt(self) -> None:
         if self._session:
             self.generate_prompt_clicked.emit(self._session.id)
@@ -1470,6 +1576,134 @@ class SessionView(QWidget):
             "previous": "Previous Notes",
         }.get(tab_id or "", "")
 
+    def attachments_tab(self) -> AttachmentsTab:
+        return self._attachments_tab
+
+    def _on_attachments_changed(self, session_id: str) -> None:
+        # Forward upward; MainApp may want to update an indicator
+        # on the session list (e.g. paperclip glyph).
+        self.attachments_changed.emit(session_id)
+
+    def set_session_highlights(
+        self,
+        total_ms: int,
+        highlights: HighlightSet,
+    ) -> None:
+        """Load the given highlight set into the bar.
+
+        Called from MainApp on session selection. total_ms is the
+        loaded audio's duration (0 disables the bar's toggle
+        button cleanly).
+        """
+        session_id = self._session.id if self._session else ""
+        self._highlight_bar.set_session_state(session_id, total_ms, highlights)
+
+    def _on_highlights_changed(self, hs: HighlightSet) -> None:
+        """Bar mutation -> bubble up so MainApp persists."""
+        if self._session is None:
+            return
+        self.highlights_changed.emit(self._session.id, hs)
+
+    def set_classification_known_lists(
+        self,
+        *,
+        series: Optional[list[str]] = None,
+        people: Optional[list[str]] = None,
+        topics: Optional[list[str]] = None,
+    ) -> None:
+        """Forward the alphabetical known-name lists to the chips bar.
+
+        Drives the dropdown half of the Add/Change pickers so the
+        user picks-or-types instead of free-form-only.
+        """
+        self._classification_bar.set_known_lists(
+            series=series, people=people, topics=topics,
+        )
+
+    def set_classification(self, classification) -> None:
+        """Push fresh classification data into the chips bar.
+
+        Called from MainApp whenever the active session's series /
+        people / topics change. None-session is handled by passing
+        an empty SessionClassification (the bar disables its
+        mutator buttons).
+        """
+        session_id = self._session.id if self._session else None
+        self._classification_bar.set_session(session_id, classification)
+
+    def set_active_tab(
+        self, tab_id: str, archive_name: Optional[str] = None,
+    ) -> bool:
+        """Switch to the named tab. Returns True if the tab exists.
+
+        Used by the cross-session search dialog: after the user
+        double-clicks a result, MainApp selects the session, then
+        calls this to drill into the matching tab. For previous-
+        notes hits, `archive_name` (the notes-YYYYMMDD-HHMM.md
+        filename) is passed through to the widget so it selects the
+        matching archive.
+        """
+        target_widget = None
+        if tab_id == "transcript":
+            # Transcript page is held under a stack; the tab widget
+            # is the page that contains either the idle or playback
+            # variant. Find it by searching the tab widget's pages
+            # for the parent of self._transcript_view.
+            for i in range(self._tabs.count()):
+                if self._tabs.tabText(i) == "Transcript":
+                    target_widget = self._tabs.widget(i)
+                    break
+        elif tab_id == "live_notes":
+            target_widget = self._live_notes_editor
+        elif tab_id == "notes":
+            target_widget = self._notes_view
+        elif tab_id == "previous":
+            target_widget = self._previous_view
+            if archive_name:
+                try:
+                    self._previous_view.select_archive_by_name(archive_name)
+                except AttributeError:
+                    # Older builds without select_archive_by_name will
+                    # still scroll to the tab; the user picks from
+                    # the list manually.
+                    pass
+        if target_widget is None:
+            return False
+        idx = self._tabs.indexOf(target_widget)
+        if idx < 0:
+            return False
+        self._tabs.setCurrentIndex(idx)
+        return True
+
+    def _find_target_for_active_tab(self) -> Optional[QWidget]:
+        """Return the text widget Ctrl+F should bind to in the active tab.
+
+        Slides tab has no searchable text and returns None; the find
+        bar treats that as a "nothing to search here" no-op so the
+        shortcut is silently inert rather than focus-shifting into
+        another tab.
+        """
+        tab_id = self._active_tab_id()
+        if tab_id == "transcript":
+            return self._transcript_view
+        if tab_id == "live_notes":
+            return self._live_notes_editor.find_target()
+        if tab_id == "notes":
+            return self._notes_view.find_target()
+        if tab_id == "previous":
+            return self._previous_view.find_target()
+        return None
+
+    def _open_find_bar(self) -> None:
+        """Ctrl+F handler. Bind the bar to the active tab's text widget
+        + reveal it. If the active tab has no searchable content
+        (Slides), the find bar stays hidden so the shortcut doesn't
+        appear broken via an empty-binding state."""
+        target = self._find_target_for_active_tab()
+        if target is None:
+            return
+        self._find_bar.show_for(target)
+
     def _on_previous_restore_requested(self, session_id: str, path: Path) -> None:
         self.restore_previous_notes_clicked.emit(session_id, path)
 
@@ -1502,8 +1736,37 @@ class SessionView(QWidget):
         is_complete = state in (STATE_COMPLETE, STATE_ERROR)
 
         has_session = self._session is not None
-        self._start_btn.setEnabled(has_session and (is_new or is_complete))
-        self._stop_btn.setEnabled(has_session and (is_recording or is_paused))
+        # Single Record button that toggles Start <-> Stop based on
+        # state. Disabled when the session already has retained audio
+        # on disk so the user can't accidentally overwrite a finished
+        # recording. The session_view doesn't know the audio path
+        # directly so we re-check via has_retained_audio.
+        if is_recording or is_paused:
+            self._record_btn.setText("Stop Recording")
+            self._record_btn.setEnabled(has_session)
+        else:
+            self._record_btn.setText("Start Recording")
+            existing_recording = False
+            if has_session:
+                from ..utils.paths import has_retained_audio  # noqa: PLC0415
+                try:
+                    existing_recording = has_retained_audio(self._session.id)
+                except Exception:
+                    existing_recording = False
+            self._record_btn.setEnabled(
+                has_session and (is_new or is_complete) and not existing_recording
+            )
+            if existing_recording:
+                self._record_btn.setToolTip(
+                    "This session already has an audio recording on "
+                    "disk. Delete the recording (right-click in the "
+                    "session list -> Delete recording) before starting "
+                    "a new one."
+                )
+            else:
+                self._record_btn.setToolTip(
+                    "Start capturing mic + system audio for this session."
+                )
         self._refresh_screencap_button_enabled()
         # Generate/paste are available as soon as a transcript exists. The
         # batch-refinement pass after Stop runs in the background and is
@@ -1774,12 +2037,18 @@ class _ClickableTranscriptView(QPlainTextEdit):
 
 
 def _pretty_state(state: str) -> str:
+    # The state-label is the small text to the right of the session
+    # title. "Complete" was visual noise -- the session-list status
+    # column already shows the green dot for completed sessions, so
+    # the label string only carries weight DURING active work. Empty
+    # string for STATE_COMPLETE / STATE_NEW lets the label collapse
+    # to no horizontal footprint when nothing's happening.
     pretty = {
-        STATE_NEW: "New",
+        STATE_NEW: "",
         STATE_RECORDING: "Recording",
         STATE_PAUSED: "Paused",
         STATE_PROCESSING: "Refining transcript -- you can synthesize now",
-        STATE_COMPLETE: "Complete",
+        STATE_COMPLETE: "",
         STATE_ERROR: "Error",
     }
     return pretty.get(state, state.title())

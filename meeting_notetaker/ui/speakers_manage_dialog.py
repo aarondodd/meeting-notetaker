@@ -37,11 +37,23 @@ class SpeakersManageDialog(QDialog):
     or Close commits nothing extra.
     """
 
-    def __init__(self, store: SpeakerStore, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        store: SpeakerStore,
+        parent: Optional[QWidget] = None,
+        *,
+        classification_store=None,
+    ) -> None:
         super().__init__(parent)
         self._store = store
+        # Phase 2: optional classification store so the dialog can
+        # render the Contact-link column + offer to rename the
+        # linked Contact alongside the speaker. Constructed with
+        # None for legacy tests; production callers (MainApp) pass
+        # the live ClassificationStore.
+        self._classification_store = classification_store
         self.setWindowTitle("Manage Speakers")
-        self.resize(560, 420)
+        self.resize(720, 460)
 
         layout = QVBoxLayout(self)
 
@@ -58,8 +70,10 @@ class SpeakersManageDialog(QDialog):
         layout.addWidget(blurb)
 
         self._table = QTableWidget(self)
-        self._table.setColumnCount(4)
-        self._table.setHorizontalHeaderLabels(["Name", "Samples", "Last seen", "Actions"])
+        self._table.setColumnCount(5)
+        self._table.setHorizontalHeaderLabels([
+            "Name", "Samples", "Last seen", "Contact link", "Actions",
+        ])
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -68,6 +82,7 @@ class SpeakersManageDialog(QDialog):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self._table, 1)
 
         # Forget All + Close.
@@ -103,17 +118,34 @@ class SpeakersManageDialog(QDialog):
             last_seen_item = QTableWidgetItem(self._friendly_date(rec.last_seen_at))
             self._table.setItem(row, 2, last_seen_item)
 
+            # Contact-link column: shows the linked Contact's
+            # display_name if any (via the optional classification
+            # store) -- the migration links every speaker on first
+            # launch. Falls back to "(unlinked)" when no link is
+            # set (legacy rows the migration hasn't seen yet).
+            link_text = self._contact_link_label(rec.contact_id)
+            link_item = QTableWidgetItem(link_text)
+            link_item.setFlags(link_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._table.setItem(row, 3, link_item)
+
             actions_widget = QWidget(self)
             actions_layout = QHBoxLayout(actions_widget)
             actions_layout.setContentsMargins(2, 2, 2, 2)
             actions_layout.setSpacing(4)
             rename_btn = QPushButton("Rename", self)
             rename_btn.clicked.connect(lambda _, n=rec.name: self._on_rename(n))
+            merge_btn = QPushButton("Merge...", self)
+            merge_btn.setToolTip(
+                "Combine this speaker's voice samples with another "
+                "speaker's; source row is deleted after the merge."
+            )
+            merge_btn.clicked.connect(lambda _, n=rec.name: self._on_merge(n))
             forget_btn = QPushButton("Forget", self)
             forget_btn.clicked.connect(lambda _, n=rec.name: self._on_forget(n))
             actions_layout.addWidget(rename_btn)
+            actions_layout.addWidget(merge_btn)
             actions_layout.addWidget(forget_btn)
-            self._table.setCellWidget(row, 3, actions_widget)
+            self._table.setCellWidget(row, 4, actions_widget)
 
         if not records:
             # No rows yet; show a single empty-state pseudo-row.
@@ -125,7 +157,7 @@ class SpeakersManageDialog(QDialog):
             empty.setFont(font)
             empty.setFlags(empty.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self._table.setItem(0, 0, empty)
-            for col in range(1, 4):
+            for col in range(1, 5):
                 self._table.setItem(0, col, QTableWidgetItem(""))
             self._forget_all_btn.setEnabled(False)
         else:
@@ -153,6 +185,56 @@ class SpeakersManageDialog(QDialog):
             return
         self._store.rename(name, new_name)
         self._refresh_table()
+
+    def _on_merge(self, name: str) -> None:
+        """Pick a target speaker, then combine voice samples + drop source."""
+        all_records = self._store.list_all()
+        candidates = sorted(
+            (r.name for r in all_records if r.name != name),
+        )
+        if not candidates:
+            QMessageBox.information(
+                self, "Merge speaker",
+                "No other speakers to merge into.",
+            )
+            return
+        target, ok = QInputDialog.getItem(
+            self, "Merge speaker",
+            f"Combine voice samples from '{name}' into:",
+            candidates, 0, False,
+        )
+        if not ok:
+            return
+        confirm = QMessageBox.question(
+            self, "Merge speaker",
+            f"Merge '{name}' into '{target}'? The combined record "
+            "keeps the target's name; the source row is deleted. "
+            "Existing transcripts already labeled with '{name}' are "
+            "not retroactively updated.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._store.merge(name, target)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Merge speaker", str(exc))
+            return
+        self._refresh_table()
+
+    def _contact_link_label(self, contact_id) -> str:
+        """Render the contact_id column. '(unlinked)' for None;
+        Contact display_name when the classification store is
+        available; raw id otherwise."""
+        if contact_id is None:
+            return "(unlinked)"
+        if self._classification_store is None:
+            return f"#{contact_id}"
+        contact = self._classification_store.get_contact(int(contact_id))
+        if contact is None:
+            return f"#{contact_id} (missing)"
+        return contact.display_name
 
     def _on_forget(self, name: str) -> None:
         confirm = QMessageBox.question(

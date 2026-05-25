@@ -40,6 +40,7 @@ from ..models.session import (
 )
 from ..utils.icons import app_icon
 from ..utils.paths import has_retained_audio
+from .classification_navigator import ClassificationNavigator
 from .session_view import SessionView
 from .status_indicators import SegmentState, StatusSegment
 
@@ -62,11 +63,52 @@ _STATE_BADGE: dict[str, tuple[str, str]] = {
     STATE_ERROR:      ("❌", "Error -- partial transcript may exist"),
 }
 
-_COL_AUDIO = 0
-_COL_SLIDES = 1
-_COL_STATE = 2
-_COL_DATE = 3
-_COL_TITLE = 4
+# Session list column order: human-relevant columns (Date + Title)
+# lead; narrow indicator glyphs trail. Sortable columns are Date
+# and Title only -- clicking any indicator column snaps back to
+# the active sort. Indicator order matches the chronology of the
+# session lifecycle: audio captured -> screen captures taken ->
+# attachments added -> processing state.
+_COL_DATE = 0
+_COL_TITLE = 1
+_COL_AUDIO = 2
+_COL_SLIDES = 3
+_COL_ATTACHMENTS = 4
+_COL_STATE = 5
+
+_INDICATOR_COLUMNS = (
+    _COL_AUDIO, _COL_SLIDES, _COL_ATTACHMENTS, _COL_STATE,
+)
+
+
+# Sort-spec serialization. Stored verbatim in config.toml under
+# ui.session_list_sort; values that don't match snap to "date_desc".
+_DEFAULT_SORT_SPEC = "date_desc"
+
+
+def _sort_spec_to_column_order(spec: str) -> tuple[int, Qt.SortOrder]:
+    """Translate a persisted sort spec string into (column, order).
+
+    Unknown specs fall back to the default (date descending).
+    """
+    table: dict[str, tuple[int, Qt.SortOrder]] = {
+        "date_desc":  (_COL_DATE,  Qt.SortOrder.DescendingOrder),
+        "date_asc":   (_COL_DATE,  Qt.SortOrder.AscendingOrder),
+        "title_asc":  (_COL_TITLE, Qt.SortOrder.AscendingOrder),
+        "title_desc": (_COL_TITLE, Qt.SortOrder.DescendingOrder),
+    }
+    return table.get(spec, table[_DEFAULT_SORT_SPEC])
+
+
+def _column_order_to_sort_spec(column: int, order: Qt.SortOrder) -> str:
+    """Inverse of _sort_spec_to_column_order. Indicator columns return
+    the default spec (callers use this to snap a click on an indicator
+    column back to a real sort)."""
+    if column == _COL_DATE:
+        return "date_asc" if order == Qt.SortOrder.AscendingOrder else "date_desc"
+    if column == _COL_TITLE:
+        return "title_asc" if order == Qt.SortOrder.AscendingOrder else "title_desc"
+    return _DEFAULT_SORT_SPEC
 
 
 class MainWindow(QMainWindow):
@@ -87,14 +129,36 @@ class MainWindow(QMainWindow):
     open_recording_requested = pyqtSignal(str)     # session_id
     export_recording_requested = pyqtSignal(str)   # session_id
     export_video_requested = pyqtSignal(str)       # session_id
+    export_package_requested = pyqtSignal(str)     # session_id (issue #30)
     delete_recording_requested = pyqtSignal(str)   # session_id
     session_selected = pyqtSignal(str)             # session_id
+    session_list_sort_changed = pyqtSignal(str)    # one of VALID_SESSION_LIST_SORTS
+    manage_series_requested = pyqtSignal()
+    manage_classification_requested = pyqtSignal()
+    address_book_requested = pyqtSignal()
+    classification_filter_changed = pyqtSignal(str, object)
+    # view (str -- one of VIEW_*), value_id (Optional[int]); emitted by
+    # the navigator when the user picks a different filter.
+    open_search_requested = pyqtSignal()           # Ctrl+Shift+F
+    rebuild_search_index_requested = pyqtSignal()  # Help > Debug
+    show_session_tab_requested = pyqtSignal(str, str, object)
+    # session_id, tab_id ('transcript' | 'live_notes' | 'notes' | 'previous'),
+    # optional archive_path (str | None); emitted by the cross-session
+    # search dialog after the user double-clicks a hit.
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Meeting Notetaker")
         self.setWindowIcon(app_icon())
         self.resize(1024, 720)
+
+        # Global shortcut: Ctrl+Shift+F opens the cross-session search
+        # dialog. Window-scoped so it fires no matter which pane has
+        # focus (session list, session view, or the find bar itself).
+        search_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+F"), self,
+        )
+        search_shortcut.activated.connect(self.open_search_requested.emit)
 
         # Menu bar
         menubar = self.menuBar()
@@ -107,6 +171,23 @@ class MainWindow(QMainWindow):
         action_settings.setShortcut("Ctrl+,")
         action_settings.triggered.connect(self.open_settings_requested.emit)
         file_menu.addAction(action_settings)
+        # Phase 2: catalog editors. Manage Classification covers
+        # Series + Topics (tabbed); Address Book covers Contacts
+        # (formerly People) -- separated because Contacts also link
+        # to the Speaker store and have alias / merge-suggestion
+        # surfaces the simpler Series/Topics tabs don't need.
+        action_manage_classification = QAction(
+            "&Manage Classification...", self,
+        )
+        action_manage_classification.triggered.connect(
+            self.manage_classification_requested.emit,
+        )
+        file_menu.addAction(action_manage_classification)
+        action_address_book = QAction("&Address Book...", self)
+        action_address_book.triggered.connect(
+            self.address_book_requested.emit,
+        )
+        file_menu.addAction(action_address_book)
         file_menu.addSeparator()
         action_quit = QAction("&Quit", self)
         action_quit.setShortcut("Ctrl+Q")
@@ -127,6 +208,14 @@ class MainWindow(QMainWindow):
         action_depcheck = QAction("&Check Dependencies...", self)
         action_depcheck.triggered.connect(self.open_dependency_check_requested.emit)
         debug_menu.addAction(action_depcheck)
+        # Rebuild Search Index: nuclear option for the FTS5 store
+        # under app_data/search.db. Useful after a corrupt write or
+        # a schema bump. Runs synchronously with a progress dialog.
+        action_rebuild_search = QAction("&Rebuild Search Index", self)
+        action_rebuild_search.triggered.connect(
+            self.rebuild_search_index_requested.emit
+        )
+        debug_menu.addAction(action_rebuild_search)
         help_menu.addSeparator()
         action_user_guide = QAction("&User Guide...", self)
         action_user_guide.triggered.connect(self.open_user_guide_requested.emit)
@@ -149,6 +238,9 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter(Qt.Orientation.Horizontal, central)
+        # Hold a reference so save_layout_state can serialize the
+        # split ratio; the local `splitter` name is shadowed below.
+        self._main_splitter = splitter
         layout.addWidget(splitter)
 
         # Left pane: session list + buttons
@@ -158,13 +250,31 @@ class MainWindow(QMainWindow):
         header_row = QHBoxLayout()
         header_row.addWidget(QLabel("Sessions", left))
         header_row.addStretch(1)
+        # Search button mirrors the Ctrl+Shift+F shortcut so users
+        # who reach for the mouse first have a visible affordance.
+        self._search_btn = QPushButton("Search", left)
+        self._search_btn.setToolTip(
+            "Search across all sessions (Ctrl+Shift+F)"
+        )
+        self._search_btn.clicked.connect(self.open_search_requested.emit)
+        header_row.addWidget(self._search_btn)
         self._new_btn = QPushButton("+ New", left)
         self._new_btn.clicked.connect(self.new_session_requested.emit)
         header_row.addWidget(self._new_btn)
         left_layout.addLayout(header_row)
+        # Classification navigator (v0.7.0+): All / By Series / By
+        # Person / By Topic filter pulldown. Emits filter_changed
+        # for MainApp to route into a filtered session list.
+        self._navigator = ClassificationNavigator(left)
+        left_layout.addWidget(self._navigator)
         self._list = QTreeWidget(left)
-        self._list.setColumnCount(5)
-        self._list.setHeaderHidden(True)
+        self._list.setColumnCount(6)
+        # Header is visible so Date + Title can be clicked to sort.
+        # Indicator columns (Audio / Slides / Attachments / State)
+        # carry no header text -- their headers stay blank but are
+        # still focusable so the column boundary can be dragged.
+        self._list.setHeaderLabels(["Date", "Title", "", "", "", ""])
+        self._list.setHeaderHidden(False)
         self._list.setRootIsDecorated(False)
         self._list.setUniformRowHeights(True)
         self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -175,19 +285,68 @@ class MainWindow(QMainWindow):
         rename_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F2), self._list)
         rename_shortcut.activated.connect(self._rename_selected)
         header = self._list.header()
-        # Audio + slides + state are narrow glyph columns; date is
-        # fixed-width to fit "YYYY-MM-DD HH:MM"; title takes the
-        # remaining space.
-        header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(_COL_SLIDES, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
+        # Date is fixed-width to fit "YYYY-MM-DD HH:MM" + the sort
+        # arrow; title takes the remaining horizontal space; audio +
+        # slides + state are narrow glyph columns trailing on the
+        # right. Critically, stretchLastSection has to be disabled --
+        # Qt defaults it to True, which would override the State
+        # column's Fixed mode and let it expand to fill the window
+        # (the regression Aaron called out post-PR-#27 since the
+        # header was previously hidden and the default was moot).
+        header.setStretchLastSection(False)
+        # Qt's default minimum section size on a sortable header is
+        # 38 px to reserve room for the sort-indicator triangle. We
+        # disable sortIndicator on indicator columns via the snap-
+        # back handler, so the triangle never paints there -- but
+        # the minimum still applies unless we lower it explicitly.
+        header.setMinimumSectionSize(20)
         header.setSectionResizeMode(_COL_DATE, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_COL_TITLE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(_COL_AUDIO, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_SLIDES, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_ATTACHMENTS, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.Fixed)
+        self._list.setColumnWidth(_COL_DATE, 150)
         self._list.setColumnWidth(_COL_AUDIO, 28)
         self._list.setColumnWidth(_COL_SLIDES, 28)
+        self._list.setColumnWidth(_COL_ATTACHMENTS, 28)
         self._list.setColumnWidth(_COL_STATE, 28)
-        self._list.setColumnWidth(_COL_DATE, 110)
+        # Indicator-column headers are blank text but still get
+        # informative tooltips so users learn the glyph meaning by
+        # hovering. Same content the per-item tooltips carry.
+        header.model().setHeaderData(
+            _COL_AUDIO, Qt.Orientation.Horizontal,
+            "Audio retained on disk", Qt.ItemDataRole.ToolTipRole,
+        )
+        header.model().setHeaderData(
+            _COL_SLIDES, Qt.Orientation.Horizontal,
+            "Screenshots captured for this session", Qt.ItemDataRole.ToolTipRole,
+        )
+        header.model().setHeaderData(
+            _COL_ATTACHMENTS, Qt.Orientation.Horizontal,
+            "Attachments stored with this session", Qt.ItemDataRole.ToolTipRole,
+        )
+        header.model().setHeaderData(
+            _COL_STATE, Qt.Orientation.Horizontal,
+            "Transcription pipeline state", Qt.ItemDataRole.ToolTipRole,
+        )
+        # Enable sortable headers. Date sort is the safe default
+        # (YYYY-MM-DD HH:MM lex order = chronological); Title sort
+        # is A->Z then Z->A on second click. Clicks on indicator
+        # columns are snapped back via _on_sort_indicator_changed.
+        self._list.setSortingEnabled(True)
+        header.setSectionsClickable(True)
+        self._current_sort_spec = _DEFAULT_SORT_SPEC
+        self._suppress_sort_emission = False
+        header.sortIndicatorChanged.connect(self._on_sort_indicator_changed)
+        # Apply the default before any items are loaded so the first
+        # set_sessions call respects it; set_session_list_sort()
+        # called from MainApp at startup overrides with the persisted
+        # value.
+        col, order = _sort_spec_to_column_order(self._current_sort_spec)
+        self._list.sortByColumn(col, order)
         left_layout.addWidget(self._list, 1)
+        self._navigator.filter_changed.connect(self.classification_filter_changed.emit)
         bulk_row = QHBoxLayout()
         bulk_row.addStretch(1)
         self._delete_btn = QPushButton("Delete Selected", left)
@@ -254,11 +413,148 @@ class MainWindow(QMainWindow):
                 segment.apply(state)
 
     def set_sessions(self, sessions: Iterable[Session]) -> None:
+        # Disabling sorting during bulk insert is the documented Qt idiom
+        # for avoiding O(N log N) re-sort per row; we re-enable + sort
+        # once at the end. Also blocking selection-changed signal so a
+        # mass-replace doesn't fire the per-row selection handler.
         self._list.blockSignals(True)
+        was_sorting = self._list.isSortingEnabled()
+        self._list.setSortingEnabled(False)
         self._list.clear()
         for s in sessions:
             self._add_item(s)
+        if was_sorting:
+            self._list.setSortingEnabled(True)
+            col, order = _sort_spec_to_column_order(self._current_sort_spec)
+            self._list.sortByColumn(col, order)
         self._list.blockSignals(False)
+
+    def set_classification_choices(
+        self,
+        *,
+        series: list[tuple[int, str]] | None = None,
+        people: list[tuple[int, str]] | None = None,
+        topics: list[tuple[int, str]] | None = None,
+    ) -> None:
+        """Push fresh series / people / topics into the navigator combo.
+
+        Called from MainApp after any classification mutation so the
+        pulldown shows current state. Pass only the changed dimension
+        to avoid unnecessary list rebuilds.
+        """
+        if series is not None:
+            self._navigator.set_series(series)
+        if people is not None:
+            self._navigator.set_people(people)
+        if topics is not None:
+            self._navigator.set_topics(topics)
+
+    def reset_classification_filter(self) -> None:
+        """Snap the navigator back to View=All. Used when the underlying
+        store is rebuilt or when MainApp wants a clean slate after a
+        bulk import."""
+        self._navigator.reset()
+
+    def save_layout_state(self) -> tuple[str, str]:
+        """Serialize window geometry + main-splitter state to base64.
+
+        Returns (geometry_b64, splitter_b64). MainApp persists both
+        to config.toml on aboutToQuit so launch->resize->relaunch
+        round-trips the user's preferred window size + left/right
+        pane ratio.
+
+        Empty strings on either side mean "Qt couldn't serialize"
+        and the restore path will fall back to defaults.
+        """
+        import base64  # noqa: PLC0415
+        try:
+            geom = base64.b64encode(bytes(self.saveGeometry())).decode("ascii")
+        except Exception:
+            geom = ""
+        try:
+            split = base64.b64encode(
+                bytes(self._main_splitter.saveState()),
+            ).decode("ascii")
+        except Exception:
+            split = ""
+        return geom, split
+
+    def restore_layout_state(
+        self,
+        geometry_b64: str,
+        splitter_b64: str,
+    ) -> None:
+        """Apply persisted geometry + splitter state from config.
+
+        Qt's restoreGeometry returns False when the stored rect is
+        off-screen (e.g. a monitor was removed since the last
+        save); we ignore the result and let Qt fall back to its
+        platform-default position rather than risking an invisible
+        window. Empty / malformed strings short-circuit to no-op.
+        """
+        import base64  # noqa: PLC0415
+        from PyQt6.QtCore import QByteArray  # noqa: PLC0415
+        if geometry_b64:
+            try:
+                self.restoreGeometry(
+                    QByteArray(base64.b64decode(geometry_b64))
+                )
+            except Exception:
+                pass
+        if splitter_b64:
+            try:
+                self._main_splitter.restoreState(
+                    QByteArray(base64.b64decode(splitter_b64))
+                )
+            except Exception:
+                pass
+
+    def set_session_list_sort(self, spec: str) -> None:
+        """Apply a persisted sort spec to the list.
+
+        Called once from MainApp at startup with the value loaded from
+        config.toml. The header click handler keeps the spec + display
+        in sync after that. Invalid specs fall through to the default
+        via _sort_spec_to_column_order.
+        """
+        self._current_sort_spec = spec or _DEFAULT_SORT_SPEC
+        col, order = _sort_spec_to_column_order(self._current_sort_spec)
+        # Apply the sort without re-emitting back to MainApp; this is
+        # the initial-state load, not a user action.
+        self._suppress_sort_emission = True
+        try:
+            self._list.sortByColumn(col, order)
+            self._list.header().setSortIndicator(col, order)
+        finally:
+            self._suppress_sort_emission = False
+
+    def _on_sort_indicator_changed(self, column: int, order: Qt.SortOrder) -> None:
+        """Handle a header click.
+
+        If the column is one of the indicator columns (Audio / Slides
+        / State), snap back to the previously-active sort -- those
+        columns hold emoji glyphs and sorting by them is nonsensical.
+        Otherwise persist the new spec back to MainApp.
+        """
+        if self._suppress_sort_emission:
+            return
+        if column in _INDICATOR_COLUMNS:
+            # Snap back. Set the indicator + actually sort to the
+            # previous (column, order) under signal-suppression so we
+            # don't recurse into this handler.
+            prev_col, prev_order = _sort_spec_to_column_order(self._current_sort_spec)
+            self._suppress_sort_emission = True
+            try:
+                self._list.header().setSortIndicator(prev_col, prev_order)
+                self._list.sortByColumn(prev_col, prev_order)
+            finally:
+                self._suppress_sort_emission = False
+            return
+        new_spec = _column_order_to_sort_spec(column, order)
+        if new_spec == self._current_sort_spec:
+            return
+        self._current_sort_spec = new_spec
+        self.session_list_sort_changed.emit(new_spec)
 
     def select_session(self, session_id: str) -> None:
         root = self._list.invisibleRootItem()
@@ -288,9 +584,7 @@ class MainWindow(QMainWindow):
             else "Audio status: not retained (recording deleted after refinement)"
         )
         # Camera glyph if any screenshots are on disk for this session.
-        # has_retained_audio mirrors this pattern for audio; we use the
-        # same path helper here.
-        from ..utils.paths import list_screenshots  # noqa: PLC0415
+        from ..utils.paths import has_attachments, list_screenshots  # noqa: PLC0415
         has_slides = bool(list_screenshots(s.id))
         slides_glyph = "📷" if has_slides else ""
         slides_tooltip = (
@@ -298,22 +592,34 @@ class MainWindow(QMainWindow):
             if has_slides
             else "No screenshots captured for this session"
         )
+        # Paperclip if the session has any attachments on disk.
+        # Cheap iterdir check -- avoids a sidecar parse per row.
+        has_attached = has_attachments(s.id)
+        attachments_glyph = "📎" if has_attached else ""
+        attachments_tooltip = (
+            "Attachments stored with this session"
+            if has_attached
+            else "No attachments stored with this session"
+        )
         state_glyph, state_tooltip = _STATE_BADGE.get(s.state, ("", s.state))
         state_tooltip = f"Transcription state: {state_tooltip}"
 
         when, title = _session_date_and_title(s)
         item = QTreeWidgetItem([
-            audio_glyph,
-            slides_glyph,
-            state_glyph,
             when,
             title,
+            audio_glyph,
+            slides_glyph,
+            attachments_glyph,
+            state_glyph,
         ])
         item.setTextAlignment(_COL_AUDIO, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_SLIDES, Qt.AlignmentFlag.AlignCenter)
+        item.setTextAlignment(_COL_ATTACHMENTS, Qt.AlignmentFlag.AlignCenter)
         item.setTextAlignment(_COL_STATE, Qt.AlignmentFlag.AlignCenter)
         item.setToolTip(_COL_AUDIO, audio_tooltip)
         item.setToolTip(_COL_SLIDES, slides_tooltip)
+        item.setToolTip(_COL_ATTACHMENTS, attachments_tooltip)
         item.setToolTip(_COL_STATE, state_tooltip)
         item.setData(_COL_TITLE, Qt.ItemDataRole.UserRole, s.id)
         # Stash the full ISO created_at so Edit Timestamp can seed the
@@ -354,6 +660,11 @@ class MainWindow(QMainWindow):
         action_export_recording.setEnabled(has_audio)
         action_export_video = menu.addAction("Export session as video...")
         action_export_video.setEnabled(has_audio)
+        # Issue #30: full-session ZIP export. Always available
+        # when a single session is selected -- the orchestrator
+        # handles missing-audio / missing-screenshots gracefully.
+        action_export_package = menu.addAction("Export full session...")
+        action_export_package.setEnabled(bool(single_id))
         action_delete_recording = menu.addAction("Delete recording...")
         action_delete_recording.setEnabled(has_audio)
         menu.addSeparator()
@@ -369,6 +680,8 @@ class MainWindow(QMainWindow):
             self.export_recording_requested.emit(single_id)
         elif action is action_export_video and single_id:
             self.export_video_requested.emit(single_id)
+        elif action is action_export_package and single_id:
+            self.export_package_requested.emit(single_id)
         elif action is action_delete_recording and single_id:
             self._confirm_delete_recording(single_id)
         elif action is action_delete:

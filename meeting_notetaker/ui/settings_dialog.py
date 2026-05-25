@@ -51,6 +51,7 @@ class SettingsDialog(QDialog):
         parent: Optional[QWidget] = None,
         *,
         ping_extension: Optional[callable] = None,
+        classification_store=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
@@ -64,6 +65,12 @@ class SettingsDialog(QDialog):
         # dependency. ``None`` is fine in tests / off-Windows where the
         # wizard falls back to "is_fully_installed()".
         self._ping_extension = ping_extension
+        # Phase 2: optional classification store passed through to
+        # the Manage Speakers dialog so its Contact-link column
+        # renders Contact display_names rather than raw ids. None
+        # is fine in tests; production callers (MainApp) pass the
+        # live store.
+        self._classification_store = classification_store
 
         # Outer layout: scroll area on top, button bar at the bottom outside
         # the scroll region so OK/Cancel are always reachable. The content
@@ -749,7 +756,10 @@ class SettingsDialog(QDialog):
     def _open_manage_speakers(self) -> None:
         store = open_speaker_store()
         try:
-            dialog = SpeakersManageDialog(store, parent=self)
+            dialog = SpeakersManageDialog(
+                store, parent=self,
+                classification_store=self._classification_store,
+            )
             dialog.exec()
         finally:
             store.close()

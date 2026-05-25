@@ -1,0 +1,526 @@
+"""ClassificationStore -- CRUD over series, people, topics + their
+many-to-many session links.
+
+The store is pure SQLite; tests use an in-tmp file and exercise the
+patterns MainApp drives: get-or-create with case-insensitive dedup,
+rename + merge for both series and topics, attendee-list sync that
+preserves manual links, suggestion-replace that preserves accepted
+topics, and the cross-DB cleanup hook for session deletion.
+"""
+from __future__ import annotations
+
+import pytest
+
+from meeting_notetaker.models.classification import (
+    ClassificationStore,
+    SOURCE_ATTENDEE_LIST,
+    SOURCE_AUTO,
+    SOURCE_DIARIZATION,
+    SOURCE_MANUAL,
+    _normalize_title,
+)
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = ClassificationStore(tmp_path / "classification.db")
+    yield s
+    s.close()
+
+
+# ----------------------------------------------------------------------
+# Series
+
+
+def test_get_or_create_series_returns_same_id_for_case_insensitive_match(store):
+    a = store.get_or_create_series("Platform Team Sync")
+    b = store.get_or_create_series("platform team sync")
+    assert a.id == b.id
+    # Canonical form is the first inserted -- not silently overwritten
+    # by the lower-case lookup.
+    assert b.name == "Platform Team Sync"
+
+
+def test_get_or_create_series_rejects_empty(store):
+    with pytest.raises(ValueError):
+        store.get_or_create_series("   ")
+
+
+def test_assign_and_lookup_series_for_session(store):
+    series = store.get_or_create_series("Sync")
+    store.assign_series("s1", series.id)
+    found = store.series_for_session("s1")
+    assert found is not None and found.id == series.id
+
+
+def test_assign_none_clears_series(store):
+    series = store.get_or_create_series("Sync")
+    store.assign_series("s1", series.id)
+    store.assign_series("s1", None)
+    assert store.series_for_session("s1") is None
+
+
+def test_assign_series_overwrites_prior_assignment(store):
+    s1 = store.get_or_create_series("Sync A")
+    s2 = store.get_or_create_series("Sync B")
+    store.assign_series("sess", s1.id)
+    store.assign_series("sess", s2.id)
+    assert store.series_for_session("sess").id == s2.id
+
+
+def test_rename_series_propagates_to_lookups(store):
+    series = store.get_or_create_series("Old Name")
+    store.rename_series(series.id, "New Name")
+    refreshed = store.find_series_by_name("New Name")
+    assert refreshed is not None and refreshed.id == series.id
+    assert store.find_series_by_name("Old Name") is None
+
+
+def test_merge_series_moves_sessions_then_drops_source(store):
+    src = store.get_or_create_series("Old")
+    dst = store.get_or_create_series("New")
+    store.assign_series("s1", src.id)
+    store.assign_series("s2", src.id)
+    store.assign_series("s3", dst.id)
+    store.merge_series(src.id, dst.id)
+    # Source series is gone; dst now owns all three sessions.
+    assert store.find_series_by_name("Old") is None
+    assert set(store.session_ids_for_series(dst.id)) == {"s1", "s2", "s3"}
+
+
+def test_merge_series_noop_when_source_equals_target(store):
+    src = store.get_or_create_series("Same")
+    store.assign_series("s1", src.id)
+    store.merge_series(src.id, src.id)
+    assert store.find_series_by_name("Same") is not None
+    assert store.session_ids_for_series(src.id) == ["s1"]
+
+
+def test_delete_series_cascades_to_session_series(store):
+    series = store.get_or_create_series("Drop me")
+    store.assign_series("s1", series.id)
+    store.delete_series(series.id)
+    assert store.series_for_session("s1") is None
+
+
+# Series auto-detection via fuzzy title
+
+
+def test_find_series_for_title_matches_recurring_pattern(store):
+    """Sessions named with a date suffix match an existing series of
+    the un-dated form. Pattern issue #24 calls out explicitly."""
+    series = store.get_or_create_series("Platform Team Sync")
+    found = store.find_series_for_title("Platform Team Sync 2026-05-24")
+    assert found is not None and found.id == series.id
+
+
+def test_find_series_for_title_matches_weekday_suffix(store):
+    series = store.get_or_create_series("Standup")
+    assert store.find_series_for_title("Standup -- Tuesday").id == series.id
+
+
+def test_find_series_for_title_returns_none_for_one_off(store):
+    store.get_or_create_series("Platform Team Sync")
+    assert store.find_series_for_title("Quarterly Roadmap Review") is None
+
+
+def test_normalize_title_strips_dates_and_weekdays():
+    assert _normalize_title("Platform Team Sync 2026-05-24") == "platform team sync"
+    assert _normalize_title("Standup -- Tuesday") == "standup"
+    assert _normalize_title("Weekly Sync") == "sync"  # weekly stripped
+
+
+# ----------------------------------------------------------------------
+# People
+
+
+def test_get_or_create_contact_finds_by_alias(store):
+    """Phase 2 rename: People -> Contacts (with aliases).
+    get_or_create_contact_by_name dedupes case-insensitively via
+    the auto-seeded display_name alias."""
+    a = store.get_or_create_contact_by_name("Alice Smith")
+    b = store.get_or_create_contact_by_name("alice smith")
+    assert a.id == b.id
+    assert b.display_name == "Alice Smith"
+
+
+def test_add_session_contact_then_lookup(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("s1", alice.id, source=SOURCE_MANUAL)
+    contacts = store.contacts_for_session("s1")
+    assert len(contacts) == 1
+    assert contacts[0].contact.display_name == "Alice"
+    assert contacts[0].source == SOURCE_MANUAL
+
+
+def test_add_session_contact_idempotent(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("s1", alice.id)
+    store.add_session_contact("s1", alice.id)
+    assert len(store.contacts_for_session("s1")) == 1
+
+
+def test_remove_session_contact_drops_link(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("s1", alice.id)
+    store.remove_session_contact("s1", alice.id)
+    assert store.contacts_for_session("s1") == []
+
+
+def test_rename_contact_propagates_via_id_and_keeps_old_as_alias(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("s1", alice.id)
+    store.rename_contact(alice.id, "Alice Smith")
+    contacts = store.contacts_for_session("s1")
+    assert contacts[0].contact.display_name == "Alice Smith"
+    # Phase 2 contract: the old name stays as an alias so transcripts
+    # mentioning "Alice" still resolve to her.
+    aliases = {a.alias for a in store.list_aliases(alice.id)}
+    assert "Alice" in aliases
+    assert "Alice Smith" in aliases
+
+
+def test_replace_session_attendee_contacts_preserves_other_sources(store):
+    """Diarization-derived + manually-added contacts must survive
+    a # Attendees list sync (which owns only attendee_list-source
+    rows)."""
+    a = store.create_contact("Alice")
+    b = store.create_contact("Bob")
+    c = store.create_contact("Carol")
+    d = store.create_contact("Dave")
+    store.add_session_contact("s1", a.id, source=SOURCE_ATTENDEE_LIST)
+    store.add_session_contact("s1", b.id, source=SOURCE_DIARIZATION)
+    store.add_session_contact("s1", c.id, source=SOURCE_MANUAL)
+    # User edits attendees so only Dave remains; Alice (attendee_list
+    # source) goes; Bob (diarization) + Carol (manual) stay.
+    store.replace_session_attendee_contacts("s1", [d.id])
+    names = {sc.contact.display_name for sc in store.contacts_for_session("s1")}
+    assert names == {"Bob", "Carol", "Dave"}
+
+
+def test_session_ids_for_contact_lists_sessions(store):
+    alice = store.create_contact("Alice")
+    store.add_session_contact("a", alice.id)
+    store.add_session_contact("b", alice.id)
+    assert sorted(store.session_ids_for_contact(alice.id)) == ["a", "b"]
+
+
+# ---- aliases ----
+
+
+def test_create_contact_seeds_name_alias(store):
+    c = store.create_contact("Bob Smith")
+    aliases = store.list_aliases(c.id)
+    assert any(a.alias == "Bob Smith" and a.kind == "name" for a in aliases)
+
+
+def test_find_contacts_by_alias_unique_match(store):
+    bob = store.create_contact("Bob Smith")
+    store.add_alias(bob.id, "BS", kind="short")
+    store.add_alias(bob.id, "bsmith@corp.com", kind="email")
+    assert store.find_contact_by_alias("BS").id == bob.id
+    assert store.find_contact_by_alias("bsmith@corp.com", kind="email").id == bob.id
+
+
+def test_find_contacts_by_alias_no_match_returns_empty(store):
+    assert store.find_contacts_by_alias("nobody") == []
+
+
+def test_find_contact_by_alias_case_insensitive(store):
+    bob = store.create_contact("Bob Smith")
+    store.add_alias(bob.id, "BS", kind="short")
+    assert store.find_contact_by_alias("bs").id == bob.id
+    assert store.find_contact_by_alias("Bs").id == bob.id
+
+
+def test_alias_can_be_shared_across_contacts(store):
+    """Per-contact uniqueness on (alias, kind) -- the SAME short
+    alias 'AB' can belong to multiple Contacts (e.g. "Alice
+    Bauer" and "Andrew Brown"). Smart resolution treats the
+    shared alias as ambiguous at match time and surfaces both as
+    suggested merges in the Address Book."""
+    a = store.create_contact("Alice")
+    b = store.create_contact("Bob")
+    store.add_alias(a.id, "AB", kind="short")
+    # Adding the same alias to a different contact is allowed.
+    store.add_alias(b.id, "AB", kind="short")
+    # find_contacts_by_alias returns both -- callers handle the
+    # multi-match case via the resolver's ambiguity branch.
+    matches = store.find_contacts_by_alias("AB")
+    assert {c.id for c in matches} == {a.id, b.id}
+
+
+def test_alias_collision_on_same_contact_is_noop(store):
+    bob = store.create_contact("Bob")
+    store.add_alias(bob.id, "B", kind="short")
+    # Adding the same alias to the same contact silently no-ops.
+    result = store.add_alias(bob.id, "B", kind="short")
+    assert result is None
+    # And only one alias row exists.
+    aliases = [a for a in store.list_aliases(bob.id) if a.kind == "short"]
+    assert len(aliases) == 1
+
+
+def test_merge_contacts_moves_aliases_and_links(store):
+    src = store.create_contact("Bob")
+    dst = store.create_contact("Bob Smith")
+    store.add_alias(src.id, "B", kind="short")
+    store.add_session_contact("s1", src.id, source=SOURCE_MANUAL)
+    store.add_session_contact("s2", dst.id, source=SOURCE_MANUAL)
+    store.merge_contacts(src.id, dst.id)
+    # src is gone; dst has both sessions + the "B" alias.
+    assert store.get_contact(src.id) is None
+    sessions = sorted(store.session_ids_for_contact(dst.id))
+    assert sessions == ["s1", "s2"]
+    aliases = {a.alias for a in store.list_aliases(dst.id)}
+    assert "B" in aliases
+    # The source's display_name lands as a merged_from alias on dst.
+    assert "Bob" in aliases
+
+
+def test_merge_contacts_handles_session_collision(store):
+    """When both src + dst are on the same session, the merged
+    target keeps a single row (no PK conflict)."""
+    src = store.create_contact("Bob")
+    dst = store.create_contact("Bob Smith")
+    store.add_session_contact("s1", src.id, source=SOURCE_DIARIZATION)
+    store.add_session_contact("s1", dst.id, source=SOURCE_MANUAL)
+    store.merge_contacts(src.id, dst.id)
+    contacts = store.contacts_for_session("s1")
+    assert len(contacts) == 1
+    assert contacts[0].contact.id == dst.id
+
+
+def test_delete_contact_cascades(store):
+    bob = store.create_contact("Bob")
+    store.add_alias(bob.id, "B", kind="short")
+    store.add_session_contact("s1", bob.id)
+    store.delete_contact(bob.id)
+    assert store.get_contact(bob.id) is None
+    assert store.contacts_for_session("s1") == []
+    assert store.list_aliases(bob.id) == []
+
+
+def test_list_contacts_in_use_excludes_orphans(store):
+    used = store.create_contact("Used")
+    store.create_contact("Orphan")
+    store.add_session_contact("s1", used.id)
+    names = [c.display_name for c in store.list_contacts_in_use()]
+    assert "Used" in names
+    assert "Orphan" not in names
+
+
+def test_list_orphan_contacts_returns_unlinked(store):
+    store.create_contact("Orphan")
+    used = store.create_contact("Used")
+    store.add_session_contact("s1", used.id)
+    orphans = store.list_orphan_contacts()
+    assert {c.display_name for c in orphans} == {"Orphan"}
+
+
+def test_delete_orphan_contacts_returns_count(store):
+    store.create_contact("Orphan A")
+    store.create_contact("Orphan B")
+    used = store.create_contact("Used")
+    store.add_session_contact("s1", used.id)
+    assert store.delete_orphan_contacts() == 2
+    assert store.list_orphan_contacts() == []
+    assert store.get_contact(used.id) is not None
+
+
+# ----------------------------------------------------------------------
+# Topics
+
+
+def test_get_or_create_topic_case_insensitive(store):
+    a = store.get_or_create_topic("MDM")
+    b = store.get_or_create_topic("mdm")
+    assert a.id == b.id
+    assert b.name == "MDM"   # canonical preserved
+
+
+def test_session_ids_for_contact_lists_sessions_dedup(store):
+    """Adding the same contact to multiple sessions; in_use filters
+    rely on this method via the navigator's session-list filter."""
+    bob = store.create_contact("Bob")
+    store.add_session_contact("a", bob.id)
+    store.add_session_contact("b", bob.id)
+    store.add_session_contact("a", bob.id)  # idempotent dup
+    assert sorted(store.session_ids_for_contact(bob.id)) == ["a", "b"]
+
+
+def test_add_session_topic_then_lookup(store):
+    mdm = store.get_or_create_topic("MDM")
+    store.add_session_topic("s1", mdm.id, source=SOURCE_MANUAL, accepted=True)
+    topics = store.topics_for_session("s1")
+    assert len(topics) == 1
+    assert topics[0].topic.name == "MDM"
+    assert topics[0].accepted is True
+
+
+def test_add_session_topic_accepted_max_keeps_user_acceptance(store):
+    """Re-adding a topic with accepted=False must NOT downgrade a
+    previously-accepted association. MAX(accepted, ...) handles this."""
+    mdm = store.get_or_create_topic("MDM")
+    store.add_session_topic("s1", mdm.id, accepted=True)
+    store.add_session_topic("s1", mdm.id, source=SOURCE_AUTO, accepted=False)
+    topic = store.topics_for_session("s1")[0]
+    assert topic.accepted is True
+
+
+def test_set_topic_accepted_explicit_downgrade(store):
+    """The explicit setter allows accepted=False (user clicks
+    'reject after accepting'); add_session_topic uses MAX to
+    avoid silent downgrades."""
+    mdm = store.get_or_create_topic("MDM")
+    store.add_session_topic("s1", mdm.id, accepted=True)
+    store.set_topic_accepted("s1", mdm.id, False)
+    topic = store.topics_for_session("s1")[0]
+    assert topic.accepted is False
+
+
+def test_topics_for_session_accepted_only_filter(store):
+    a = store.get_or_create_topic("Accepted")
+    b = store.get_or_create_topic("Suggested")
+    store.add_session_topic("s1", a.id, accepted=True)
+    store.add_session_topic("s1", b.id, source=SOURCE_AUTO, accepted=False)
+    all_topics = store.topics_for_session("s1", accepted_only=False)
+    accepted_only = store.topics_for_session("s1", accepted_only=True)
+    assert {t.topic.name for t in all_topics} == {"Accepted", "Suggested"}
+    assert {t.topic.name for t in accepted_only} == {"Accepted"}
+
+
+def test_replace_session_topic_suggestions_preserves_accepted(store):
+    """A fresh extraction shouldn't blow away topics the user already
+    accepted from a prior pass."""
+    kept = store.get_or_create_topic("Kept")
+    discarded = store.get_or_create_topic("Discarded")
+    store.add_session_topic("s1", kept.id, accepted=True)
+    store.add_session_topic("s1", discarded.id, source=SOURCE_AUTO, accepted=False)
+    store.replace_session_topic_suggestions("s1", ["FreshSuggestion"])
+    names = {t.topic.name for t in store.topics_for_session("s1")}
+    assert names == {"Kept", "FreshSuggestion"}
+
+
+def test_session_ids_for_topic_only_returns_accepted(store):
+    """The navigator's "By Topic" view should only surface accepted
+    associations, not auto-suggestions still in the suggestion
+    bucket."""
+    mdm = store.get_or_create_topic("MDM")
+    store.add_session_topic("yes", mdm.id, accepted=True)
+    store.add_session_topic("no", mdm.id, source=SOURCE_AUTO, accepted=False)
+    assert store.session_ids_for_topic(mdm.id) == ["yes"]
+
+
+def test_rename_topic_preserves_associations(store):
+    mdm = store.get_or_create_topic("MDM")
+    store.add_session_topic("s1", mdm.id, accepted=True)
+    store.rename_topic(mdm.id, "Master Data Management")
+    topics = store.topics_for_session("s1")
+    assert topics[0].topic.name == "Master Data Management"
+
+
+def test_merge_topics_unions_session_links(store):
+    src = store.get_or_create_topic("MDM")
+    dst = store.get_or_create_topic("MasterData")
+    store.add_session_topic("a", src.id, accepted=True)
+    store.add_session_topic("b", dst.id, accepted=True)
+    store.add_session_topic("c", src.id, accepted=True)
+    store.add_session_topic("c", dst.id, accepted=True)  # session c has both
+    store.merge_topics(src.id, dst.id)
+    assert sorted(store.session_ids_for_topic(dst.id)) == ["a", "b", "c"]
+    # Source topic gone.
+    assert all(t.name != "MDM" for t in store.list_topics())
+
+
+def test_remove_session_drops_all_associations(store):
+    """Session deletion cleanup -- the FK doesn't cascade across
+    databases, so the explicit hook has to do it."""
+    series = store.get_or_create_series("S")
+    alice = store.create_contact("Alice")
+    topic = store.get_or_create_topic("MDM")
+    store.assign_series("s1", series.id)
+    store.add_session_contact("s1", alice.id)
+    store.add_session_topic("s1", topic.id, accepted=True)
+    store.remove_session("s1")
+    assert store.series_for_session("s1") is None
+    assert store.contacts_for_session("s1") == []
+    assert store.topics_for_session("s1") == []
+
+
+# ----------------------------------------------------------------------
+# In-use list variants (v0.7.0 follow-up). The navigator only offers
+# values that have at least one session association -- empty options
+# would just waste clicks.
+
+
+def test_list_series_in_use_excludes_orphans(store):
+    used = store.get_or_create_series("Used")
+    store.get_or_create_series("Orphan")  # never assigned
+    store.assign_series("s1", used.id)
+    names = [s.name for s in store.list_series_in_use()]
+    assert "Used" in names
+    assert "Orphan" not in names
+    # Full list still carries both -- chips bar uses that for
+    # re-link affordances.
+    assert {s.name for s in store.list_series()} == {"Used", "Orphan"}
+
+
+def test_list_series_in_use_recovers_after_unassign(store):
+    series = store.get_or_create_series("Sometimes")
+    store.assign_series("s1", series.id)
+    assert any(s.name == "Sometimes" for s in store.list_series_in_use())
+    store.assign_series("s1", None)
+    assert not any(s.name == "Sometimes" for s in store.list_series_in_use())
+
+
+def test_list_contacts_in_use_excludes_unlinked(store):
+    alice = store.create_contact("Alice")
+    store.create_contact("Bob")  # no session_contacts row
+    store.add_session_contact("s1", alice.id)
+    names = [c.display_name for c in store.list_contacts_in_use()]
+    assert "Alice" in names
+    assert "Bob" not in names
+
+
+def test_list_topics_in_use_excludes_orphans_and_suggestion_only(store):
+    """Three states matter:
+       - Topic with accepted=1 association  -> in use
+       - Topic with only accepted=0 (suggestion) associations -> NOT in use
+         (session_ids_for_topic only returns accepted rows -> filter
+         would always return empty)
+       - Topic with no associations at all -> NOT in use
+    """
+    accepted = store.get_or_create_topic("Accepted")
+    suggestion_only = store.get_or_create_topic("SuggestionOnly")
+    orphan = store.get_or_create_topic("Orphan")
+    store.add_session_topic("s1", accepted.id, accepted=True)
+    store.add_session_topic("s1", suggestion_only.id, source="auto", accepted=False)
+    # orphan has no add_session_topic call
+    names = [t.name for t in store.list_topics_in_use()]
+    assert "Accepted" in names
+    assert "SuggestionOnly" not in names
+    assert "Orphan" not in names
+
+
+def test_list_topics_in_use_promotes_after_user_accepts(store):
+    """A suggestion-only topic becomes 'in use' once the user accepts
+    it (set_topic_accepted(True))."""
+    topic = store.get_or_create_topic("Pending")
+    store.add_session_topic("s1", topic.id, source="auto", accepted=False)
+    assert "Pending" not in {t.name for t in store.list_topics_in_use()}
+    store.set_topic_accepted("s1", topic.id, True)
+    assert "Pending" in {t.name for t in store.list_topics_in_use()}
+
+
+def test_classification_for_session_aggregates_all_three(store):
+    series = store.get_or_create_series("Sync")
+    alice = store.create_contact("Alice")
+    topic = store.get_or_create_topic("MDM")
+    store.assign_series("s1", series.id)
+    store.add_session_contact("s1", alice.id)
+    store.add_session_topic("s1", topic.id, accepted=True)
+    cls = store.classification_for_session("s1")
+    assert cls.series.name == "Sync"
+    assert [sc.contact.display_name for sc in cls.contacts] == ["Alice"]
+    assert [t.topic.name for t in cls.topics] == ["MDM"]

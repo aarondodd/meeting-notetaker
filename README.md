@@ -9,9 +9,19 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.6.5. End-to-end capture, transcription, synthesis,
-> screen capture, retained-audio playback + export, and transcript-
-> synchronized playback all working. Performance tuning is ongoing.
+> **Status:** v0.7.0 (in development). End-to-end capture,
+> transcription, synthesis, screen capture, retained-audio playback +
+> export, and transcript-synchronized playback all working. v0.7.0
+> adds within-tab `Ctrl+F` find + cross-session full-text search
+> (`Ctrl+Shift+F`), per-session classification (series / topics with
+> a filter pulldown above the session list and a compact popup-menu
+> bar on each session), File > Manage Classification for renaming /
+> merging / deleting series + topics, a unified File > Address Book
+> that ties Session People to Speaker voices via Contact aliases (so
+> typing "BS" in attendees resolves to Bob Smith and propagates to
+> voice recognition), sortable session-list columns with persisted
+> window + splitter geometry, and highlight markers with MP4 / audio
+> export.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -34,6 +44,97 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.0
+
+- **Cross-session full-text search** (`Ctrl+Shift+F`, or the
+  **Search** button in the session-list header) over the
+  Transcript, My Notes, Synthesis, and Previous Notes tabs of
+  every session. Backed by SQLite FTS5, indexed on save with a
+  30s catch-up scan. **Help > Debug > Rebuild Search Index** for
+  cold starts.
+- **Within-tab find** (`Ctrl+F`, or the **Find...** button in the
+  session view) on every text tab: incremental highlight,
+  Next/Prev navigation, case + whole-word toggles.
+- **Session classification:** every session has a Series (recurring
+  meeting), People (auto-populated from the My Notes `# Attendees`
+  list, resolved to unified Contacts), and Topics (deterministic
+  extractor over the synthesis output -- no LLM round-trip). A
+  compact bar above the tabs shows
+  *Series: \<name\>* | *People (N)* | *Topics (N, M suggested)*;
+  each count opens a popup menu with the full list + Add / Remove
+  / Accept actions. The window width stays constant regardless of
+  how many people or topics a session accumulates.
+- **Filter pulldown** above the session list: **All / By Series /
+  By Person / By Topic**. The value combo lists only "in-use"
+  values (no zero-result options) and preserves your selection
+  across classification refreshes.
+- **Unified Address Book** (File > Address Book...): every Session
+  Person and every labeled Speaker is a reference to one Contact.
+  Add aliases ("BS", "bsmith@corp.com") on a Contact and typing
+  any of them in attendees resolves silently; voice recognition
+  finds the same Contact across meetings. The Address Book
+  surfaces suggested merges when two Contacts look like duplicates
+  (shared alias, name-token subset, or low edit distance), bulk-
+  deletes orphans, and lets you rename / merge / delete Contacts.
+- **Smart attendee resolution:** typing a name routes through a
+  silent matcher -- unique alias hit links to the existing
+  Contact, no hit creates a new one, ambiguous matches create a
+  new Contact and flag both candidates in the Address Book's
+  suggested-merges section so you resolve the conflict
+  deliberately rather than via a typing-time modal.
+- **Calendar email rewrite:** when a calendar invite carries an
+  attendee by email only, the seed flow looks up an email alias
+  on Contacts; hits surface the Contact's friendly display name in
+  the seeded `# Attendees` list. Misses create a stub Contact
+  named after the email's local-part with the email registered as
+  an alias for future hits.
+- **File > Manage Classification**: tabbed dialog (Series + Topics)
+  for renaming, merging, and deleting catalog entries. The Topics
+  tab includes a "Cleanup orphans" button that bulk-removes
+  topics with zero session associations.
+- **Manage Speakers** gains a Merge action (combines two voice
+  records' samples + centroids + drops the source) and a
+  Contact-link column showing the unified Contact behind each
+  voice.
+- **Session list reorder + sort:** columns now appear as
+  Date | Title | Audio | Slides | State. Date and Title headers
+  click to sort ascending / descending, and the choice persists
+  across launches.
+- **Persisted window + splitter geometry:** the main window's size
+  and the horizontal split between the session list and session
+  view survive a relaunch.
+- **Highlight markers + export:** mark interesting moments via the
+  Start / End toggle below the playback scrubber, optionally
+  title each one, then export an MP4 (with an initial
+  session-title slide carrying *"Recorded on YYYY-MM-DD HH:MM"*,
+  per-highlight 2-second title cards, and 2-second
+  *"Jumping to MM:SS"* cards between consecutive highlights) or
+  an audio file (MP3 / FLAC / AAC / Opus / WAV with short silent
+  gaps) of just the highlights.
+- **Attachments tab:** per-session file attach + inline preview.
+  Click **Add file...** or drag-drop anywhere on the tab; files
+  are copied into the session folder (originals untouched). Right-
+  click any attachment for Rename / Save as / Open externally /
+  Delete. Preview pane dispatches by file type: images render
+  inline, plain text / markdown / source code show in a viewer,
+  audio plays via the existing player bar, PDFs use Qt's built-in
+  PDF viewer, and **Office documents (.docx, .xlsx, .pptx)
+  convert via Word/Excel/PowerPoint COM to PDF on first preview
+  and cache the result** so subsequent previews of the same file
+  are instant. Calendar-derived sessions auto-import any attached
+  files from the Outlook invite.
+
+  ![Attachments tab](docs/screenshots/17-main-attachments.png)
+
+- **Export full session:** right-click a session and choose
+  *Export full session...* to bundle everything into a single
+  ZIP: PDFs of My Notes + Synthesis, plain-text transcript, MP3
+  audio, MP4 video (if screenshots present), every attachment,
+  every screen capture. When highlights exist you pick once
+  between Full / Highlights-only / Both for the audio + video
+  files. Suggested filename uses the session timestamp + title
+  so files sort chronologically in Explorer.
 
 ## What's in v0.6.5
 

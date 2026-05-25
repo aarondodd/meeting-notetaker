@@ -63,6 +63,7 @@ from .paths import config_path
 VALID_MODEL_SIZES = ("tiny.en", "base.en", "small.en", "medium.en")
 VALID_LLM_TARGETS = ("claude", "copilot")
 VALID_RETAIN_FORMATS = ("opus", "flac", "wav")
+VALID_SESSION_LIST_SORTS = ("date_desc", "date_asc", "title_asc", "title_desc")
 
 
 @dataclass
@@ -134,6 +135,18 @@ class UiConfig:
     # user can resize the splitter at runtime; SessionView pushes
     # the new pct back to MainApp which saves it here (debounced).
     transcript_playback_split_top_pct: int = 70
+    # Session-list sort spec. One of: date_desc (default, newest first),
+    # date_asc (oldest first), title_asc (A-Z), title_desc (Z-A). MainWindow
+    # parses + applies; clicking the Date/Title header updates the value.
+    session_list_sort: str = "date_desc"
+    # Persisted window layout: QMainWindow.saveGeometry() output
+    # (size + position + maximized state) and the main horizontal
+    # splitter's saveState() output (left/right pane ratio), each
+    # base64-encoded for TOML safety. Saved on app aboutToQuit;
+    # restored at startup. Empty strings mean "use Qt defaults"
+    # (first launch or after a stale-state recovery).
+    main_window_geometry: str = ""
+    main_splitter_state: str = ""
 
 
 @dataclass
@@ -303,6 +316,11 @@ class Config:
             errors.append(
                 "ui.transcript_playback_split_top_pct must be between 10 "
                 f"and 90, got {self.ui.transcript_playback_split_top_pct}"
+            )
+        if self.ui.session_list_sort not in VALID_SESSION_LIST_SORTS:
+            errors.append(
+                f"ui.session_list_sort {self.ui.session_list_sort!r} "
+                f"must be one of {VALID_SESSION_LIST_SORTS}"
             )
         if self.synthesis.llm_target not in VALID_LLM_TARGETS:
             errors.append(

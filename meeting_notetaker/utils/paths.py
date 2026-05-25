@@ -88,6 +88,27 @@ def has_retained_audio(session_id: str) -> bool:
     return bool(session_audio_files(session_id))
 
 
+def has_attachments(session_id: str) -> bool:
+    """Cheap O(1) check used by the session-list indicator column.
+
+    Reads the on-disk attachments/ subdir directly rather than
+    parsing attachments.json -- the sidecar can be slightly stale
+    if a user manually rm'd a file, but the *indicator* should
+    reflect what's actually present. AttachmentsStore.list() does
+    the full reconciliation when the Attachments tab is opened.
+    """
+    attachments_dir = session_dir(session_id) / "attachments"
+    if not attachments_dir.is_dir():
+        return False
+    try:
+        for entry in attachments_dir.iterdir():
+            if entry.is_file():
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def session_screenshots_dir(session_id: str) -> Path:
     """Per-session screenshots/ dir. Created on first access.
 

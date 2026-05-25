@@ -48,13 +48,33 @@ from .models.session import (
 )
 from .models.transcript import TranscriptSegment, TranscriptStore
 from .transcription import model_manager
+from .models.classification import (
+    ClassificationStore,
+    SOURCE_ATTENDEE_LIST,
+    SOURCE_AUTO,
+    SOURCE_MANUAL,
+    SessionClassification,
+)
+from .utils.contact_resolution import (
+    display_name_for_email,
+    resolve_attendees_batch,
+)
+from .models.highlights import HighlightSet, HighlightsStore
+from .models.search_index import SearchIndex
+from .ui.classification_navigator import (
+    VIEW_ALL, VIEW_BY_SERIES, VIEW_BY_PERSON, VIEW_BY_TOPIC,
+)
+from .ui.address_book_dialog import AddressBookDialog
 from .ui.devices_dialog import DevicesDialog
 from .ui.main_window import MainWindow
+from .ui.manage_classification_dialog import ManageClassificationDialog
+from .ui.search_dialog import SearchDialog, SessionSummary
 from .ui.status_indicators import SegmentState
 from .ui.new_session_dialog import NewSessionDialog
 from .ui.progress import run_with_progress
 from .ui.prompt_dialog import GeneratePromptDialog, PasteNotesDialog
 from .ui.settings_dialog import SettingsDialog
+from .utils.topic_extractor import extract_topics
 from .ui.speaker_walker_dialog import (
     SpeakerWalkerDecision,
     SpeakerWalkerDialog,
@@ -211,6 +231,54 @@ class MainApp(QObject):
         self.bridge_message_received.connect(self._dispatch_bridge_message)
         self.bridge_state_changed.connect(self._poll_synthesis_state)
 
+        # Cross-session search index (FTS5). Created lazily so a corrupt
+        # search.db doesn't keep the app from launching; opened on first
+        # use and at the startup stale-scan below.
+        try:
+            self.search_index: Optional[SearchIndex] = SearchIndex()
+        except Exception:
+            log.exception("SearchIndex open failed; search disabled this session")
+            self.search_index = None
+        # Classification store (series / people / topics). Same
+        # cold-start safety as search: a corrupt classification.db
+        # disables the feature for the session but doesn't block
+        # launch. Active filter state lives on MainApp because
+        # set_sessions has to apply it client-side after every
+        # store query.
+        try:
+            self.classification: Optional[ClassificationStore] = ClassificationStore()
+        except Exception:
+            log.exception("ClassificationStore open failed; chips disabled this session")
+            self.classification = None
+        # Phase 2 migration: link existing SpeakerStore rows to
+        # Contacts in the classification store. Runs once per launch
+        # (cheap when there's nothing to link). A failure here is
+        # logged but non-fatal -- the user can re-trigger via Help
+        # > Debug if it skipped a batch.
+        if self.classification is not None:
+            try:
+                self._migrate_speakers_to_contacts()
+            except Exception:
+                log.exception("speakers -> contacts migration failed")
+        self._classification_filter_view: str = VIEW_ALL
+        self._classification_filter_value: Optional[int] = None
+        self._search_dialog: Optional[SearchDialog] = None
+        # Periodic catch-up: a 30s timer walks stale sessions and re-
+        # indexes them. Belt-and-suspenders against missed explicit
+        # hooks (e.g. a save path we haven't wired) so the user
+        # never sees "I just edited X and search can't find it" for
+        # more than 30 seconds.
+        self._search_index_scan_timer = QTimer(self)
+        self._search_index_scan_timer.setInterval(30_000)
+        self._search_index_scan_timer.timeout.connect(self._scan_search_index_stale)
+
+        # Persist window geometry + splitter state at app exit.
+        # aboutToQuit fires regardless of how the app shuts down
+        # (X button, menu Quit, tray Quit, Cmd+Q, OS signal) so this
+        # is the single canonical save point. Single write -- no
+        # debouncing needed for one-shot exit.
+        self.qt_app.aboutToQuit.connect(self._persist_window_layout)
+
         self._wire_signals()
         self._apply_user_name()
         self._apply_synthesis_automation()
@@ -234,6 +302,12 @@ class MainApp(QObject):
         # after show() so the network call never blocks the first paint.
         QTimer.singleShot(2000, self._auto_check_for_updates)
 
+        # Startup stale-scan for the search index. Deferred so it
+        # doesn't extend the first-paint critical path; once done,
+        # the periodic catch-up timer takes over.
+        QTimer.singleShot(1500, self._search_index_startup_scan)
+        self._search_index_scan_timer.start()
+
         # Pre-warm the speaker-embedding encoder on a background thread.
         # The first batch refinement OR voice enrollment after a fresh
         # install otherwise blocks the UI for the ~22 MB ECAPA-TDNN
@@ -256,6 +330,18 @@ class MainApp(QObject):
         self.window.session_view.set_transcript_playback_split_top_pct(
             int(self.config.ui.transcript_playback_split_top_pct)
         )
+        # Apply the persisted session-list sort spec so the user opens
+        # the app the way they left it. Sort is set before any sessions
+        # load via _refresh_sessions, so the first render is sorted.
+        self.window.set_session_list_sort(self.config.ui.session_list_sort)
+        # Restore the persisted window size + position + horizontal
+        # splitter ratio. Has to run before window.show() ideally,
+        # but Qt accepts restoreGeometry after show too -- it just
+        # repositions the live window. Either way, applied here.
+        self.window.restore_layout_state(
+            self.config.ui.main_window_geometry,
+            self.config.ui.main_splitter_state,
+        )
 
     def _on_transcript_playback_split_changed(self, pct: int) -> None:
         """Persist the user's new splitter ratio (debounced)."""
@@ -267,6 +353,36 @@ class MainApp(QObject):
             self._save_split_timer.setSingleShot(True)
             self._save_split_timer.setInterval(500)
             self._save_split_timer.timeout.connect(self.config.save)
+
+    def _persist_window_layout(self) -> None:
+        """Serialize + write window size/position + splitter state
+        to config.toml at app exit.
+
+        Tolerant of partial failure: if either save returns an empty
+        string, the corresponding config field stays at the last
+        successfully-saved value (no half-update). aboutToQuit is
+        the only caller, so logging is enough on failure -- the user
+        is exiting anyway.
+        """
+        try:
+            geom, split = self.window.save_layout_state()
+            self.config.ui.main_window_geometry = geom or self.config.ui.main_window_geometry
+            self.config.ui.main_splitter_state = split or self.config.ui.main_splitter_state
+            self.config.save()
+        except Exception:
+            log.exception("window layout persist failed")
+
+    def _on_session_list_sort_changed(self, spec: str) -> None:
+        """Persist the user's chosen sort order for the session list.
+
+        Called from MainWindow when the user clicks the Date or Title
+        column header. Indicator-column clicks snap back inside
+        MainWindow without reaching this handler.
+        """
+        self.config.ui.session_list_sort = spec
+        # Saved synchronously -- this is a one-shot user click, not a
+        # drag event that would benefit from debouncing.
+        self.config.save()
         self._save_split_timer.start()
 
     def _apply_synthesis_automation(self) -> None:
@@ -474,6 +590,7 @@ class MainApp(QObject):
                 markdown, archive_existing=True
             )
             self.store.update_session(session_id, has_notes=True)
+            self._reindex_search_for(session_id)
         except OSError:
             log.exception("save_notes failed for %s", session_id)
             QMessageBox.critical(
@@ -861,7 +978,28 @@ class MainApp(QObject):
         self.window.open_recording_requested.connect(self._on_open_recording)
         self.window.export_recording_requested.connect(self._on_export_recording)
         self.window.export_video_requested.connect(self._on_export_video)
+        self.window.export_package_requested.connect(self._on_export_package)
         self.window.delete_recording_requested.connect(self._on_delete_recording)
+        self.window.session_list_sort_changed.connect(self._on_session_list_sort_changed)
+        self.window.open_search_requested.connect(self._on_open_search)
+        self.window.rebuild_search_index_requested.connect(self._on_rebuild_search_index)
+        self.window.classification_filter_changed.connect(
+            self._on_classification_filter_changed
+        )
+        self.window.manage_series_requested.connect(self._on_manage_series)
+        self.window.manage_classification_requested.connect(
+            self._on_manage_classification,
+        )
+        self.window.address_book_requested.connect(self._on_address_book)
+        # SessionView -> classification chip mutations
+        sv = self.window.session_view
+        sv.add_topic_requested.connect(self._on_add_topic_requested)
+        sv.remove_topic_requested.connect(self._on_remove_topic_requested)
+        sv.accept_topic_requested.connect(self._on_accept_topic_requested)
+        sv.add_person_requested.connect(self._on_add_person_requested)
+        sv.remove_person_requested.connect(self._on_remove_person_requested)
+        sv.set_series_requested.connect(self._on_set_series_requested)
+        sv.highlights_changed.connect(self._on_session_highlights_changed)
 
         self.tray.open_main_window.connect(self._foreground_window)
         self.tray.new_session_requested.connect(self._on_new_session)
@@ -933,11 +1071,100 @@ class MainApp(QObject):
 
     def _refresh_session_list(self, *, select: Optional[str] = None) -> None:
         sessions = self.store.list_sessions()
+        # Apply the active classification filter, if any.
+        sessions = self._apply_classification_filter(sessions)
         self.window.set_sessions(sessions)
+        # Refresh the navigator's choice lists so newly-added series/
+        # people/topics show up in the pulldown without a restart.
+        self._refresh_classification_choices()
         if select:
             self.window.select_session(select)
         elif sessions:
             self.window.select_session(sessions[0].id)
+
+    def _apply_classification_filter(self, sessions: list[Session]) -> list[Session]:
+        """Intersect the full session list with the active filter.
+
+        VIEW_ALL or unselected value -> no filtering (returns the
+        input). VIEW_BY_* with a value -> the subset that
+        ClassificationStore associates with that filter value.
+        Preserves the input list's order (which is already sorted
+        by the session-list sort spec).
+        """
+        if (
+            self._classification_filter_view == VIEW_ALL
+            or self._classification_filter_value is None
+            or self.classification is None
+        ):
+            return sessions
+        try:
+            if self._classification_filter_view == VIEW_BY_SERIES:
+                allowed = set(self.classification.session_ids_for_series(
+                    self._classification_filter_value
+                ))
+            elif self._classification_filter_view == VIEW_BY_PERSON:
+                # "By Person" -- backed by Contacts post-Phase 2.
+                allowed = set(self.classification.session_ids_for_contact(
+                    self._classification_filter_value
+                ))
+            elif self._classification_filter_view == VIEW_BY_TOPIC:
+                allowed = set(self.classification.session_ids_for_topic(
+                    self._classification_filter_value
+                ))
+            else:
+                return sessions
+        except Exception:
+            log.exception("classification filter query failed")
+            return sessions
+        return [s for s in sessions if s.id in allowed]
+
+    def _refresh_classification_choices(self) -> None:
+        """Re-populate the navigator combo + chips-bar pickers with
+        current series / people / topics. Cheap (sub-millisecond at
+        any realistic store size) so we run it on every list
+        refresh rather than tracking dirty bits.
+
+        Two different lists power the two surfaces:
+
+        * Navigator (filter pulldown) -- in-use only. Offering a
+          value that returns zero sessions wastes a click.
+        * Chips bar (Add/Change pickers) -- full catalog. The user
+          might re-link a session to a known-but-currently-orphan
+          series/person/topic.
+        """
+        if self.classification is None:
+            return
+        try:
+            # Navigator: in-use only (EXISTS-filtered server-side).
+            nav_series = [
+                (s.id, s.name)
+                for s in self.classification.list_series_in_use()
+            ]
+            # People navigator entries -- backed by Contacts.
+            nav_people = [
+                (c.id, c.display_name)
+                for c in self.classification.list_contacts_in_use()
+            ]
+            nav_topics = [
+                (t.id, t.name)
+                for t in self.classification.list_topics_in_use()
+            ]
+            self.window.set_classification_choices(
+                series=nav_series, people=nav_people, topics=nav_topics,
+            )
+            # Chips bar: full catalog so the user can pick a topic
+            # they previously used on another session even if it's
+            # currently unassigned everywhere.
+            full_series_rows = self.classification.list_series()
+            full_people_rows = self.classification.list_contacts()
+            full_topic_rows = self.classification.list_topics()
+            self.window.session_view.set_classification_known_lists(
+                series=[s.name for s in full_series_rows],
+                people=[p.display_name for p in full_people_rows],
+                topics=[t.name for t in full_topic_rows],
+            )
+        except Exception:
+            log.exception("classification refresh failed")
 
     def _on_session_selected(self, session_id: str) -> None:
         session = self.store.get_session(session_id)
@@ -945,13 +1172,23 @@ class MainApp(QObject):
             return
         store = TranscriptStore(session_id)
         live_notes_body = store.read_live_notes()
+        notes_body = store.read_notes()
         self.window.session_view.set_session(
             session,
             transcript=store.read_transcript(),
-            notes=store.read_notes(),
+            notes=notes_body,
             previous_notes_paths=store.list_previous_notes(),
             live_notes=live_notes_body,
         )
+        # Backfill classification from whatever's on disk, so pre-
+        # v0.7.0 sessions get People + Topic suggestions populated as
+        # the user clicks through them. Both calls are cheap and
+        # idempotent -- sync_session_people replaces only the
+        # attendee_list-source rows; replace_session_topic_suggestions
+        # only replaces unaccepted auto-suggestions.
+        self._sync_attendees_to_people(session_id, live_notes_body)
+        if notes_body.strip():
+            self._extract_topics_for_session(session_id, notes_body)
         # Load the session's retained audio into the player (if any).
         # The player bar in the Transcript pane greys out cleanly when
         # there's nothing on disk; loading itself is a no-op for
@@ -983,6 +1220,47 @@ class MainApp(QObject):
             store = self.controller._tag_stores.get(session_id)
             if store is not None:
                 self.window.session_view.set_speaker_tag_counts(store.counts())
+        # Push the session's classification (series / people / topics)
+        # into the chips bar. Missing classification store -> empty
+        # bar with disabled mutators.
+        self._refresh_session_classification(session_id)
+        # Load the persisted highlight markers. total_ms comes from
+        # the audio player; if no audio is loaded yet, set 0 -- the
+        # bar disables interaction cleanly and updates when audio
+        # arrives via set_player_total_ms.
+        try:
+            highlights = HighlightsStore(session_id).load()
+        except Exception:
+            log.exception("highlights load failed for %s", session_id)
+            highlights = HighlightSet()
+        total_ms = 0
+        if self._audio_player is not None and self._player_loaded_session_id == session_id:
+            try:
+                total_ms = int(self._audio_player.total_ms())
+            except Exception:
+                total_ms = 0
+        self.window.session_view.set_session_highlights(total_ms, highlights)
+        # Issue #29: Attachments tab pulls the per-session list.
+        try:
+            self.window.session_view.attachments_tab().set_session(session_id)
+        except Exception:
+            log.exception("attachments tab failed to load for %s", session_id)
+
+    def _refresh_session_classification(self, session_id: str) -> None:
+        """Re-read + repaint the chips bar for the given session.
+
+        Cheap to call after any classification mutation -- the store
+        lookups are indexed and the bar's render is one layout pass.
+        """
+        if self.classification is None:
+            self.window.session_view.set_classification(SessionClassification())
+            return
+        try:
+            cls = self.classification.classification_for_session(session_id)
+        except Exception:
+            log.exception("classification read failed for %s", session_id)
+            cls = SessionClassification()
+        self.window.session_view.set_classification(cls)
 
     # ---- session lifecycle handlers ---------------------------------------
 
@@ -1004,12 +1282,32 @@ class MainApp(QObject):
         if result.calendar_meeting is not None:
             self._align_created_at_to_meeting(session.id, result.calendar_meeting)
             self._seed_live_notes_from_meeting(session.id, result.calendar_meeting)
+        # Best-effort recurring-meeting series link from the title.
+        # Runs AFTER calendar seed so the seeded attendees flow into
+        # _sync_attendees_to_people on the first live_notes_changed.
+        self._auto_link_series_for_new_session(session.id, result.title)
         self._refresh_session_list(select=session.id)
 
     def _seed_live_notes_from_meeting(
         self, session_id: str, info: MeetingInfo
     ) -> None:
-        attendee_names = [a.display for a in info.attendees if a.display]
+        """Seed My Notes with the calendar invite's attendees + body.
+
+        Phase 2 enhancement: for attendees that only carry an email
+        (no display name), try to resolve via Contact email aliases.
+        Hit -> seed the canonical Contact display_name instead of
+        the raw email. Miss -> register the email as a stub Contact
+        + email alias so future invites with that email resolve
+        cleanly.
+
+        Issue #29: also pull file attachments off the MeetingItem
+        and stash them in the session's AttachmentsStore.
+        """
+        attendee_names: list[str] = []
+        for a in info.attendees:
+            chosen = self._resolve_calendar_attendee_display(a)
+            if chosen:
+                attendee_names.append(chosen)
         try:
             TranscriptStore(session_id).save_live_notes(
                 seed_body_with_calendar(
@@ -1018,6 +1316,145 @@ class MainApp(QObject):
             )
         except OSError:
             log.exception("failed to seed live notes from calendar")
+        # Pull calendar attachments (issue #29). Off-Windows / no
+        # pywin32 -> pull_attachments_to_temp returns []. Errors
+        # during save are logged + swallowed; the session is still
+        # usable without the attachments.
+        if info.attachments:
+            try:
+                from .integrations.outlook_calendar import pull_attachments_to_temp  # noqa: PLC0415
+                from .models.attachments import (  # noqa: PLC0415
+                    AttachmentsStore, SOURCE_CALENDAR,
+                )
+                tmp_paths = pull_attachments_to_temp(info.entry_id)
+                if tmp_paths:
+                    store = AttachmentsStore(session_id)
+                    for p in tmp_paths:
+                        try:
+                            store.add_file(p, source=SOURCE_CALENDAR)
+                        except Exception:
+                            log.exception(
+                                "calendar attachment import failed for %s", p,
+                            )
+                    # Bug fix: pre-convert Office attachments to PDF
+                    # in the background so previews are warm by the
+                    # time the user clicks them. Manual adds get the
+                    # same treatment via AttachmentsTab's progress-
+                    # dialog worker; calendar adds happen during
+                    # session creation without a dialog, so we run
+                    # silently in the background.
+                    self._spawn_background_office_preconvert(session_id)
+            except Exception:
+                log.exception(
+                    "calendar attachment pull failed for %s", session_id,
+                )
+
+    def _spawn_background_office_preconvert(self, session_id: str) -> None:
+        """Scan the session's attachments for Office files and run
+        COM conversion silently on a background thread. Pre-warms
+        the office_preview cache so the user's first click on each
+        attachment shows the preview instantly.
+
+        No progress dialog: this typically completes before the
+        user even reaches the Attachments tab. If they click an
+        Office attachment before conversion completes, the
+        preview pane's existing 'Converting...' flow handles it.
+
+        Uses threading.Thread (not QThread) because this is pure
+        fire-and-forget background work: no Qt signals, no UI
+        updates, no lifetime tracking. The earlier QThread version
+        crashed with 'QThread: Destroyed while thread is still
+        running' when the deleteLater queued from finished raced
+        ahead of Qt's internal isRunning() cleanup. convert_office_
+        to_pdf does its own pythoncom.CoInitialize per call, so
+        it's safe to run from a non-Qt thread.
+        """
+        import threading  # noqa: PLC0415
+
+        from .models.attachments import AttachmentsStore  # noqa: PLC0415
+        from .utils.office_preview import (  # noqa: PLC0415
+            convert_office_to_pdf,
+            is_office_extension,
+        )
+
+        try:
+            store = AttachmentsStore(session_id)
+            office_paths: list = []
+            for rec in store.list():
+                ext = Path(rec.stored_name).suffix.lower().lstrip(".")
+                if not is_office_extension(ext):
+                    continue
+                p = store.file_path(rec.id)
+                if p is not None:
+                    office_paths.append(p)
+            if not office_paths:
+                return
+
+            def _run() -> None:
+                for p in office_paths:
+                    try:
+                        convert_office_to_pdf(p)
+                    except Exception:
+                        log.exception(
+                            "background Office pre-convert failed for %s",
+                            p,
+                        )
+
+            thread = threading.Thread(
+                target=_run,
+                name=f"office-preconvert-{session_id[:8]}",
+                daemon=True,
+            )
+            thread.start()
+            log.info(
+                "spawned background Office pre-convert for %d file(s) in %s",
+                len(office_paths), session_id,
+            )
+        except Exception:
+            log.exception(
+                "background Office pre-convert spawn failed for %s",
+                session_id,
+            )
+
+    def _resolve_calendar_attendee_display(self, attendee) -> str:
+        """Pick the best display string for one calendar attendee.
+
+        Order of preference:
+        1. Attendee.name (if present) -- the calendar already had
+           a friendly name; use it as-is.
+        2. Email alias hit in Contacts -- use the Contact's
+           canonical display_name.
+        3. Stub-create a Contact named after the email local-part,
+           register the email as an alias, use the local-part.
+        4. Whatever attendee.display falls back to (raw email or
+           "(unknown)").
+        """
+        # Step 1: explicit name.
+        name = (getattr(attendee, "name", "") or "").strip()
+        if name:
+            return name
+        # Step 2 + 3: email-driven resolution.
+        email = (getattr(attendee, "email", "") or "").strip()
+        if email and self.classification is not None:
+            try:
+                from .utils.contact_resolution import (  # noqa: PLC0415
+                    display_name_for_email, resolve_attendee_email,
+                )
+                hit = display_name_for_email(self.classification, email)
+                if hit:
+                    return hit
+                # Stub-create so the next invite resolves silently.
+                result = resolve_attendee_email(
+                    self.classification, email,
+                )
+                if result is not None:
+                    return result.contact.display_name
+            except Exception:
+                log.exception(
+                    "calendar email resolution failed for %r", email,
+                )
+        # Step 4: fall back to the existing display logic.
+        return getattr(attendee, "display", "") or email or ""
 
     def _align_created_at_to_meeting(
         self, session_id: str, info: MeetingInfo
@@ -1176,6 +1613,12 @@ class MainApp(QObject):
         sv = self.window.session_view
         if sv._session is not None and sv._session.id == session_id:
             sv.set_attendee_names(parse_attendees(body))
+        # Mirror attendees into the classification People set so the
+        # chips bar shows them and they're available as a filter.
+        self._sync_attendees_to_people(session_id, body)
+        if sv._session is not None and sv._session.id == session_id:
+            self._refresh_session_classification(session_id)
+            self._refresh_classification_choices()
 
     def _on_speaker_tags_changed(self, session_id: str, counts: dict[str, int]) -> None:
         sv = self.window.session_view
@@ -1195,8 +1638,17 @@ class MainApp(QObject):
             session = self.store.get_session(session_id)
             if session is not None and not session.has_notes and body.strip():
                 self.store.update_session(session_id, has_notes=True)
+            self._reindex_search_for(session_id)
         except OSError:
             log.exception("failed to save synthesis notes for %s", session_id)
+            return
+        # Refresh classification topic suggestions from the new body
+        # and repaint the chips. Already-accepted topics survive.
+        self._extract_topics_for_session(session_id, body)
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            self._refresh_session_classification(session_id)
+            self._refresh_classification_choices()
 
     # ---- speaker refinement + labeling -------------------------------------
 
@@ -1368,6 +1820,11 @@ class MainApp(QObject):
                 )
             labeled.append(new_seg)
         store.write_segments(labeled)
+        # Transcript finalized -- push it into the search index now so
+        # the user can search the meeting they just finished. The
+        # periodic stale-scan would catch this in <=30s anyway; the
+        # explicit call shortens the window to ~immediately.
+        self._reindex_search_for(session_id)
 
     def _read_transcript_segments(self, session_id: str) -> list[TranscriptSegment]:
         """Parse raw.transcript.md back into TranscriptSegments.
@@ -1538,6 +1995,9 @@ class MainApp(QObject):
             return
         archive_path = store.save_notes(body, archive_existing=dialog.archive_existing)
         self.store.update_session(session_id, has_notes=True)
+        self._reindex_search_for(session_id)
+        # Fresh synthesis -> fresh topic suggestions.
+        self._extract_topics_for_session(session_id, body)
         self._on_session_selected(session_id)
         if archive_path:
             self.window.status(f"Notes saved. Prior notes archived to {archive_path.name}", timeout_ms=8000)
@@ -1963,6 +2423,13 @@ class MainApp(QObject):
                 "No recording on disk for this session.", timeout_ms=5000,
             )
             return
+        # If the user has marked highlights, ask whether to export
+        # the full session or just the highlights. No highlights ->
+        # silent fallthrough to full-session export (original
+        # behavior unchanged).
+        highlight_mode = self._prompt_highlights_or_full(session_id)
+        if highlight_mode is None:
+            return  # user cancelled
         session = self.store.get_session(session_id)
         title = session.title if session is not None else "session"
 
@@ -2019,7 +2486,13 @@ class MainApp(QObject):
         progress.setAutoReset(True)
         progress.setCancelButton(None)
 
-        worker = _AudioExportWorker(mic_path, sys_path, target)
+        if highlight_mode == "highlights":
+            highlights = self._session_highlights(session_id).sorted_by_start()
+            worker = _HighlightAudioExportWorker(
+                mic_path, sys_path, highlights, target,
+            )
+        else:
+            worker = _AudioExportWorker(mic_path, sys_path, target)
 
         def on_done(err_msg: str) -> None:
             progress.cancel()
@@ -2033,6 +2506,17 @@ class MainApp(QObject):
                 self.window.status(
                     f"Exported recording to {target.name}", timeout_ms=5000,
                 )
+            # wait() before deleteLater() closes a PyQt race: the
+            # finished_with_result signal is emitted from run() but
+            # the OS thread isn't guaranteed to be joined yet when
+            # the queued slot fires on the main thread. If we call
+            # deleteLater() while isRunning() is still True, Qt's
+            # destructor (when it runs at the next event loop tick)
+            # logs "QThread: Destroyed while thread '...' is still
+            # running" and the process can crash. wait() blocks the
+            # main thread for at most a few ms (the worker already
+            # returned from run()) and guarantees the join.
+            worker.wait()
             worker.deleteLater()
 
         worker.finished_with_result.connect(on_done)
@@ -2071,6 +2555,10 @@ class MainApp(QObject):
             self.window.status(
                 "Session metadata missing; cannot export.", timeout_ms=5000,
             )
+            return
+        # Highlights present -> ask Full or Highlights-only.
+        highlight_mode = self._prompt_highlights_or_full(session_id)
+        if highlight_mode is None:
             return
         title = session.title
 
@@ -2111,9 +2599,25 @@ class MainApp(QObject):
         progress.setCancelButton(None)
         progress.setValue(0)
 
-        worker = _VideoExportWorker(
-            mic_path, sys_path, offsets, transcript_text, target,
-        )
+        if highlight_mode == "highlights":
+            highlights = self._session_highlights(session_id).sorted_by_start()
+            # Pass session.title + session.started_at so the export
+            # can prepend an initial session-title card carrying
+            # the title on line 1 and "Recorded on YYYY-MM-DD HH:MM"
+            # on line 2. Falls back to created_at when the session
+            # was never recorded -- structurally impossible to have
+            # highlights without a recording, but cheap to guard.
+            started_at_iso = session.started_at or session.created_at or ""
+            worker = _HighlightVideoExportWorker(
+                mic_path, sys_path, offsets, transcript_text,
+                highlights, target,
+                session_title=session.title,
+                session_started_at_iso=started_at_iso,
+            )
+        else:
+            worker = _VideoExportWorker(
+                mic_path, sys_path, offsets, transcript_text, target,
+            )
 
         def on_progress(pct: int) -> None:
             progress.setValue(pct)
@@ -2130,6 +2634,247 @@ class MainApp(QObject):
                 self.window.status(
                     f"Exported video to {target.name}", timeout_ms=5000,
                 )
+            worker.wait()  # see comment in _on_export_mixed_audio
+            worker.deleteLater()
+
+        worker.progress_changed.connect(on_progress)
+        worker.finished_with_result.connect(on_done)
+        progress.show()
+        worker.start()
+
+    def _on_export_package(self, session_id: str) -> None:
+        """Full-session ZIP export (issue #30).
+
+        Builds an archive containing PDFs of My Notes + Synthesis,
+        plaintext transcript, MP3 audio, MP4 video (if screenshots
+        exist), all attachments, and all screenshots. When highlights
+        exist, prompts once for Full / Highlights-only / Both.
+        """
+        import tempfile  # noqa: PLC0415
+        from datetime import datetime  # noqa: PLC0415
+
+        from PyQt6.QtWidgets import (  # noqa: PLC0415
+            QFileDialog, QMessageBox, QProgressDialog,
+        )
+        from .models.attachments import AttachmentsStore  # noqa: PLC0415
+        from .models.highlights import HighlightsStore  # noqa: PLC0415
+        from .models.transcript import TranscriptStore  # noqa: PLC0415
+        from .screencap.timestamps import screenshot_offsets  # noqa: PLC0415
+        from .utils.export_package import (  # noqa: PLC0415
+            HIGHLIGHTS_MODE_BOTH,
+            HIGHLIGHTS_MODE_FULL,
+            HIGHLIGHTS_MODE_HIGHLIGHTS,
+            PackageOptions,
+            default_package_filename,
+            render_session_pdf,
+        )
+        from .utils.paths import (  # noqa: PLC0415
+            list_screenshots, session_audio_files, session_dir,
+        )
+
+        session = self.store.get_session(session_id)
+        if session is None:
+            return
+
+        # Pre-flight: ask about highlights mode when applicable.
+        highlights = []
+        try:
+            highlights = HighlightsStore(session_id).load().sorted_by_start()
+        except Exception:
+            highlights = []
+        if highlights:
+            dialog = QMessageBox(self.window)
+            dialog.setWindowTitle("Export full session")
+            dialog.setText(
+                f"This session has {len(highlights)} highlight(s). For "
+                "the audio + video files, export:"
+            )
+            full_btn = dialog.addButton(
+                "Full recording only", QMessageBox.ButtonRole.AcceptRole,
+            )
+            high_btn = dialog.addButton(
+                "Highlights only", QMessageBox.ButtonRole.AcceptRole,
+            )
+            both_btn = dialog.addButton(
+                "Both", QMessageBox.ButtonRole.AcceptRole,
+            )
+            cancel_btn = dialog.addButton(QMessageBox.StandardButton.Cancel)
+            dialog.setDefaultButton(both_btn)
+            dialog.exec()
+            clicked = dialog.clickedButton()
+            if clicked is cancel_btn:
+                return
+            elif clicked is full_btn:
+                highlights_mode = HIGHLIGHTS_MODE_FULL
+            elif clicked is high_btn:
+                highlights_mode = HIGHLIGHTS_MODE_HIGHLIGHTS
+            else:
+                highlights_mode = HIGHLIGHTS_MODE_BOTH
+        else:
+            highlights_mode = HIGHLIGHTS_MODE_FULL
+
+        # Save dialog with suggested filename.
+        suggested = default_package_filename(
+            session.title or "session",
+            session.started_at or session.created_at or "",
+        )
+        suggested_path = str(Path.home() / "Documents" / suggested)
+        path_str, _ = QFileDialog.getSaveFileName(
+            self.window, "Export full session",
+            suggested_path,
+            "ZIP archive (*.zip)",
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        if target.suffix.lower() != ".zip":
+            target = target.with_suffix(".zip")
+
+        # Gather inputs.
+        store = TranscriptStore(session_id)
+        notes_md = ""
+        synthesis_md = ""
+        transcript_text = ""
+        try:
+            notes_md = store.read_live_notes()
+        except OSError:
+            log.exception("notes read failed for %s", session_id)
+        try:
+            synthesis_md = store.read_notes()
+        except OSError:
+            log.exception("synthesis read failed for %s", session_id)
+        try:
+            transcript_text = store.read_transcript()
+        except OSError:
+            log.exception("transcript read failed for %s", session_id)
+
+        audio_files = session_audio_files(session_id)
+        mic_path = next(
+            (p for p in audio_files if p.stem == "mic"), None,
+        )
+        sys_path = next(
+            (p for p in audio_files if p.stem == "sys"), None,
+        )
+        screenshots = screenshot_offsets(
+            list_screenshots(session_id), session.started_at or "",
+        )
+
+        # Attachments -- copy the file + display name pairs into the
+        # orchestrator. The display name lands as the on-disk
+        # filename in the package, with FS-safe normalization.
+        attachments_pairs: list[tuple[Path, str]] = []
+        try:
+            attach_store = AttachmentsStore(session_id)
+            for rec in attach_store.list():
+                path = attach_store.file_path(rec.id)
+                if path is not None:
+                    attachments_pairs.append((path, rec.display_name))
+        except Exception:
+            log.exception("attachments enumerate failed for %s", session_id)
+
+        # Pre-render the two PDFs on the main thread (Bug fix):
+        # QTextDocument + QPrinter are GUI classes; cross-thread use
+        # produced spurious dialog flashes after the worker finished
+        # and the PDFs themselves rendered with the wrong font size
+        # vs. the in-app Export PDF button. Doing the render here
+        # uses the same PrintTextDocument path the user sees in the
+        # in-app Export PDF and keeps everything on the main thread.
+        pdf_temp_dir = Path(tempfile.mkdtemp(prefix="mtn-export-pdfs-"))
+        session_when = None
+        try:
+            session_when = datetime.fromisoformat(
+                (session.created_at or "").replace("Z", "+00:00")
+            ).astimezone()
+        except ValueError:
+            session_when = None
+        sdir = session_dir(session_id)
+        notes_pdf_path = None
+        synthesis_pdf_path = None
+        try:
+            if notes_md.strip():
+                notes_pdf_path = pdf_temp_dir / "my-notes.pdf"
+                render_session_pdf(
+                    notes_md,
+                    dst=notes_pdf_path,
+                    base_dir=sdir,
+                    session_title=session.title or "session",
+                    tab_label="My Notes",
+                    session_date=session_when,
+                )
+            if synthesis_md.strip():
+                synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
+                render_session_pdf(
+                    synthesis_md,
+                    dst=synthesis_pdf_path,
+                    base_dir=sdir,
+                    session_title=session.title or "session",
+                    tab_label="Synthesis",
+                    session_date=session_when,
+                )
+        except Exception:
+            log.exception("PDF pre-render failed for %s", session_id)
+
+        options = PackageOptions(
+            session_id=session_id,
+            session_title=session.title or "session",
+            session_started_at_iso=session.started_at or session.created_at or "",
+            mic_path=mic_path,
+            sys_path=sys_path,
+            screenshots=screenshots,
+            transcript_text=transcript_text,
+            notes_pdf_path=notes_pdf_path,
+            synthesis_pdf_path=synthesis_pdf_path,
+            attachments=attachments_pairs,
+            highlights=highlights,
+            highlights_mode=highlights_mode,
+        )
+
+        # Worker thread with determinate progress.
+        progress = QProgressDialog(
+            f"Building {target.name}...", None, 0, 100, self.window,
+        )
+        progress.setWindowTitle("Export full session")
+        progress.setMinimumDuration(0)
+        # setAutoClose + setAutoReset together caused stuttering on
+        # 100 (close + reset + setValue updates). Manage closing
+        # explicitly in on_done.
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setCancelButton(None)
+        progress.setValue(0)
+
+        worker = _ExportPackageWorker(options, target)
+
+        def on_progress(pct: int) -> None:
+            progress.setValue(pct)
+
+        def on_done(err_msg: str) -> None:
+            # Close the dialog before showing any follow-up message
+            # so we never have two top-level QDialogs visible at the
+            # same time (cause of the 'multiple flashing dialogs'
+            # bug Aaron caught -- combining autoClose + autoReset
+            # with an immediate post-close QMessageBox produced
+            # transient ghost windows).
+            progress.close()
+            # Clean up the temp PDF dir; it's cheap to keep but
+            # we're disciplined about temp leaks.
+            try:
+                import shutil
+                shutil.rmtree(pdf_temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            if err_msg:
+                log.error("export_package failed: %s", err_msg)
+                QMessageBox.warning(
+                    self.window, "Export full session",
+                    f"Could not build the export package:\n\n{err_msg}",
+                )
+            else:
+                self.window.status(
+                    f"Exported full session to {target.name}",
+                    timeout_ms=5000,
+                )
+            worker.wait()  # see comment in _on_export_mixed_audio
             worker.deleteLater()
 
         worker.progress_changed.connect(on_progress)
@@ -2168,6 +2913,24 @@ class MainApp(QObject):
                 shutil.rmtree(session_dir(sid), ignore_errors=True)
             except OSError:
                 log.exception("failed to remove session dir for %s", sid)
+        # Drop the deleted sessions out of the search index BEFORE the
+        # store delete; the FTS5 store doesn't know about the SQL
+        # cascade but a stale row would surface in the next search
+        # until the periodic catch-up scan ran.
+        if self.search_index is not None:
+            for sid in session_ids:
+                try:
+                    self.search_index.remove_session(sid)
+                except Exception:
+                    log.exception("search remove failed for %s", sid)
+        # Classification associations live in a separate DB; same
+        # explicit cleanup pattern.
+        if self.classification is not None:
+            for sid in session_ids:
+                try:
+                    self.classification.remove_session(sid)
+                except Exception:
+                    log.exception("classification remove failed for %s", sid)
         removed = self.store.delete_sessions(session_ids)
         self._refresh_session_list()
         self.window.session_view.set_session(None, transcript="", notes="", previous_notes_paths=[])
@@ -2175,6 +2938,504 @@ class MainApp(QObject):
             self._audio_player.close()
             self._player_loaded_session_id = None
         self.window.status(f"Deleted {removed} session(s)", timeout_ms=5000)
+
+    # ---- search ------------------------------------------------------------
+
+    def _reindex_search_for(self, session_id: str) -> None:
+        """Trigger a one-off reindex for a specific session.
+
+        Cheap to call from any save site: the indexer fingerprints
+        the four content files and no-ops when nothing changed.
+        Any exception is swallowed -- search is an enhancement, not
+        load-bearing for transcription / synthesis.
+        """
+        if not session_id or self.search_index is None:
+            return
+        try:
+            from .utils.search_indexer import reindex_session
+            reindex_session(self.search_index, session_id)
+        except Exception:
+            log.exception("search reindex failed for %s", session_id)
+
+    def _scan_search_index_stale(self) -> None:
+        """30s periodic sweep: re-index any session whose on-disk
+        fingerprint differs from the index. Catches paths that didn't
+        get an explicit _reindex_search_for hook."""
+        if self.search_index is None:
+            return
+        try:
+            from .utils.search_indexer import reindex_session
+            for s in self.store.list_sessions():
+                reindex_session(self.search_index, s.id)
+        except Exception:
+            log.exception("search stale-scan failed")
+
+    def _search_index_startup_scan(self) -> None:
+        """Initial pass after launch: catch any edits made offline."""
+        if self.search_index is None:
+            return
+        try:
+            from .utils.search_indexer import reindex_session
+            for s in self.store.list_sessions():
+                reindex_session(self.search_index, s.id)
+            log.info("search index startup scan complete")
+        except Exception:
+            log.exception("search startup scan failed")
+
+    def _session_summary_for_search(self, session_id: str) -> Optional[SessionSummary]:
+        """Adapter for the search dialog's session_lookup parameter."""
+        s = self.store.get_session(session_id)
+        if s is None:
+            return None
+        return SessionSummary(
+            session_id=s.id, title=s.title, created_at=s.created_at,
+        )
+
+    def _on_open_search(self) -> None:
+        """Ctrl+Shift+F handler: surface the cross-session search
+        dialog, creating it on first use. Subsequent opens reuse the
+        same dialog so the user's query + results aren't wiped when
+        they Cmd+Tab away."""
+        if self.search_index is None:
+            QMessageBox.warning(
+                self.window, "Search unavailable",
+                "Could not open the search index. Try Help > Debug > "
+                "Rebuild Search Index, or check the log for an "
+                "underlying SQLite error.",
+            )
+            return
+        if self._search_dialog is None:
+            self._search_dialog = SearchDialog(
+                self.search_index,
+                self._session_summary_for_search,
+                parent=self.window,
+            )
+            self._search_dialog.result_chosen.connect(self._on_search_result_chosen)
+        self._search_dialog.show()
+        self._search_dialog.raise_()
+        self._search_dialog.activateWindow()
+        self._search_dialog.focus_input()
+
+    def _on_search_result_chosen(
+        self, session_id: str, source: str, archive_name: object,
+    ) -> None:
+        """User double-clicked a hit -- select the session + drill
+        into the matching tab. archive_name is a str only when the
+        hit came from a notes archive file; None otherwise."""
+        self.window.select_session(session_id)
+        # select_session emits session_selected which already loads
+        # the session into the view. Now switch to the right tab.
+        tab_id = {
+            "transcript":    "transcript",
+            "live_notes":    "live_notes",
+            "notes":         "notes",
+            "notes_archive": "previous",
+        }.get(source)
+        if tab_id is None:
+            return
+        archive_str = archive_name if isinstance(archive_name, str) else None
+        self.window.session_view.set_active_tab(tab_id, archive_str)
+
+    def _on_rebuild_search_index(self) -> None:
+        """Help > Debug > Rebuild Search Index. Wipes search.db and
+        re-indexes every session from disk. Synchronous with a
+        QProgressDialog so the user can watch + cancel."""
+        if self.search_index is None:
+            # Try to re-open in case the prior open failed.
+            try:
+                self.search_index = SearchIndex()
+            except Exception:
+                QMessageBox.critical(
+                    self.window, "Rebuild failed",
+                    "Could not open the search index file. See log for details.",
+                )
+                return
+        confirm = QMessageBox.question(
+            self.window, "Rebuild search index?",
+            "This drops the existing search index and re-reads every "
+            "session's transcript, notes, and archived notes from "
+            "disk. Safe to do anytime -- usually only needed after "
+            "a corrupt write or moving the data directory.\n\n"
+            "Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from .utils.search_indexer import rebuild_all
+            ids = [s.id for s in self.store.list_sessions()]
+            done = rebuild_all(self.search_index, ids)
+            self.window.status(
+                f"Rebuilt search index ({done} session(s)).",
+                timeout_ms=5000,
+            )
+        except Exception:
+            log.exception("Rebuild search index failed")
+            QMessageBox.critical(
+                self.window, "Rebuild failed",
+                "An error occurred while rebuilding the search index. "
+                "See the log for details.",
+            )
+
+    # ---- classification -----------------------------------------------------
+
+    def _migrate_speakers_to_contacts(self) -> None:
+        """Link every existing SpeakerStore row to a Contact.
+
+        Runs once at launch (cheap when there's nothing to link).
+        For each speaker without a contact_id:
+        * Unique Contact alias hit on the speaker's name -> link.
+        * No match -> create a new Contact named after the speaker,
+          with the speaker's name as a `name`-kind alias sourced
+          from `diarization`.
+        * Multiple matches -> create a new Contact rather than
+          guess; the Address Book's suggested-merges surface lets
+          the user pick later.
+
+        Idempotent: a second run is a no-op since speakers gain
+        contact_id on first link.
+        """
+        if self.classification is None:
+            return
+        from .models.classification import (  # noqa: PLC0415
+            ALIAS_KIND_NAME, SOURCE_DIARIZATION,
+        )
+        speaker_store = open_speaker_store()
+        try:
+            unlinked = speaker_store.list_unlinked()
+            for speaker in unlinked:
+                name = (speaker.name or "").strip()
+                if not name:
+                    continue
+                matches = self.classification.find_contacts_by_alias(name)
+                if len(matches) == 1:
+                    contact = matches[0]
+                elif not matches:
+                    contact = self.classification.create_contact(
+                        name, initial_alias_source=SOURCE_DIARIZATION,
+                    )
+                else:
+                    # Ambiguous -- create a new Contact; suggested
+                    # merges in Address Book will surface the
+                    # collision.
+                    contact = self.classification.create_contact(
+                        name, initial_alias_source=SOURCE_DIARIZATION,
+                    )
+                speaker_store.set_contact_id(name, contact.id)
+            if unlinked:
+                log.info(
+                    "speakers -> contacts migration linked %d speaker(s)",
+                    len(unlinked),
+                )
+        finally:
+            speaker_store.close()
+
+    def _auto_link_series_for_new_session(self, session_id: str, title: str) -> None:
+        """Best-effort: fuzzy-match the title against known series + link.
+
+        Called from _on_new_session and the calendar-creation path
+        after the session row exists. Silent on no-match -- the
+        chips bar will show "Series: (none)" and the user can pick
+        one manually.
+        """
+        if self.classification is None or not title.strip():
+            return
+        try:
+            series = self.classification.find_series_for_title(title)
+            if series is not None:
+                self.classification.assign_series(session_id, series.id)
+        except Exception:
+            log.exception("series auto-link failed for %s", session_id)
+
+    def _sync_attendees_to_people(self, session_id: str, body: str) -> None:
+        """Mirror the live notes' # Attendees list into the session's
+        Contact links.
+
+        Resolution is smart (issue #28): each typed name routes through
+        resolve_attendees_batch which:
+        * Unique alias match -> link to existing Contact, register
+          the typed form as a `name` alias if new.
+        * No match -> create new Contact.
+        * Ambiguous -> create new Contact AND surface the conflict
+          via the Address Book's suggested-merges section so the
+          user can resolve deliberately.
+
+        The hot path stays modal-free; ambiguity prompts wait for an
+        explicit Address Book visit.
+        """
+        if self.classification is None:
+            return
+        try:
+            names = parse_attendees(body or "")
+            contacts = resolve_attendees_batch(
+                self.classification, names, source=SOURCE_ATTENDEE_LIST,
+            )
+            self.classification.replace_session_attendee_contacts(
+                session_id, [c.id for c in contacts],
+            )
+        except Exception:
+            log.exception("attendee sync failed for %s", session_id)
+
+    def _extract_topics_for_session(self, session_id: str, body: str) -> None:
+        """Run the deterministic extractor over synthesis text + push
+        suggestions into the classification store.
+
+        Already-accepted topics survive the replace; only previously-
+        unaccepted auto-suggestions get refreshed.
+
+        Stopword strategy: tokenize every known person's display
+        name AND this session's parsed attendees, adding every
+        token (>= 2 chars) to the stopword set. Names usually
+        appear in synthesis text by first name alone -- "Alice
+        said..." rather than "Alice Smith said..." -- so just
+        passing display_names misses the noise. Catches first,
+        middle, last names alike. Case-insensitive comparison is
+        done inside extract_topics so we don't need to pre-fold
+        case here.
+        """
+        if self.classification is None:
+            return
+        try:
+            stopwords: set[str] = set()
+            # Every known person (across all sessions, not just
+            # this one) gets their full name + every name token
+            # added. A "Bob" surfacing in this synthesis because
+            # he was mentioned in a different meeting still gets
+            # suppressed.
+            for person in self.classification.list_contacts():
+                name = (person.display_name or "").strip()
+                if not name:
+                    continue
+                stopwords.add(name)
+                for tok in name.split():
+                    if len(tok) >= 2:
+                        stopwords.add(tok)
+            # Also pull from this session's live-notes attendees in
+            # case some haven't made it into the people store yet
+            # (e.g. typed but the live_notes save hasn't fired the
+            # attendee sync this cycle).
+            try:
+                live = TranscriptStore(session_id).read_live_notes()
+                for name in parse_attendees(live or ""):
+                    name = (name or "").strip()
+                    if not name:
+                        continue
+                    stopwords.add(name)
+                    for tok in name.split():
+                        if len(tok) >= 2:
+                            stopwords.add(tok)
+            except Exception:
+                log.exception(
+                    "attendee read for stopword build failed for %s", session_id,
+                )
+            suggestions = extract_topics(
+                body or "", extra_stopwords=stopwords,
+            )
+            self.classification.replace_session_topic_suggestions(
+                session_id, suggestions,
+            )
+        except Exception:
+            log.exception("topic extraction failed for %s", session_id)
+
+    def _on_manage_series(self) -> None:
+        """Legacy menu entry (kept for back-compat). Opens the
+        full Manage Classification dialog (Series + Topics tabs)
+        landing on the Series tab."""
+        self._on_manage_classification(initial_tab="series")
+
+    def _on_manage_classification(
+        self, _checked: bool = False, *, initial_tab: str = "series",
+    ) -> None:
+        """File > Manage Classification. Tabbed dialog (Series +
+        Topics) over the ClassificationStore. People moved to the
+        Address Book in Phase 2 -- see _on_address_book."""
+        if self.classification is None:
+            QMessageBox.warning(
+                self.window, "Manage Classification",
+                "Classification store unavailable. See log for details.",
+            )
+            return
+        dialog = ManageClassificationDialog(
+            self.classification, parent=self.window,
+        )
+        if initial_tab == "topics":
+            dialog._tabs.setCurrentIndex(1)  # noqa: SLF001
+        dialog.exec()
+        self._refresh_session_list()
+        sv = self.window.session_view
+        if sv._session is not None:
+            self._refresh_session_classification(sv._session.id)
+
+    def _on_address_book(self) -> None:
+        """File > Address Book. Manages Contacts (the master
+        identity behind People + Speakers). On close, refresh
+        navigator + chips bar + the speakers manage dialog (if
+        open) won't auto-refresh -- it's typically closed before
+        reaching here."""
+        if self.classification is None:
+            QMessageBox.warning(
+                self.window, "Address Book",
+                "Classification store unavailable. See log for details.",
+            )
+            return
+        speaker_store = open_speaker_store()
+        try:
+            dialog = AddressBookDialog(
+                self.classification, parent=self.window,
+                speaker_store=speaker_store,
+            )
+            dialog.exec()
+        finally:
+            speaker_store.close()
+        self._refresh_session_list()
+        sv = self.window.session_view
+        if sv._session is not None:
+            self._refresh_session_classification(sv._session.id)
+
+    def _on_classification_filter_changed(self, view: str, value_id) -> None:
+        self._classification_filter_view = view
+        # value_id is int | None; the navigator emits None when "All"
+        # is active or when a By_X view has no value picked.
+        self._classification_filter_value = (
+            int(value_id) if isinstance(value_id, int) else None
+        )
+        self._refresh_session_list()
+
+    def _on_add_topic_requested(self, session_id: str, name: str) -> None:
+        if self.classification is None or not name:
+            return
+        try:
+            topic = self.classification.get_or_create_topic(name)
+            self.classification.add_session_topic(
+                session_id, topic.id, source=SOURCE_MANUAL, accepted=True,
+            )
+        except Exception:
+            log.exception("add_topic failed for %s/%s", session_id, name)
+        self._refresh_session_classification(session_id)
+        self._refresh_classification_choices()
+
+    def _on_remove_topic_requested(self, session_id: str, topic_id: int) -> None:
+        if self.classification is None:
+            return
+        try:
+            self.classification.remove_session_topic(session_id, topic_id)
+        except Exception:
+            log.exception("remove_topic failed for %s/%s", session_id, topic_id)
+        self._refresh_session_classification(session_id)
+
+    def _on_accept_topic_requested(self, session_id: str, topic_id: int) -> None:
+        if self.classification is None:
+            return
+        try:
+            self.classification.set_topic_accepted(session_id, topic_id, True)
+        except Exception:
+            log.exception("accept_topic failed for %s/%s", session_id, topic_id)
+        self._refresh_session_classification(session_id)
+
+    def _on_add_person_requested(self, session_id: str, name: str) -> None:
+        if self.classification is None or not name:
+            return
+        try:
+            # Manual chip-bar add: same smart resolution as the
+            # attendee-sync path so a typed "BS" hits the Bob Smith
+            # Contact via its alias rather than creating a new
+            # "BS" Contact.
+            from .utils.contact_resolution import resolve_attendee_text  # noqa: PLC0415
+            result = resolve_attendee_text(
+                self.classification, name, source=SOURCE_MANUAL,
+            )
+            if result is not None:
+                self.classification.add_session_contact(
+                    session_id, result.contact.id, source=SOURCE_MANUAL,
+                )
+        except Exception:
+            log.exception("add_person failed for %s/%s", session_id, name)
+        self._refresh_session_classification(session_id)
+        self._refresh_classification_choices()
+
+    def _on_remove_person_requested(self, session_id: str, person_id: int) -> None:
+        if self.classification is None:
+            return
+        try:
+            self.classification.remove_session_contact(session_id, person_id)
+        except Exception:
+            log.exception("remove_person failed for %s/%s", session_id, person_id)
+        self._refresh_session_classification(session_id)
+
+    def _on_set_series_requested(self, session_id: str, series_name: str) -> None:
+        if self.classification is None:
+            return
+        try:
+            if not series_name.strip():
+                # Empty -> unfile.
+                self.classification.assign_series(session_id, None)
+            else:
+                series = self.classification.get_or_create_series(series_name)
+                self.classification.assign_series(session_id, series.id)
+        except Exception:
+            log.exception("set_series failed for %s/%s", session_id, series_name)
+        self._refresh_session_classification(session_id)
+        self._refresh_classification_choices()
+
+    # ---- highlights --------------------------------------------------------
+
+    def _on_session_highlights_changed(self, session_id: str, hs: HighlightSet) -> None:
+        """Persist the user's marker edits to highlights.json.
+
+        Synchronous (no debounce) -- highlight adds/removes are
+        infrequent (one click each) and the JSON file is tiny.
+        """
+        try:
+            HighlightsStore(session_id).save(hs)
+        except Exception:
+            log.exception("highlights save failed for %s", session_id)
+
+    def _session_highlights(self, session_id: str) -> HighlightSet:
+        try:
+            return HighlightsStore(session_id).load()
+        except Exception:
+            log.exception("highlights load failed for %s", session_id)
+            return HighlightSet()
+
+    def _prompt_highlights_or_full(self, session_id: str) -> Optional[str]:
+        """Ask the user "full session or highlights-only" when the
+        session has highlights. Returns:
+            "full"       -- export the full recording
+            "highlights" -- export the concatenated highlights
+            None         -- user cancelled
+
+        Sessions with no highlights short-circuit to "full" without
+        prompting.
+        """
+        try:
+            hs = self._session_highlights(session_id)
+        except Exception:
+            hs = HighlightSet()
+        if not hs.highlights:
+            return "full"
+        total_s = hs.total_duration_ms() // 1000
+        dialog = QMessageBox(self.window)
+        dialog.setWindowTitle("Export scope")
+        dialog.setText(
+            f"This session has {len(hs.highlights)} highlight(s) "
+            f"({total_s}s total). Export everything, or just the highlights?"
+        )
+        full_btn = dialog.addButton(
+            "Full session", QMessageBox.ButtonRole.AcceptRole,
+        )
+        highlights_btn = dialog.addButton(
+            "Highlights only", QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_btn = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(full_btn)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is full_btn:
+            return "full"
+        if clicked is highlights_btn:
+            return "highlights"
+        return None
 
     # ---- settings ---------------------------------------------------------
 
@@ -2232,6 +3493,7 @@ class MainApp(QObject):
             self.config,
             parent=self.window,
             ping_extension=self._ping_extension,
+            classification_store=self.classification,
         )
         accepted = dialog.exec() == dialog.DialogCode.Accepted
         # The Manage Speakers sub-dialog can mutate the store regardless
@@ -2842,6 +4104,7 @@ class _AudioExportWorker(QThread):
 
     def __init__(self, mic_path, sys_path, target) -> None:
         super().__init__()
+        self.setObjectName("AudioExportWorker")
         self._mic = mic_path
         self._sys = sys_path
         self._target = target
@@ -2872,6 +4135,7 @@ class _VideoExportWorker(QThread):
         self, mic_path, sys_path, screenshots, transcript_text, target,
     ) -> None:
         super().__init__()
+        self.setObjectName("VideoExportWorker")
         self._mic = mic_path
         self._sys = sys_path
         self._screenshots = screenshots
@@ -2888,6 +4152,99 @@ class _VideoExportWorker(QThread):
             )
             self.finished_with_result.emit("")
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
+            self.finished_with_result.emit(str(exc))
+
+
+class _HighlightAudioExportWorker(QThread):
+    """Run audio/highlights_export.export_highlights_audio off the GUI thread.
+
+    Mirrors _AudioExportWorker's signal shape -- empty string on
+    success, error message on failure.
+    """
+
+    progress_changed = pyqtSignal(int)
+    finished_with_result = pyqtSignal(str)
+
+    def __init__(self, mic_path, sys_path, highlights, target) -> None:
+        super().__init__()
+        self.setObjectName("HighlightAudioExportWorker")
+        self._mic = mic_path
+        self._sys = sys_path
+        self._highlights = highlights
+        self._target = target
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from .audio.highlights_export import export_highlights_audio  # noqa: PLC0415
+            export_highlights_audio(
+                self._mic, self._sys, self._highlights, self._target,
+                progress=self.progress_changed.emit,
+            )
+            self.finished_with_result.emit("")
+        except Exception as exc:  # noqa: BLE001
+            self.finished_with_result.emit(str(exc))
+
+
+class _HighlightVideoExportWorker(QThread):
+    """Run audio/highlights_export.export_highlights_video off the GUI thread."""
+
+    progress_changed = pyqtSignal(int)
+    finished_with_result = pyqtSignal(str)
+
+    def __init__(
+        self, mic_path, sys_path, screenshots, transcript_text,
+        highlights, target,
+        *,
+        session_title: str = "",
+        session_started_at_iso: str = "",
+    ) -> None:
+        super().__init__()
+        self.setObjectName("HighlightVideoExportWorker")
+        self._mic = mic_path
+        self._sys = sys_path
+        self._screenshots = screenshots
+        self._transcript_text = transcript_text
+        self._highlights = highlights
+        self._target = target
+        self._session_title = session_title
+        self._session_started_at_iso = session_started_at_iso
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from .audio.highlights_export import export_highlights_video  # noqa: PLC0415
+            export_highlights_video(
+                self._mic, self._sys, self._screenshots,
+                self._transcript_text, self._highlights, self._target,
+                session_title=self._session_title,
+                session_started_at_iso=self._session_started_at_iso,
+                progress=self.progress_changed.emit,
+            )
+            self.finished_with_result.emit("")
+        except Exception as exc:  # noqa: BLE001
+            self.finished_with_result.emit(str(exc))
+
+
+class _ExportPackageWorker(QThread):
+    """Run utils.export_package.build_session_package off the GUI thread."""
+
+    progress_changed = pyqtSignal(int)
+    finished_with_result = pyqtSignal(str)
+
+    def __init__(self, options, target_path) -> None:
+        super().__init__()
+        self.setObjectName("ExportPackageWorker")
+        self._options = options
+        self._target = target_path
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            from .utils.export_package import build_session_package  # noqa: PLC0415
+            build_session_package(
+                self._options, self._target,
+                progress=self.progress_changed.emit,
+            )
+            self.finished_with_result.emit("")
+        except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
 
 
