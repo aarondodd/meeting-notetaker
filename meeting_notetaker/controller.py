@@ -67,6 +67,83 @@ from .utils.vocabulary import derive_session_hotwords, join_hotwords, load_vocab
 log = logging.getLogger(__name__)
 
 
+def _retire_thread(thread: Optional[QThread]) -> None:
+    """Join an OS thread before destroying its QObject wrapper.
+
+    QThread.finished fires inside the run-wrapper BEFORE the OS thread
+    is joined. Calling deleteLater (or letting Python refcount drop)
+    races against that join and trips "QThread: Destroyed while thread
+    is still running" on Windows. Mirrors the helpers in
+    audio/player.py and ui/attachment_preview.py -- inlined here to
+    keep controller.py self-contained.
+
+    Safe to call with None (e.g., when proc_state.batch_thread was
+    never set because the session went straight to finalize).
+    """
+    if thread is None:
+        return
+    try:
+        thread.wait()
+    except Exception:
+        log.exception("controller: thread.wait() failed during retirement")
+    try:
+        thread.deleteLater()
+    except Exception:
+        log.exception("controller: thread.deleteLater() failed during retirement")
+
+
+class _RetainedAudioEncodeWorker(QThread):
+    """Re-encode mic.wav + sys.wav to the configured retain format on
+    a background thread (issue #45).
+
+    The encode itself (PyAV via audio.encode.encode_pair) is CPU-bound
+    and takes ~10 s for a 20-minute recording. Running it on the Qt
+    main thread inside `_finalize_session` froze the UI for the full
+    duration -- the watchdog caught it after the 750 ms threshold.
+
+    Emits exactly one of:
+    * `done()` -- encode completed (success OR caught failure).
+    * `failed(message)` -- only on a programming/IO error outside the
+      encode call itself; the path is kept narrow because the
+      individual-format failure path is already caught + logged
+      inside the worker.
+    """
+
+    done = pyqtSignal()
+    # Free-text status message the controller forwards to the app
+    # (e.g., "Audio retained as WAV (opus re-encode failed)").
+    status_message = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        mic_wav: Path,
+        sys_wav: Path,
+        fmt: str,
+    ) -> None:
+        super().__init__(None)
+        self._mic_wav = mic_wav
+        self._sys_wav = sys_wav
+        self._fmt = fmt
+
+    def run(self) -> None:
+        try:
+            from .audio.encode import encode_pair  # noqa: PLC0415
+            encode_pair(self._mic_wav, self._sys_wav, self._fmt)
+        except ImportError:
+            log.warning("PyAV not available; keeping WAVs in place")
+            self.status_message.emit(
+                "Audio retained as WAV (compressed encoder unavailable)."
+            )
+        except Exception:
+            log.exception("retained-audio re-encode failed (fmt=%s)", self._fmt)
+            self.status_message.emit(
+                f"Audio retained as WAV ({self._fmt} re-encode failed; see log)."
+            )
+        finally:
+            self.done.emit()
+
+
 class _BatchTranscribeThread(QThread):
     """Wraps batch_transcribe for the final-pass after stop().
 
@@ -282,6 +359,11 @@ class _ProcessingState:
     speaker_tags: list[SpeakerTag] = field(default_factory=list)
     batch_thread: Optional["_BatchTranscribeThread"] = None
     refinement_thread: Optional["_SpeakerRefinementThread"] = None
+    # Issue #45: opus / flac re-encode runs on a worker thread so the
+    # 10-second encode for a long recording doesn't freeze the UI at
+    # _finalize_session time. Held here so the worker survives until
+    # its finished signal fires.
+    encode_worker: Optional["_RetainedAudioEncodeWorker"] = None
 
 
 class SessionController(QObject):
@@ -308,6 +390,12 @@ class SessionController(QObject):
     speaker_tags_changed = pyqtSignal(str, dict)               # session_id, counts
     error = pyqtSignal(str)
     status = pyqtSignal(str)
+    # Non-fatal capture warning forwarded from the recorder (issue #44).
+    # The recording still succeeded; the trailing seconds of the WAV
+    # are silence because the device callback stalled before Stop.
+    # The app surfaces this as a status-bar message rather than an
+    # error dialog so the user keeps the session.
+    capture_warning = pyqtSignal(str, str)  # session_id, message
 
     def __init__(self, store: SessionStore, config: Config, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -410,7 +498,18 @@ class SessionController(QObject):
             audio_dir = session_audio_dir(session.id)
             self._mic_wav = audio_dir / "mic.wav"
             self._sys_wav = audio_dir / "sys.wav"
-            self._chunk_buffer = ChunkBuffer(sources=[MIC, SYS])
+            # Issue #47: the chunk_buffer is purely a scratchpad for
+            # LiveTranscriptionWorker.pop_window. In capture-only mode
+            # no worker is created so nothing drains it -- and the
+            # recorders' callbacks would still push into it, growing
+            # the underlying numpy array O(N) per write and starving
+            # the PortAudio capture callback at ~10-15 min in. Don't
+            # even allocate it when there's no consumer.
+            self._chunk_buffer = (
+                ChunkBuffer(sources=[MIC, SYS])
+                if not capture_only_effective
+                else None
+            )
 
             # Live transcription off if capture-only mode is on. The model is
             # expected to be already cached -- the app layer preloads it via a
@@ -446,6 +545,13 @@ class SessionController(QObject):
                 device_name=self.config.audio.mic_device_name,
             )
             self._mic_recorder.error.connect(self.error.emit)
+            # Non-fatal capture-stall warning (issue #44). Routed to a
+            # local handler that tags the message with the session id
+            # before emitting capture_warning.
+            mic_session_id = session.id
+            self._mic_recorder.capture_warning.connect(
+                lambda msg, sid=mic_session_id: self.capture_warning.emit(sid, msg)
+            )
             self._mic_recorder.start()
 
             # Loopback recorder (Windows only; fail soft if unavailable).
@@ -458,6 +564,13 @@ class SessionController(QObject):
                     device_name=self.config.audio.loopback_device_name,
                 )
                 self._loopback_recorder.error.connect(self.error.emit)
+                # Same shape as the mic path. Tag with session id so
+                # the app can correlate the warning to a specific
+                # recording when surfacing it.
+                lb_session_id = session.id
+                self._loopback_recorder.capture_warning.connect(
+                    lambda msg, sid=lb_session_id: self.capture_warning.emit(sid, msg)
+                )
                 try:
                     self._loopback_recorder.start()
                 except LoopbackUnavailable as exc:
@@ -752,11 +865,67 @@ class SessionController(QObject):
                 self.store.update_session(session.id, has_audio=False)
             except OSError:
                 log.exception("audio cleanup failed")
-        else:
-            self._maybe_reencode_retained_audio(session.id)
+            self._complete_session_finalize(session_id, proc_state)
+            return
+        # retain_audio=True path. If the configured format is wav, no
+        # encode is needed and we can finish synchronously. Otherwise
+        # dispatch the encode worker (issue #45); the rest of finalize
+        # runs in a continuation when the worker emits done.
+        fmt = self.config.audio.retain_format
+        if fmt == "wav":
+            self._complete_session_finalize(session_id, proc_state)
+            return
+        audio_dir = session_audio_dir(session_id)
+        mic_wav = audio_dir / "mic.wav"
+        sys_wav = audio_dir / "sys.wav"
+        self.status.emit(f"Encoding retained audio ({fmt})...")
+        worker = _RetainedAudioEncodeWorker(
+            mic_wav=mic_wav, sys_wav=sys_wav, fmt=fmt,
+        )
+        worker.setObjectName(f"RetainedAudioEncodeWorker[{session_id[:8]}]")
+        worker.status_message.connect(self.status.emit)
+        worker.done.connect(
+            lambda sid=session_id: self._on_retained_encode_done(sid)
+        )
+        worker.finished.connect(lambda w=worker: _retire_thread(w))
+        # Hold a reference so the worker isn't GC'd before it runs.
+        proc_state.encode_worker = worker
+        worker.start()
+
+    def _on_retained_encode_done(self, session_id: str) -> None:
+        """Continuation of _finalize_session after the encode worker."""
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is None:
+            # Session was deleted while encoding ran. Encode worker
+            # already cleaned up via its finished -> _retire_thread
+            # connection; nothing left to do.
+            return
+        # The encode worker is about to be retired via its finished
+        # signal; clear our reference here so the cleanup below
+        # doesn't try to retire it twice.
+        proc_state.encode_worker = None
+        self._complete_session_finalize(session_id, proc_state)
+
+    def _complete_session_finalize(self, session_id: str, proc_state) -> None:
+        """The state-flip + cleanup sequence at the end of _finalize_session.
+
+        Lives in its own function because the retain_audio=True path
+        defers everything past audio handling to after the encode
+        worker finishes; no-retain + wav-retain paths run it inline.
+        """
+        session = proc_state.session
         self.store.update_session(session.id, state=STATE_COMPLETE)
         session.state = STATE_COMPLETE
         self.state_changed.emit(session.id, STATE_COMPLETE)
+        # Belt-and-suspenders: most completion paths already retired
+        # their thread, but if a session went straight to finalize
+        # (skip-batch path) the threads were never set, and if a
+        # refinement_done landed _before_ we got here, retirement
+        # already ran -- _retire_thread(None) is safe either way.
+        _retire_thread(proc_state.batch_thread)
+        proc_state.batch_thread = None
+        _retire_thread(proc_state.refinement_thread)
+        proc_state.refinement_thread = None
         self._processing_sessions.pop(session_id, None)
         # The tag store stayed in self._tag_stores so the sidebar widget
         # could keep showing live counts during processing. Drop it now
@@ -771,38 +940,6 @@ class SessionController(QObject):
         self.batch_progress.emit(session_id, 100)
         self._phase_plans.pop(session_id, None)
         self.status.emit("Transcription complete.")
-
-    def _maybe_reencode_retained_audio(self, session_id: str) -> None:
-        """Re-encode the WAV pair to opus / flac per config.retain_format.
-
-        Only called on the retain_audio=True branch of _finalize_session.
-        Skipped silently when retain_format is 'wav' (the escape hatch
-        that matches v0.6.4 behavior). On encoder failure, the source
-        WAV is kept in place so the user doesn't lose audio to a
-        codec bug -- they get warned via status.emit and that's it.
-        """
-        fmt = self.config.audio.retain_format
-        if fmt == "wav":
-            return
-        audio_dir = session_audio_dir(session_id)
-        mic_wav = audio_dir / "mic.wav"
-        sys_wav = audio_dir / "sys.wav"
-        try:
-            from .audio.encode import encode_pair  # noqa: PLC0415
-            encode_pair(mic_wav, sys_wav, fmt)
-        except ImportError:
-            log.warning(
-                "PyAV not available; keeping WAV recording for session %s",
-                session_id,
-            )
-            self.status.emit(
-                "Audio retained as WAV (compressed encoder unavailable)."
-            )
-        except Exception:
-            log.exception("re-encode failed for session %s", session_id)
-            self.status.emit(
-                f"Audio retained as WAV ({fmt} re-encode failed; see log)."
-            )
 
     def _on_batch_done(
         self,
@@ -824,6 +961,13 @@ class SessionController(QObject):
         if proc_state is None:
             log.warning("batch done for unknown processing session %s", session_id)
             return
+        # Retire the batch QThread now that its work is done. The done
+        # signal fires from inside run()'s return; wait() blocks at most
+        # microseconds for the OS thread to finish joining. Without
+        # this, the QThread sits in memory until app exit and can land
+        # "Destroyed while running" if Qt cleans it up earlier.
+        _retire_thread(proc_state.batch_thread)
+        proc_state.batch_thread = None
         session = proc_state.session
         store = TranscriptStore(session.id)
         if segments:
@@ -878,6 +1022,10 @@ class SessionController(QObject):
         result: RefinementResult,
     ) -> None:
         """Apply labels, persist diarization metadata, and finalize."""
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is not None:
+            _retire_thread(proc_state.refinement_thread)
+            proc_state.refinement_thread = None
         try:
             labeled = apply_labels_to_segments(input_segments, result.segment_labels)
             store = TranscriptStore(session_id)
@@ -900,6 +1048,10 @@ class SessionController(QObject):
         self._finalize_session(session_id, batch_segments=None)
 
     def _on_refinement_skipped(self, session_id: str, reason: str) -> None:
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is not None:
+            _retire_thread(proc_state.refinement_thread)
+            proc_state.refinement_thread = None
         log.info("speaker refinement skipped for %s: %s", session_id, reason)
         self.speaker_refinement_skipped.emit(session_id, reason)
         self._finalize_session(session_id, batch_segments=None)
@@ -975,6 +1127,10 @@ class SessionController(QObject):
             store.close()
 
     def _on_refinement_failed(self, session_id: str, msg: str) -> None:
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is not None:
+            _retire_thread(proc_state.refinement_thread)
+            proc_state.refinement_thread = None
         log.warning("speaker refinement failed for %s: %s", session_id, msg)
         # Don't fail the whole session over a refinement bug; just skip
         # the labeling step and finalize normally.
@@ -984,6 +1140,9 @@ class SessionController(QObject):
     def _on_batch_failed(self, session_id: str, msg: str) -> None:
         proc_state = self._processing_sessions.pop(session_id, None)
         self._phase_plans.pop(session_id, None)
+        if proc_state is not None:
+            _retire_thread(proc_state.batch_thread)
+            proc_state.batch_thread = None
         self.store.update_session(session_id, state=STATE_ERROR)
         if proc_state is not None:
             proc_state.session.state = STATE_ERROR

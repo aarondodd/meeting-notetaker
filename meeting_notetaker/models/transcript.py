@@ -103,6 +103,21 @@ def rewrite_user_label(text: str, user_name: str) -> str:
     return _USER_LABEL_LINE_RE.sub(rf"\1 {name}: ", text)
 
 
+def _atomic_write_text(path: Path, body: str) -> None:
+    """Write body to path atomically (write to .tmp, then rename).
+
+    Eliminates the narrow window in which a concurrent reader sees a
+    partial file during an in-place rewrite. Path.replace is atomic
+    on both POSIX (rename(2)) and Windows (MoveFileExW with
+    REPLACE_EXISTING). The tmp lives in the same directory so the
+    rename can't cross a filesystem boundary.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(body, encoding="utf-8")
+    tmp_path.replace(path)
+
+
 class TranscriptStore:
     """Persists committed segments to raw.transcript.md and manages notes files."""
 
@@ -143,7 +158,10 @@ class TranscriptStore:
         text = "\n".join(format_segment(s) for s in committed)
         if text:
             text += "\n"
-        self.transcript_path.write_text(text, encoding="utf-8")
+        # Atomic write (issue #38): batch completion overwrites the
+        # live transcript; if synthesis is reading mid-write, the
+        # prompt would otherwise be built from a partial file.
+        _atomic_write_text(self.transcript_path, text)
 
     def read_transcript(self) -> str:
         if not self.transcript_path.exists():
@@ -155,13 +173,15 @@ class TranscriptStore:
         """Return live_notes.md, seeding the template if the file is missing."""
         if not self.live_notes_path.exists():
             body = live_notes_seed_body()
-            self.live_notes_path.write_text(body, encoding="utf-8")
+            _atomic_write_text(self.live_notes_path, body)
             return body
         return self.live_notes_path.read_text(encoding="utf-8")
 
     def save_live_notes(self, body: str) -> None:
         """Overwrite live_notes.md. No archive -- this is the user's running buffer."""
-        self.live_notes_path.write_text(body, encoding="utf-8")
+        # Atomic write: this fires on every debounced keystroke; a
+        # crash mid-write would otherwise truncate the user's notes.
+        _atomic_write_text(self.live_notes_path, body)
 
     # ---- notes (LLM-synthesized, paste-back) ----
     def save_notes(self, body: str, *, archive_existing: bool = True) -> Optional[Path]:
@@ -182,7 +202,7 @@ class TranscriptStore:
                 archive_path = self.session_dir / f"notes-{stamp}-{counter}.md"
                 counter += 1
             self.notes_path.rename(archive_path)
-        self.notes_path.write_text(body, encoding="utf-8")
+        _atomic_write_text(self.notes_path, body)
         return archive_path
 
     def read_notes(self) -> str:
@@ -255,7 +275,7 @@ class TranscriptStore:
 
     # ---- metadata ----
     def write_metadata(self, meta: dict) -> None:
-        self.metadata_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        _atomic_write_text(self.metadata_path, json.dumps(meta, indent=2))
 
     def read_metadata(self) -> dict:
         if not self.metadata_path.exists():
