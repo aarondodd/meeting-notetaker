@@ -1116,6 +1116,11 @@ class MainApp(QObject):
         self.controller.speaker_tags_changed.connect(self._on_speaker_tags_changed)
         self.controller.error.connect(self._on_controller_error)
         self.controller.status.connect(lambda msg: self.window.status(msg, timeout_ms=5000))
+        # Non-fatal capture-stall warning (issue #44). Surface via the
+        # status bar with a long timeout so the user notices, but don't
+        # block them with a modal -- the recording succeeded; only the
+        # trailing N seconds are silence.
+        self.controller.capture_warning.connect(self._on_capture_warning)
 
     # ---- session list ------------------------------------------------------
 
@@ -1668,6 +1673,17 @@ class MainApp(QObject):
         log.error("controller error: %s", msg)
         self.window.status(msg, timeout_ms=8000)
         QMessageBox.warning(self.window, "Meeting Notetaker", msg)
+
+    def _on_capture_warning(self, _session_id: str, msg: str) -> None:
+        """Status-bar surface for a non-fatal capture stall (issue #44).
+
+        The recording succeeded; the trailing seconds of audio are
+        silence because the device callback stopped firing before
+        Stop. Show in the status bar with a long timeout so it
+        catches the user's eye without blocking them.
+        """
+        log.warning("capture warning: %s", msg)
+        self.window.status(msg, timeout_ms=15000)
 
     # ---- synthesis flows ---------------------------------------------------
 

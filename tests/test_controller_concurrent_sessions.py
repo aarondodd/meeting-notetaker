@@ -215,6 +215,9 @@ def test_start_session_status_message_when_prior_is_processing(qt_app, isolated_
         is_recording = False
         def __init__(self, *a, **kw):
             self.error = _SignalStub()
+            # Non-fatal capture-stall warning surface, mirrors the
+            # real recorder signal added in v0.7.1 (issue #44).
+            self.capture_warning = _SignalStub()
         def start(self): pass
         def stop(self): pass
         def pause(self): pass
@@ -263,6 +266,7 @@ def test_start_session_no_warning_when_nothing_is_processing(qt_app, isolated_da
         is_recording = False
         def __init__(self, *a, **kw):
             self.error = _SignalStub()
+            self.capture_warning = _SignalStub()
         def start(self): pass
         def stop(self): pass
 

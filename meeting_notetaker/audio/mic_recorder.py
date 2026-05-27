@@ -32,6 +32,12 @@ class MicRecorder(QObject):
     error = pyqtSignal(str)
     started = pyqtSignal()
     stopped = pyqtSignal()
+    # Non-fatal warning: capture callback stopped firing well before
+    # Stop, so the trailing pad inserted N seconds of silence. The
+    # recording still succeeded -- this signals "your last N seconds
+    # of audio are silence; the upstream cause is likely driver or
+    # power-management". Issue #44.
+    capture_warning = pyqtSignal(str)
 
     def __init__(
         self,
@@ -252,8 +258,43 @@ class MicRecorder(QObject):
                 "did not close cleanly; the partial WAV is left as-is",
                 self.wav_path,
             )
+        self._check_for_trailing_capture_stall()
         log.info("MicRecorder stopped")
         self.stopped.emit()
+
+    # Threshold for "PortAudio callback gave up before Stop". 10 s is
+    # well above normal jitter (the WAV-pad threshold is 100 ms;
+    # gap_fill kicks in at ~100 ms callback-to-callback gaps). A
+    # 10 s no-callback span unambiguously means the device stopped
+    # delivering audio, not just that one callback was late.
+    _TRAILING_STALL_THRESHOLD_S = 10.0
+
+    def _check_for_trailing_capture_stall(self) -> None:
+        """Warn if PortAudio stopped delivering audio well before Stop.
+
+        Issue #44: the trailing pad inserted by _maybe_pad_wav silently
+        masks the case where the capture callback died mid-recording.
+        Detection here makes the next "audio went silent" report
+        diagnosable from the log alone instead of requiring detective
+        work on the WAV's frame count.
+        """
+        if (
+            self._last_callback_wallclock is None
+            or self._stop_wallclock is None
+        ):
+            return
+        stall_s = self._stop_wallclock - self._last_callback_wallclock
+        if stall_s < self._TRAILING_STALL_THRESHOLD_S:
+            return
+        msg = (
+            f"Microphone capture stopped delivering audio "
+            f"{stall_s:.1f} s before Stop -- the last {stall_s:.0f} s "
+            f"of the recording is silence. Likely cause: USB selective "
+            f"suspend or driver stall. Check the device + Windows USB "
+            f"power-management settings."
+        )
+        log.warning("MicRecorder: %s", msg)
+        self.capture_warning.emit(msg)
 
     def _maybe_pad_wav(self) -> None:
         """Rewrite the WAV with leading + trailing silence to span

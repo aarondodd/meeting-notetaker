@@ -40,6 +40,11 @@ class LoopbackRecorder(QObject):
     error = pyqtSignal(str)
     started = pyqtSignal()
     stopped = pyqtSignal()
+    # Non-fatal warning: loopback callback stopped firing well before
+    # Stop, leaving N seconds of trailing silence in sys.wav. Issue #44.
+    # Distinct from mic capture stall in expected causes (WASAPI engine
+    # idle vs USB driver) but same UX impact and same signal shape.
+    capture_warning = pyqtSignal(str)
 
     def __init__(
         self,
@@ -324,8 +329,35 @@ class LoopbackRecorder(QObject):
                 "did not close cleanly; the partial WAV is left as-is",
                 self.wav_path,
             )
+        self._check_for_trailing_capture_stall()
         log.info("LoopbackRecorder stopped")
         self.stopped.emit()
+
+    # See MicRecorder._TRAILING_STALL_THRESHOLD_S for the rationale.
+    # WASAPI loopback is slightly more prone to multi-second idle
+    # spans (audio engine sleeps when no renderer is active), so the
+    # 10 s threshold is generous on this side too. Issue #44.
+    _TRAILING_STALL_THRESHOLD_S = 10.0
+
+    def _check_for_trailing_capture_stall(self) -> None:
+        """Warn if WASAPI loopback stopped delivering audio well before Stop."""
+        if (
+            self._last_callback_wallclock is None
+            or self._stop_wallclock is None
+        ):
+            return
+        stall_s = self._stop_wallclock - self._last_callback_wallclock
+        if stall_s < self._TRAILING_STALL_THRESHOLD_S:
+            return
+        msg = (
+            f"System-audio loopback stopped delivering audio "
+            f"{stall_s:.1f} s before Stop -- the last {stall_s:.0f} s "
+            f"of the system-audio track is silence. Likely cause: the "
+            f"Windows audio engine went idle (nothing playing through "
+            f"the speakers)."
+        )
+        log.warning("LoopbackRecorder: %s", msg)
+        self.capture_warning.emit(msg)
 
     def _maybe_pad_wav(self) -> None:
         """Rewrite the WAV with leading + trailing silence to span

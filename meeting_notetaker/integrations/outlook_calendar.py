@@ -512,7 +512,14 @@ try:
                 "OutlookCalendarMonitor starting (window=%d min, poll=%dms)",
                 self._window_minutes, self._timer.interval(),
             )
-            self._tick()
+            # Defer the first tick to the next event-loop iteration
+            # (issue #43). Inline calling _tick() here was blocking
+            # MainApp.__init__ for ~750 ms via win32com's lazy COM
+            # attribute resolution -- the window didn't paint until
+            # Outlook had been queried. Deferring lets the window
+            # become interactive first; the first poll lands ~one
+            # event-loop tick later.
+            QTimer.singleShot(0, self._tick)
             self._timer.start()
 
         def stop(self) -> None:
