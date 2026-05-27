@@ -89,6 +89,7 @@ from .utils import updater as updater_mod
 from .utils.config import Config
 from .utils.icons import app_icon
 from .utils.live_notes import extract_section, parse_attendees, seed_body_with_calendar
+from .utils.main_loop_watchdog import MainLoopWatchdog
 from .utils.paths import (
     app_data_dir,
     audio_session_state_path,
@@ -152,6 +153,17 @@ class MainApp(QObject):
     def __init__(self, qt_app: QApplication) -> None:
         super().__init__()
         self.qt_app = qt_app
+        # Detect main-event-loop stalls (issue #31). When Windows
+        # reports the app as "Not Responding", we now get a full
+        # all-thread stack dump in meeting_notetaker.log so the next
+        # freeze leaves a forensic trail. Start the watchdog as early
+        # as possible so even cold-start hitches get captured.
+        self._loop_watchdog = MainLoopWatchdog(
+            stall_threshold_ms=750,
+            log_file_path=log_path(),
+            parent=self,
+        )
+        self._loop_watchdog.start()
         self.config = Config.load()
         prompts_mod.seed_user_prompts()
         seed_vocabulary_file()
@@ -278,6 +290,10 @@ class MainApp(QObject):
         # is the single canonical save point. Single write -- no
         # debouncing needed for one-shot exit.
         self.qt_app.aboutToQuit.connect(self._persist_window_layout)
+        # Stop the watchdog thread before the app tears down so its
+        # final state lands in the log cleanly rather than getting
+        # interrupted mid-write at process exit.
+        self.qt_app.aboutToQuit.connect(self._loop_watchdog.stop)
 
         self._wire_signals()
         self._apply_user_name()
@@ -2324,11 +2340,17 @@ class MainApp(QObject):
         mic_path = next((p for p in files if p.stem == "mic"), None)
         sys_path = next((p for p in files if p.stem == "sys"), None)
         player = self._ensure_audio_player()
+        # AudioPlayer.load() is async (issue #31): the PyAV decode +
+        # mix runs on a worker QThread and the loaded / load_failed
+        # signals fire when it finishes. Disable the player controls
+        # until then so the user can't click Play on a buffer that
+        # isn't ready, and so a long decode (1-3 s for a multi-hour
+        # meeting) doesn't gray-out the whole window.
+        self.window.session_view.set_player_enabled(False)
         try:
             player.load(mic_path, sys_path)
         except Exception:
             log.exception("AudioPlayer.load raised")
-            self.window.session_view.set_player_enabled(False)
             self._player_loaded_session_id = None
             return
         self._player_loaded_session_id = session_id

@@ -4,6 +4,12 @@ The actual sounddevice playback can't run without PortAudio, so we
 patch the stream creation to skip the audio output path. The
 load + buffer math is what most regressions would land on, and we
 exercise that directly.
+
+As of v0.7.1 (issue #31), AudioPlayer.load is asynchronous: the
+PyAV decode runs on a worker QThread and emits loaded / load_failed
+when finished. Tests wait for completion via `_wait_for_load`
+rather than assuming the buffer is ready after a single
+processEvents() call.
 """
 from __future__ import annotations
 
@@ -11,6 +17,7 @@ import math
 import os
 import struct
 import sys
+import time
 import wave
 from pathlib import Path
 from unittest import mock
@@ -35,6 +42,25 @@ import numpy as np  # noqa: E402
 def qt_app():
     app = QApplication.instance() or QApplication(sys.argv)
     yield app
+
+
+def _wait_for_load(player, qt_app, *, timeout: float = 5.0) -> None:
+    """Spin processEvents until the AudioPlayer's pending load finishes.
+
+    The async decode worker runs on a QThread; its emit lands as a
+    queued event on the main thread. We have to (a) wait for the OS
+    thread to finish AND (b) let the event loop run so the queued
+    decoded signal fires. processEvents alone does neither -- it
+    drains whatever is already queued and returns. The loop here
+    combines a short sleep with processEvents until the player
+    reports no in-flight load.
+    """
+    deadline = time.monotonic() + timeout
+    qt_app.processEvents()
+    while player._load_worker is not None and time.monotonic() < deadline:  # noqa: SLF001
+        qt_app.processEvents()
+        time.sleep(0.01)
+    qt_app.processEvents()  # one more pass to drain the final signal
 
 
 def _write_sine_wav(
@@ -85,11 +111,34 @@ def test_load_emits_loaded_with_total_ms(qt_app, tmp_path):
     captured: list[int] = []
     player.loaded.connect(captured.append)
     player.load(mic, None)
-    qt_app.processEvents()
+    _wait_for_load(player, qt_app)
     assert captured, "load should emit loaded(total_ms) on success"
     # 1 second of audio -> ~1000 ms; the resample to 16k preserves it
     # within one frame's worth of jitter.
     assert 990 <= captured[0] <= 1010
+
+
+def test_load_returns_immediately(qt_app, tmp_path):
+    """The whole point of moving decode to a worker (issue #31) is that
+    load() must not block the caller. Even with a large WAV the
+    method should return in milliseconds; the decode happens on a
+    background QThread.
+    """
+    mic = tmp_path / "mic.wav"
+    # 5 seconds is small enough to keep the test fast but long enough
+    # that a synchronous decode would take measurably longer than the
+    # < 50 ms budget for an async load call.
+    _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=5.0)
+    player = AudioPlayer()
+    start = time.monotonic()
+    player.load(mic, None)
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.1, (
+        f"load() must return immediately (worker-thread decode), "
+        f"took {elapsed * 1000:.0f}ms"
+    )
+    # Drain the worker so the test fixture tears down cleanly.
+    _wait_for_load(player, qt_app)
 
 
 def test_load_emits_load_failed_for_missing_sources(qt_app, tmp_path):
@@ -97,7 +146,7 @@ def test_load_emits_load_failed_for_missing_sources(qt_app, tmp_path):
     captured: list[str] = []
     player.load_failed.connect(captured.append)
     player.load(tmp_path / "missing-mic.wav", tmp_path / "missing-sys.wav")
-    qt_app.processEvents()
+    _wait_for_load(player, qt_app)
     assert captured, "load should emit load_failed for missing files"
 
 
@@ -106,7 +155,7 @@ def test_position_starts_at_zero_after_load(qt_app, tmp_path):
     _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
     player = AudioPlayer()
     player.load(mic, None)
-    qt_app.processEvents()
+    _wait_for_load(player, qt_app)
     assert player.position_ms() == 0
 
 
@@ -115,7 +164,7 @@ def test_seek_ms_clamps_to_bounds(qt_app, tmp_path):
     _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
     player = AudioPlayer()
     player.load(mic, None)
-    qt_app.processEvents()
+    _wait_for_load(player, qt_app)
     player.seek_ms(-100)
     assert player.position_ms() == 0
     player.seek_ms(10_000_000)  # way past end
@@ -127,7 +176,7 @@ def test_close_drops_buffer_and_resets_position(qt_app, tmp_path):
     _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
     player = AudioPlayer()
     player.load(mic, None)
-    qt_app.processEvents()
+    _wait_for_load(player, qt_app)
     assert player.total_ms() > 0
     player.close()
     assert player.total_ms() == 0
@@ -135,6 +184,17 @@ def test_close_drops_buffer_and_resets_position(qt_app, tmp_path):
 
 
 def test_load_twice_replaces_session(qt_app, tmp_path):
+    """Second load() supersedes the first.
+
+    Async decode means the first load's result might land before or
+    after the second load completes. Either way, only the SECOND
+    load's buffer should be active: the generation check in the
+    player drops the first decode's emit if it arrives late.
+
+    Asserts the final total_ms reflects the second (longer) WAV
+    rather than counting emit calls, since the first one may have
+    been dropped entirely.
+    """
     mic1 = tmp_path / "mic1.wav"
     _write_sine_wav(mic1, sample_rate=48000, channels=1, duration_s=0.5)
     mic2 = tmp_path / "mic2.wav"
@@ -144,9 +204,34 @@ def test_load_twice_replaces_session(qt_app, tmp_path):
     player.loaded.connect(captured.append)
     player.load(mic1, None)
     player.load(mic2, None)
-    qt_app.processEvents()
-    # The latest total should reflect the second (longer) session.
-    assert captured[-1] > captured[0]
+    _wait_for_load(player, qt_app)
+    # The active buffer must reflect mic2 (1.0s = ~1000ms), never
+    # mic1 (0.5s = ~500ms).
+    assert 990 <= player.total_ms() <= 1010, (
+        f"second load's buffer must win; got total_ms={player.total_ms()}"
+    )
+    # If both signals fired, the last one must be the second load.
+    if len(captured) >= 2:
+        assert captured[-1] > captured[0]
+
+
+def test_close_during_load_drops_pending_decode(qt_app, tmp_path):
+    """close() while a load is in-flight must cancel the load so the
+    result -- if it lands after close() returns -- is dropped. The
+    generation counter is the load-bearing piece here.
+    """
+    mic = tmp_path / "mic.wav"
+    _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
+    player = AudioPlayer()
+    captured: list[int] = []
+    player.loaded.connect(captured.append)
+    player.load(mic, None)
+    # Close immediately, before the worker can finish.
+    player.close()
+    # Now drain the worker thread.
+    _wait_for_load(player, qt_app)
+    assert player.total_ms() == 0
+    assert not captured, "loaded must not fire after close()"
 
 
 def test_seek_during_playback_restarts_position_tick(qt_app, tmp_path):
@@ -157,7 +242,7 @@ def test_seek_during_playback_restarts_position_tick(qt_app, tmp_path):
     _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
     player = AudioPlayer()
     player.load(mic, None)
-    qt_app.processEvents()
+    _wait_for_load(player, qt_app)
 
     fake_stream = mock.MagicMock()
     fake_stream.active = True
@@ -186,7 +271,7 @@ def test_stale_finished_callback_does_not_close_new_stream(qt_app, tmp_path):
     _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
     player = AudioPlayer()
     player.load(mic, None)
-    qt_app.processEvents()
+    _wait_for_load(player, qt_app)
 
     fake_stream = mock.MagicMock()
     fake_stream.active = True
@@ -223,7 +308,7 @@ def test_play_calls_start_stream(qt_app, tmp_path):
     _write_sine_wav(mic, sample_rate=48000, channels=1, duration_s=0.5)
     player = AudioPlayer()
     player.load(mic, None)
-    qt_app.processEvents()
+    _wait_for_load(player, qt_app)
 
     fake_stream = mock.MagicMock()
     fake_stream.active = True

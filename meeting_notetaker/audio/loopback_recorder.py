@@ -26,6 +26,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from .chunk_buffer import ChunkBuffer
 from .resample import to_mono_16k
 from .wav_align import compute_pad_frames, gap_frames_to_fill, pad_wav
+from .wav_writer import AsyncWavWriter
 
 
 log = logging.getLogger(__name__)
@@ -56,7 +57,13 @@ class LoopbackRecorder(QObject):
         self.device_name = device_name
         self._pa = None
         self._stream = None
-        self._wf: Optional[wave.Wave_write] = None
+        # Background WAV writer (issue #31). PortAudio's loopback
+        # callback fires at ~21 ms cadence on Windows; doing disk I/O
+        # in the callback exposes us to filesystem-cache + antivirus
+        # latency spikes that grow more frequent as the WAV size
+        # grows past a few hundred MB, which is exactly when the
+        # observed corruption kicks in at ~10-15 minutes.
+        self._writer: Optional[AsyncWavWriter] = None
         self._lock = threading.Lock()
         self._is_recording = False
         self._paused = False
@@ -151,11 +158,13 @@ class LoopbackRecorder(QObject):
         self._native_rate = int(device["defaultSampleRate"])
         self._channels = int(device["maxInputChannels"]) or 2
         self._pa = pyaudio.PyAudio()
-        self.wav_path.parent.mkdir(parents=True, exist_ok=True)
-        self._wf = wave.open(str(self.wav_path), "wb")
-        self._wf.setnchannels(self._channels)
-        self._wf.setsampwidth(2)
-        self._wf.setframerate(self._native_rate)
+        self._writer = AsyncWavWriter(
+            self.wav_path,
+            channels=self._channels,
+            sample_width=2,
+            sample_rate=self._native_rate,
+        )
+        self._writer.start()
         self._is_recording = True
         self._start_wallclock = time.monotonic()
         self._first_sample_wallclock = None
@@ -191,7 +200,7 @@ class LoopbackRecorder(QObject):
             now = time.monotonic()
             if self._first_sample_wallclock is None:
                 self._first_sample_wallclock = now
-            elif self._last_callback_wallclock is not None and self._wf is not None:
+            elif self._last_callback_wallclock is not None and self._writer is not None:
                 # WASAPI loopback can stop firing callbacks during
                 # silence (no renderer active -> audio engine sleeps).
                 # Detect the gap by wall-clock vs frame-time delta;
@@ -210,11 +219,12 @@ class LoopbackRecorder(QObject):
                         "LoopbackRecorder gap-fill: %d frames (%.0f ms)",
                         gap, gap * 1000 / self._native_rate,
                     )
-                    self._write_silence_frames(gap)
+                    self._writer.write_silence_frames(gap)
                     self._gap_fill_frames_total += gap
             self._last_callback_wallclock = now
-            if self._wf is not None:
-                self._wf.writeframes(in_data)
+            if self._writer is not None:
+                # Non-blocking enqueue -- writer thread drains to disk.
+                self._writer.write_frames(in_data)
             pcm = np.frombuffer(in_data, dtype=np.int16)
             mono16k = to_mono_16k(pcm, channels=self._channels, src_rate=self._native_rate)
             self.chunk_buffer.write(self.source_name, mono16k)
@@ -249,33 +259,19 @@ class LoopbackRecorder(QObject):
             except Exception:
                 log.exception("PyAudio terminate failed")
             self._pa = None
-            if self._wf is not None:
-                try:
-                    self._wf.close()
-                finally:
-                    self._wf = None
+            writer = self._writer
+            self._writer = None
+        # Drain queue + join writer + finalize WAV. Outside the lock
+        # because it may wait several seconds for the writer to
+        # flush any backlog.
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                log.exception("LoopbackRecorder: writer.close failed")
         self._maybe_pad_wav()
         log.info("LoopbackRecorder stopped")
         self.stopped.emit()
-
-    def _write_silence_frames(self, frame_count: int) -> None:
-        """Append `frame_count` of all-zero PCM to the current WAV.
-
-        Sampwidth is 2 (int16); channels = self._channels. Stream
-        in 64 KB blocks so a long gap (rare but possible) doesn't
-        materialize a giant byte string.
-        """
-        if self._wf is None or frame_count <= 0:
-            return
-        bytes_per_frame = self._channels * 2
-        BLOCK_FRAMES = 8192
-        block = b"\x00" * (BLOCK_FRAMES * bytes_per_frame)
-        remaining = frame_count
-        while remaining >= BLOCK_FRAMES:
-            self._wf.writeframes(block)
-            remaining -= BLOCK_FRAMES
-        if remaining > 0:
-            self._wf.writeframes(b"\x00" * (remaining * bytes_per_frame))
 
     def _maybe_pad_wav(self) -> None:
         """Rewrite the WAV with leading + trailing silence to span

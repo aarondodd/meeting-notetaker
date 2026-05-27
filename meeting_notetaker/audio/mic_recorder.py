@@ -22,6 +22,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from .chunk_buffer import ChunkBuffer
 from .resample import to_mono_16k
 from .wav_align import compute_pad_frames, gap_frames_to_fill, pad_wav
+from .wav_writer import AsyncWavWriter
 
 
 log = logging.getLogger(__name__)
@@ -48,7 +49,11 @@ class MicRecorder(QObject):
         self.device_name = device_name
         self._pa = None
         self._stream = None
-        self._wf: Optional[wave.Wave_write] = None
+        # The WAV writer runs on a background thread so the PortAudio
+        # callback can return without ever touching the disk -- the
+        # fix for the audio-corruption arm of issue #31. None outside
+        # an active capture; built in start(), torn down in stop().
+        self._writer: Optional[AsyncWavWriter] = None
         self._lock = threading.Lock()
         self._is_recording = False
         self._paused = False
@@ -85,11 +90,13 @@ class MicRecorder(QObject):
         # Force mono on the mic side. Whisper does not benefit from stereo
         # mic and most laptop mics are mono anyway.
         self._channels = 1
-        self.wav_path.parent.mkdir(parents=True, exist_ok=True)
-        self._wf = wave.open(str(self.wav_path), "wb")
-        self._wf.setnchannels(self._channels)
-        self._wf.setsampwidth(2)
-        self._wf.setframerate(self._native_rate)
+        self._writer = AsyncWavWriter(
+            self.wav_path,
+            channels=self._channels,
+            sample_width=2,
+            sample_rate=self._native_rate,
+        )
+        self._writer.start()
         self._is_recording = True
         self._start_wallclock = time.monotonic()
         self._first_sample_wallclock = None
@@ -125,7 +132,7 @@ class MicRecorder(QObject):
             now = time.monotonic()
             if self._first_sample_wallclock is None:
                 self._first_sample_wallclock = now
-            elif self._last_callback_wallclock is not None and self._wf is not None:
+            elif self._last_callback_wallclock is not None and self._writer is not None:
                 # Mid-callback gap detection. If PyAudio's input stream
                 # stalled (rare on mic capture but possible under heavy
                 # load), fill the gap with silence so the WAV stays
@@ -142,11 +149,14 @@ class MicRecorder(QObject):
                         "MicRecorder gap-fill: %d frames (%.0f ms)",
                         gap, gap * 1000 / self._native_rate,
                     )
-                    self._write_silence_frames(gap)
+                    self._writer.write_silence_frames(gap)
                     self._gap_fill_frames_total += gap
             self._last_callback_wallclock = now
-            if self._wf is not None:
-                self._wf.writeframes(in_data)
+            if self._writer is not None:
+                # Non-blocking enqueue; the writer thread does the
+                # actual writeframes() so a slow disk can't stall
+                # the PortAudio callback.
+                self._writer.write_frames(in_data)
             pcm = np.frombuffer(in_data, dtype=np.int16)
             mono16k = to_mono_16k(pcm, channels=self._channels, src_rate=self._native_rate)
             self.chunk_buffer.write(self.source_name, mono16k)
@@ -185,34 +195,20 @@ class MicRecorder(QObject):
             except Exception:
                 log.exception("PyAudio terminate failed")
             self._pa = None
-            if self._wf is not None:
-                try:
-                    self._wf.close()
-                finally:
-                    self._wf = None
+            writer = self._writer
+            self._writer = None
+        # close() drains the queue + joins the writer thread + closes
+        # the wave file with the final header. Done outside the lock
+        # because it can wait up to a few seconds for the writer to
+        # finish.
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                log.exception("MicRecorder: writer.close failed")
         self._maybe_pad_wav()
         log.info("MicRecorder stopped")
         self.stopped.emit()
-
-    def _write_silence_frames(self, frame_count: int) -> None:
-        """Append `frame_count` of all-zero PCM to the current WAV.
-
-        Called from the audio callback when a wall-clock gap is
-        detected. Sampwidth is 2 (int16), channels = self._channels.
-        Streams in 64 KB blocks so a very long gap (rare) doesn't
-        materialize a giant byte string.
-        """
-        if self._wf is None or frame_count <= 0:
-            return
-        bytes_per_frame = self._channels * 2
-        BLOCK_FRAMES = 8192
-        block = b"\x00" * (BLOCK_FRAMES * bytes_per_frame)
-        remaining = frame_count
-        while remaining >= BLOCK_FRAMES:
-            self._wf.writeframes(block)
-            remaining -= BLOCK_FRAMES
-        if remaining > 0:
-            self._wf.writeframes(b"\x00" * (remaining * bytes_per_frame))
 
     def _maybe_pad_wav(self) -> None:
         """Rewrite the WAV with leading + trailing silence to span
