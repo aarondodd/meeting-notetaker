@@ -8,6 +8,7 @@ import logging
 import secrets
 import sys
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -174,6 +175,26 @@ class MainApp(QObject):
         self._calendar_monitor = None  # set lazily by _apply_calendar_config
         self._audio_monitor = None  # set lazily by _apply_audio_monitor_config
         self._encoder_prewarm: Optional[EncoderPrewarmThread] = None
+        # One-shot worker for GitHub release checks (issue #34). Set
+        # while a check is in flight, cleared by _retire_update_check_worker
+        # on finished. Two starts in flight at once would race; guarded
+        # in _auto_check_for_updates / _on_check_for_updates.
+        self._update_check_worker: Optional[QThread] = None
+        # Periodic search-index sweep worker (issue #37). The 30s
+        # QTimer dispatches a one-shot scan; a second tick while a
+        # prior scan is still running is skipped rather than queued.
+        self._search_scan_worker: Optional[QThread] = None
+        # Async session-content loader (issue #39). Bumped on every
+        # _on_session_selected call; results whose captured generation
+        # doesn't match are dropped (rapid session-switch cancels
+        # the in-flight load). The worker reads transcript / live
+        # notes / synthesis notes / archive list / highlights /
+        # template list off-thread; the slot applies them via the
+        # piecemeal session_view setters when the user-visible
+        # session still matches.
+        self._session_load_generation: int = 0
+        self._session_content_worker: Optional[QThread] = None
+        self._session_currently_loading: Optional[str] = None
         # Per-session capture-only overrides captured from NewSessionDialog.
         # Consumed at start_session time, then evicted. Sessions absent from
         # the dict fall back to the global config value.
@@ -294,6 +315,11 @@ class MainApp(QObject):
         # final state lands in the log cleanly rather than getting
         # interrupted mid-write at process exit.
         self.qt_app.aboutToQuit.connect(self._loop_watchdog.stop)
+        # Wait for the encoder prewarm to finish if it's still in
+        # flight (issue #36). The download can take 30+s on a fresh
+        # install; without this wait, quitting during that window
+        # destroys a running QThread = process abort.
+        self.qt_app.aboutToQuit.connect(self._retire_encoder_prewarm)
 
         self._wire_signals()
         self._apply_user_name()
@@ -1183,51 +1209,44 @@ class MainApp(QObject):
             log.exception("classification refresh failed")
 
     def _on_session_selected(self, session_id: str) -> None:
+        """Bind the session to the right pane, then load its content
+        asynchronously (issue #39).
+
+        The synchronous prelude binds metadata + clears the panes via
+        set_session() with empty content. Cheap state (classification
+        chips, screenshot offsets, attachments tab, player) runs
+        inline. The expensive disk reads (transcript / live notes /
+        synthesis / previous-notes glob / templates / highlights) run
+        on `_SessionContentLoader`; the result lands in
+        `_on_session_content_loaded` which fills in the panes.
+
+        Rapid session-switching is handled by a generation counter:
+        every call bumps it, and stale results are dropped.
+        """
         session = self.store.get_session(session_id)
         if session is None:
             return
-        store = TranscriptStore(session_id)
-        live_notes_body = store.read_live_notes()
-        notes_body = store.read_notes()
+        # Bind the session up front (empty content). The worker fills
+        # in transcript / notes / live_notes / etc. when it finishes.
         self.window.session_view.set_session(
             session,
-            transcript=store.read_transcript(),
-            notes=notes_body,
-            previous_notes_paths=store.list_previous_notes(),
-            live_notes=live_notes_body,
+            transcript="",
+            notes="",
+            previous_notes_paths=[],
+            live_notes="",
         )
-        # Backfill classification from whatever's on disk, so pre-
-        # v0.7.0 sessions get People + Topic suggestions populated as
-        # the user clicks through them. Both calls are cheap and
-        # idempotent -- sync_session_people replaces only the
-        # attendee_list-source rows; replace_session_topic_suggestions
-        # only replaces unaccepted auto-suggestions.
-        self._sync_attendees_to_people(session_id, live_notes_body)
-        if notes_body.strip():
-            self._extract_topics_for_session(session_id, notes_body)
-        # Load the session's retained audio into the player (if any).
-        # The player bar in the Transcript pane greys out cleanly when
-        # there's nothing on disk; loading itself is a no-op for
-        # already-loaded sessions.
+        # Bump generation BEFORE dispatching so any in-flight worker
+        # from a prior selection is treated as stale on its emit.
+        self._session_load_generation += 1
+        self._session_currently_loading = session_id
+        # Things that don't need disk content -- run synchronously so
+        # the immediate UI is responsive (buttons, audio player, chips).
         self._maybe_load_player_for_session(session_id)
-        # Push the screenshot offset list so the rail + Slides tab
-        # can anchor + auto-advance against this session's recording-
-        # start moment.
         self._push_screenshot_offsets(session_id)
-        # Populate the prompt-template picker with the available
-        # templates + restore the session's saved choice.
-        templates = [t.name for t in prompts_mod.list_templates()]
-        self.window.session_view.set_prompt_templates(
-            templates,
-            selected=store.read_prompt_template_name(),
-        )
-        # Seed the click-to-tag sidebar from the live_notes '# Attendees'
-        # section. The sidebar is hidden unless the session is recording,
-        # but seeding now means it shows up populated the moment Start
-        # is clicked.
-        self.window.session_view.set_attendee_names(
-            parse_attendees(live_notes_body)
-        )
+        # Push the session's classification (series / people / topics)
+        # into the chips bar. Missing classification store -> empty
+        # bar with disabled mutators.
+        self._refresh_session_classification(session_id)
         # If the user reselected a session that's still actively being
         # recorded (back-to-back-session scenario), surface any tag counts
         # the controller already collected.
@@ -1236,31 +1255,90 @@ class MainApp(QObject):
             store = self.controller._tag_stores.get(session_id)
             if store is not None:
                 self.window.session_view.set_speaker_tag_counts(store.counts())
-        # Push the session's classification (series / people / topics)
-        # into the chips bar. Missing classification store -> empty
-        # bar with disabled mutators.
-        self._refresh_session_classification(session_id)
-        # Load the persisted highlight markers. total_ms comes from
-        # the audio player; if no audio is loaded yet, set 0 -- the
-        # bar disables interaction cleanly and updates when audio
-        # arrives via set_player_total_ms.
-        try:
-            highlights = HighlightsStore(session_id).load()
-        except Exception:
-            log.exception("highlights load failed for %s", session_id)
-            highlights = HighlightSet()
-        total_ms = 0
-        if self._audio_player is not None and self._player_loaded_session_id == session_id:
-            try:
-                total_ms = int(self._audio_player.total_ms())
-            except Exception:
-                total_ms = 0
-        self.window.session_view.set_session_highlights(total_ms, highlights)
         # Issue #29: Attachments tab pulls the per-session list.
+        # AttachmentsStore opens a SQLite connection on the main
+        # thread -- typically fast, so keep it inline. Could move
+        # off-thread later if attachment counts grow.
         try:
             self.window.session_view.attachments_tab().set_session(session_id)
         except Exception:
             log.exception("attachments tab failed to load for %s", session_id)
+        # Async content load. Worker emits content_loaded(generation,
+        # _LoadedSessionContent); _on_session_content_loaded applies
+        # if the generation still matches.
+        self._dispatch_session_content_load(session_id)
+
+    def _dispatch_session_content_load(self, session_id: str) -> None:
+        """Spawn the off-thread loader for a session's disk content."""
+        prior = self._session_content_worker
+        if prior is not None:
+            prior.requestInterruption()
+        worker = _SessionContentLoader(
+            session_id=session_id,
+            generation=self._session_load_generation,
+        )
+        worker.setObjectName(
+            f"SessionContentLoader[{self._session_load_generation}]"
+        )
+        worker.content_loaded.connect(self._on_session_content_loaded)
+        worker.finished.connect(lambda w=worker: self._retire_session_content_worker(w))
+        self._session_content_worker = worker
+        worker.start()
+
+    def _on_session_content_loaded(self, generation: int, content) -> None:
+        """Apply worker results when the user still has this session selected."""
+        if generation != self._session_load_generation:
+            log.debug(
+                "dropping stale session-content result (gen=%d, current=%d)",
+                generation, self._session_load_generation,
+            )
+            return
+        if content.error is not None:
+            log.warning(
+                "session content load returned error for %s: %s",
+                content.session_id, content.error,
+            )
+            # Leave the panes empty; the user can re-click or restart.
+            return
+        sv = self.window.session_view
+        # Fill the panes via the piecemeal setters so we don't go
+        # through set_session() again (which would flush saves +
+        # reset state we already configured in the prelude).
+        sv.set_transcript_text(content.transcript)
+        sv._set_live_notes_text(content.live_notes)  # noqa: SLF001
+        sv.set_notes_text(content.notes)
+        sv.set_previous_notes(content.previous_notes_paths)
+        sv.set_prompt_templates(
+            content.template_names, selected=content.selected_template,
+        )
+        sv.set_attendee_names(parse_attendees(content.live_notes))
+        # Highlights: total_ms is 0 until the audio player finishes
+        # its own async load and fires set_player_total_ms. The
+        # highlight bar disables interaction cleanly at total_ms=0
+        # and updates when audio arrives.
+        total_ms = 0
+        if self._audio_player is not None and self._player_loaded_session_id == content.session_id:
+            try:
+                total_ms = int(self._audio_player.total_ms())
+            except Exception:
+                total_ms = 0
+        sv.set_session_highlights(total_ms, content.highlights or HighlightSet())
+        # Content-dependent side effects.
+        self._sync_attendees_to_people(content.session_id, content.live_notes)
+        if content.notes.strip():
+            self._extract_topics_for_session(content.session_id, content.notes)
+
+    def _retire_session_content_worker(self, worker) -> None:
+        try:
+            worker.wait()
+        except Exception:
+            log.exception("session content worker wait failed")
+        try:
+            worker.deleteLater()
+        except Exception:
+            log.exception("session content worker deleteLater failed")
+        if self._session_content_worker is worker:
+            self._session_content_worker = None
 
     def _refresh_session_classification(self, session_id: str) -> None:
         """Re-read + repaint the chips bar for the given session.
@@ -2982,27 +3060,63 @@ class MainApp(QObject):
     def _scan_search_index_stale(self) -> None:
         """30s periodic sweep: re-index any session whose on-disk
         fingerprint differs from the index. Catches paths that didn't
-        get an explicit _reindex_search_for hook."""
+        get an explicit _reindex_search_for hook.
+
+        Runs on a worker QThread (issue #37) so the per-session
+        fingerprint stat + SQLite point query doesn't hold the main
+        event loop. With 1000 sessions the old inline scan blocked
+        the UI for ~2 s every 30 s.
+        """
         if self.search_index is None:
             return
-        try:
-            from .utils.search_indexer import reindex_session
-            for s in self.store.list_sessions():
-                reindex_session(self.search_index, s.id)
-        except Exception:
-            log.exception("search stale-scan failed")
+        self._dispatch_search_scan(kind="periodic")
 
     def _search_index_startup_scan(self) -> None:
         """Initial pass after launch: catch any edits made offline."""
         if self.search_index is None:
             return
+        self._dispatch_search_scan(kind="startup")
+
+    def _dispatch_search_scan(self, *, kind: str) -> None:
+        """Spawn a worker thread to walk every session through the
+        search-index fingerprint check.
+
+        Skips dispatch when a scan is already in flight -- two scans
+        racing on the same SQLite WAL would serialize but still
+        double-cost the disk reads.
+        """
+        if self._search_scan_worker is not None and self._search_scan_worker.isRunning():
+            log.debug("search scan already running; skipping new %s scan", kind)
+            return
+        session_ids = [s.id for s in self.store.list_sessions()]
+        worker = _SearchScanWorker(session_ids=session_ids, kind=kind)
+        worker.scan_complete.connect(self._on_search_scan_complete)
+        worker.finished.connect(lambda w=worker: self._retire_search_scan_worker(w))
+        self._search_scan_worker = worker
+        worker.start()
+
+    def _on_search_scan_complete(self, kind: str, reindexed: int) -> None:
+        if kind == "startup":
+            log.info(
+                "search index startup scan complete (%d session(s) reindexed)",
+                reindexed,
+            )
+        elif reindexed > 0:
+            log.debug(
+                "search index periodic scan reindexed %d session(s)", reindexed,
+            )
+
+    def _retire_search_scan_worker(self, worker) -> None:
         try:
-            from .utils.search_indexer import reindex_session
-            for s in self.store.list_sessions():
-                reindex_session(self.search_index, s.id)
-            log.info("search index startup scan complete")
+            worker.wait()
         except Exception:
-            log.exception("search startup scan failed")
+            log.exception("search scan worker wait failed")
+        try:
+            worker.deleteLater()
+        except Exception:
+            log.exception("search scan worker deleteLater failed")
+        if self._search_scan_worker is worker:
+            self._search_scan_worker = None
 
     def _session_summary_for_search(self, session_id: str) -> Optional[SessionSummary]:
         """Adapter for the search dialog's session_lookup parameter."""
@@ -3888,13 +4002,38 @@ class MainApp(QObject):
             return
         if self._encoder_prewarm is not None and self._encoder_prewarm.isRunning():
             return
-        self._encoder_prewarm = EncoderPrewarmThread(parent=self)
+        # Unparented (parent=None) so a quit-during-download (which can
+        # take 30+s for the SpeechBrain ECAPA-TDNN encoder) doesn't trip
+        # "QThread: Destroyed while running" via parent destruction.
+        # aboutToQuit -> _retire_encoder_prewarm waits for the thread
+        # to finish before the QApplication tears down.
+        self._encoder_prewarm = EncoderPrewarmThread(parent=None)
         self._encoder_prewarm.download_started.connect(
             self._on_encoder_download_started
         )
         self._encoder_prewarm.finished_ok.connect(self._on_encoder_ready)
         self._encoder_prewarm.failed.connect(self._on_encoder_failed)
         self._encoder_prewarm.start()
+
+    def _retire_encoder_prewarm(self) -> None:
+        """Join the encoder prewarm thread before app teardown.
+
+        Connected to qt_app.aboutToQuit. If the SpeechBrain encoder is
+        mid-download (which can take 30+ s on first install with a slow
+        network), letting the parent QApplication tear down while the
+        thread is still running aborts the process. Wait up to 2 s for
+        a graceful join; longer than that we'd rather log + leak the
+        thread than freeze the close.
+        """
+        worker = self._encoder_prewarm
+        if worker is None or not worker.isRunning():
+            return
+        log.info("waiting up to 2s for encoder prewarm to finish before quit")
+        if not worker.wait(2000):
+            log.warning(
+                "encoder prewarm did not finish within 2s; abandoning "
+                "(process may log a Qt warning at exit)"
+            )
 
     def _on_encoder_download_started(self) -> None:
         self.window.status(
@@ -3918,19 +4057,24 @@ class MainApp(QObject):
     # ---- update checks ----------------------------------------------------
 
     def _auto_check_for_updates(self) -> None:
-        """Silent weekly check on startup.
+        """Silent weekly check on startup (issue #34).
 
-        Only nags the user via QMessageBox when there's a newer release.
-        Network errors / private-repo 404s degrade to silent no-op.
+        Dispatches to a worker QThread so the urllib request can't
+        block the main thread for up to 30 s if GitHub is slow or
+        unreachable. Only nags the user via QMessageBox when there's
+        a newer release; network errors and private-repo 404s
+        degrade to silent no-op.
         """
-        try:
-            result = updater_mod.check_for_updates()
-        except Exception:
-            log.exception("auto update check failed")
+        if self._update_check_worker is not None and self._update_check_worker.isRunning():
             return
-        if result is None:
-            return
-        local, remote = result
+        worker = _UpdateCheckWorker(mode="auto")
+        worker.result_ready.connect(self._on_auto_update_available)
+        # `up_to_date` and `failed` in auto mode -> silent no-op.
+        worker.finished.connect(lambda w=worker: self._retire_update_check_worker(w))
+        self._update_check_worker = worker
+        worker.start()
+
+    def _on_auto_update_available(self, local: str, remote: str) -> None:
         self.window.status(
             f"Update available: v{remote} (current v{local}). See Help > Upgrade.",
             timeout_ms=10000,
@@ -3946,42 +4090,62 @@ class MainApp(QObject):
 
     def _on_check_for_updates(self) -> None:
         """Manual Help > Check for Updates... path -- ignores the 7-day cooldown."""
-        self.window.status("Checking for updates...", timeout_ms=4000)
-        QApplication.processEvents()
-        release = updater_mod.get_latest_release()
-        if release is None:
-            QMessageBox.information(
-                self.window,
-                "Check for Updates",
-                "Could not check for updates.\n\n"
-                "Possible reasons:\n"
-                "  - No network connectivity\n"
-                "  - The release feed is restricted (private repo)\n"
-                "  - GitHub is unreachable from this network",
-            )
-            self.window.status("Ready", timeout_ms=2000)
+        if self._update_check_worker is not None and self._update_check_worker.isRunning():
+            self.window.status("Already checking for updates...", timeout_ms=2000)
             return
-        remote = release["tag_name"]
-        if updater_mod.is_newer_version(remote, __version__):
-            choice = QMessageBox.question(
-                self.window,
-                "Update Available",
-                f"A new version is available.\n\n"
-                f"Current version: {__version__}\n"
-                f"Latest version: {remote}\n\n"
-                + _upgrade_path_blurb()
-                + "\n\nUpgrade now?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if choice == QMessageBox.StandardButton.Yes:
-                self._on_upgrade()
-        else:
-            QMessageBox.information(
-                self.window,
-                "Check for Updates",
-                f"You are running the latest version ({__version__}).",
-            )
+        self.window.status("Checking for updates...", timeout_ms=0)
+        worker = _UpdateCheckWorker(mode="manual")
+        worker.result_ready.connect(self._on_manual_update_available)
+        worker.up_to_date.connect(self._on_manual_up_to_date)
+        worker.failed.connect(self._on_manual_check_failed)
+        worker.finished.connect(lambda w=worker: self._retire_update_check_worker(w))
+        self._update_check_worker = worker
+        worker.start()
+
+    def _on_manual_update_available(self, local: str, remote: str) -> None:
         self.window.status("Ready", timeout_ms=2000)
+        choice = QMessageBox.question(
+            self.window,
+            "Update Available",
+            f"A new version is available.\n\n"
+            f"Current version: {local}\n"
+            f"Latest version: {remote}\n\n"
+            + _upgrade_path_blurb()
+            + "\n\nUpgrade now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self._on_upgrade()
+
+    def _on_manual_up_to_date(self) -> None:
+        self.window.status("Ready", timeout_ms=2000)
+        QMessageBox.information(
+            self.window,
+            "Check for Updates",
+            f"You are running the latest version ({__version__}).",
+        )
+
+    def _on_manual_check_failed(self, message: str) -> None:
+        self.window.status("Ready", timeout_ms=2000)
+        QMessageBox.information(self.window, "Check for Updates", message)
+
+    def _retire_update_check_worker(self, worker) -> None:
+        """Join + deleteLater the update-check QThread after `finished`.
+
+        Mirrors the _safe_cleanup_thread pattern. wait() blocks at most
+        microseconds (finished already fired); the deleteLater drops
+        the QObject after Qt's next event loop tick.
+        """
+        try:
+            worker.wait()
+        except Exception:
+            log.exception("update-check worker wait failed")
+        try:
+            worker.deleteLater()
+        except Exception:
+            log.exception("update-check worker deleteLater failed")
+        if self._update_check_worker is worker:
+            self._update_check_worker = None
 
     def _on_upgrade(self) -> None:
         """Help > Upgrade... -- confirm + run UpgradeProgressDialog.
@@ -4112,6 +4276,205 @@ class MainApp(QObject):
         self.window.showNormal()
         self.window.raise_()
         self.window.activateWindow()
+
+
+class _UpdateCheckWorker(QThread):
+    """Run the GitHub release-check off the main thread (issue #34).
+
+    Emits exactly one of:
+      - `result_ready(local, remote)` when a newer release exists
+      - `up_to_date()` when the current version is the latest
+      - `failed(message)` on network / parse failure
+
+    `mode='auto'` honors the weekly cooldown (silent startup check);
+    `mode='manual'` ignores it (Help > Check for Updates ...). Either
+    way the worker is one-shot -- `finished` triggers
+    _safe_cleanup_qthread via the call-site connection.
+    """
+
+    result_ready = pyqtSignal(str, str)  # (local, remote)
+    up_to_date = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, mode: str = "auto") -> None:
+        super().__init__(None)
+        self._mode = mode
+
+    def run(self) -> None:
+        try:
+            if self._mode == "auto":
+                result = updater_mod.check_for_updates()
+                if result is None:
+                    self.up_to_date.emit()
+                    return
+                local, remote = result
+                self.result_ready.emit(local, remote)
+                return
+            release = updater_mod.get_latest_release()
+            if release is None:
+                self.failed.emit(
+                    "Could not check for updates.\n\n"
+                    "Possible reasons:\n"
+                    "  - No network connectivity\n"
+                    "  - The release feed is restricted (private repo)\n"
+                    "  - GitHub is unreachable from this network"
+                )
+                return
+            remote = release["tag_name"]
+            if updater_mod.is_newer_version(remote, __version__):
+                self.result_ready.emit(__version__, remote)
+            else:
+                self.up_to_date.emit()
+        except Exception as exc:
+            log.exception("update check worker failed")
+            self.failed.emit(f"Update check failed: {exc}")
+
+
+class _SessionContentLoader(QThread):
+    """Off-thread disk-read pass for session selection (issue #39).
+
+    Pulls every disk-backed content blob the right pane needs --
+    transcript, live notes, synthesis notes, previous-notes archive
+    list, prompt template metadata, highlight markers, attendee
+    parse, attachments info -- on a background thread, then hands
+    the whole bundle to the main thread for application via
+    individual UI setters.
+
+    The main thread isn't completely freed: setPlainText for a
+    500 KB transcript still has to compute layout on the GUI thread
+    (QTextDocument is not thread-safe). But the disk wait, JSON
+    parse, and glob scan move off, which is the dominant cost on
+    Windows with antivirus + large meetings.
+
+    Cancellation: every load() bumps the player's load generation;
+    the slot receiving content_loaded checks the captured generation
+    against the current and drops stale results.
+    """
+
+    content_loaded = pyqtSignal(int, object)  # (generation, _LoadedSessionContent)
+
+    def __init__(self, *, session_id: str, generation: int) -> None:
+        super().__init__(None)
+        self._session_id = session_id
+        self._generation = generation
+
+    def run(self) -> None:
+        from .models.transcript import TranscriptStore
+        from .utils import prompts as prompts_mod
+        try:
+            store = TranscriptStore(self._session_id)
+            transcript = store.read_transcript()
+            live_notes = store.read_live_notes()
+            notes = store.read_notes()
+            previous_notes_paths = store.list_previous_notes()
+            template_names = [t.name for t in prompts_mod.list_templates()]
+            selected_template = store.read_prompt_template_name()
+        except Exception as exc:
+            log.exception("session content load failed for %s", self._session_id)
+            self.content_loaded.emit(
+                self._generation,
+                _LoadedSessionContent(
+                    session_id=self._session_id,
+                    transcript="",
+                    live_notes="",
+                    notes="",
+                    previous_notes_paths=[],
+                    template_names=[],
+                    selected_template=None,
+                    error=str(exc),
+                ),
+            )
+            return
+        # Highlights live in a separate JSON file; the load is cheap
+        # but folding it into the same off-thread pass means the slot
+        # has all the data it needs in one queued event.
+        try:
+            highlights = HighlightsStore(self._session_id).load()
+        except Exception:
+            log.exception("highlights load failed for %s", self._session_id)
+            highlights = HighlightSet()
+        self.content_loaded.emit(
+            self._generation,
+            _LoadedSessionContent(
+                session_id=self._session_id,
+                transcript=transcript,
+                live_notes=live_notes,
+                notes=notes,
+                previous_notes_paths=previous_notes_paths,
+                template_names=template_names,
+                selected_template=selected_template,
+                highlights=highlights,
+                error=None,
+            ),
+        )
+
+
+@dataclass
+class _LoadedSessionContent:
+    """Container for everything _SessionContentLoader collects off-thread."""
+    session_id: str
+    transcript: str
+    live_notes: str
+    notes: str
+    previous_notes_paths: list
+    template_names: list
+    selected_template: Optional[str]
+    highlights: Optional["HighlightSet"] = None
+    error: Optional[str] = None
+
+
+class _SearchScanWorker(QThread):
+    """Walk every session's content fingerprint, reindex if stale.
+
+    Constructs its own SearchIndex inside run() so the SQLite
+    connection lives on the worker thread (sqlite3 connections enforce
+    creator-thread ownership by default). WAL mode lets this writer
+    interleave safely with the main thread's per-session reindex
+    writes from save sites.
+
+    Emits scan_complete(kind, reindexed_count) exactly once before
+    finished fires.
+    """
+
+    scan_complete = pyqtSignal(str, int)
+
+    def __init__(self, *, session_ids: list, kind: str) -> None:
+        super().__init__(None)
+        self._session_ids = list(session_ids)
+        self._kind = kind
+
+    def run(self) -> None:
+        reindexed = 0
+        # Local imports keep app.py's top-level import graph small
+        # and isolate the SQLite open to this thread.
+        try:
+            from .models.search_index import SearchIndex
+            from .utils.search_indexer import reindex_session
+        except Exception:
+            log.exception("search scan worker: imports failed")
+            self.scan_complete.emit(self._kind, 0)
+            return
+        try:
+            index = SearchIndex()
+        except Exception:
+            log.exception("search scan worker: SearchIndex open failed")
+            self.scan_complete.emit(self._kind, 0)
+            return
+        try:
+            for sid in self._session_ids:
+                if self.isInterruptionRequested():
+                    break
+                try:
+                    if reindex_session(index, sid):
+                        reindexed += 1
+                except Exception:
+                    log.exception("search scan worker: reindex %s failed", sid)
+        finally:
+            try:
+                index.close()
+            except Exception:
+                log.exception("search scan worker: index close failed")
+        self.scan_complete.emit(self._kind, reindexed)
 
 
 class _AudioExportWorker(QThread):

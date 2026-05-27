@@ -47,6 +47,48 @@ def test_write_segments_sorts_by_start(isolated_data_dir):
     assert body == expected
 
 
+def test_write_segments_is_atomic(isolated_data_dir):
+    """Issue #38: write_segments must not leave a partial file on
+    disk. The .tmp dance + Path.replace gives us atomic rewrite, so a
+    concurrent reader either sees the prior version or the new one --
+    never a half-written file.
+
+    We can't easily simulate a concurrent read here, but we can pin
+    the contract: after write_segments returns, no .tmp sibling
+    should be sitting next to the real file, and the real file's
+    contents must match the rendered segments exactly."""
+    store = TranscriptStore("atomic1")
+    store.write_segments([
+        _seg(MIC, "first", 0.0, 1.0),
+        _seg(MIC, "second", 1.0, 2.0),
+    ])
+    tmp_sibling = store.transcript_path.with_name(
+        store.transcript_path.name + ".tmp",
+    )
+    assert not tmp_sibling.exists(), (
+        "atomic-write tmp must be replaced into the real path, not left over"
+    )
+    assert store.transcript_path.read_text(encoding="utf-8") == (
+        "[00:00:00] Me: first\n[00:00:01] Me: second\n"
+    )
+
+
+def test_save_live_notes_is_atomic(isolated_data_dir):
+    """live_notes.md is overwritten on every debounced keystroke; an
+    in-place rewrite could truncate if the app crashes mid-write."""
+    store = TranscriptStore("atomic2")
+    store.save_live_notes("# Attendees\n- Aaron\n\n# Notes\n- one\n")
+    tmp_sibling = store.live_notes_path.with_name(
+        store.live_notes_path.name + ".tmp",
+    )
+    assert not tmp_sibling.exists()
+    assert "Aaron" in store.live_notes_path.read_text(encoding="utf-8")
+    # Second write replaces cleanly (no .tmp residue).
+    store.save_live_notes("# Attendees\n- Aaron\n- Beth\n")
+    assert not tmp_sibling.exists()
+    assert "Beth" in store.live_notes_path.read_text(encoding="utf-8")
+
+
 def test_save_notes_archives_existing(isolated_data_dir):
     store = TranscriptStore("s3")
     archive_path = store.save_notes("first pass notes")

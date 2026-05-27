@@ -157,30 +157,42 @@ class LoopbackRecorder(QObject):
             raise LoopbackUnavailable("no WASAPI loopback device found for default output")
         self._native_rate = int(device["defaultSampleRate"])
         self._channels = int(device["maxInputChannels"]) or 2
-        self._pa = pyaudio.PyAudio()
-        self._writer = AsyncWavWriter(
-            self.wav_path,
-            channels=self._channels,
-            sample_width=2,
-            sample_rate=self._native_rate,
-        )
-        self._writer.start()
-        self._is_recording = True
-        self._start_wallclock = time.monotonic()
-        self._first_sample_wallclock = None
-        self._last_callback_wallclock = None
-        self._stop_wallclock = None
-        self._gap_fill_frames_total = 0
-        self._stream = self._pa.open(
-            format=pyaudio.paInt16,
-            channels=self._channels,
-            rate=self._native_rate,
-            input=True,
-            input_device_index=device["index"],
-            frames_per_buffer=1024,
-            stream_callback=self._callback,
-        )
-        self._stream.start_stream()
+        # All resource creation past this point is wrapped so a
+        # mid-flight failure (e.g., pa.open raising OSError after the
+        # writer thread is already running) tears down what was built
+        # before propagating. Without this, the outer controller's
+        # cleanup only ran when `is_recording` was True, which left a
+        # gap between writer.start() and the flag flip where the
+        # writer thread would leak (issue #40).
+        try:
+            self._pa = pyaudio.PyAudio()
+            self._writer = AsyncWavWriter(
+                self.wav_path,
+                channels=self._channels,
+                sample_width=2,
+                sample_rate=self._native_rate,
+            )
+            self._writer.start()
+            self._is_recording = True
+            self._start_wallclock = time.monotonic()
+            self._first_sample_wallclock = None
+            self._last_callback_wallclock = None
+            self._stop_wallclock = None
+            self._gap_fill_frames_total = 0
+            self._stream = self._pa.open(
+                format=pyaudio.paInt16,
+                channels=self._channels,
+                rate=self._native_rate,
+                input=True,
+                input_device_index=device["index"],
+                frames_per_buffer=1024,
+                stream_callback=self._callback,
+            )
+            self._stream.start_stream()
+        except Exception:
+            log.exception("LoopbackRecorder.start failed; tearing down partial state")
+            self._partial_start_cleanup()
+            raise
         log.info(
             "LoopbackRecorder started: %s, %d Hz, %d ch -> %s",
             device.get("name", "?"),
@@ -188,6 +200,36 @@ class LoopbackRecorder(QObject):
             self._channels,
             self.wav_path,
         )
+
+    def _partial_start_cleanup(self) -> None:
+        """Best-effort teardown when start() fails mid-flight.
+
+        Called from start()'s except clause -- the controller's outer
+        handler also calls stop() if is_recording is True, but the
+        is_recording flag isn't set early enough to cover every
+        path. Owning the cleanup here means start() is the single
+        source of truth for "what was built; tear it down."
+        """
+        self._is_recording = False
+        if self._stream is not None:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                log.exception("LoopbackRecorder partial-start stream cleanup failed")
+            self._stream = None
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:
+                log.exception("LoopbackRecorder partial-start writer cleanup failed")
+            self._writer = None
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                log.exception("LoopbackRecorder partial-start pa terminate failed")
+            self._pa = None
         self.started.emit()
 
     def _callback(self, in_data, frame_count, time_info, status):
@@ -264,12 +306,24 @@ class LoopbackRecorder(QObject):
         # Drain queue + join writer + finalize WAV. Outside the lock
         # because it may wait several seconds for the writer to
         # flush any backlog.
+        writer_closed_cleanly = True
         if writer is not None:
             try:
                 writer.close()
             except Exception:
                 log.exception("LoopbackRecorder: writer.close failed")
-        self._maybe_pad_wav()
+                writer_closed_cleanly = False
+        # Skip pad_wav if the writer couldn't finalize the header
+        # (issue #41) -- the partial WAV would be made worse by a
+        # subsequent rewrite against an unfinalized header.
+        if writer_closed_cleanly:
+            self._maybe_pad_wav()
+        else:
+            log.warning(
+                "LoopbackRecorder: skipping pad_wav for %s because writer "
+                "did not close cleanly; the partial WAV is left as-is",
+                self.wav_path,
+            )
         log.info("LoopbackRecorder stopped")
         self.stopped.emit()
 

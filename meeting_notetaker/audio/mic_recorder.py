@@ -90,36 +90,69 @@ class MicRecorder(QObject):
         # Force mono on the mic side. Whisper does not benefit from stereo
         # mic and most laptop mics are mono anyway.
         self._channels = 1
-        self._writer = AsyncWavWriter(
-            self.wav_path,
-            channels=self._channels,
-            sample_width=2,
-            sample_rate=self._native_rate,
-        )
-        self._writer.start()
-        self._is_recording = True
-        self._start_wallclock = time.monotonic()
-        self._first_sample_wallclock = None
-        self._last_callback_wallclock = None
-        self._stop_wallclock = None
-        self._gap_fill_frames_total = 0
-        open_kwargs: dict = dict(
-            format=pyaudio.paInt16,
-            channels=self._channels,
-            rate=self._native_rate,
-            input=True,
-            frames_per_buffer=1024,
-            stream_callback=self._callback,
-        )
-        if device_index is not None:
-            open_kwargs["input_device_index"] = device_index
-        self._stream = self._pa.open(**open_kwargs)
-        self._stream.start_stream()
+        # Wrap so mid-flight failures (e.g., pa.open after the writer
+        # thread is already running) tear down the partial state
+        # before propagating. The outer controller's cleanup runs
+        # stop() only when is_recording is True, leaving a gap that
+        # this self-cleanup covers (issue #40).
+        try:
+            self._writer = AsyncWavWriter(
+                self.wav_path,
+                channels=self._channels,
+                sample_width=2,
+                sample_rate=self._native_rate,
+            )
+            self._writer.start()
+            self._is_recording = True
+            self._start_wallclock = time.monotonic()
+            self._first_sample_wallclock = None
+            self._last_callback_wallclock = None
+            self._stop_wallclock = None
+            self._gap_fill_frames_total = 0
+            open_kwargs: dict = dict(
+                format=pyaudio.paInt16,
+                channels=self._channels,
+                rate=self._native_rate,
+                input=True,
+                frames_per_buffer=1024,
+                stream_callback=self._callback,
+            )
+            if device_index is not None:
+                open_kwargs["input_device_index"] = device_index
+            self._stream = self._pa.open(**open_kwargs)
+            self._stream.start_stream()
+        except Exception:
+            log.exception("MicRecorder.start failed; tearing down partial state")
+            self._partial_start_cleanup()
+            raise
         log.info(
             "MicRecorder started: device=%s (%s), %d Hz, %d ch -> %s",
             device_index, info.get("name", "?"), self._native_rate, self._channels, self.wav_path,
         )
         self.started.emit()
+
+    def _partial_start_cleanup(self) -> None:
+        """Best-effort teardown when start() fails mid-flight."""
+        self._is_recording = False
+        if self._stream is not None:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                log.exception("MicRecorder partial-start stream cleanup failed")
+            self._stream = None
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:
+                log.exception("MicRecorder partial-start writer cleanup failed")
+            self._writer = None
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                log.exception("MicRecorder partial-start pa terminate failed")
+            self._pa = None
 
     def _callback(self, in_data, frame_count, time_info, status):
         import pyaudio
@@ -201,12 +234,24 @@ class MicRecorder(QObject):
         # the wave file with the final header. Done outside the lock
         # because it can wait up to a few seconds for the writer to
         # finish.
+        writer_closed_cleanly = True
         if writer is not None:
             try:
                 writer.close()
             except Exception:
                 log.exception("MicRecorder: writer.close failed")
-        self._maybe_pad_wav()
+                writer_closed_cleanly = False
+        # Skip pad_wav if the writer couldn't finalize the header
+        # (issue #41) -- rewriting an unfinalized WAV produces a
+        # doubly-corrupt file that's worse than the partial original.
+        if writer_closed_cleanly:
+            self._maybe_pad_wav()
+        else:
+            log.warning(
+                "MicRecorder: skipping pad_wav for %s because writer "
+                "did not close cleanly; the partial WAV is left as-is",
+                self.wav_path,
+            )
         log.info("MicRecorder stopped")
         self.stopped.emit()
 

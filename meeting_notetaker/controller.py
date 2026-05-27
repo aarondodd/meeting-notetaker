@@ -67,6 +67,31 @@ from .utils.vocabulary import derive_session_hotwords, join_hotwords, load_vocab
 log = logging.getLogger(__name__)
 
 
+def _retire_thread(thread: Optional[QThread]) -> None:
+    """Join an OS thread before destroying its QObject wrapper.
+
+    QThread.finished fires inside the run-wrapper BEFORE the OS thread
+    is joined. Calling deleteLater (or letting Python refcount drop)
+    races against that join and trips "QThread: Destroyed while thread
+    is still running" on Windows. Mirrors the helpers in
+    audio/player.py and ui/attachment_preview.py -- inlined here to
+    keep controller.py self-contained.
+
+    Safe to call with None (e.g., when proc_state.batch_thread was
+    never set because the session went straight to finalize).
+    """
+    if thread is None:
+        return
+    try:
+        thread.wait()
+    except Exception:
+        log.exception("controller: thread.wait() failed during retirement")
+    try:
+        thread.deleteLater()
+    except Exception:
+        log.exception("controller: thread.deleteLater() failed during retirement")
+
+
 class _BatchTranscribeThread(QThread):
     """Wraps batch_transcribe for the final-pass after stop().
 
@@ -757,6 +782,15 @@ class SessionController(QObject):
         self.store.update_session(session.id, state=STATE_COMPLETE)
         session.state = STATE_COMPLETE
         self.state_changed.emit(session.id, STATE_COMPLETE)
+        # Belt-and-suspenders: most completion paths already retired
+        # their thread, but if a session went straight to finalize
+        # (skip-batch path) the threads were never set, and if a
+        # refinement_done landed _before_ we got here, retirement
+        # already ran -- _retire_thread(None) is safe either way.
+        _retire_thread(proc_state.batch_thread)
+        proc_state.batch_thread = None
+        _retire_thread(proc_state.refinement_thread)
+        proc_state.refinement_thread = None
         self._processing_sessions.pop(session_id, None)
         # The tag store stayed in self._tag_stores so the sidebar widget
         # could keep showing live counts during processing. Drop it now
@@ -824,6 +858,13 @@ class SessionController(QObject):
         if proc_state is None:
             log.warning("batch done for unknown processing session %s", session_id)
             return
+        # Retire the batch QThread now that its work is done. The done
+        # signal fires from inside run()'s return; wait() blocks at most
+        # microseconds for the OS thread to finish joining. Without
+        # this, the QThread sits in memory until app exit and can land
+        # "Destroyed while running" if Qt cleans it up earlier.
+        _retire_thread(proc_state.batch_thread)
+        proc_state.batch_thread = None
         session = proc_state.session
         store = TranscriptStore(session.id)
         if segments:
@@ -878,6 +919,10 @@ class SessionController(QObject):
         result: RefinementResult,
     ) -> None:
         """Apply labels, persist diarization metadata, and finalize."""
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is not None:
+            _retire_thread(proc_state.refinement_thread)
+            proc_state.refinement_thread = None
         try:
             labeled = apply_labels_to_segments(input_segments, result.segment_labels)
             store = TranscriptStore(session_id)
@@ -900,6 +945,10 @@ class SessionController(QObject):
         self._finalize_session(session_id, batch_segments=None)
 
     def _on_refinement_skipped(self, session_id: str, reason: str) -> None:
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is not None:
+            _retire_thread(proc_state.refinement_thread)
+            proc_state.refinement_thread = None
         log.info("speaker refinement skipped for %s: %s", session_id, reason)
         self.speaker_refinement_skipped.emit(session_id, reason)
         self._finalize_session(session_id, batch_segments=None)
@@ -975,6 +1024,10 @@ class SessionController(QObject):
             store.close()
 
     def _on_refinement_failed(self, session_id: str, msg: str) -> None:
+        proc_state = self._processing_sessions.get(session_id)
+        if proc_state is not None:
+            _retire_thread(proc_state.refinement_thread)
+            proc_state.refinement_thread = None
         log.warning("speaker refinement failed for %s: %s", session_id, msg)
         # Don't fail the whole session over a refinement bug; just skip
         # the labeling step and finalize normally.
@@ -984,6 +1037,9 @@ class SessionController(QObject):
     def _on_batch_failed(self, session_id: str, msg: str) -> None:
         proc_state = self._processing_sessions.pop(session_id, None)
         self._phase_plans.pop(session_id, None)
+        if proc_state is not None:
+            _retire_thread(proc_state.batch_thread)
+            proc_state.batch_thread = None
         self.store.update_session(session_id, state=STATE_ERROR)
         if proc_state is not None:
             proc_state.session.state = STATE_ERROR
