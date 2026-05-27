@@ -485,7 +485,59 @@ class _DedupStore:
 
 
 try:
-    from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+    from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
+
+    class _OutlookFetchWorker(QThread):
+        """Run the Outlook COM call on a background thread (issue #48).
+
+        Outlook calendar resolution goes through win32com's lazy
+        attribute lookup, which is synchronous + can take 700-1000 ms
+        per tick. Running it on the main thread froze the UI for
+        ~900 ms every 60 s (the QTimer cadence). The worker calls
+        ``fetch_imminent_meetings`` then emits ``done(meetings)`` on
+        the main thread for the dedup + signal-emit step.
+
+        COM apartment: ``pythoncom.CoInitialize`` must be called once
+        per thread that touches win32com. The worker initializes on
+        entry + uninitializes in a finally so a raise during the COM
+        call doesn't leak the apartment.
+        """
+
+        done = pyqtSignal(object)  # list[MeetingInfo]
+
+        def __init__(self, window_minutes: int) -> None:
+            super().__init__(None)
+            self._window_minutes = window_minutes
+
+        def run(self) -> None:
+            # Local import keeps the pure-Python test env from needing
+            # pywin32 just to import the module.
+            try:
+                import pythoncom  # type: ignore[import-not-found]
+            except ImportError:
+                pythoncom = None
+            if pythoncom is not None:
+                try:
+                    pythoncom.CoInitialize()
+                except Exception:
+                    log.exception("OutlookFetchWorker: CoInitialize failed")
+                    self.done.emit([])
+                    return
+            try:
+                try:
+                    meetings = fetch_imminent_meetings(self._window_minutes)
+                except Exception:
+                    log.exception("calendar poll failed (worker)")
+                    meetings = []
+                self.done.emit(meetings)
+            finally:
+                if pythoncom is not None:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        log.exception(
+                            "OutlookFetchWorker: CoUninitialize failed"
+                        )
 
     class OutlookCalendarMonitor(QObject):
         """Polls Outlook every poll_interval_sec; emits meeting_imminent per new meeting."""
@@ -506,24 +558,29 @@ try:
             self._timer = QTimer(self)
             self._timer.setInterval(max(5, int(poll_interval_sec)) * 1000)
             self._timer.timeout.connect(self._tick)
+            # In-flight worker (issue #48). At most one tick runs at a
+            # time; if the QTimer fires while a prior tick is still
+            # crunching, the new tick is skipped rather than queued
+            # behind it.
+            self._worker: Optional[_OutlookFetchWorker] = None
 
         def start(self) -> None:
             log.info(
                 "OutlookCalendarMonitor starting (window=%d min, poll=%dms)",
                 self._window_minutes, self._timer.interval(),
             )
-            # Defer the first tick to the next event-loop iteration
-            # (issue #43). Inline calling _tick() here was blocking
-            # MainApp.__init__ for ~750 ms via win32com's lazy COM
-            # attribute resolution -- the window didn't paint until
-            # Outlook had been queried. Deferring lets the window
-            # become interactive first; the first poll lands ~one
-            # event-loop tick later.
+            # First tick still goes through the worker now (issue #48
+            # subsumes #43); QTimer.singleShot(0) just ensures the
+            # window paints before we even dispatch the worker.
             QTimer.singleShot(0, self._tick)
             self._timer.start()
 
         def stop(self) -> None:
             self._timer.stop()
+            # Don't wait for the in-flight worker -- it's a one-shot
+            # COM call and the finished signal handler retires it
+            # via _safe_cleanup. wait() at stop would block the
+            # caller (potentially the app's aboutToQuit handler).
             log.info("OutlookCalendarMonitor stopped")
 
         def is_running(self) -> bool:
@@ -534,15 +591,37 @@ try:
             return self._window_minutes
 
         def _tick(self) -> None:
-            try:
-                meetings = fetch_imminent_meetings(self._window_minutes)
-            except Exception:
-                log.exception("calendar poll failed")
+            if self._worker is not None and self._worker.isRunning():
+                # Prior poll still resolving COM -- skip this tick
+                # rather than overlapping (Outlook COM access from
+                # two threads is asking for trouble).
+                log.debug("OutlookCalendarMonitor: prior tick still running, skipping")
                 return
+            worker = _OutlookFetchWorker(self._window_minutes)
+            worker.done.connect(self._on_fetch_done)
+            worker.finished.connect(lambda w=worker: self._retire_worker(w))
+            self._worker = worker
+            worker.start()
+
+        def _on_fetch_done(self, meetings) -> None:
+            """Slot for worker.done. Runs on the main thread; safe to
+            touch _dedup + emit Qt signals."""
             for m in meetings:
                 if self._dedup.is_seen(m.entry_id):
                     continue
                 self._dedup.mark_seen(m.entry_id)
                 self.meeting_imminent.emit(m)
+
+        def _retire_worker(self, worker) -> None:
+            try:
+                worker.wait()
+            except Exception:
+                log.exception("Outlook worker wait failed")
+            try:
+                worker.deleteLater()
+            except Exception:
+                log.exception("Outlook worker deleteLater failed")
+            if self._worker is worker:
+                self._worker = None
 except ImportError:  # pragma: no cover -- pure-Python test envs without PyQt6
     OutlookCalendarMonitor = None  # type: ignore[assignment,misc]
