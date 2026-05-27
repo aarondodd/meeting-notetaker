@@ -498,7 +498,18 @@ class SessionController(QObject):
             audio_dir = session_audio_dir(session.id)
             self._mic_wav = audio_dir / "mic.wav"
             self._sys_wav = audio_dir / "sys.wav"
-            self._chunk_buffer = ChunkBuffer(sources=[MIC, SYS])
+            # Issue #47: the chunk_buffer is purely a scratchpad for
+            # LiveTranscriptionWorker.pop_window. In capture-only mode
+            # no worker is created so nothing drains it -- and the
+            # recorders' callbacks would still push into it, growing
+            # the underlying numpy array O(N) per write and starving
+            # the PortAudio capture callback at ~10-15 min in. Don't
+            # even allocate it when there's no consumer.
+            self._chunk_buffer = (
+                ChunkBuffer(sources=[MIC, SYS])
+                if not capture_only_effective
+                else None
+            )
 
             # Live transcription off if capture-only mode is on. The model is
             # expected to be already cached -- the app layer preloads it via a

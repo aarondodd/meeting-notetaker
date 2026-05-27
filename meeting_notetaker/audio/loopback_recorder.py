@@ -48,7 +48,7 @@ class LoopbackRecorder(QObject):
 
     def __init__(
         self,
-        chunk_buffer: ChunkBuffer,
+        chunk_buffer: Optional[ChunkBuffer],
         wav_path: Path,
         *,
         source_name: str = "sys",
@@ -56,6 +56,11 @@ class LoopbackRecorder(QObject):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
+        # See MicRecorder.__init__ for the chunk_buffer = None
+        # rationale (issue #47): in capture-only mode there's no
+        # LiveTranscriptionWorker consumer + the buffer would grow
+        # unbounded under a lock in the audio callback, starving the
+        # device callback.
         self.chunk_buffer = chunk_buffer
         self.wav_path = Path(wav_path)
         self.source_name = source_name
@@ -92,6 +97,21 @@ class LoopbackRecorder(QObject):
         # silence between them -- the bug Aaron flagged where the
         # second music clip played at the wrong wall-clock moment.
         self._gap_fill_frames_total: int = 0
+        # Diagnostic counters (issue #47). paInputOverflow tracks
+        # PortAudio's "samples dropped" flag; _callbacks_seen catches
+        # the "never received a callback" failure mode. Trailing pad
+        # is recorded at stop time so the #44 detector can also fire
+        # on cumulative loss, not just complete tail-end silence.
+        self._input_overflow_count: int = 0
+        self._callbacks_seen: int = 0
+        self._trailing_pad_frames: int = 0
+        # Per-minute diagnostic log (see MicRecorder for the same
+        # pattern). Tracks the last time we emitted a status line so
+        # the callback can decide whether to log this cycle.
+        self._last_diag_log_wallclock: Optional[float] = None
+
+    # See MicRecorder._DIAG_LOG_INTERVAL_S.
+    _DIAG_LOG_INTERVAL_S = 60.0
 
     @staticmethod
     def is_available() -> bool:
@@ -245,6 +265,23 @@ class LoopbackRecorder(QObject):
             return (None, pyaudio.paContinue)
         try:
             now = time.monotonic()
+            self._callbacks_seen += 1
+            # See MicRecorder._callback for the status-flag rationale
+            # (issue #47). Same fix here: track + log paInputOverflow,
+            # force-fill the wallclock deficit when flagged so the
+            # cumulative loss doesn't accumulate to the trailing pad.
+            had_input_overflow = bool(status & pyaudio.paInputOverflow)
+            if had_input_overflow:
+                self._input_overflow_count += 1
+                if (
+                    self._input_overflow_count <= 5
+                    or self._input_overflow_count % 100 == 0
+                ):
+                    log.warning(
+                        "LoopbackRecorder: paInputOverflow flagged "
+                        "(count=%d, status=0x%x)",
+                        self._input_overflow_count, int(status),
+                    )
             if self._first_sample_wallclock is None:
                 self._first_sample_wallclock = now
             elif self._last_callback_wallclock is not None and self._writer is not None:
@@ -255,26 +292,37 @@ class LoopbackRecorder(QObject):
                 # wall-clock-aligned. Without this, two separate
                 # audio bursts land back-to-back in sys.wav and the
                 # second one plays at the wrong moment in playback.
+                threshold_ms = 0 if had_input_overflow else 100
                 gap = gap_frames_to_fill(
                     now_wallclock=now,
                     last_callback_wallclock=self._last_callback_wallclock,
                     frame_count=frame_count,
                     sample_rate=self._native_rate,
+                    threshold_ms=threshold_ms,
                 )
                 if gap > 0:
                     log.info(
-                        "LoopbackRecorder gap-fill: %d frames (%.0f ms)",
+                        "LoopbackRecorder gap-fill: %d frames (%.0f ms)%s",
                         gap, gap * 1000 / self._native_rate,
+                        " [overflow]" if had_input_overflow else "",
                     )
                     self._writer.write_silence_frames(gap)
                     self._gap_fill_frames_total += gap
             self._last_callback_wallclock = now
+            # Periodic diagnostic snapshot -- see MicRecorder._callback.
+            if self._last_diag_log_wallclock is None:
+                self._last_diag_log_wallclock = now
+            elif now - self._last_diag_log_wallclock >= self._DIAG_LOG_INTERVAL_S:
+                self._emit_diag_log(now, frame_count, sample_rate=self._native_rate)
+                self._last_diag_log_wallclock = now
             if self._writer is not None:
                 # Non-blocking enqueue -- writer thread drains to disk.
                 self._writer.write_frames(in_data)
-            pcm = np.frombuffer(in_data, dtype=np.int16)
-            mono16k = to_mono_16k(pcm, channels=self._channels, src_rate=self._native_rate)
-            self.chunk_buffer.write(self.source_name, mono16k)
+            # Skip chunk_buffer + downmix when no live consumer (issue #47).
+            if self.chunk_buffer is not None:
+                pcm = np.frombuffer(in_data, dtype=np.int16)
+                mono16k = to_mono_16k(pcm, channels=self._channels, src_rate=self._native_rate)
+                self.chunk_buffer.write(self.source_name, mono16k)
         except Exception as exc:  # pragma: no cover - audio-callback safety net
             log.exception("loopback callback failed")
             self.error.emit(str(exc))
@@ -330,6 +378,7 @@ class LoopbackRecorder(QObject):
                 self.wav_path,
             )
         self._check_for_trailing_capture_stall()
+        self._emit_stop_summary()
         log.info("LoopbackRecorder stopped")
         self.stopped.emit()
 
@@ -338,26 +387,98 @@ class LoopbackRecorder(QObject):
     # spans (audio engine sleeps when no renderer is active), so the
     # 10 s threshold is generous on this side too. Issue #44.
     _TRAILING_STALL_THRESHOLD_S = 10.0
+    # Mirror of MicRecorder._TRAILING_PAD_WARNING_S. Issue #47.
+    _TRAILING_PAD_WARNING_S = 30.0
+
+    def _emit_diag_log(
+        self, now_wallclock: float, frame_count: int, *, sample_rate: int,
+    ) -> None:
+        """Per-minute health snapshot. See MicRecorder._emit_diag_log."""
+        elapsed = (
+            now_wallclock - self._start_wallclock
+            if self._start_wallclock is not None
+            else 0.0
+        )
+        gap_ms = self._gap_fill_frames_total * 1000 / sample_rate if sample_rate else 0
+        chunk_state = (
+            f"chunk_buf=ON({self.chunk_buffer.written_seconds(self.source_name):.1f}s)"
+            if self.chunk_buffer is not None
+            else "chunk_buf=OFF"
+        )
+        log.info(
+            "LoopbackRecorder diag: elapsed=%.0fs callbacks=%d overflow=%d "
+            "gap_fill=%.0fms last_frame_count=%d %s",
+            elapsed, self._callbacks_seen, self._input_overflow_count,
+            gap_ms, frame_count, chunk_state,
+        )
+
+    def _emit_stop_summary(self) -> None:
+        """One-line summary of this recorder's capture health at Stop.
+        See MicRecorder._emit_stop_summary for the rationale."""
+        elapsed = (
+            (self._stop_wallclock or 0.0) - (self._start_wallclock or 0.0)
+        )
+        gap_ms = (
+            self._gap_fill_frames_total * 1000 / self._native_rate
+            if self._native_rate else 0
+        )
+        trailing_ms = (
+            self._trailing_pad_frames * 1000 / self._native_rate
+            if self._native_rate else 0
+        )
+        last_callback_gap = (
+            ((self._stop_wallclock or 0.0) - (self._last_callback_wallclock or 0.0))
+            if self._last_callback_wallclock is not None else None
+        )
+        log.info(
+            "LoopbackRecorder summary: elapsed=%.1fs callbacks=%d overflow=%d "
+            "gap_fill=%.0fms trailing_pad=%.0fms "
+            "last_callback_gap=%s rate=%d",
+            elapsed, self._callbacks_seen, self._input_overflow_count,
+            gap_ms, trailing_ms,
+            f"{last_callback_gap:.2f}s" if last_callback_gap is not None else "n/a",
+            self._native_rate,
+        )
 
     def _check_for_trailing_capture_stall(self) -> None:
-        """Warn if WASAPI loopback stopped delivering audio well before Stop."""
+        """Warn on tail-silence (callback stopped) or cumulative under-delivery.
+
+        See MicRecorder._check_for_trailing_capture_stall for the
+        two-case rationale. Same structure here; the user-facing
+        message differs because the expected cause is WASAPI audio-
+        engine idle, not USB power management.
+        """
         if (
             self._last_callback_wallclock is None
             or self._stop_wallclock is None
         ):
             return
-        stall_s = self._stop_wallclock - self._last_callback_wallclock
-        if stall_s < self._TRAILING_STALL_THRESHOLD_S:
+        last_callback_gap_s = self._stop_wallclock - self._last_callback_wallclock
+        pad_s = self._trailing_pad_frames / self._native_rate if self._native_rate else 0.0
+        if last_callback_gap_s >= self._TRAILING_STALL_THRESHOLD_S:
+            msg = (
+                f"System-audio loopback stopped delivering audio "
+                f"{last_callback_gap_s:.1f} s before Stop -- the last "
+                f"{last_callback_gap_s:.0f} s of the system-audio track is silence. "
+                f"Likely cause: the Windows audio engine went idle "
+                f"(nothing playing through the speakers)."
+            )
+            log.warning("LoopbackRecorder: %s", msg)
+            self.capture_warning.emit(msg)
             return
-        msg = (
-            f"System-audio loopback stopped delivering audio "
-            f"{stall_s:.1f} s before Stop -- the last {stall_s:.0f} s "
-            f"of the system-audio track is silence. Likely cause: the "
-            f"Windows audio engine went idle (nothing playing through "
-            f"the speakers)."
-        )
-        log.warning("LoopbackRecorder: %s", msg)
-        self.capture_warning.emit(msg)
+        if pad_s >= self._TRAILING_PAD_WARNING_S:
+            overflow_hint = (
+                f" PortAudio flagged paInputOverflow {self._input_overflow_count} time(s)"
+                if self._input_overflow_count
+                else ""
+            )
+            msg = (
+                f"System-audio loopback under-delivered: {pad_s:.0f} s of "
+                f"silence padded at the end to maintain wallclock alignment. "
+                f"Cumulative sample loss across the recording.{overflow_hint}"
+            )
+            log.warning("LoopbackRecorder: %s", msg)
+            self.capture_warning.emit(msg)
 
     def _maybe_pad_wav(self) -> None:
         """Rewrite the WAV with leading + trailing silence to span
@@ -382,6 +503,9 @@ class LoopbackRecorder(QObject):
             actual_frames=actual_frames,
             sample_rate=self._native_rate,
         )
+        # Record the trailing pad so _check_for_trailing_capture_stall
+        # can fire on cumulative loss (issue #47).
+        self._trailing_pad_frames = trailing
         if leading == 0 and trailing == 0:
             return
         log.info(
