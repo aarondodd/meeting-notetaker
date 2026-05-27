@@ -627,6 +627,14 @@ class MainApp(QObject):
                 "automation in Settings.",
             )
             return
+        # Tighten Claude's loose-list serialization (issue #42).
+        # Claude.ai's Copy button writes a blank line between every
+        # bullet + multiple blank lines between sections; the user-
+        # expected source view (matching browser text-selection paste)
+        # is tight-list. No-op for any target that already returns
+        # tight markdown.
+        from .automation.markdown_normalize import normalize_synthesis_markdown
+        markdown = normalize_synthesis_markdown(markdown)
         try:
             archive_path = TranscriptStore(session_id).save_notes(
                 markdown, archive_existing=True
