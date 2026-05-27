@@ -9,19 +9,14 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.0 (in development). End-to-end capture,
-> transcription, synthesis, screen capture, retained-audio playback +
-> export, and transcript-synchronized playback all working. v0.7.0
-> adds within-tab `Ctrl+F` find + cross-session full-text search
-> (`Ctrl+Shift+F`), per-session classification (series / topics with
-> a filter pulldown above the session list and a compact popup-menu
-> bar on each session), File > Manage Classification for renaming /
-> merging / deleting series + topics, a unified File > Address Book
-> that ties Session People to Speaker voices via Contact aliases (so
-> typing "BS" in attendees resolves to Bob Smith and propagates to
-> voice recognition), sortable session-list columns with persisted
-> window + splitter geometry, and highlight markers with MP4 / audio
-> export.
+> **Status:** v0.7.1. End-to-end capture, transcription, synthesis,
+> screen capture, retained-audio playback + export, and transcript-
+> synchronized playback all working. v0.7.1 is a stability + UX
+> release focused on the audio pipeline: a long-recording garbling
+> bug that had been present since v0.6.5 is fixed, the synthesis
+> output matches manual paste from Claude.ai exactly, the post-
+> refinement and Outlook-polling main-thread stalls are gone, and
+> session-switching on multi-hour meetings is now responsive.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -44,6 +39,70 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.1
+
+Bug fixes + stability work. No new user-facing features; everything
+that was in v0.7.0 still works the same way.
+
+- **Long-recording audio capture is fixed.** Recordings past 10-15
+  minutes had been garbling and losing the trailing minutes as
+  silence -- a regression that surfaced in v0.6.5 when capture-only
+  mode became the default. Root cause turned out to be an unbounded
+  in-memory scratchpad buffer running under a lock in the audio
+  callback path: with no live-transcription consumer to drain it,
+  every callback was copying the entire recording history, which
+  starved the PortAudio capture thread by minute 10-15 and dropped
+  samples silently. The buffer is now skipped entirely when nothing
+  reads it, and the recorders also inspect PortAudio's
+  paInputOverflow flag so any future capture stall (driver hiccup,
+  power-management, etc.) gets logged + filled with silence rather
+  than accumulating to a multi-minute silent tail.
+- **Diagnostic logging during recording.** Each recorder writes a
+  per-minute health snapshot (`MicRecorder diag: elapsed=Ns
+  callbacks=N overflow=N gap_fill=Nms ...`) and a one-line summary
+  at Stop. Future "audio went silent" reports now come with a
+  minute-by-minute timeline.
+- **UI freezes during refinement and Outlook polling are gone.**
+  The post-refinement opus re-encode ran synchronously on the main
+  thread and froze the UI for ~10 seconds at the end of long
+  recordings; it now runs on a worker. The Outlook calendar poll
+  fired every 60 seconds with a ~900 ms COM call on the main
+  thread; that now runs on a worker too, with per-thread COM
+  apartment init and skip-on-overlap so two ticks can't race.
+- **Session-switch is responsive on long meetings.** Switching to a
+  session with a 2-hour transcript used to freeze the UI for half a
+  second while the transcript + notes loaded. The disk reads and
+  layout work now run off the main thread with a generation counter
+  that cancels stale loads when you click through sessions quickly.
+- **Synthesis source matches what you'd paste manually.** Claude.ai's
+  Copy button writes a "loose" markdown serialization with extra
+  blank lines between every bullet and after every section heading.
+  The app now tightens that to match what a manual Ctrl+C of the
+  same response produces, so the source view of the Synthesis tab
+  is the same shape as the rendered output.
+- **Updater and search-index scan moved off the main thread.** Cold
+  launch on a slow network no longer hangs for up to 30 seconds on
+  the GitHub release check. Installs with hundreds of sessions no
+  longer hitch every 30 seconds while the search index fingerprint
+  scan runs.
+- **Atomic transcript writes.** `raw.transcript.md`, `live_notes.md`,
+  and `notes.md` are written via a `.tmp` + rename dance so a
+  concurrent reader can't see a partial file.
+- **Recorder reliability.** A WAV that didn't close cleanly is no
+  longer rewritten by the wallclock-alignment pad (which would have
+  made it worse), partial-start failures inside the recorders no
+  longer leak threads, and the `_BatchTranscribeThread` /
+  `_SpeakerRefinementThread` / `EncoderPrewarmThread` lifecycle now
+  matches the rest of the codebase so quitting mid-processing exits
+  cleanly instead of aborting with "QThread destroyed while
+  running".
+- **MainLoopWatchdog forensic capture.** Whenever the Qt event loop
+  is unresponsive for >750 ms, every thread's Python stack gets
+  dumped into `meeting_notetaker.log` with a `MainLoopWatchdog:
+  event loop stalled` header. The diagnostic was what made
+  every fix in this release possible -- if a freeze comes back,
+  paste the dump.
 
 ## What's new in v0.7.0
 
