@@ -329,3 +329,141 @@ def test_enrich_from_outlook_handles_missing_attributes(store):
     after = store.get_contact(c.id)
     assert after.primary_email == "bob@bobco.com"
     assert after.title is None
+
+
+# ---- resolve_calendar_attendee + auto-merge (2026-05-28) ------------------
+
+
+from meeting_notetaker.models.classification import (  # noqa: E402
+    ALIAS_KIND_EMAIL,
+    SOURCE_CALENDAR,
+)
+from meeting_notetaker.utils.contact_resolution import (  # noqa: E402
+    resolve_calendar_attendee,
+)
+
+
+def test_resolve_calendar_attendee_creates_fresh_when_no_match(store):
+    """First-time calendar attendee with no existing contact -> a single
+    new Contact gets the friendly display name AND both email +
+    name aliases."""
+    result = resolve_calendar_attendee(
+        store, name="Bob Smith", email="bob@fhb.com",
+    )
+    assert result is not None
+    assert result.was_created is True
+    assert result.contact.display_name == "Bob Smith"
+    # Both aliases registered.
+    by_email = store.find_contacts_by_alias("bob@fhb.com", kind=ALIAS_KIND_EMAIL)
+    by_name = store.find_contacts_by_alias("Bob Smith")
+    assert len(by_email) == 1 and by_email[0].id == result.contact.id
+    assert any(c.id == result.contact.id for c in by_name)
+
+
+def test_resolve_calendar_attendee_merges_email_stub_into_friendly(store):
+    """The classic v0.7.2 bug: an existing stub Contact named after
+    the email local-part holds the rich fields, while a bare
+    Contact with the friendly display_name was created by the
+    attendee-by-name sync. The resolver must merge them into ONE."""
+    # Pre-existing stub (created earlier by buggy email path).
+    stub = store.create_contact("adodd", initial_alias_source=SOURCE_CALENDAR)
+    store.add_alias(
+        stub.id, "adodd@fhb.com",
+        kind=ALIAS_KIND_EMAIL, source=SOURCE_CALENDAR,
+    )
+    store.update_contact_fields(
+        stub.id, title="Senior Engineer", department="EDA",
+        source=ENRICH_SOURCE_OUTLOOK,
+    )
+    # Pre-existing bare contact from attendee-by-name sync.
+    bare = store.create_contact("Aaron Dodd")
+
+    result = resolve_calendar_attendee(
+        store, name="Aaron Dodd", email="adodd@fhb.com",
+    )
+    assert result is not None
+
+    # Exactly one Contact named "Aaron Dodd" or "adodd" should remain.
+    remaining = [
+        c for c in store.list_contacts()
+        if c.display_name in ("Aaron Dodd", "adodd")
+    ]
+    assert len(remaining) == 1, [c.display_name for c in remaining]
+    survivor = remaining[0]
+    # Survivor has the friendly display name AND the rich fields.
+    assert survivor.display_name == "Aaron Dodd"
+    assert survivor.title == "Senior Engineer"
+    assert survivor.department == "EDA"
+    # Aliases include both email and friendly name.
+    aliases = store.list_aliases(survivor.id)
+    alias_set = {(a.alias, a.kind) for a in aliases}
+    assert ("adodd@fhb.com", ALIAS_KIND_EMAIL) in alias_set
+    assert any(
+        a.alias == "Aaron Dodd" and a.kind == ALIAS_KIND_NAME for a in aliases
+    )
+
+
+def test_resolve_calendar_attendee_merges_three_way_duplicate(store):
+    """The user's 2026-05-28 case: three contacts for the same person
+    (one stub, two bare 'Aaron Dodd' from repeated attendee-syncs).
+    Resolver collapses them to one and keeps the richest data."""
+    stub = store.create_contact("adodd")
+    store.add_alias(stub.id, "adodd@fhb.com", kind=ALIAS_KIND_EMAIL)
+    store.update_contact_fields(
+        stub.id, title="VP", department="EDA",
+        source=ENRICH_SOURCE_OUTLOOK,
+    )
+    bare1 = store.create_contact("Aaron Dodd")
+    bare2 = store.create_contact("Aaron Dodd")
+    result = resolve_calendar_attendee(
+        store, name="Aaron Dodd", email="adodd@fhb.com",
+    )
+    assert result is not None
+    remaining = [
+        c for c in store.list_contacts()
+        if c.display_name in ("Aaron Dodd", "adodd")
+    ]
+    assert len(remaining) == 1
+    survivor = remaining[0]
+    assert survivor.display_name == "Aaron Dodd"
+    assert survivor.title == "VP"
+    assert survivor.department == "EDA"
+
+
+def test_resolve_calendar_attendee_preserves_richest_fields_on_merge(store):
+    """When duplicates that the resolver can join (exact name + email
+    matches) split rich-field data across rows, the merged survivor
+    carries every populated field. Fuzzy variants like 'ADodd' vs
+    'Aaron Dodd' surface via the Address Book suggested-merges
+    path, not here -- this resolver does exact alias matching only."""
+    a = store.create_contact("Aaron Dodd")  # bare, lowest id
+    store.update_contact_fields(a.id, phone="555-0100")  # phone only
+    b = store.create_contact("adodd")  # has title only
+    store.add_alias(b.id, "adodd@fhb.com", kind=ALIAS_KIND_EMAIL)
+    store.update_contact_fields(b.id, title="VP", source=ENRICH_SOURCE_OUTLOOK)
+    result = resolve_calendar_attendee(
+        store, name="Aaron Dodd", email="adodd@fhb.com",
+    )
+    assert result is not None
+    survivor = store.get_contact(result.contact.id)
+    assert survivor is not None
+    assert survivor.display_name == "Aaron Dodd"
+    # Both fields collected on the canonical row.
+    assert survivor.title == "VP"
+    assert survivor.phone == "555-0100"
+
+
+def test_resolve_calendar_attendee_idempotent_on_clean_state(store):
+    """Calling the resolver twice in a row on already-merged data
+    doesn't create new rows or scramble anything."""
+    resolve_calendar_attendee(store, name="Bob Smith", email="bob@fhb.com")
+    before = store.list_contacts()
+    resolve_calendar_attendee(store, name="Bob Smith", email="bob@fhb.com")
+    after = store.list_contacts()
+    assert len(before) == len(after)
+
+
+def test_resolve_calendar_attendee_returns_none_for_empty_inputs(store):
+    """No name + no email -> None, not an empty Contact."""
+    assert resolve_calendar_attendee(store, name="", email="") is None
+    assert resolve_calendar_attendee(store, name="  ", email="  ") is None

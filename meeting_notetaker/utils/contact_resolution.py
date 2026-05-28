@@ -368,3 +368,175 @@ def suggest_contact_merges(
                 if len(out) >= max_suggestions:
                     return out
     return out
+
+
+def _count_rich_fields(contact: Contact) -> int:
+    """Score a Contact by how many rich fields it has populated.
+
+    Used to pick a canonical merge target when multiple Contact rows
+    refer to the same person -- prefer the one with the most data so
+    auto-merge never loses fields. Tie-break is left to the caller
+    (usually lowest id = oldest).
+    """
+    return sum(
+        1 for v in (
+            contact.title, contact.company, contact.department,
+            contact.primary_email, contact.phone, contact.notes,
+        ) if v
+    )
+
+
+def _copy_rich_fields_if_empty(
+    store: ClassificationStore,
+    source: Contact,
+    target_id: int,
+) -> None:
+    """Copy non-empty rich fields from `source` into target where target's
+    field is empty. Uses update_contact_fields(fill_empty_only=True) so
+    target's user-set values are preserved. Each per-field source flag
+    on the target inherits source's last_enriched_source.
+    """
+    fields: dict[str, Optional[str]] = {}
+    if source.title:
+        fields["title"] = source.title
+    if source.company:
+        fields["company"] = source.company
+    if source.department:
+        fields["department"] = source.department
+    if source.primary_email:
+        fields["primary_email"] = source.primary_email
+    if source.phone:
+        fields["phone"] = source.phone
+    if source.notes:
+        fields["notes"] = source.notes
+    if not fields:
+        return
+    src_tag = source.last_enriched_source or ENRICH_SOURCE_OUTLOOK
+    store.update_contact_fields(
+        target_id,
+        source=src_tag,
+        fill_empty_only=True,
+        **fields,
+    )
+
+
+def resolve_calendar_attendee(
+    store: ClassificationStore,
+    *,
+    name: str,
+    email: str,
+) -> Optional[ResolutionResult]:
+    """Resolve a calendar attendee to a SINGLE canonical Contact.
+
+    Auto-merges duplicates. The bug this fixes: separate code paths
+    create separate Contact rows for the same person (email path
+    creates a stub named after the local-part; attendee-by-name sync
+    creates a bare row from the friendly name). Calling this from the
+    calendar enrichment step BEFORE attendee-sync runs guarantees a
+    single canonical row, and the friendly-name lookup downstream
+    finds the same Contact.
+
+    Algorithm:
+      1. Find candidates by email-kind alias match (0 or 1).
+      2. Find candidates by any-kind alias match for the friendly name
+         (0..N).
+      3. Union the candidate ids.
+      4. If 0 candidates: create a fresh Contact with both email and
+         name registered as aliases.
+      5. If >= 1 candidates: pick the one with the most rich fields
+         (tie-break = lowest id) as canonical. Copy each duplicate's
+         rich fields into canonical (fill_empty_only) so no data is
+         lost. Merge each duplicate into canonical via merge_contacts.
+         Promote canonical's display_name to the friendly form if it
+         currently looks like the email local-part. Ensure the email
+         + the friendly name are both registered as aliases.
+
+    Returns ResolutionResult or None if neither name nor email was
+    provided.
+    """
+    name = (name or "").strip()
+    email = (email or "").strip()
+    if not name and not email:
+        return None
+    candidate_ids: list[int] = []
+    seen: set[int] = set()
+
+    def _add(contacts):
+        for c in contacts:
+            if c.id not in seen:
+                candidate_ids.append(c.id)
+                seen.add(c.id)
+
+    if email and "@" in email:
+        _add(store.find_contacts_by_alias(email, kind=ALIAS_KIND_EMAIL))
+    if name:
+        _add(store.find_contacts_by_alias(name))
+
+    if not candidate_ids:
+        # Create fresh.
+        contact = store.create_contact(
+            name or email.split("@", 1)[0],
+            initial_alias_source=SOURCE_CALENDAR,
+        )
+        if email and "@" in email:
+            try:
+                store.add_alias(
+                    contact.id, email,
+                    kind=ALIAS_KIND_EMAIL, source=SOURCE_CALENDAR,
+                )
+            except ValueError:
+                pass
+        # Re-fetch so display_name reflects current row.
+        refreshed = store.get_contact(contact.id) or contact
+        return ResolutionResult(contact=refreshed, was_created=True)
+
+    # Pick canonical: most rich fields, then lowest id.
+    candidates = [store.get_contact(cid) for cid in candidate_ids]
+    candidates = [c for c in candidates if c is not None]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (-_count_rich_fields(c), c.id))
+    canonical = candidates[0]
+    duplicates = candidates[1:]
+
+    # Copy rich fields from duplicates so merge_contacts doesn't drop them.
+    for dup in duplicates:
+        _copy_rich_fields_if_empty(store, dup, canonical.id)
+    for dup in duplicates:
+        try:
+            store.merge_contacts(dup.id, canonical.id)
+        except Exception:
+            # Best-effort -- if a merge fails, leave both rows.
+            continue
+
+    # Promote display_name to friendly form if it looks like a stub.
+    canonical = store.get_contact(canonical.id) or canonical
+    if name and email and "@" in email:
+        local_part = email.split("@", 1)[0].lower()
+        current = (canonical.display_name or "").strip()
+        if current.lower() == local_part and name != current:
+            try:
+                store.rename_contact(canonical.id, name)
+            except Exception:
+                pass
+
+    # Ensure name + email aliases exist on canonical.
+    if name:
+        try:
+            store.add_alias(
+                canonical.id, name,
+                kind=ALIAS_KIND_NAME, source=SOURCE_CALENDAR,
+            )
+        except (ValueError, Exception):
+            pass
+    if email and "@" in email:
+        try:
+            store.add_alias(
+                canonical.id, email,
+                kind=ALIAS_KIND_EMAIL, source=SOURCE_CALENDAR,
+            )
+        except (ValueError, Exception):
+            pass
+
+    refreshed = store.get_contact(canonical.id) or canonical
+    return ResolutionResult(contact=refreshed, was_created=False)
