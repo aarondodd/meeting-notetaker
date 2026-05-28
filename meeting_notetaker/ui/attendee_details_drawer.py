@@ -41,8 +41,26 @@ from PyQt6.QtWidgets import (
 _SOURCE_EMOJI = {
     "outlook": "\U0001F4E7",  # envelope
     "llm": "\U0001F916",      # robot
-    "manual": "✏️",  # pencil
+    "manual": "✋",       # raised hand -- "user touched this"
 }
+
+
+def _badge_for(source) -> str:
+    return _SOURCE_EMOJI.get(source or "", "")
+
+
+def _cell_with_badge(value, source) -> str:
+    """Format a value cell with a trailing source emoji when set.
+
+    Empty values stay empty so the cell isn't a lone badge. Trailing
+    space + emoji keeps the value readable + the badge visually
+    distinct without a separator character.
+    """
+    text = value or ""
+    badge = _badge_for(source)
+    if text and badge:
+        return f"{text} {badge}"
+    return text
 
 
 class AttendeeDetailsDrawer(QWidget):
@@ -138,16 +156,30 @@ class AttendeeDetailsDrawer(QWidget):
         self._table.setRowCount(len(contacts))
         self._row_contact_ids = [c.id for c in contacts]
         for row, c in enumerate(contacts):
-            badge = _SOURCE_EMOJI.get(c.last_enriched_source or "", "")
-            name_text = f"{c.display_name} {badge}".strip()
+            # Name cell keeps the rollup badge -- one icon at the row
+            # head signals "at least one field came from <source>"
+            # without the user scanning every column.
+            rollup = _badge_for(getattr(c, "last_enriched_source", None))
+            name_text = f"{c.display_name} {rollup}".strip()
             name_item = QTableWidgetItem(name_text)
             name_item.setData(Qt.ItemDataRole.UserRole, c.id)
             self._table.setItem(row, 0, name_item)
-            self._table.setItem(row, 1, QTableWidgetItem(c.title or ""))
-            self._table.setItem(row, 2, QTableWidgetItem(c.company or ""))
-            self._table.setItem(row, 3, QTableWidgetItem(c.primary_email or ""))
+            self._table.setItem(row, 1, QTableWidgetItem(
+                _cell_with_badge(c.title, getattr(c, "title_source", None)),
+            ))
+            self._table.setItem(row, 2, QTableWidgetItem(
+                _cell_with_badge(c.company, getattr(c, "company_source", None)),
+            ))
+            self._table.setItem(row, 3, QTableWidgetItem(
+                _cell_with_badge(
+                    c.primary_email,
+                    getattr(c, "primary_email_source", None),
+                ),
+            ))
             notes_value = (getattr(c, "notes", "") or "")
-            notes_item = QTableWidgetItem(notes_value)
+            notes_item = QTableWidgetItem(
+                _cell_with_badge(notes_value, getattr(c, "notes_source", None)),
+            )
             # Multi-line notes get a tooltip with the full text so the
             # truncated single-line cell display isn't a dead-end.
             if notes_value:

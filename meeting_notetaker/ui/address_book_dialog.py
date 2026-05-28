@@ -97,7 +97,7 @@ _KIND_LABELS = {
 _SOURCE_EMOJI = {
     ENRICH_SOURCE_OUTLOOK: "\U0001F4E7",  # envelope (Outlook)
     ENRICH_SOURCE_LLM: "\U0001F916",      # robot (LLM)
-    ENRICH_SOURCE_MANUAL: "✏️",  # pencil (manual edit)
+    ENRICH_SOURCE_MANUAL: "✋",  # raised hand (manual edit)
 }
 _SOURCE_LABELS = {
     ENRICH_SOURCE_OUTLOOK: "Outlook calendar",
@@ -232,18 +232,25 @@ class AddressBookDialog(QDialog):
         fields_layout = QFormLayout(self._fields_box)
         fields_layout.setContentsMargins(8, 8, 8, 8)
         fields_layout.setVerticalSpacing(4)
+        # Per-field label widgets: kept as references so we can append
+        # the source emoji when _populate_field_inputs runs. Labels live
+        # in self._field_labels keyed by field name; updated to e.g.
+        # "Title 📧:" when Outlook last wrote that field.
+        self._field_labels: dict[str, QLabel] = {}
         self._title_input = QLineEdit(right)
         self._title_input.setPlaceholderText("e.g. VP of Engineering")
         self._title_input.editingFinished.connect(
             lambda: self._on_field_edited("title", self._title_input.text())
         )
-        fields_layout.addRow("Title:", self._title_input)
+        self._field_labels["title"] = QLabel("Title:", right)
+        fields_layout.addRow(self._field_labels["title"], self._title_input)
         self._company_input = QLineEdit(right)
         self._company_input.setPlaceholderText("e.g. Acme Corp")
         self._company_input.editingFinished.connect(
             lambda: self._on_field_edited("company", self._company_input.text())
         )
-        fields_layout.addRow("Company:", self._company_input)
+        self._field_labels["company"] = QLabel("Company:", right)
+        fields_layout.addRow(self._field_labels["company"], self._company_input)
         self._department_input = QLineEdit(right)
         self._department_input.setPlaceholderText("e.g. Engineering")
         self._department_input.editingFinished.connect(
@@ -251,7 +258,10 @@ class AddressBookDialog(QDialog):
                 "department", self._department_input.text(),
             )
         )
-        fields_layout.addRow("Department:", self._department_input)
+        self._field_labels["department"] = QLabel("Department:", right)
+        fields_layout.addRow(
+            self._field_labels["department"], self._department_input,
+        )
         self._email_input = QLineEdit(right)
         self._email_input.setPlaceholderText("e.g. vp@acme.com (primary)")
         self._email_input.editingFinished.connect(
@@ -259,13 +269,17 @@ class AddressBookDialog(QDialog):
                 "primary_email", self._email_input.text(),
             )
         )
-        fields_layout.addRow("Primary email:", self._email_input)
+        self._field_labels["primary_email"] = QLabel("Primary email:", right)
+        fields_layout.addRow(
+            self._field_labels["primary_email"], self._email_input,
+        )
         self._phone_input = QLineEdit(right)
         self._phone_input.setPlaceholderText("e.g. +1-555-0100")
         self._phone_input.editingFinished.connect(
             lambda: self._on_field_edited("phone", self._phone_input.text())
         )
-        fields_layout.addRow("Phone:", self._phone_input)
+        self._field_labels["phone"] = QLabel("Phone:", right)
+        fields_layout.addRow(self._field_labels["phone"], self._phone_input)
         self._notes_input = QPlainTextEdit(right)
         self._notes_input.setPlaceholderText(
             "Free-form notes (preferences, context, anything)"
@@ -275,7 +289,8 @@ class AddressBookDialog(QDialog):
         # focus-out via the focusOutEvent override-equivalent: connect
         # to the textChanged signal but debounce via a timer.
         self._notes_input.installEventFilter(self)
-        fields_layout.addRow("Notes:", self._notes_input)
+        self._field_labels["notes"] = QLabel("Notes:", right)
+        fields_layout.addRow(self._field_labels["notes"], self._notes_input)
         right_layout.addWidget(self._fields_box)
 
         right_layout.addWidget(QLabel("Aliases:", right))
@@ -461,6 +476,48 @@ class AddressBookDialog(QDialog):
         # Stash the as-loaded notes value so the focusOut commit can
         # tell whether the user actually changed it.
         self._notes_input_loaded_value = (contact.notes if contact else "") or ""
+        self._refresh_field_source_labels(contact)
+
+    def _refresh_field_source_labels(self, contact) -> None:
+        """Append the per-field source emoji to each form label.
+
+        Empty fields keep the bare label ("Title:"). Fields with a
+        value whose source is known append the corresponding emoji
+        ("Title 📧:" for Outlook). Hover tooltip names the source.
+        Called by _populate_field_inputs + after every save so the
+        badge tracks the most recent state without a re-select.
+        """
+        base_labels = {
+            "title": "Title:",
+            "company": "Company:",
+            "department": "Department:",
+            "primary_email": "Primary email:",
+            "phone": "Phone:",
+            "notes": "Notes:",
+        }
+        source_attrs = {
+            "title": "title_source",
+            "company": "company_source",
+            "department": "department_source",
+            "primary_email": "primary_email_source",
+            "phone": "phone_source",
+            "notes": "notes_source",
+        }
+        for field, base in base_labels.items():
+            label = self._field_labels.get(field)
+            if label is None:
+                continue
+            source = (
+                getattr(contact, source_attrs[field], None)
+                if contact is not None else None
+            )
+            badge = _SOURCE_EMOJI.get(source or "", "")
+            if badge:
+                label.setText(f"{base} {badge}")
+                label.setToolTip(_SOURCE_LABELS.get(source, ""))
+            else:
+                label.setText(base)
+                label.setToolTip("")
 
     def _on_field_edited(self, field: str, value: str) -> None:
         """Persist a single rich-field edit. Source = manual.
@@ -486,8 +543,14 @@ class AddressBookDialog(QDialog):
             source=ENRICH_SOURCE_MANUAL,
         )
         # Refresh the header badge if this was the first manual touch.
+        # Also refresh per-field labels so the ✋ on the edited field
+        # appears without waiting for a re-select.
         if contact.last_enriched_source != ENRICH_SOURCE_MANUAL:
             self._refresh_details()
+        else:
+            refreshed = self._store.get_contact(contact.id)
+            if refreshed is not None:
+                self._refresh_field_source_labels(refreshed)
 
     def eventFilter(self, obj, event):
         """Commit notes-field edits on focus-out.

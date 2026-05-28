@@ -48,6 +48,9 @@ def test_fresh_db_has_all_rich_columns(tmp_path):
     expected = {
         "id", "display_name", "notes", "title", "company", "department",
         "primary_email", "phone", "last_enriched_source", "created_at",
+        # Per-field source columns (2026-05-28).
+        "title_source", "company_source", "department_source",
+        "primary_email_source", "phone_source", "notes_source",
     }
     assert expected.issubset(cols), f"missing columns: {expected - cols}"
 
@@ -81,6 +84,8 @@ def test_legacy_db_without_rich_columns_gets_migrated(tmp_path):
         for col in (
             "title", "company", "department",
             "primary_email", "phone", "last_enriched_source",
+            "title_source", "company_source", "department_source",
+            "primary_email_source", "phone_source", "notes_source",
         ):
             assert col in cols, f"migration missed {col}"
         # Existing row still readable; new fields all NULL.
@@ -254,3 +259,108 @@ def test_fill_empty_only_ignores_empty_incoming_values(store):
         fill_empty_only=True,
     )
     assert store.get_contact(c.id).title == "VP"
+
+
+# ---- per-field source tracking (2026-05-28) ---------------------------------
+
+
+def test_per_field_source_records_outlook_write(store):
+    """An Outlook enrichment that fills title sets title_source = outlook."""
+    c = _make_contact(store)
+    store.update_contact_fields(
+        c.id, title="VP", source=ENRICH_SOURCE_OUTLOOK,
+    )
+    refreshed = store.get_contact(c.id)
+    assert refreshed.title == "VP"
+    assert refreshed.title_source == ENRICH_SOURCE_OUTLOOK
+    # Untouched fields' sources stay None.
+    assert refreshed.company_source is None
+    assert refreshed.phone_source is None
+
+
+def test_per_field_source_independent_across_fields(store):
+    """Different fields can carry different sources on the same row."""
+    c = _make_contact(store)
+    store.update_contact_fields(c.id, title="VP", source=ENRICH_SOURCE_OUTLOOK)
+    store.update_contact_fields(
+        c.id, department="Engineering", source=ENRICH_SOURCE_LLM,
+    )
+    store.update_contact_fields(c.id, phone="555-0100")  # default = manual
+    refreshed = store.get_contact(c.id)
+    assert refreshed.title_source == ENRICH_SOURCE_OUTLOOK
+    assert refreshed.department_source == ENRICH_SOURCE_LLM
+    assert refreshed.phone_source == ENRICH_SOURCE_MANUAL
+
+
+def test_per_field_source_overwritten_by_subsequent_write(store):
+    """Manual edit after an Outlook fill flips title_source to manual."""
+    c = _make_contact(store)
+    store.update_contact_fields(
+        c.id, title="VP", source=ENRICH_SOURCE_OUTLOOK,
+    )
+    assert store.get_contact(c.id).title_source == ENRICH_SOURCE_OUTLOOK
+    store.update_contact_fields(c.id, title="VP of Eng")  # manual default
+    refreshed = store.get_contact(c.id)
+    assert refreshed.title == "VP of Eng"
+    assert refreshed.title_source == ENRICH_SOURCE_MANUAL
+
+
+def test_per_field_source_cleared_when_value_emptied(store):
+    """Clearing a field clears its source too -- no source for no value."""
+    c = _make_contact(store)
+    store.update_contact_fields(
+        c.id, title="VP", source=ENRICH_SOURCE_OUTLOOK,
+    )
+    assert store.get_contact(c.id).title_source == ENRICH_SOURCE_OUTLOOK
+    store.update_contact_fields(c.id, title="")  # user cleared it
+    refreshed = store.get_contact(c.id)
+    assert (refreshed.title or "") == ""
+    assert refreshed.title_source is None
+
+
+def test_per_field_source_not_set_when_fill_empty_only_skips(store):
+    """fill_empty_only refuses to overwrite, so the source on a
+    pre-filled field stays at the original value, not the would-be
+    new source."""
+    c = _make_contact(store)
+    store.update_contact_fields(
+        c.id, title="VP", source=ENRICH_SOURCE_MANUAL,
+    )
+    # Outlook enrichment tries to set title but fill_empty_only blocks it.
+    store.update_contact_fields(
+        c.id, title="Director",
+        source=ENRICH_SOURCE_OUTLOOK, fill_empty_only=True,
+    )
+    refreshed = store.get_contact(c.id)
+    assert refreshed.title == "VP"
+    assert refreshed.title_source == ENRICH_SOURCE_MANUAL
+
+
+def test_legacy_row_per_field_source_columns_are_null(tmp_path):
+    """A row that existed before the per-field migration has NULL on
+    every *_source column -- we can't reconstruct historical provenance."""
+    db_file = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript("""
+        CREATE TABLE contacts (
+            id INTEGER PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            notes TEXT DEFAULT '',
+            title TEXT,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO contacts (id, display_name, notes, title, created_at)
+        VALUES (1, 'Old Bob', '', 'VP', '2025-01-01T00:00:00Z');
+    """)
+    conn.commit()
+    conn.close()
+    store = ClassificationStore(db_file)
+    try:
+        c = store.get_contact(1)
+        assert c.title == "VP"
+        # Pre-existing values lose their provenance through migration; all None.
+        assert c.title_source is None
+        assert c.company_source is None
+        assert c.notes_source is None
+    finally:
+        store.close()

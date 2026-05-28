@@ -97,6 +97,18 @@ CREATE TABLE IF NOT EXISTS contacts (
     primary_email           TEXT,
     phone                   TEXT,
     last_enriched_source    TEXT,
+    -- Per-field source tracking (issue #51 follow-up, 2026-05-28).
+    -- Each *_source column records which enrichment path most
+    -- recently wrote that specific field. NULL = never written or
+    -- written before the per-field migration. last_enriched_source
+    -- stays as the "any field" rollup so the name-cell badge has a
+    -- single value to show.
+    title_source            TEXT,
+    company_source          TEXT,
+    department_source       TEXT,
+    primary_email_source    TEXT,
+    phone_source            TEXT,
+    notes_source            TEXT,
     created_at              TEXT NOT NULL
 );
 
@@ -185,8 +197,20 @@ class Contact:
     # Source of the last automatic enrichment (Outlook fetch or LLM
     # extraction). 'manual' means the user typed the most recent
     # change. None when no field has been touched by any enrichment
-    # pass yet.
+    # pass yet. Kept as the "any-field" rollup so the name-level
+    # badge has a single value to show -- per-field sources live on
+    # the {field}_source columns below.
     last_enriched_source: Optional[str] = None
+    # Per-field source tracking (2026-05-28). Each field records the
+    # source that most recently wrote it: 'outlook' / 'llm' / 'manual'.
+    # NULL = field is empty OR was set before per-field migration
+    # (we can't reconstruct historical provenance).
+    title_source: Optional[str] = None
+    company_source: Optional[str] = None
+    department_source: Optional[str] = None
+    primary_email_source: Optional[str] = None
+    phone_source: Optional[str] = None
+    notes_source: Optional[str] = None
     created_at: str = ""
 
 
@@ -279,6 +303,16 @@ class ClassificationStore:
             ("primary_email", "TEXT"),
             ("phone", "TEXT"),
             ("last_enriched_source", "TEXT"),
+            # Per-field source columns (2026-05-28). NULL means
+            # "unknown source" -- common for rows that existed before
+            # this migration; the next manual or enrichment touch fills
+            # the value in.
+            ("title_source", "TEXT"),
+            ("company_source", "TEXT"),
+            ("department_source", "TEXT"),
+            ("primary_email_source", "TEXT"),
+            ("phone_source", "TEXT"),
+            ("notes_source", "TEXT"),
         ):
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE contacts ADD COLUMN {col} {decl}")
@@ -562,6 +596,12 @@ class ClassificationStore:
         "title", "company", "department", "primary_email", "phone",
         "notes", "last_enriched_source",
     })
+    # Fields that get per-field source tracking. last_enriched_source
+    # itself doesn't (it IS the rollup); the field-source columns are
+    # named "<field>_source" by convention.
+    _FIELDS_WITH_PER_FIELD_SOURCE = frozenset({
+        "title", "company", "department", "primary_email", "phone", "notes",
+    })
 
     def update_contact_fields(
         self,
@@ -614,6 +654,17 @@ class ClassificationStore:
         cols = sorted(fields.keys())
         set_clauses = [f"{col} = ?" for col in cols]
         params = [fields[col] for col in cols]
+        # Per-field source tracking: every touched field gets its
+        # source column written alongside the value. Empty/None values
+        # clear the source too (no value -> no source). Done before
+        # appending the rollup so column order stays deterministic.
+        for col in cols:
+            if col not in self._FIELDS_WITH_PER_FIELD_SOURCE:
+                continue
+            value = fields[col]
+            value_set = value is not None and str(value).strip() != ""
+            set_clauses.append(f"{col}_source = ?")
+            params.append(effective_source if value_set else None)
         # Always update last_enriched_source so we can tell who
         # touched the contact last. Setter is the Address Book form
         # by default -> manual; Outlook + LLM paths pass their tag.
@@ -1130,18 +1181,26 @@ def _row_to_series(row: sqlite3.Row) -> Series:
 
 def _row_to_contact(row: sqlite3.Row) -> Contact:
     keys = set(row.keys())
+
+    def _opt(col: str):
+        return row[col] if col in keys else None
+
     return Contact(
         id=row["id"],
         display_name=row["display_name"],
         notes=row["notes"] if "notes" in keys else "",
-        title=row["title"] if "title" in keys else None,
-        company=row["company"] if "company" in keys else None,
-        department=row["department"] if "department" in keys else None,
-        primary_email=row["primary_email"] if "primary_email" in keys else None,
-        phone=row["phone"] if "phone" in keys else None,
-        last_enriched_source=(
-            row["last_enriched_source"] if "last_enriched_source" in keys else None
-        ),
+        title=_opt("title"),
+        company=_opt("company"),
+        department=_opt("department"),
+        primary_email=_opt("primary_email"),
+        phone=_opt("phone"),
+        last_enriched_source=_opt("last_enriched_source"),
+        title_source=_opt("title_source"),
+        company_source=_opt("company_source"),
+        department_source=_opt("department_source"),
+        primary_email_source=_opt("primary_email_source"),
+        phone_source=_opt("phone_source"),
+        notes_source=_opt("notes_source"),
         created_at=row["created_at"],
     )
 

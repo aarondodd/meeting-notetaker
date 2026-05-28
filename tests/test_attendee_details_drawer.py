@@ -29,7 +29,8 @@ def qt_app():
 @dataclass
 class _FakeContact:
     """Minimal Contact stand-in for drawer tests; the drawer only
-    reads display_name + rich-field attrs + last_enriched_source."""
+    reads display_name + rich-field attrs + per-field source attrs +
+    the last_enriched_source rollup."""
     id: int
     display_name: str
     title: Optional[str] = None
@@ -39,6 +40,12 @@ class _FakeContact:
     phone: Optional[str] = None
     notes: str = ""
     last_enriched_source: Optional[str] = None
+    title_source: Optional[str] = None
+    company_source: Optional[str] = None
+    department_source: Optional[str] = None
+    primary_email_source: Optional[str] = None
+    phone_source: Optional[str] = None
+    notes_source: Optional[str] = None
 
 
 def test_drawer_initial_state_collapsed_with_zero_count(qt_app):
@@ -70,7 +77,8 @@ def test_drawer_table_renders_contact_fields(qt_app):
     Column shape: Name | Title | Company | Email | Notes | (edit button).
     Phone field on Contact is intentionally not shown -- the drawer
     favors Notes (free-form context) over Phone (rarely used in
-    meeting prep) per Aaron's 2026-05-28 feedback.
+    meeting prep) per Aaron's 2026-05-28 feedback. Each value cell
+    that has a non-None source gets a trailing source emoji.
     """
     d = AttendeeDetailsDrawer()
     try:
@@ -87,6 +95,7 @@ def test_drawer_table_renders_contact_fields(qt_app):
         assert d._table.columnCount() == 6  # noqa: SLF001
         # Name cell holds the display name + (possibly) a source badge.
         assert "Bob Smith" in d._table.item(0, 0).text()  # noqa: SLF001
+        # No per-field sources set -> cells carry just the values.
         assert d._table.item(0, 1).text() == "VP"  # noqa: SLF001
         assert d._table.item(0, 2).text() == "Acme"  # noqa: SLF001
         assert d._table.item(0, 3).text() == "bob@acme.com"  # noqa: SLF001
@@ -95,6 +104,51 @@ def test_drawer_table_renders_contact_fields(qt_app):
         assert d._table.cellWidget(0, 5) is not None  # noqa: SLF001
     finally:
         d.deleteLater()
+
+
+def test_drawer_renders_per_field_source_badges(qt_app):
+    """Each value cell gets a trailing badge matching its *_source."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([
+            _FakeContact(
+                id=1, display_name="Bob",
+                title="VP", title_source="outlook",
+                company="Acme", company_source="llm",
+                primary_email="bob@acme.com", primary_email_source="manual",
+                notes="ok", notes_source="manual",
+            ),
+        ])
+        assert "\U0001F4E7" in d._table.item(0, 1).text()  # noqa: SLF001 # Title -> envelope
+        assert "\U0001F916" in d._table.item(0, 2).text()  # noqa: SLF001 # Company -> robot
+        assert "✋" in d._table.item(0, 3).text()  # noqa: SLF001 # Email -> hand
+        assert "✋" in d._table.item(0, 4).text()  # noqa: SLF001 # Notes -> hand
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_empty_value_omits_badge_even_with_source(qt_app):
+    """Defensive: an empty value with a stale source column shouldn't
+    render a lone badge. The cell stays empty."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([
+            _FakeContact(
+                id=1, display_name="Bob",
+                title="", title_source="outlook",  # cleared, source stale
+            ),
+        ])
+        assert d._table.item(0, 1).text() == ""  # noqa: SLF001
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_manual_emoji_is_hand_not_pencil(qt_app):
+    """The manual-edit emoji moved from pencil to a raised hand so it
+    doesn't visually clash with the Edit button's pencil glyph."""
+    from meeting_notetaker.ui.attendee_details_drawer import _SOURCE_EMOJI
+    assert _SOURCE_EMOJI["manual"] == "✋"
+    assert "✏" not in _SOURCE_EMOJI["manual"]
 
 
 def test_drawer_empty_fields_render_as_blank(qt_app):
