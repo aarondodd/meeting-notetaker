@@ -115,8 +115,19 @@ class AttendeeDetailsDrawer(QWidget):
         ])
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(
-            QTableWidget.SelectionBehavior.SelectRows,
+        # No selection highlight + no hover highlight -- the drawer
+        # is a read-only summary, the Edit button is the only
+        # actionable element, so the default click/hover row tint
+        # was just visual noise (2026-05-28 feedback).
+        self._table.setSelectionMode(
+            QTableWidget.SelectionMode.NoSelection,
+        )
+        self._table.setMouseTracking(False)
+        self._table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._table.setStyleSheet(
+            "QTableWidget::item:hover { background: transparent; }"
+            "QTableWidget::item:selected {"
+            " background: transparent; color: palette(text); }"
         )
         self._table.setAlternatingRowColors(True)
         h = self._table.horizontalHeader()
