@@ -180,11 +180,11 @@ def test_rich_field_inputs_populate_from_selected_contact(qt_app, store):
         assert dlg._department_input.text() == "Executive"  # noqa: SLF001
         assert dlg._email_input.text() == "bob@bobco.com"  # noqa: SLF001
         assert dlg._phone_input.text() == "+1-555-0100"  # noqa: SLF001
-        # Source badge present in the header text (envelope emoji for
-        # Outlook, per Aaron's spec).
+        # Source badge present in the header text (superscript O for
+        # Outlook, per the 2026-05-28 switch from emoji to small caps).
         header = dlg._detail_name.text()  # noqa: SLF001
         assert "Bob Smith" in header
-        assert "\U0001F4E7" in header, f"expected envelope emoji in header, got {header!r}"
+        assert "ᴼ" in header, f"expected superscript O badge in header, got {header!r}"
     finally:
         dlg.deleteLater()
 

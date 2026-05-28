@@ -34,19 +34,26 @@ from PyQt6.QtWidgets import (
 )
 
 
-# Same source-emoji map used in the Address Book dialog. Duplicated
-# here rather than imported because the dialog imports the model
-# layer, and the drawer should be independent of dialog internals.
-# If the icon set needs to change, update both.
-_SOURCE_EMOJI = {
-    "outlook": "\U0001F4E7",  # envelope
-    "llm": "\U0001F916",      # robot
-    "manual": "✋",       # raised hand -- "user touched this"
+# Source-marker glyphs. Unicode "MODIFIER LETTER CAPITAL X" code
+# points render as small superscripted letters in most fonts -- text
+# glyphs that inherit the cell's color and weight, so they read as a
+# subtle annotation rather than a separate UI element. Switched from
+# color emoji on 2026-05-28 (Aaron flagged the emoji as distracting).
+# Mapping:
+#   ᴼ = Outlook   (ᴼ MODIFIER LETTER CAPITAL O)
+#   ᴸ = LLM       (ᴸ MODIFIER LETTER CAPITAL L)
+#   ᴹ = Manual    (ᴹ MODIFIER LETTER CAPITAL M)
+# Hover tooltip names the source in plain English for the
+# "what does this letter mean" case.
+_SOURCE_BADGE = {
+    "outlook": "ᴼ",  # superscript O
+    "llm": "ᴸ",      # superscript L
+    "manual": "ᴹ",   # superscript M
 }
 
 
 def _badge_for(source) -> str:
-    return _SOURCE_EMOJI.get(source or "", "")
+    return _SOURCE_BADGE.get(source or "", "")
 
 
 def _cell_with_badge(value, source) -> str:

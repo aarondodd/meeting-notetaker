@@ -107,7 +107,9 @@ def test_drawer_table_renders_contact_fields(qt_app):
 
 
 def test_drawer_renders_per_field_source_badges(qt_app):
-    """Each value cell gets a trailing badge matching its *_source."""
+    """Each value cell gets a trailing superscript letter matching its
+    *_source. Switched from color emoji to small-cap modifier letters
+    on 2026-05-28 (Aaron's anti-distraction feedback)."""
     d = AttendeeDetailsDrawer()
     try:
         d.set_contacts([
@@ -119,10 +121,10 @@ def test_drawer_renders_per_field_source_badges(qt_app):
                 notes="ok", notes_source="manual",
             ),
         ])
-        assert "\U0001F4E7" in d._table.item(0, 1).text()  # noqa: SLF001 # Title -> envelope
-        assert "\U0001F916" in d._table.item(0, 2).text()  # noqa: SLF001 # Company -> robot
-        assert "✋" in d._table.item(0, 3).text()  # noqa: SLF001 # Email -> hand
-        assert "✋" in d._table.item(0, 4).text()  # noqa: SLF001 # Notes -> hand
+        assert "ᴼ" in d._table.item(0, 1).text()  # noqa: SLF001 # Title -> Outlook
+        assert "ᴸ" in d._table.item(0, 2).text()  # noqa: SLF001 # Company -> LLM
+        assert "ᴹ" in d._table.item(0, 3).text()  # noqa: SLF001 # Email -> Manual
+        assert "ᴹ" in d._table.item(0, 4).text()  # noqa: SLF001 # Notes -> Manual
     finally:
         d.deleteLater()
 
@@ -143,12 +145,17 @@ def test_drawer_empty_value_omits_badge_even_with_source(qt_app):
         d.deleteLater()
 
 
-def test_drawer_manual_emoji_is_hand_not_pencil(qt_app):
-    """The manual-edit emoji moved from pencil to a raised hand so it
-    doesn't visually clash with the Edit button's pencil glyph."""
-    from meeting_notetaker.ui.attendee_details_drawer import _SOURCE_EMOJI
-    assert _SOURCE_EMOJI["manual"] == "✋"
-    assert "✏" not in _SOURCE_EMOJI["manual"]
+def test_drawer_source_badges_are_text_glyphs_not_emoji(qt_app):
+    """Pins the small-cap modifier-letter mapping so a future change
+    can't quietly bring color emoji back. These code points are text
+    glyphs (inherit color + font from the cell), so they read as
+    annotations rather than competing UI elements."""
+    from meeting_notetaker.ui.attendee_details_drawer import _SOURCE_BADGE
+    assert _SOURCE_BADGE == {
+        "outlook": "ᴼ",
+        "llm": "ᴸ",
+        "manual": "ᴹ",
+    }
 
 
 def test_drawer_empty_fields_render_as_blank(qt_app):
@@ -196,7 +203,7 @@ def test_drawer_notes_cell_has_tooltip_with_full_text(qt_app):
 
 
 def test_drawer_source_badge_renders_for_outlook(qt_app):
-    """A contact enriched from Outlook gets the envelope emoji."""
+    """A contact enriched from Outlook gets the superscript O badge."""
     d = AttendeeDetailsDrawer()
     try:
         d.set_contacts([_FakeContact(
@@ -205,15 +212,15 @@ def test_drawer_source_badge_renders_for_outlook(qt_app):
         )])
         name_cell = d._table.item(0, 0).text()  # noqa: SLF001
         assert "Bob" in name_cell
-        assert "\U0001F4E7" in name_cell, (
-            f"expected envelope emoji, got {name_cell!r}"
+        assert "ᴼ" in name_cell, (
+            f"expected superscript O badge, got {name_cell!r}"
         )
     finally:
         d.deleteLater()
 
 
 def test_drawer_source_badge_renders_for_llm(qt_app):
-    """A contact enriched from LLM extraction gets the robot emoji."""
+    """A contact enriched from LLM extraction gets the superscript L badge."""
     d = AttendeeDetailsDrawer()
     try:
         d.set_contacts([_FakeContact(
@@ -221,7 +228,7 @@ def test_drawer_source_badge_renders_for_llm(qt_app):
             last_enriched_source="llm",
         )])
         name_cell = d._table.item(0, 0).text()  # noqa: SLF001
-        assert "\U0001F916" in name_cell
+        assert "ᴸ" in name_cell
     finally:
         d.deleteLater()
 

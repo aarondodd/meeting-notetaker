@@ -87,17 +87,17 @@ _KIND_LABELS = {
 }
 
 
-# Source emoji map for the rich-Contact-fields header badge (issue #51).
-# Aaron's spec was "unobtrusive single-character indicators"; one emoji
-# per known source value, blank when no enrichment has touched the
-# Contact yet. The badge sits next to the contact's display name in
-# the right-pane header so the user can see at a glance whether
-# manual edits, an Outlook pull, or an LLM extraction was the most
-# recent touch.
-_SOURCE_EMOJI = {
-    ENRICH_SOURCE_OUTLOOK: "\U0001F4E7",  # envelope (Outlook)
-    ENRICH_SOURCE_LLM: "\U0001F916",      # robot (LLM)
-    ENRICH_SOURCE_MANUAL: "✋",  # raised hand (manual edit)
+# Source-marker glyphs for the rich-Contact-fields per-field labels.
+# Unicode MODIFIER LETTER CAPITAL X code points render as superscript
+# letters in most fonts -- text glyphs that inherit color and weight
+# from the surrounding label, so they read as a subtle annotation
+# rather than a separate UI element. Switched from color emoji on
+# 2026-05-28 (Aaron flagged the color emoji as distracting). Hover
+# tooltip names the source in plain English via _SOURCE_LABELS.
+_SOURCE_BADGE = {
+    ENRICH_SOURCE_OUTLOOK: "ᴼ",  # superscript O
+    ENRICH_SOURCE_LLM: "ᴸ",      # superscript L
+    ENRICH_SOURCE_MANUAL: "ᴹ",   # superscript M
 }
 _SOURCE_LABELS = {
     ENRICH_SOURCE_OUTLOOK: "Outlook calendar",
@@ -534,7 +534,7 @@ class AddressBookDialog(QDialog):
                 getattr(contact, source_attrs[field], None)
                 if contact is not None else None
             )
-            badge = _SOURCE_EMOJI.get(source or "", "")
+            badge = _SOURCE_BADGE.get(source or "", "")
             if badge:
                 label.setText(f"{base} {badge}")
                 label.setToolTip(_SOURCE_LABELS.get(source, ""))
@@ -566,7 +566,7 @@ class AddressBookDialog(QDialog):
             source=ENRICH_SOURCE_MANUAL,
         )
         # Refresh the header badge if this was the first manual touch.
-        # Also refresh per-field labels so the ✋ on the edited field
+        # Also refresh per-field labels so the ᴹ on the edited field
         # appears without waiting for a re-select.
         if contact.last_enriched_source != ENRICH_SOURCE_MANUAL:
             self._refresh_details()
@@ -611,7 +611,7 @@ class AddressBookDialog(QDialog):
         # The emoji is the badge Aaron asked for in his 2026-05-28
         # spec -- envelope for Outlook, robot for LLM, pencil for
         # manual edits. Tooltip on the name explains.
-        badge = _SOURCE_EMOJI.get(contact.last_enriched_source or "", "")
+        badge = _SOURCE_BADGE.get(contact.last_enriched_source or "", "")
         self._detail_name.setText(
             f"{contact.display_name} {badge}".strip()
         )
