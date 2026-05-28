@@ -322,42 +322,134 @@ def fetch_remaining_today(now: Optional[datetime] = None) -> list[MeetingInfo]:
     return [m for m in candidates if m.end_time > now]
 
 
-def _safe_address_entry_field(recipient, field_name: str) -> str:
-    """Pull `field_name` off a Recipient's AddressEntry, blank on miss.
+def _looks_like_legacy_dn(value: str) -> bool:
+    """True when a string looks like an X.500 legacyExchangeDN.
 
-    Outlook's COM Recipient has an AddressEntry that exposes
-    JobTitle / CompanyName / Department for entries resolved against
-    the GAL or the user's Outlook contacts. External attendees (a
-    plain vendor email with no contacts entry) have either no
-    AddressEntry at all or one whose accessors return None / raise.
-
-    Wrap the whole chain in try/except + treat any error as 'no
-    value available' so a missing field never crashes the calendar
-    fetch. Issue #51 Phase 2.
+    Exchange recipients have an `Address` of the form
+    '/o=ExchangeLabs/ou=Exchange Administrative Group (.../cn=Recipients/cn=...'
+    -- not a useful email value to store. We detect + reject these so
+    the fallback path can hunt for a real SMTP address.
     """
+    if not value:
+        return False
+    v = value.strip().lower()
+    return v.startswith("/o=") or v.startswith("/cn=")
+
+
+def _resolve_recipient_fields(recipient) -> dict:
+    """Pull name / email / title / company / department from a Recipient.
+
+    Exchange COM quirk: for GAL-resolved recipients ('Type' == 'EX'),
+    AddressEntry.Address returns the X.500 legacyExchangeDN
+    (/o=ExchangeLabs/... ) and AddressEntry.JobTitle / .CompanyName
+    are often empty or unavailable. The rich fields + the actual SMTP
+    address live on the ExchangeUser object returned by
+    AddressEntry.GetExchangeUser(). For external invitees ('Type' ==
+    'SMTP'), AddressEntry.Address is the real email and there's no
+    ExchangeUser to fetch.
+
+    Strategy:
+      1. Try AddressEntry.GetExchangeUser() -- when it returns an
+         object, it's authoritative for both the SMTP address and
+         the JobTitle/CompanyName/Department triplet.
+      2. Otherwise fall back to AddressEntry.Address for email +
+         AddressEntry direct fields for the others.
+      3. If the resulting email is still an X.500 DN, drop it (better
+         to record no email than a useless one). The contact-resolver
+         can still match by Name on subsequent meetings.
+
+    Every step is wrapped so a flaky COM call never crashes the
+    calendar fetch.
+    """
+    name = str(getattr(recipient, "Name", "") or "").strip()
+    email = ""
+    title = ""
+    company = ""
+    department = ""
+
     try:
         ae = recipient.AddressEntry
-        if ae is None:
-            return ""
-        value = getattr(ae, field_name, None)
-        return str(value or "").strip()
     except Exception:
-        return ""
+        ae = None
+    if ae is None:
+        return {
+            "name": name, "email": email,
+            "title": title, "company": company, "department": department,
+        }
+
+    exchange_user = None
+    try:
+        exchange_user = ae.GetExchangeUser()
+    except Exception:
+        exchange_user = None
+
+    if exchange_user is not None:
+        # Exchange path: the ExchangeUser object is authoritative.
+        try:
+            email = str(
+                getattr(exchange_user, "PrimarySmtpAddress", "") or ""
+            ).strip()
+        except Exception:
+            email = ""
+        try:
+            title = str(getattr(exchange_user, "JobTitle", "") or "").strip()
+        except Exception:
+            title = ""
+        try:
+            company = str(getattr(exchange_user, "CompanyName", "") or "").strip()
+        except Exception:
+            company = ""
+        try:
+            department = str(
+                getattr(exchange_user, "Department", "") or ""
+            ).strip()
+        except Exception:
+            department = ""
+
+    # Fill any blanks from direct AddressEntry accessors. For SMTP
+    # external attendees this is the only path. Defensive: also runs
+    # when GetExchangeUser succeeded but a specific field came back
+    # empty -- the direct fields *occasionally* carry data for
+    # contacts where the Exchange query didn't.
+    if not email:
+        try:
+            raw_email = str(getattr(ae, "Address", "") or "").strip()
+        except Exception:
+            raw_email = ""
+        if raw_email and not _looks_like_legacy_dn(raw_email):
+            email = raw_email
+    if not title:
+        try:
+            title = str(getattr(ae, "JobTitle", "") or "").strip()
+        except Exception:
+            title = ""
+    if not company:
+        try:
+            company = str(getattr(ae, "CompanyName", "") or "").strip()
+        except Exception:
+            company = ""
+    if not department:
+        try:
+            department = str(getattr(ae, "Department", "") or "").strip()
+        except Exception:
+            department = ""
+
+    # Final guard: never let an X.500 DN escape as an email value.
+    if _looks_like_legacy_dn(email):
+        email = ""
+
+    return {
+        "name": name, "email": email,
+        "title": title, "company": company, "department": department,
+    }
 
 
 def _item_to_info(item) -> MeetingInfo:
     attendees: list[CalendarAttendee] = []
     try:
         for r in item.Recipients:
-            attendees.append(
-                CalendarAttendee(
-                    name=str(getattr(r, "Name", "") or "").strip(),
-                    email=str(getattr(r, "Address", "") or "").strip(),
-                    title=_safe_address_entry_field(r, "JobTitle"),
-                    company=_safe_address_entry_field(r, "CompanyName"),
-                    department=_safe_address_entry_field(r, "Department"),
-                )
-            )
+            fields = _resolve_recipient_fields(r)
+            attendees.append(CalendarAttendee(**fields))
     except Exception:
         log.debug("recipients parse failed", exc_info=True)
 

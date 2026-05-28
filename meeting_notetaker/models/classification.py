@@ -279,7 +279,40 @@ class ClassificationStore:
         self._conn.executescript(SCHEMA)
         # v0.7.2 (issue #51): add rich-addressbook columns to the
         # contacts table on databases created before this release.
+        # Order matters: the legacy-DN sweep below references the
+        # per-field source column, which the migration adds.
         self._ensure_contact_rich_columns()
+        # 2026-05-28: prior Outlook fetches stored the X.500
+        # legacyExchangeDN as primary_email for Exchange recipients.
+        # Sweep it out so the next enrichment can fill in the real
+        # SMTP address (fill_empty_only requires the field be empty).
+        self._sanitize_legacy_dn_emails()
+
+    def _sanitize_legacy_dn_emails(self) -> None:
+        """Clear primary_email values that hold an X.500 legacyExchangeDN.
+
+        Pre-fix Outlook fetches stored ``AddressEntry.Address`` directly,
+        which for Exchange recipients is the X.500 distinguished name
+        ('/o=ExchangeLabs/ou=Exchange Administrative Group .../cn=Recipients/cn=...').
+        That's a useless value; sweep it to NULL so the next Outlook
+        enrichment can fill in the real PrimarySmtpAddress via the
+        ``GetExchangeUser()`` code path. Cheap query -- WHERE LIKE
+        prefix match on a single column with at most a few hundred
+        rows in practice. Idempotent: a second run finds nothing.
+        """
+        try:
+            self._conn.execute(
+                "UPDATE contacts "
+                "SET primary_email = NULL, primary_email_source = NULL "
+                "WHERE primary_email LIKE '/o=%' "
+                "   OR primary_email LIKE '/O=%' "
+                "   OR primary_email LIKE '/cn=%' "
+                "   OR primary_email LIKE '/CN=%'"
+            )
+        except sqlite3.Error:
+            # Don't block store open if the sweep fails (e.g. on a
+            # legacy DB before the per-field columns migrated in).
+            pass
 
     def _ensure_contact_rich_columns(self) -> None:
         """Additive ALTER TABLE migration for the v0.7.2 Contact fields.

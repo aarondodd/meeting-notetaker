@@ -364,3 +364,75 @@ def test_legacy_row_per_field_source_columns_are_null(tmp_path):
         assert c.notes_source is None
     finally:
         store.close()
+
+
+# ---- legacy-DN email sanitization on store open (2026-05-28) ---------------
+
+
+def test_legacy_dn_email_swept_on_store_open(tmp_path):
+    """Existing contacts that hold an X.500 legacyExchangeDN as
+    primary_email get cleared on store open so the next Outlook
+    enrichment can fill the real SMTP address (fill_empty_only
+    won't overwrite an existing non-empty value).
+
+    Reason: pre-fix Outlook fetches stored AddressEntry.Address
+    directly, which for Exchange recipients is the X.500 DN. The
+    sweep runs once at __init__ and is idempotent.
+    """
+    db_file = tmp_path / "dirty.db"
+    # Create a store, write a contact with a legacy-DN email, close.
+    s1 = ClassificationStore(db_file)
+    c = s1.create_contact("Bob Smith")
+    s1.update_contact_fields(
+        c.id,
+        primary_email=(
+            "/o=ExchangeLabs/ou=Exchange Administrative Group "
+            "(FYDIBOHF23SPDLT)/cn=Recipients/cn=user-guid"
+        ),
+        source=ENRICH_SOURCE_OUTLOOK,
+    )
+    s1.close()
+    # Re-open the store: sweep runs in __init__.
+    s2 = ClassificationStore(db_file)
+    try:
+        refreshed = s2.get_contact(c.id)
+        assert refreshed is not None
+        # Email + its source were cleared so future enrichment can fill.
+        assert (refreshed.primary_email or "") == ""
+        assert refreshed.primary_email_source is None
+        # Other fields untouched.
+        assert refreshed.display_name == "Bob Smith"
+    finally:
+        s2.close()
+
+
+def test_legacy_dn_sweep_is_idempotent(tmp_path):
+    """Opening the store twice in a row after the sweep finds nothing
+    to do on the second pass and doesn't error."""
+    db_file = tmp_path / "clean.db"
+    s1 = ClassificationStore(db_file)
+    s1.create_contact("Bob")  # no legacy DN to clear
+    s1.close()
+    s2 = ClassificationStore(db_file)
+    s2.close()
+    s3 = ClassificationStore(db_file)
+    s3.close()  # no exception = pass
+
+
+def test_legacy_dn_sweep_preserves_real_smtp_emails(tmp_path):
+    """A contact with a real SMTP email is NOT touched by the sweep."""
+    db_file = tmp_path / "mixed.db"
+    s1 = ClassificationStore(db_file)
+    real = s1.create_contact("Real Bob")
+    s1.update_contact_fields(real.id, primary_email="real@example.com")
+    dn = s1.create_contact("Legacy Bob")
+    s1.update_contact_fields(
+        dn.id, primary_email="/o=ExchangeLabs/ou=g/cn=r/cn=x",
+    )
+    s1.close()
+    s2 = ClassificationStore(db_file)
+    try:
+        assert s2.get_contact(real.id).primary_email == "real@example.com"
+        assert (s2.get_contact(dn.id).primary_email or "") == ""
+    finally:
+        s2.close()
