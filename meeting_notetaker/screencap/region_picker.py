@@ -14,6 +14,7 @@ background trick is standard for screen-selection tools.
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal
@@ -28,6 +29,32 @@ from PyQt6.QtGui import (
     QPen,
 )
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+
+
+log = logging.getLogger(__name__)
+
+
+def _describe_screens() -> str:
+    """One-line summary of every connected screen (issue #49 diagnostics).
+
+    Includes Qt's reported geometry, its device pixel ratio (the
+    Windows DPI scaling factor at this screen), and the physical-
+    pixel equivalent so the next mis-aligned-capture report shows
+    the mismatch directly in the log.
+    """
+    parts = []
+    for i, s in enumerate(QGuiApplication.screens()):
+        geo = s.geometry()
+        dpr = s.devicePixelRatio()
+        phys_w = int(geo.width() * dpr)
+        phys_h = int(geo.height() * dpr)
+        parts.append(
+            f"screen[{i}]={s.name()!r} "
+            f"qt_geo=({geo.x()},{geo.y()},{geo.width()}x{geo.height()}) "
+            f"dpr={dpr:.3f} "
+            f"physical={phys_w}x{phys_h}"
+        )
+    return " | ".join(parts) if parts else "no screens"
 
 
 class RegionPicker(QWidget):
@@ -54,6 +81,15 @@ class RegionPicker(QWidget):
         # Cover the virtual desktop (all monitors). primaryScreen.geometry()
         # is just one monitor; we need the union via screens() bounding box.
         virtual_rect = self._virtual_desktop_rect()
+        # Diagnostic snapshot (issue #49). The next mis-aligned-region
+        # report includes this line in the log so the screen layout +
+        # per-monitor DPI scaling are visible from the get-go.
+        log.info(
+            "RegionPicker init: virtual_rect=(%d,%d,%dx%d) | %s",
+            virtual_rect.x(), virtual_rect.y(),
+            virtual_rect.width(), virtual_rect.height(),
+            _describe_screens(),
+        )
         self.setGeometry(virtual_rect)
         self._start: Optional[QPoint] = None
         self._end: Optional[QPoint] = None
@@ -127,6 +163,11 @@ class RegionPicker(QWidget):
         # are accidental and should cancel rather than commit.
         if rect_widget.width() < 8 or rect_widget.height() < 8:
             self._result = None
+            log.info(
+                "RegionPicker release: degenerate rect_widget=(%d,%d,%dx%d); cancelled",
+                rect_widget.x(), rect_widget.y(),
+                rect_widget.width(), rect_widget.height(),
+            )
         else:
             # Translate widget-local coords back to absolute screen coords.
             origin = self._virtual_desktop_rect().topLeft()
@@ -135,6 +176,30 @@ class RegionPicker(QWidget):
                 rect_widget.size(),
             )
             self._result = rect_screen
+            # Diagnostic (issue #49). Logs the input mouse positions,
+            # the widget-local rect, the origin used for translation,
+            # the resulting absolute-screen rect, plus which Qt screen
+            # the rect's top-left lands on + that screen's
+            # devicePixelRatio. Reproducing the bug means matching
+            # these numbers against the captured PNG's offset.
+            tl_screen = QGuiApplication.screenAt(rect_screen.topLeft())
+            tl_dpr = tl_screen.devicePixelRatio() if tl_screen else None
+            br_screen = QGuiApplication.screenAt(rect_screen.bottomRight())
+            br_dpr = br_screen.devicePixelRatio() if br_screen else None
+            log.info(
+                "RegionPicker release: rect_widget=(%d,%d,%dx%d) "
+                "origin=(%d,%d) rect_screen=(%d,%d,%dx%d) "
+                "tl_screen=%s tl_dpr=%s br_screen=%s br_dpr=%s",
+                rect_widget.x(), rect_widget.y(),
+                rect_widget.width(), rect_widget.height(),
+                origin.x(), origin.y(),
+                rect_screen.x(), rect_screen.y(),
+                rect_screen.width(), rect_screen.height(),
+                tl_screen.name() if tl_screen else "n/a",
+                f"{tl_dpr:.3f}" if tl_dpr is not None else "n/a",
+                br_screen.name() if br_screen else "n/a",
+                f"{br_dpr:.3f}" if br_dpr is not None else "n/a",
+            )
         self.region_selected.emit(self._result)
         self.close()
 

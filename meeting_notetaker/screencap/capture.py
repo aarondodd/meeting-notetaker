@@ -57,12 +57,24 @@ def capture_region_to_file(
         from PIL import Image  # noqa: PLC0415
 
         with mss.MSS() as sct:
+            # Diagnostic snapshot (issue #49). Log mss's own monitor
+            # enumeration (physical pixels) alongside the region we
+            # were handed (Qt logical pixels on Windows under DPI
+            # scaling) so the next mis-aligned capture report shows
+            # the coord-space mismatch directly.
+            _log_capture_diagnostics(sct, region)
             raw = sct.grab({
                 "left": left, "top": top,
                 "width": width, "height": height,
             })
         # mss returns BGRA; PIL.Image.frombytes can read it directly.
         img = Image.frombytes("RGB", raw.size, raw.rgb)
+        log.info(
+            "capture_region: saved %s region_in=(%d,%d,%dx%d) "
+            "image_out=%dx%d",
+            out_path.name, left, top, width, height,
+            img.width, img.height,
+        )
         img.save(str(out_path), format="PNG", optimize=False)
         return out_path
     except Exception:
@@ -74,6 +86,36 @@ def capture_region_to_file(
             except OSError:
                 pass
         return None
+
+
+def _log_capture_diagnostics(sct, region: tuple[int, int, int, int]) -> None:
+    """One-line snapshot of mss's monitor view + the requested region.
+
+    Issue #49 instrumentation. mss's ``sct.monitors`` returns monitor
+    bounds in **physical** pixels (Windows' raw device coordinates),
+    while ``region`` was almost certainly produced by Qt in
+    **logical** pixels (DPI-scaled). The deltas between the two are
+    what we're trying to surface here so the actual coordinate-
+    space mismatch is visible in the log on the next reproduction
+    instead of inferred from a mismatched PNG.
+    """
+    try:
+        # sct.monitors[0] is the union of all monitors (virtual screen)
+        # in physical pixels. Subsequent entries are per-monitor.
+        parts = []
+        for i, mon in enumerate(sct.monitors):
+            parts.append(
+                f"mss[{i}]=(L{mon.get('left', 0)},"
+                f"T{mon.get('top', 0)},"
+                f"{mon.get('width', 0)}x{mon.get('height', 0)})"
+            )
+        left, top, w, h = region
+        log.info(
+            "capture_region diag: region_in_qt=(L%d,T%d,%dx%d) | %s",
+            left, top, w, h, " ".join(parts),
+        )
+    except Exception:
+        log.exception("capture_region diag: enumeration failed")
 
 
 def _next_screenshot_path(dst_dir: Path, *, now: Optional[datetime] = None) -> Path:
