@@ -35,6 +35,7 @@ from typing import Optional
 from ..models.classification import (
     ALIAS_KIND_EMAIL,
     ALIAS_KIND_NAME,
+    ENRICH_SOURCE_OUTLOOK,
     SOURCE_ATTENDEE_LIST,
     SOURCE_CALENDAR,
     ClassificationStore,
@@ -152,6 +153,49 @@ def resolve_attendees_batch(
         seen_contact_ids.add(result.contact.id)
         out.append(result.contact)
     return out
+
+
+def enrich_contact_from_calendar_attendee(
+    store: ClassificationStore,
+    contact_id: int,
+    attendee,
+) -> None:
+    """Fill missing Contact rich fields from a calendar attendee.
+
+    Issue #51 Phase 2. ``attendee`` is duck-typed: any object with
+    ``title`` / ``company`` / ``department`` / ``email`` string-ish
+    attributes works. Anything else is silently treated as empty.
+
+    Uses ``update_contact_fields(fill_empty_only=True,
+    source=outlook)`` so:
+    * Existing user-set values are never overwritten.
+    * The Contact's ``last_enriched_source`` flips to ``outlook``
+      only when at least one field was actually filled.
+
+    Idempotent + safe to call on every resolution -- a Contact with
+    every field set is a no-op.
+    """
+    title = (getattr(attendee, "title", "") or "").strip()
+    company = (getattr(attendee, "company", "") or "").strip()
+    department = (getattr(attendee, "department", "") or "").strip()
+    email = (getattr(attendee, "email", "") or "").strip()
+    fields: dict[str, Optional[str]] = {}
+    if title:
+        fields["title"] = title
+    if company:
+        fields["company"] = company
+    if department:
+        fields["department"] = department
+    if email:
+        fields["primary_email"] = email
+    if not fields:
+        return
+    store.update_contact_fields(
+        contact_id,
+        source=ENRICH_SOURCE_OUTLOOK,
+        fill_empty_only=True,
+        **fields,
+    )
 
 
 def display_name_for_email(

@@ -1,0 +1,177 @@
+"""AttendeeDetailsDrawer (issue #51 Phase 3).
+
+Widget-level tests for the collapsible attendee-details drawer
+mounted above the My Notes + Synthesis editors. Headless via
+QT_QPA_PLATFORM=offscreen.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+from typing import Optional
+
+import pytest
+
+pytest.importorskip("PyQt6.QtWidgets")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt6.QtWidgets import QApplication  # noqa: E402
+
+from meeting_notetaker.ui.attendee_details_drawer import AttendeeDetailsDrawer  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def qt_app():
+    return QApplication.instance() or QApplication(sys.argv)
+
+
+@dataclass
+class _FakeContact:
+    """Minimal Contact stand-in for drawer tests; the drawer only
+    reads display_name + rich-field attrs + last_enriched_source."""
+    id: int
+    display_name: str
+    title: Optional[str] = None
+    company: Optional[str] = None
+    department: Optional[str] = None
+    primary_email: Optional[str] = None
+    phone: Optional[str] = None
+    notes: str = ""
+    last_enriched_source: Optional[str] = None
+
+
+def test_drawer_initial_state_collapsed_with_zero_count(qt_app):
+    """A freshly-constructed drawer starts collapsed and reports
+    'Attendees (0)' before set_contacts is called."""
+    d = AttendeeDetailsDrawer()
+    try:
+        assert not d.is_expanded()
+        assert d._title.text() == "Attendees (0)"  # noqa: SLF001
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_expand_toggle_changes_state(qt_app):
+    """Clicking the toggle expands; clicking again collapses."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d._on_toggle()  # noqa: SLF001
+        assert d.is_expanded()
+        d._on_toggle()  # noqa: SLF001
+        assert not d.is_expanded()
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_table_renders_contact_fields(qt_app):
+    """set_contacts populates the table; cells map to rich fields."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([
+            _FakeContact(
+                id=1, display_name="Bob Smith",
+                title="VP", company="Acme",
+                primary_email="bob@acme.com", phone="+1-555-0100",
+            ),
+        ])
+        assert d._title.text() == "Attendees (1)"  # noqa: SLF001
+        assert d._table.rowCount() == 1  # noqa: SLF001
+        # Name cell holds the display name + (possibly) a source badge.
+        assert "Bob Smith" in d._table.item(0, 0).text()  # noqa: SLF001
+        assert d._table.item(0, 1).text() == "VP"  # noqa: SLF001
+        assert d._table.item(0, 2).text() == "Acme"  # noqa: SLF001
+        assert d._table.item(0, 3).text() == "bob@acme.com"  # noqa: SLF001
+        assert d._table.item(0, 4).text() == "+1-555-0100"  # noqa: SLF001
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_empty_fields_render_as_blank(qt_app):
+    """A Contact with NULL rich fields renders empty cells, not 'n/a'."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([_FakeContact(id=1, display_name="Plain Jane")])
+        for col in (1, 2, 3, 4):
+            assert d._table.item(0, col).text() == ""  # noqa: SLF001
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_source_badge_renders_for_outlook(qt_app):
+    """A contact enriched from Outlook gets the envelope emoji."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([_FakeContact(
+            id=1, display_name="Bob",
+            last_enriched_source="outlook",
+        )])
+        name_cell = d._table.item(0, 0).text()  # noqa: SLF001
+        assert "Bob" in name_cell
+        assert "\U0001F4E7" in name_cell, (
+            f"expected envelope emoji, got {name_cell!r}"
+        )
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_source_badge_renders_for_llm(qt_app):
+    """A contact enriched from LLM extraction gets the robot emoji."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([_FakeContact(
+            id=1, display_name="Mary",
+            last_enriched_source="llm",
+        )])
+        name_cell = d._table.item(0, 0).text()  # noqa: SLF001
+        assert "\U0001F916" in name_cell
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_no_badge_when_no_source(qt_app):
+    """A never-enriched contact's name cell has no trailing emoji."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([_FakeContact(
+            id=1, display_name="Anonymous",
+            last_enriched_source=None,
+        )])
+        # Strip() in the drawer means trailing space from missing
+        # emoji is removed.
+        assert d._table.item(0, 0).text() == "Anonymous"  # noqa: SLF001
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_cell_double_click_emits_contact_id(qt_app):
+    """Double-clicking a row's cell emits contact_clicked with the
+    Contact's id. MainApp routes that to the Address Book."""
+    d = AttendeeDetailsDrawer()
+    captured = []
+    d.contact_clicked.connect(captured.append)
+    try:
+        d.set_contacts([
+            _FakeContact(id=42, display_name="Alpha"),
+            _FakeContact(id=99, display_name="Beta"),
+        ])
+        d._on_cell_clicked(0, 0)  # noqa: SLF001
+        d._on_cell_clicked(1, 2)  # noqa: SLF001
+        assert captured == [42, 99]
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_set_contacts_with_empty_collapses(qt_app):
+    """If the drawer is expanded and set_contacts gets an empty list,
+    auto-collapse so the empty body isn't taking visual space."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([_FakeContact(id=1, display_name="Bob")])
+        d.set_expanded(True)
+        assert d.is_expanded()
+        d.set_contacts([])
+        assert not d.is_expanded()
+        assert d._title.text() == "Attendees (0)"  # noqa: SLF001
+    finally:
+        d.deleteLater()

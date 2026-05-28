@@ -115,6 +115,7 @@ def test_render_uses_explicit_attendees_when_provided():
         transcript="",
         live_notes="# Attendees\n- Ignored\n",
         attendees=["Override"],
+        include_system_prompts=False,
     )
     assert out == "Override"
 

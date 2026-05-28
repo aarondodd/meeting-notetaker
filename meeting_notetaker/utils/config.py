@@ -194,6 +194,17 @@ class SynthesisConfig:
     # synthesized notes accumulate inside the named project rather
     # than flooding the user's default chat list. Empty == no project.
     claude_project_id: str = ""
+    # v0.7.2 (issue #51 Phase 4): auto-extract attendee details from
+    # the synthesis via a system-prompt appendix. Default ON --
+    # enrichment is additive (fill_empty_only) so worst case is a
+    # no-op. User can disable to keep the synthesis prompt shorter
+    # or skip the auto-fill behavior entirely.
+    auto_extract_attendee_details: bool = True
+    # When True, the "## Attendee Details (auto-extracted)" appendix
+    # is removed from the saved notes.md after parsing. Default OFF
+    # so the user can see what the LLM extracted (transparency); flip
+    # ON if the appendix is cluttering shared synthesis exports.
+    strip_attendee_appendix: bool = False
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

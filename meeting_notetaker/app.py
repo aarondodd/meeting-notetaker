@@ -636,6 +636,15 @@ class MainApp(QObject):
         # tight markdown.
         from .automation.markdown_normalize import normalize_synthesis_markdown
         markdown = normalize_synthesis_markdown(markdown)
+        # Parse + apply the LLM-extracted attendee details appendix
+        # (issue #51 Phase 4). Done BEFORE save_notes so the parsed
+        # data is independent of the save path's success. Strip
+        # behavior is gated on a config flag; default keeps the
+        # appendix visible so the user can see what was extracted.
+        self._apply_attendee_details_appendix(session_id, markdown)
+        if self.config.synthesis.strip_attendee_appendix:
+            from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
+            markdown = strip_appendix(markdown)
         try:
             archive_path = TranscriptStore(session_id).save_notes(
                 markdown, archive_existing=True
@@ -1092,6 +1101,9 @@ class MainApp(QObject):
         sv.screencap_insert_clicked.connect(self._on_screencap_insert)
         sv.screencap_auto_toggled.connect(self._on_auto_capture_toggled)
         sv.delete_screenshot_clicked.connect(self._on_delete_screenshot)
+        # v0.7.2 (#51 Phase 3): drawer row-click opens the Address
+        # Book filtered to that contact.
+        sv.contact_clicked_in_drawer.connect(self._on_drawer_contact_clicked)
         # Transcript playback wiring. The player bar fires play / pause /
         # seek; MainApp owns the single AudioPlayer and routes them.
         sv.transcript_play_clicked.connect(self._on_transcript_play)
@@ -1326,6 +1338,10 @@ class MainApp(QObject):
             content.template_names, selected=content.selected_template,
         )
         sv.set_attendee_names(parse_attendees(content.live_notes))
+        # Push the session's Contact list into the attendee-details
+        # drawer (issue #51 Phase 3). Cheap query; refreshed again
+        # whenever attendee sync re-runs (see _sync_attendees_to_people).
+        self._refresh_session_contacts_in_drawer(content.session_id)
         # Highlights: total_ms is 0 until the audio player finishes
         # its own async load and fires set_player_total_ms. The
         # highlight bar disables interaction cleanly at total_ms=0
@@ -1537,12 +1553,17 @@ class MainApp(QObject):
         4. Whatever attendee.display falls back to (raw email or
            "(unknown)").
         """
-        # Step 1: explicit name.
+        # Step 1: explicit name. Even when we have a name, we still
+        # run email-based contact resolution + Outlook enrichment
+        # (issue #51 Phase 2) so the Contact's title/company/etc.
+        # get populated. Resolution + enrichment are best-effort;
+        # display name comes back from the name field directly.
         name = (getattr(attendee, "name", "") or "").strip()
+        email = (getattr(attendee, "email", "") or "").strip()
+        self._enrich_contact_for_calendar_attendee(attendee, email)
         if name:
             return name
-        # Step 2 + 3: email-driven resolution.
-        email = (getattr(attendee, "email", "") or "").strip()
+        # Step 2 + 3: email-driven resolution for the display name.
         if email and self.classification is not None:
             try:
                 from .utils.contact_resolution import (  # noqa: PLC0415
@@ -1563,6 +1584,50 @@ class MainApp(QObject):
                 )
         # Step 4: fall back to the existing display logic.
         return getattr(attendee, "display", "") or email or ""
+
+    def _enrich_contact_for_calendar_attendee(self, attendee, email: str) -> None:
+        """Apply Outlook-pulled rich fields to the Contact, if any.
+
+        Issue #51 Phase 2. CalendarAttendee carries title/company/
+        department from the Outlook AddressEntry (GAL or user
+        contacts). Resolve the Contact via email when we have one
+        OR by name otherwise, then call
+        enrich_contact_from_calendar_attendee with fill_empty_only=True.
+        Existing user values stay intact; new values populate NULL
+        fields and flip last_enriched_source to 'outlook'.
+
+        Best-effort: any exception falls through silently so a
+        calendar-seed flow never errors over enrichment.
+        """
+        if self.classification is None:
+            return
+        # Need either a name or email to find/create the Contact.
+        name = (getattr(attendee, "name", "") or "").strip()
+        if not name and not email:
+            return
+        try:
+            from .models.classification import SOURCE_CALENDAR as _SRC_CAL  # noqa: PLC0415
+            from .utils.contact_resolution import (  # noqa: PLC0415
+                enrich_contact_from_calendar_attendee,
+                resolve_attendee_email,
+                resolve_attendee_text,
+            )
+            result = None
+            if email:
+                result = resolve_attendee_email(self.classification, email)
+            if result is None and name:
+                result = resolve_attendee_text(
+                    self.classification, name, source=_SRC_CAL,
+                )
+            if result is None:
+                return
+            enrich_contact_from_calendar_attendee(
+                self.classification, result.contact.id, attendee,
+            )
+        except Exception:
+            log.exception(
+                "calendar enrichment failed for %r / %r", name, email,
+            )
 
     def _align_created_at_to_meeting(
         self, session_id: str, info: MeetingInfo
@@ -2940,6 +3005,18 @@ class MainApp(QObject):
         except ValueError:
             session_when = None
         sdir = session_dir(session_id)
+        # v0.7.2 #51 Phase 5: fetch the session's linked Contacts so the
+        # PDF render path can swap the Attendees bullet list for a rich
+        # table when any contact has detail fields populated.
+        session_contacts_for_pdf: list = []
+        if self.classification is not None:
+            try:
+                session_contacts_for_pdf = [
+                    sc.contact
+                    for sc in self.classification.contacts_for_session(session_id)
+                ]
+            except Exception:
+                log.exception("contact fetch failed for export PDF: %s", session_id)
         notes_pdf_path = None
         synthesis_pdf_path = None
         try:
@@ -2952,6 +3029,7 @@ class MainApp(QObject):
                     session_title=session.title or "session",
                     tab_label="My Notes",
                     session_date=session_when,
+                    session_contacts=session_contacts_for_pdf,
                 )
             if synthesis_md.strip():
                 synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
@@ -2962,6 +3040,7 @@ class MainApp(QObject):
                     session_title=session.title or "session",
                     tab_label="Synthesis",
                     session_date=session_when,
+                    session_contacts=session_contacts_for_pdf,
                 )
         except Exception:
             log.exception("PDF pre-render failed for %s", session_id)
@@ -3364,6 +3443,125 @@ class MainApp(QObject):
             )
         except Exception:
             log.exception("attendee sync failed for %s", session_id)
+            return
+        # Push the resolved contacts into the attendee-details drawer
+        # so the table refreshes inline as the user edits My Notes.
+        # Issue #51 Phase 3.
+        if (
+            self.window.session_view._session is not None  # noqa: SLF001
+            and self.window.session_view._session.id == session_id  # noqa: SLF001
+        ):
+            self._refresh_session_contacts_in_drawer(session_id)
+
+    def _apply_attendee_details_appendix(self, session_id: str, markdown: str) -> None:
+        """Parse + apply the LLM "Attendee Details" appendix.
+
+        Issue #51 Phase 4. Resolves each appendix entry's name to a
+        Contact via the same resolver attendee-list typing uses,
+        then fills missing rich fields via update_contact_fields
+        with fill_empty_only=True + source=llm.
+
+        Best-effort; any exception logs + returns -- the synthesis
+        save proceeds regardless.
+        """
+        if self.classification is None:
+            return
+        if not self.config.synthesis.auto_extract_attendee_details:
+            return
+        try:
+            from .models.classification import ENRICH_SOURCE_LLM  # noqa: PLC0415
+            from .utils.attendee_appendix import parse_appendix  # noqa: PLC0415
+            from .utils.contact_resolution import (  # noqa: PLC0415
+                resolve_attendee_email, resolve_attendee_text,
+            )
+            entries = parse_appendix(markdown)
+            if not entries:
+                return
+            applied_count = 0
+            for entry in entries:
+                # Prefer email-based resolution when the LLM gave us
+                # an email -- it's the most unambiguous identifier.
+                result = None
+                if entry.email:
+                    result = resolve_attendee_email(self.classification, entry.email)
+                if result is None and entry.name:
+                    result = resolve_attendee_text(self.classification, entry.name)
+                if result is None:
+                    continue
+                fields: dict[str, str] = {}
+                if entry.title:
+                    fields["title"] = entry.title
+                if entry.company:
+                    fields["company"] = entry.company
+                if entry.department:
+                    fields["department"] = entry.department
+                if entry.email:
+                    fields["primary_email"] = entry.email
+                if entry.phone:
+                    fields["phone"] = entry.phone
+                if not fields:
+                    continue
+                self.classification.update_contact_fields(
+                    result.contact.id,
+                    source=ENRICH_SOURCE_LLM,
+                    fill_empty_only=True,
+                    **fields,
+                )
+                applied_count += 1
+            if applied_count:
+                log.info(
+                    "attendee appendix applied: %d entries for session %s",
+                    applied_count, session_id,
+                )
+        except Exception:
+            log.exception(
+                "attendee appendix application failed for %s", session_id,
+            )
+
+    def _refresh_session_contacts_in_drawer(self, session_id: str) -> None:
+        """Pull the session's linked Contacts + push them into the
+        SessionView's drawer widgets (issue #51 Phase 3).
+
+        Used both on session-select (initial paint) and after
+        attendee sync (live updates while the user types in My Notes).
+        Cheap query; called on every keystroke in the worst case
+        but bounded by the My Notes debounce so it doesn't fire
+        more than a few times a second.
+        """
+        if self.classification is None:
+            return
+        try:
+            session_contacts = self.classification.contacts_for_session(
+                session_id,
+            )
+            contacts = [sc.contact for sc in session_contacts]
+        except Exception:
+            log.exception("drawer refresh failed for %s", session_id)
+            return
+        self.window.session_view.set_session_contacts(contacts)
+
+    def _on_drawer_contact_clicked(self, contact_id: int) -> None:
+        """Open the Address Book filtered to a specific contact
+        (issue #51 Phase 3). Bridges the drawer's row-click signal
+        through to the existing _on_address_book handler with a
+        pre-selected contact id."""
+        if self.classification is None:
+            return
+        speaker_store = open_speaker_store()
+        try:
+            dialog = AddressBookDialog(
+                self.classification, parent=self.window,
+                speaker_store=speaker_store,
+            )
+            dialog.select_contact(contact_id)
+            dialog.exec()
+        finally:
+            speaker_store.close()
+        # After the dialog closes the drawer may need to reflect
+        # any field edits the user made.
+        sv = self.window.session_view
+        if sv._session is not None:  # noqa: SLF001
+            self._refresh_session_contacts_in_drawer(sv._session.id)  # noqa: SLF001
 
     def _extract_topics_for_session(self, session_id: str, body: str) -> None:
         """Run the deterministic extractor over synthesis text + push

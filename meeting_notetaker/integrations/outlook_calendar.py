@@ -41,6 +41,16 @@ log = logging.getLogger(__name__)
 class CalendarAttendee:
     name: str = ""
     email: str = ""
+    # v0.7.2 (issue #51): Outlook's AddressEntry exposes these for
+    # attendees resolved against the GAL (Global Address List) or
+    # the user's Outlook contacts. External invitees (vendor email
+    # addresses with no AddressEntry) get empty strings. Threaded
+    # through to resolve_attendees_batch + applied via
+    # update_contact_fields(fill_empty_only=True) so existing
+    # Contact values are never overwritten.
+    title: str = ""
+    company: str = ""
+    department: str = ""
 
     @property
     def display(self) -> str:
@@ -312,6 +322,29 @@ def fetch_remaining_today(now: Optional[datetime] = None) -> list[MeetingInfo]:
     return [m for m in candidates if m.end_time > now]
 
 
+def _safe_address_entry_field(recipient, field_name: str) -> str:
+    """Pull `field_name` off a Recipient's AddressEntry, blank on miss.
+
+    Outlook's COM Recipient has an AddressEntry that exposes
+    JobTitle / CompanyName / Department for entries resolved against
+    the GAL or the user's Outlook contacts. External attendees (a
+    plain vendor email with no contacts entry) have either no
+    AddressEntry at all or one whose accessors return None / raise.
+
+    Wrap the whole chain in try/except + treat any error as 'no
+    value available' so a missing field never crashes the calendar
+    fetch. Issue #51 Phase 2.
+    """
+    try:
+        ae = recipient.AddressEntry
+        if ae is None:
+            return ""
+        value = getattr(ae, field_name, None)
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
 def _item_to_info(item) -> MeetingInfo:
     attendees: list[CalendarAttendee] = []
     try:
@@ -320,6 +353,9 @@ def _item_to_info(item) -> MeetingInfo:
                 CalendarAttendee(
                     name=str(getattr(r, "Name", "") or "").strip(),
                     email=str(getattr(r, "Address", "") or "").strip(),
+                    title=_safe_address_entry_field(r, "JobTitle"),
+                    company=_safe_address_entry_field(r, "CompanyName"),
+                    department=_safe_address_entry_field(r, "Department"),
                 )
             )
     except Exception:

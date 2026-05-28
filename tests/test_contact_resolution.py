@@ -246,3 +246,86 @@ def test_ambiguous_attendee_surfaces_in_suggested_merges(store):
     # And both prior candidates appear in suggestion pairs.
     assert bob.id in involved_ids
     assert brenda.id in involved_ids
+
+
+# ---- Outlook enrichment (issue #51 Phase 2) -----------------------------
+
+
+from dataclasses import dataclass
+from meeting_notetaker.models.classification import ENRICH_SOURCE_OUTLOOK
+from meeting_notetaker.utils.contact_resolution import (
+    enrich_contact_from_calendar_attendee,
+)
+
+
+@dataclass
+class _FakeAttendee:
+    """Duck-typed stand-in for CalendarAttendee in pure-Python tests."""
+    name: str = ""
+    email: str = ""
+    title: str = ""
+    company: str = ""
+    department: str = ""
+
+
+def test_enrich_from_outlook_fills_empty_fields(store):
+    """A Contact with no rich fields gets every Outlook-supplied
+    field, and last_enriched_source flips to 'outlook'."""
+    c = store.create_contact("Bob Smith")
+    enrich_contact_from_calendar_attendee(
+        store, c.id,
+        _FakeAttendee(
+            email="bob@bobco.com",
+            title="CEO",
+            company="Bobco",
+            department="Executive",
+        ),
+    )
+    after = store.get_contact(c.id)
+    assert after.title == "CEO"
+    assert after.company == "Bobco"
+    assert after.department == "Executive"
+    assert after.primary_email == "bob@bobco.com"
+    assert after.last_enriched_source == ENRICH_SOURCE_OUTLOOK
+
+
+def test_enrich_from_outlook_skips_already_set_fields(store):
+    """Outlook never overwrites a value the user already set."""
+    c = store.create_contact("Bob Smith")
+    store.update_contact_fields(c.id, title="VP", company="Acme")
+    enrich_contact_from_calendar_attendee(
+        store, c.id,
+        _FakeAttendee(title="CEO", company="Bobco", department="Sales"),
+    )
+    after = store.get_contact(c.id)
+    assert after.title == "VP"  # preserved
+    assert after.company == "Acme"  # preserved
+    assert after.department == "Sales"  # filled (was NULL)
+
+
+def test_enrich_from_outlook_with_no_data_is_noop(store):
+    """An external attendee with no AddressEntry comes back with
+    empty strings everywhere. Enrichment must NOT touch the
+    Contact at all (no spurious last_enriched_source flip)."""
+    c = store.create_contact("External Bob")
+    enrich_contact_from_calendar_attendee(
+        store, c.id, _FakeAttendee(name="External Bob", email=""),
+    )
+    after = store.get_contact(c.id)
+    assert after.last_enriched_source is None
+    assert after.title is None
+
+
+def test_enrich_from_outlook_handles_missing_attributes(store):
+    """Duck-typed safety: enrich_contact_from_calendar_attendee
+    on an object missing the rich-field attributes treats them as
+    empty rather than raising."""
+    c = store.create_contact("Bob Smith")
+    class _Minimal:
+        name = "Bob"
+        email = "bob@bobco.com"
+    enrich_contact_from_calendar_attendee(store, c.id, _Minimal())
+    # Only the email was available; title/company/department stay NULL.
+    after = store.get_contact(c.id)
+    assert after.primary_email == "bob@bobco.com"
+    assert after.title is None

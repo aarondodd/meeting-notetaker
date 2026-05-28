@@ -268,6 +268,7 @@ def render_session_pdf(
     session_title: str,
     tab_label: str,
     session_date,
+    session_contacts: Optional[list] = None,
 ) -> Path:
     """Render a session-tab markdown body to a PDF on the MAIN
     THREAD.
@@ -292,12 +293,22 @@ def render_session_pdf(
 
     from ..ui.print_document import PrintTextDocument
     from .export import build_print_markdown
+    from .live_notes import (
+        replace_attendees_section_with_table,
+        should_render_attendees_as_table,
+    )
+
+    # v0.7.2 #51 Phase 5: replace the Attendees bullet list with a
+    # rich-fields table when any session contact has detail data.
+    body = markdown_body or ""
+    if session_contacts and should_render_attendees_as_table(session_contacts):
+        body = replace_attendees_section_with_table(body, session_contacts)
 
     printable = build_print_markdown(
         session_title=session_title,
         tab_label=tab_label,
         session_date=session_date,
-        body=markdown_body or "",
+        body=body,
     )
     doc = PrintTextDocument(Path(base_dir))
     doc.setMarkdown(printable)

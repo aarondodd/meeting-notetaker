@@ -329,6 +329,23 @@ class AddressBookDialog(QDialog):
         self._refresh_list()
         self._refresh_suggestions()
 
+    # ---- public API ----
+    def select_contact(self, contact_id: int) -> None:
+        """Select the row for ``contact_id`` if present in the list.
+
+        Used by the attendee-drawer click path (issue #51 Phase 3)
+        to open the dialog already focused on a specific contact.
+        No-op when the contact is filtered out or doesn't exist.
+        """
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is None:
+                continue
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if data is not None and int(data) == int(contact_id):
+                self._list.setCurrentRow(i)
+                return
+
     # ---- list refresh / filter ----
     def _refresh_list(self) -> None:
         filt = self._filter_input.text().strip().casefold()
