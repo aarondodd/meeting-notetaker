@@ -1606,7 +1606,9 @@ class MainApp(QObject):
         if not name and not email:
             return
         try:
-            from .models.classification import SOURCE_CALENDAR as _SRC_CAL  # noqa: PLC0415
+            from .models.classification import (  # noqa: PLC0415
+                ALIAS_KIND_NAME, SOURCE_CALENDAR as _SRC_CAL,
+            )
             from .utils.contact_resolution import (  # noqa: PLC0415
                 enrich_contact_from_calendar_attendee,
                 resolve_attendee_email,
@@ -1621,8 +1623,46 @@ class MainApp(QObject):
                 )
             if result is None:
                 return
+            contact_id = result.contact.id
+            # Issue #51 follow-up (2026-05-28): when we resolved via
+            # email and have a friendly name, also register the name
+            # so the subsequent attendee-by-name sync finds the same
+            # Contact instead of creating a duplicate stub. Without
+            # this, the email path creates "mlawrencegallagher" with
+            # all the Outlook rich fields, then _sync_attendees_to_people
+            # parses "Michael Lawrence Gallagher" from the live notes,
+            # doesn't find it as an alias, and creates a *second*
+            # bare Contact -- which is what ends up linked to the
+            # session, hiding all the enrichment from the user.
+            if name and email:
+                current_name = (result.contact.display_name or "").strip()
+                # If the existing display_name looks like the email
+                # local-part (created by the email stub path), promote
+                # the friendly name as the canonical display.
+                local_part = email.split("@", 1)[0].lower()
+                if current_name.lower() == local_part and name != current_name:
+                    try:
+                        self.classification.rename_contact(contact_id, name)
+                    except Exception:
+                        log.exception(
+                            "calendar display-name promotion failed for %r",
+                            name,
+                        )
+                else:
+                    # Already has a friendly display name -- just make
+                    # sure the friendly form is also a name alias.
+                    try:
+                        self.classification.add_alias(
+                            contact_id, name,
+                            kind=ALIAS_KIND_NAME, source=_SRC_CAL,
+                        )
+                    except (ValueError, Exception):
+                        # add_alias raises ValueError on cross-contact
+                        # collision; ignore so the enrichment still
+                        # lands. Other exceptions are also non-fatal.
+                        pass
             enrich_contact_from_calendar_attendee(
-                self.classification, result.contact.id, attendee,
+                self.classification, contact_id, attendee,
             )
         except Exception:
             log.exception(
