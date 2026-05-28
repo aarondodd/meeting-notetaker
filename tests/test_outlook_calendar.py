@@ -519,3 +519,40 @@ def test_resolve_handles_resolve_call_raising():
     fields = outlook_calendar._resolve_recipient_fields(_RaisingRecipient())
     assert fields["email"] == "bob@fhb.com"
     assert fields["title"] == "VP"
+
+
+def test_address_entry_property_accessor_fills_when_others_empty():
+    """When GetExchangeUser() returns an object with empty fields AND
+    Recipient.PropertyAccessor also comes back blank, the
+    AddressEntry.PropertyAccessor is the last automatic fallback.
+
+    This is the FHB Exchange Online + cached-mode failure mode Aaron
+    hit on 2026-05-28 -- ExchangeUser came back but with empty
+    title/company, Recipient.PA also empty, ae_pa fills in."""
+    # ExchangeUser exists but every field is empty/None.
+    eu = _FakeExchangeUser(
+        primary_smtp="", job_title="", company="", department="",
+    )
+    ae_accessor = _FakePropertyAccessor({
+        outlook_calendar._PR_SMTP_ADDRESS: "bob@fhb.com",
+        outlook_calendar._PR_TITLE: "VP Engineering",
+        outlook_calendar._PR_COMPANY_NAME: "First Hawaiian Bank",
+        outlook_calendar._PR_DEPARTMENT_NAME: "EDA",
+    })
+
+    class _AEWithPA(_FakeAddressEntry):
+        def __init__(self, *args, ae_accessor=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.PropertyAccessor = ae_accessor
+
+    ae = _AEWithPA(exchange_user=eu, ae_accessor=ae_accessor)
+    # Recipient PA returns nothing -- the gap the ae_pa fills.
+    empty_accessor = _FakePropertyAccessor({})
+    rec = _FakeRecipientWithResolve(
+        name="Bob", address_entry=ae, accessor=empty_accessor,
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["email"] == "bob@fhb.com"
+    assert fields["title"] == "VP Engineering"
+    assert fields["company"] == "First Hawaiian Bank"
+    assert fields["department"] == "EDA"

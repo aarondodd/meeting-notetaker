@@ -404,6 +404,11 @@ def _resolve_recipient_fields(recipient) -> dict:
     # the downstream paths since AddressEntry may already be populated.
     try:
         recipient.Resolve()
+        try:
+            resolved_flag = bool(getattr(recipient, "Resolved", False))
+            path_taken.append(f"resolved={resolved_flag}")
+        except Exception:
+            pass
     except Exception:
         path_taken.append("resolve_failed")
 
@@ -413,13 +418,28 @@ def _resolve_recipient_fields(recipient) -> dict:
         ae = None
     if ae is None:
         path_taken.append("no_address_entry")
-        log.debug(
+        log.info(
             "recipient resolve [%s]: %s", name, ",".join(path_taken) or "none",
         )
         return {
             "name": name, "email": email,
             "title": title, "company": company, "department": department,
         }
+    # Diagnostic: capture the AddressEntry type so we can correlate
+    # empty-field cases with the AddressEntryUserType / Type combo
+    # they're coming from on FHB Exchange Online.
+    try:
+        ae_type = str(getattr(ae, "Type", "") or "")
+        if ae_type:
+            path_taken.append(f"type={ae_type}")
+    except Exception:
+        pass
+    try:
+        user_type = getattr(ae, "AddressEntryUserType", None)
+        if user_type is not None:
+            path_taken.append(f"user_type={user_type}")
+    except Exception:
+        pass
 
     # Step 2: GetExchangeUser() -- authoritative when it works.
     exchange_user = None
@@ -450,8 +470,8 @@ def _resolve_recipient_fields(recipient) -> dict:
         except Exception:
             department = ""
 
-    # Step 3: PropertyAccessor fallback for any field still empty.
-    # Works even when GetExchangeUser() returned None.
+    # Step 3a: Recipient.PropertyAccessor fallback for any field still
+    # empty. Works even when GetExchangeUser() returned None.
     missing = not (email and title and company and department)
     if missing:
         accessor = None
@@ -460,7 +480,7 @@ def _resolve_recipient_fields(recipient) -> dict:
         except Exception:
             accessor = None
         if accessor is not None:
-            path_taken.append("property_accessor")
+            path_taken.append("recipient_pa")
             if not email:
                 v = _proptag_get(accessor, _PR_SMTP_ADDRESS)
                 if v and not _looks_like_legacy_dn(v):
@@ -471,6 +491,31 @@ def _resolve_recipient_fields(recipient) -> dict:
                 company = _proptag_get(accessor, _PR_COMPANY_NAME)
             if not department:
                 department = _proptag_get(accessor, _PR_DEPARTMENT_NAME)
+
+    # Step 3b: AddressEntry.PropertyAccessor. Some Exchange Online +
+    # cached-mode configurations don't expose the proptags on the
+    # Recipient but do on the AddressEntry. Catches the case where
+    # GetExchangeUser() returns an object with empty fields AND the
+    # Recipient's PA also comes back blank.
+    missing = not (email and title and company and department)
+    if missing:
+        ae_accessor = None
+        try:
+            ae_accessor = ae.PropertyAccessor
+        except Exception:
+            ae_accessor = None
+        if ae_accessor is not None:
+            path_taken.append("ae_pa")
+            if not email:
+                v = _proptag_get(ae_accessor, _PR_SMTP_ADDRESS)
+                if v and not _looks_like_legacy_dn(v):
+                    email = v
+            if not title:
+                title = _proptag_get(ae_accessor, _PR_TITLE)
+            if not company:
+                company = _proptag_get(ae_accessor, _PR_COMPANY_NAME)
+            if not department:
+                department = _proptag_get(ae_accessor, _PR_DEPARTMENT_NAME)
 
     # Step 4: direct AddressEntry fields. Last-resort for SMTP external
     # attendees who never had an ExchangeUser to begin with.
@@ -502,7 +547,7 @@ def _resolve_recipient_fields(recipient) -> dict:
     if _looks_like_legacy_dn(email):
         email = ""
 
-    log.debug(
+    log.info(
         "recipient resolve [%s]: paths=%s email=%r title=%r company=%r dept=%r",
         name, ",".join(path_taken) or "none",
         email or "", title or "", company or "", department or "",
