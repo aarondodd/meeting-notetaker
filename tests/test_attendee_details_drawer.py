@@ -65,24 +65,34 @@ def test_drawer_expand_toggle_changes_state(qt_app):
 
 
 def test_drawer_table_renders_contact_fields(qt_app):
-    """set_contacts populates the table; cells map to rich fields."""
+    """set_contacts populates the table; cells map to rich fields.
+
+    Column shape: Name | Title | Company | Email | Notes | (edit button).
+    Phone field on Contact is intentionally not shown -- the drawer
+    favors Notes (free-form context) over Phone (rarely used in
+    meeting prep) per Aaron's 2026-05-28 feedback.
+    """
     d = AttendeeDetailsDrawer()
     try:
         d.set_contacts([
             _FakeContact(
                 id=1, display_name="Bob Smith",
                 title="VP", company="Acme",
-                primary_email="bob@acme.com", phone="+1-555-0100",
+                primary_email="bob@acme.com",
+                notes="met at strategy offsite",
             ),
         ])
         assert d._title.text() == "Attendees (1)"  # noqa: SLF001
         assert d._table.rowCount() == 1  # noqa: SLF001
+        assert d._table.columnCount() == 6  # noqa: SLF001
         # Name cell holds the display name + (possibly) a source badge.
         assert "Bob Smith" in d._table.item(0, 0).text()  # noqa: SLF001
         assert d._table.item(0, 1).text() == "VP"  # noqa: SLF001
         assert d._table.item(0, 2).text() == "Acme"  # noqa: SLF001
         assert d._table.item(0, 3).text() == "bob@acme.com"  # noqa: SLF001
-        assert d._table.item(0, 4).text() == "+1-555-0100"  # noqa: SLF001
+        assert d._table.item(0, 4).text() == "met at strategy offsite"  # noqa: SLF001
+        # Edit button column carries a widget, not text.
+        assert d._table.cellWidget(0, 5) is not None  # noqa: SLF001
     finally:
         d.deleteLater()
 
@@ -94,6 +104,39 @@ def test_drawer_empty_fields_render_as_blank(qt_app):
         d.set_contacts([_FakeContact(id=1, display_name="Plain Jane")])
         for col in (1, 2, 3, 4):
             assert d._table.item(0, col).text() == ""  # noqa: SLF001
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_edit_button_emits_contact_id(qt_app):
+    """Clicking the per-row Edit button emits contact_clicked so the
+    SessionView opens the Address Book editor filtered to that contact."""
+    d = AttendeeDetailsDrawer()
+    captured = []
+    d.contact_clicked.connect(captured.append)
+    try:
+        d.set_contacts([
+            _FakeContact(id=42, display_name="Alpha"),
+            _FakeContact(id=99, display_name="Beta"),
+        ])
+        # Trigger the embedded button programmatically.
+        d._table.cellWidget(0, 5).click()  # noqa: SLF001
+        d._table.cellWidget(1, 5).click()  # noqa: SLF001
+        assert captured == [42, 99]
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_notes_cell_has_tooltip_with_full_text(qt_app):
+    """Notes can be long; the cell tooltip exposes the full string
+    even when the visible text is truncated."""
+    d = AttendeeDetailsDrawer()
+    try:
+        long_notes = "a" * 200
+        d.set_contacts([_FakeContact(
+            id=1, display_name="Bob", notes=long_notes,
+        )])
+        assert d._table.item(0, 4).toolTip() == long_notes  # noqa: SLF001
     finally:
         d.deleteLater()
 

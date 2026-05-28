@@ -91,9 +91,9 @@ class AttendeeDetailsDrawer(QWidget):
         body_layout = QVBoxLayout(self._body)
         body_layout.setContentsMargins(6, 4, 6, 6)
         body_layout.setSpacing(0)
-        self._table = QTableWidget(0, 5, self._body)
+        self._table = QTableWidget(0, 6, self._body)
         self._table.setHorizontalHeaderLabels([
-            "Name", "Title", "Company", "Email", "Phone",
+            "Name", "Title", "Company", "Email", "Notes", "",
         ])
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -105,8 +105,10 @@ class AttendeeDetailsDrawer(QWidget):
         h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        h.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(5, 32)
         self._table.cellDoubleClicked.connect(self._on_cell_clicked)
         body_layout.addWidget(self._table)
         self._body.setVisible(False)
@@ -144,7 +146,15 @@ class AttendeeDetailsDrawer(QWidget):
             self._table.setItem(row, 1, QTableWidgetItem(c.title or ""))
             self._table.setItem(row, 2, QTableWidgetItem(c.company or ""))
             self._table.setItem(row, 3, QTableWidgetItem(c.primary_email or ""))
-            self._table.setItem(row, 4, QTableWidgetItem(c.phone or ""))
+            notes_value = (getattr(c, "notes", "") or "")
+            notes_item = QTableWidgetItem(notes_value)
+            # Multi-line notes get a tooltip with the full text so the
+            # truncated single-line cell display isn't a dead-end.
+            if notes_value:
+                notes_item.setToolTip(notes_value)
+            self._table.setItem(row, 4, notes_item)
+            self._table.setItem(row, 5, QTableWidgetItem(""))
+            self._install_edit_button(row, c.id)
         # If there's nothing to show, collapse so the drawer isn't
         # taking visual space with an empty table.
         if not contacts and self._is_expanded:
@@ -172,3 +182,20 @@ class AttendeeDetailsDrawer(QWidget):
     def _on_cell_clicked(self, row: int, _col: int) -> None:
         if 0 <= row < len(self._row_contact_ids):
             self.contact_clicked.emit(self._row_contact_ids[row])
+
+    def _install_edit_button(self, row: int, contact_id: int) -> None:
+        """Embed a small Edit button in the rightmost column.
+
+        Single click routes through ``contact_clicked`` so the
+        SessionView opens the Address Book filtered to this contact.
+        Pencil glyph picked to read as "edit"; matches the "manual"
+        source emoji intentionally -- both mean "human-editable".
+        """
+        btn = QPushButton("✎", self._table)  # lower-right pencil
+        btn.setFlat(True)
+        btn.setFixedWidth(28)
+        btn.setToolTip("Edit contact in Address Book")
+        btn.clicked.connect(
+            lambda _checked=False, cid=contact_id: self.contact_clicked.emit(cid),
+        )
+        self._table.setCellWidget(row, 5, btn)
