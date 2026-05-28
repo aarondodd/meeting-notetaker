@@ -8,6 +8,7 @@ import logging
 import secrets
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2277,11 +2278,10 @@ class MainApp(QObject):
             # Region was disarmed while the timer was pending; stop.
             self._stop_auto_capture(session_id)
             return
-        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
         from .screencap.dedup import dhash_path, is_dedup_match  # noqa: PLC0415
         from .utils.paths import session_screenshots_dir  # noqa: PLC0415
         dst_dir = session_screenshots_dir(session_id)
-        saved = capture_region_to_file(region, dst_dir)
+        saved = self._capture_region_hiding_overlay(region, dst_dir)
         if saved is None:
             log.warning("auto-capture: capture_region_to_file returned None")
             return
@@ -2323,11 +2323,10 @@ class MainApp(QObject):
                 timeout_ms=5000,
             )
             return
-        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
         from .screencap.dedup import dhash_path  # noqa: PLC0415
         from .utils.paths import session_screenshots_dir  # noqa: PLC0415
         dst_dir = session_screenshots_dir(session_id)
-        saved = capture_region_to_file(region, dst_dir)
+        saved = self._capture_region_hiding_overlay(region, dst_dir)
         if saved is None:
             self.window.status(
                 "Screen capture failed (see log).", timeout_ms=5000,
@@ -2351,6 +2350,35 @@ class MainApp(QObject):
         self.window.status(
             f"Screenshot saved: {saved.name}", timeout_ms=4000,
         )
+
+    def _capture_region_hiding_overlay(self, region, dst_dir):
+        """Hide the armed-region outline, take the screenshot, restore.
+
+        mss reads the OS-composited screen state, which includes our
+        cyan ArmedRegionOverlay outline -- so without this dance the
+        outline ends up in every captured PNG. Hiding the widget
+        before the grab + processing the hide event + a short sleep
+        gives the Windows compositor a frame to redraw the area
+        underneath. Restoring after the grab leaves the on-screen
+        outline as before for the rest of the armed session.
+        """
+        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
+        overlay = self._armed_region_overlay
+        was_visible = overlay is not None and overlay.isVisible()
+        if was_visible:
+            overlay.hide()
+            QApplication.processEvents()
+            # ~50 ms gives the OS compositor a frame to repaint the
+            # region underneath the overlay before mss's BitBlt
+            # pulls the screen state. Shorter intervals occasionally
+            # leave a ghost on Windows; 50 ms is the smallest
+            # reliable value we've found in practice.
+            time.sleep(0.05)
+        try:
+            return capture_region_to_file(region, dst_dir)
+        finally:
+            if was_visible and overlay is not None:
+                overlay.show()
 
     def _on_delete_screenshot(self, session_id: str, path) -> None:
         try:

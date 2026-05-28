@@ -782,6 +782,14 @@ class SessionView(QWidget):
         or clicks Stop Screen Capture / the recording ends (-> False).
         Keeping the visible state in one place avoids the toggle button
         and the sidebar drifting out of sync.
+
+        On arm we also switch the active tab to My Notes -- that's
+        where the screencap sidebar lives, and without the switch the
+        user has to manually click into My Notes before the Capture /
+        Insert / Auto-capture controls are visible (the sidebar's
+        visibility is gated on `current tab is My Notes` in
+        _refresh_sidebar_visibility, and arming alone doesn't trigger
+        that refresh).
         """
         self._screencap_armed = armed
         self._screencap_sidebar.set_armed(armed)
@@ -789,6 +797,10 @@ class SessionView(QWidget):
             "Stop Screen Capture" if armed else "Start Screen Capture"
         )
         self._refresh_screencap_button_enabled()
+        if armed and self._tabs.currentWidget() is not self._live_notes_editor:
+            # setCurrentWidget triggers _on_tab_changed which calls
+            # _refresh_sidebar_visibility, surfacing the sidebar.
+            self._tabs.setCurrentWidget(self._live_notes_editor)
 
     def is_screencap_armed(self) -> bool:
         return self._screencap_armed
