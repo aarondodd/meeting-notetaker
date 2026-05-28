@@ -109,8 +109,6 @@ class SessionView(QWidget):
     add_topic_requested = pyqtSignal(str, str)            # session_id, name
     remove_topic_requested = pyqtSignal(str, int)         # session_id, topic_id
     accept_topic_requested = pyqtSignal(str, int)         # session_id, topic_id
-    add_person_requested = pyqtSignal(str, str)           # session_id, name
-    remove_person_requested = pyqtSignal(str, int)        # session_id, person_id
     set_series_requested = pyqtSignal(str, str)           # session_id, series_name ("" clears)
     # Highlight bar mutations (v0.7.0+). The bar carries the whole
     # HighlightSet to keep the signal-fired writes atomic.
@@ -649,8 +647,6 @@ class SessionView(QWidget):
         self._classification_bar.add_topic_requested.connect(self.add_topic_requested.emit)
         self._classification_bar.remove_topic_requested.connect(self.remove_topic_requested.emit)
         self._classification_bar.accept_topic_requested.connect(self.accept_topic_requested.emit)
-        self._classification_bar.add_person_requested.connect(self.add_person_requested.emit)
-        self._classification_bar.remove_person_requested.connect(self.remove_person_requested.emit)
         self._classification_bar.set_series_requested.connect(self.set_series_requested.emit)
 
         self._set_buttons_for_state(STATE_NEW, has_transcript=False, has_notes=False)

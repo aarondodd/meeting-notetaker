@@ -176,13 +176,18 @@ def test_series_button_label_unchanged_for_short_names(qt_app):
         bar.deleteLater()
 
 
-def test_people_button_label_carries_count(qt_app):
+def test_people_button_removed_in_v0_7_2(qt_app):
+    """The People button + its add/remove signals were removed in
+    v0.7.2; the Attendee Details drawer + live-notes Attendees list
+    cover the same data surface. This test pins the removal so a
+    future refactor doesn't accidentally bring it back."""
     bar = ClassificationBar()
     try:
-        bar.set_session("s", _make_classification(n_people=0, n_topics=0))
-        assert bar._people_btn.text() == "People"  # noqa: SLF001
-        bar.set_session("s", _make_classification(n_people=7, n_topics=0))
-        assert bar._people_btn.text() == "People (7)"  # noqa: SLF001
+        assert not hasattr(bar, "_people_btn")
+        assert not hasattr(bar, "_people_menu")
+        assert not hasattr(bar, "_known_people")
+        assert not hasattr(bar, "add_person_requested")
+        assert not hasattr(bar, "remove_person_requested")
     finally:
         bar.deleteLater()
 

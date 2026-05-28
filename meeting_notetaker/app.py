@@ -1056,8 +1056,6 @@ class MainApp(QObject):
         sv.add_topic_requested.connect(self._on_add_topic_requested)
         sv.remove_topic_requested.connect(self._on_remove_topic_requested)
         sv.accept_topic_requested.connect(self._on_accept_topic_requested)
-        sv.add_person_requested.connect(self._on_add_person_requested)
-        sv.remove_person_requested.connect(self._on_remove_person_requested)
         sv.set_series_requested.connect(self._on_set_series_requested)
         sv.highlights_changed.connect(self._on_session_highlights_changed)
 
@@ -3719,36 +3717,6 @@ class MainApp(QObject):
             self.classification.set_topic_accepted(session_id, topic_id, True)
         except Exception:
             log.exception("accept_topic failed for %s/%s", session_id, topic_id)
-        self._refresh_session_classification(session_id)
-
-    def _on_add_person_requested(self, session_id: str, name: str) -> None:
-        if self.classification is None or not name:
-            return
-        try:
-            # Manual chip-bar add: same smart resolution as the
-            # attendee-sync path so a typed "BS" hits the Bob Smith
-            # Contact via its alias rather than creating a new
-            # "BS" Contact.
-            from .utils.contact_resolution import resolve_attendee_text  # noqa: PLC0415
-            result = resolve_attendee_text(
-                self.classification, name, source=SOURCE_MANUAL,
-            )
-            if result is not None:
-                self.classification.add_session_contact(
-                    session_id, result.contact.id, source=SOURCE_MANUAL,
-                )
-        except Exception:
-            log.exception("add_person failed for %s/%s", session_id, name)
-        self._refresh_session_classification(session_id)
-        self._refresh_classification_choices()
-
-    def _on_remove_person_requested(self, session_id: str, person_id: int) -> None:
-        if self.classification is None:
-            return
-        try:
-            self.classification.remove_session_contact(session_id, person_id)
-        except Exception:
-            log.exception("remove_person failed for %s/%s", session_id, person_id)
         self._refresh_session_classification(session_id)
 
     def _on_set_series_requested(self, session_id: str, series_name: str) -> None:
