@@ -336,55 +336,99 @@ def _looks_like_legacy_dn(value: str) -> bool:
     return v.startswith("/o=") or v.startswith("/cn=")
 
 
+# MAPI property tags used as a fallback when GetExchangeUser() returns
+# None (cached Exchange mode without offline GAL, certain hybrid setups).
+# The Recipient's PropertyAccessor surfaces these via the proptag URL.
+# Reference: docs.microsoft.com/en-us/office/client-developer/outlook/
+# pia/how-to-display-properties-not-shown-in-the-outlook-object-model
+_PR_SMTP_ADDRESS = (
+    "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+)
+_PR_TITLE = "http://schemas.microsoft.com/mapi/proptag/0x3A17001F"
+_PR_COMPANY_NAME = "http://schemas.microsoft.com/mapi/proptag/0x3A16001F"
+_PR_DEPARTMENT_NAME = "http://schemas.microsoft.com/mapi/proptag/0x3A18001F"
+
+
+def _proptag_get(accessor, proptag: str) -> str:
+    try:
+        value = accessor.GetProperty(proptag)
+    except Exception:
+        return ""
+    return str(value or "").strip()
+
+
 def _resolve_recipient_fields(recipient) -> dict:
     """Pull name / email / title / company / department from a Recipient.
 
-    Exchange COM quirk: for GAL-resolved recipients ('Type' == 'EX'),
-    AddressEntry.Address returns the X.500 legacyExchangeDN
-    (/o=ExchangeLabs/... ) and AddressEntry.JobTitle / .CompanyName
-    are often empty or unavailable. The rich fields + the actual SMTP
-    address live on the ExchangeUser object returned by
-    AddressEntry.GetExchangeUser(). For external invitees ('Type' ==
-    'SMTP'), AddressEntry.Address is the real email and there's no
-    ExchangeUser to fetch.
+    Three-tier resolution because Exchange COM is uncooperative:
 
-    Strategy:
-      1. Try AddressEntry.GetExchangeUser() -- when it returns an
-         object, it's authoritative for both the SMTP address and
-         the JobTitle/CompanyName/Department triplet.
-      2. Otherwise fall back to AddressEntry.Address for email +
-         AddressEntry direct fields for the others.
-      3. If the resulting email is still an X.500 DN, drop it (better
-         to record no email than a useless one). The contact-resolver
-         can still match by Name on subsequent meetings.
+      1. Call Recipient.Resolve() first. Unresolved recipients have an
+         AddressEntry but GetExchangeUser() returns None until the
+         recipient is resolved against the GAL. Resolve() is idempotent
+         on already-resolved recipients.
 
-    Every step is wrapped so a flaky COM call never crashes the
-    calendar fetch.
+      2. AddressEntry.GetExchangeUser() -- when it returns an object,
+         it's authoritative for both the SMTP address and the
+         JobTitle/CompanyName/Department triplet. AddressEntry.Address
+         for an Exchange recipient is the X.500 legacyExchangeDN
+         (/o=ExchangeLabs/.../cn=Recipients/cn=...), useless as an
+         email value.
+
+      3. PropertyAccessor fallback. Cached Exchange mode without an
+         offline GAL (or some hybrid setups) makes GetExchangeUser()
+         return None even for resolved Exchange users. The MAPI
+         PropertyAccessor on the Recipient itself exposes PR_SMTP_ADDRESS
+         + PR_TITLE + PR_COMPANY_NAME + PR_DEPARTMENT_NAME without
+         needing the ExchangeUser object.
+
+      4. AddressEntry direct fields as the final fallback for SMTP
+         external attendees who have a direct .Address email.
+
+    Final guard: any email value that still looks like an X.500 DN
+    gets dropped (better to record no email than a useless one).
+
+    Each step is wrapped so a flaky COM call never crashes the fetch.
+    Logs each recipient's resolution path at debug level so users
+    troubleshooting empty-fields can pinpoint where their environment
+    diverges.
     """
     name = str(getattr(recipient, "Name", "") or "").strip()
     email = ""
     title = ""
     company = ""
     department = ""
+    # Track which resolution paths fired for debug logging.
+    path_taken: list[str] = []
+
+    # Step 1: Resolve. Best-effort; if Resolve fails we still try
+    # the downstream paths since AddressEntry may already be populated.
+    try:
+        recipient.Resolve()
+    except Exception:
+        path_taken.append("resolve_failed")
 
     try:
         ae = recipient.AddressEntry
     except Exception:
         ae = None
     if ae is None:
+        path_taken.append("no_address_entry")
+        log.debug(
+            "recipient resolve [%s]: %s", name, ",".join(path_taken) or "none",
+        )
         return {
             "name": name, "email": email,
             "title": title, "company": company, "department": department,
         }
 
+    # Step 2: GetExchangeUser() -- authoritative when it works.
     exchange_user = None
     try:
         exchange_user = ae.GetExchangeUser()
     except Exception:
         exchange_user = None
-
     if exchange_user is not None:
-        # Exchange path: the ExchangeUser object is authoritative.
+        path_taken.append("exchange_user")
         try:
             email = str(
                 getattr(exchange_user, "PrimarySmtpAddress", "") or ""
@@ -406,11 +450,30 @@ def _resolve_recipient_fields(recipient) -> dict:
         except Exception:
             department = ""
 
-    # Fill any blanks from direct AddressEntry accessors. For SMTP
-    # external attendees this is the only path. Defensive: also runs
-    # when GetExchangeUser succeeded but a specific field came back
-    # empty -- the direct fields *occasionally* carry data for
-    # contacts where the Exchange query didn't.
+    # Step 3: PropertyAccessor fallback for any field still empty.
+    # Works even when GetExchangeUser() returned None.
+    missing = not (email and title and company and department)
+    if missing:
+        accessor = None
+        try:
+            accessor = recipient.PropertyAccessor
+        except Exception:
+            accessor = None
+        if accessor is not None:
+            path_taken.append("property_accessor")
+            if not email:
+                v = _proptag_get(accessor, _PR_SMTP_ADDRESS)
+                if v and not _looks_like_legacy_dn(v):
+                    email = v
+            if not title:
+                title = _proptag_get(accessor, _PR_TITLE)
+            if not company:
+                company = _proptag_get(accessor, _PR_COMPANY_NAME)
+            if not department:
+                department = _proptag_get(accessor, _PR_DEPARTMENT_NAME)
+
+    # Step 4: direct AddressEntry fields. Last-resort for SMTP external
+    # attendees who never had an ExchangeUser to begin with.
     if not email:
         try:
             raw_email = str(getattr(ae, "Address", "") or "").strip()
@@ -418,6 +481,7 @@ def _resolve_recipient_fields(recipient) -> dict:
             raw_email = ""
         if raw_email and not _looks_like_legacy_dn(raw_email):
             email = raw_email
+            path_taken.append("ae_address")
     if not title:
         try:
             title = str(getattr(ae, "JobTitle", "") or "").strip()
@@ -438,6 +502,11 @@ def _resolve_recipient_fields(recipient) -> dict:
     if _looks_like_legacy_dn(email):
         email = ""
 
+    log.debug(
+        "recipient resolve [%s]: paths=%s email=%r title=%r company=%r dept=%r",
+        name, ",".join(path_taken) or "none",
+        email or "", title or "", company or "", department or "",
+    )
     return {
         "name": name, "email": email,
         "title": title, "company": company, "department": department,
