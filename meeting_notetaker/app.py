@@ -1639,12 +1639,9 @@ class MainApp(QObject):
         self._on_session_selected(session_id)
         self.tray.set_state(_TRAY_FOR_STATE.get(state, "idle"))
         # Drop any armed screen-capture region when the recording ends.
-        # The button itself stays enabled outside RECORDING / PAUSED
-        # (per the 2026-05-28 change to support pre-recording capture
-        # testing), but the in-memory region from a now-ended session
-        # would otherwise leak across state transitions. Clear it on
-        # the transition so the next time the user clicks the button
-        # they re-pick a region rather than reusing a stale one.
+        # The button itself is greyed-out post-recording (the SessionView
+        # gates on RECORDING / PAUSED), but the in-memory region would
+        # otherwise stay until the user re-enters the session.
         from .models.session import (  # noqa: PLC0415
             STATE_COMPLETE, STATE_ERROR, STATE_NEW, STATE_PROCESSING,
         )

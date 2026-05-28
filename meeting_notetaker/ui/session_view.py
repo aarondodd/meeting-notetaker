@@ -852,20 +852,17 @@ class SessionView(QWidget):
         self.delete_screenshot_clicked.emit(self._session.id, path)
 
     def _refresh_screencap_button_enabled(self) -> None:
-        """Enabled whenever a session is selected.
+        """Enabled only while RECORDING or PAUSED, OR while armed.
 
-        Originally gated on RECORDING / PAUSED only (the legitimate
-        capture states), with an 'OR armed' branch so a user who hit
-        Stop before disarming could still click the toggle to disarm.
-        Aaron 2026-05-28: enable always so the capture flow can be
-        exercised outside an active recording -- especially useful
-        while debugging #49 (mixed-DPI multi-monitor coordinate
-        misalignment) where reproducing the bug shouldn't require
-        starting a meeting first. Captured PNGs still go to the
-        session's screenshots directory; they're orphan-tolerated by
-        the existing screenshot enumeration code.
+        The 'OR armed' branch is the Stop-Screen-Capture-after-recording
+        edge case: if the user hit Stop before disarming, the toggle
+        still needs to be clickable so they can disarm it cleanly.
         """
-        self._screen_capture_btn.setEnabled(self._session is not None)
+        if self._session is None:
+            self._screen_capture_btn.setEnabled(False)
+            return
+        live = self._session.state in (STATE_RECORDING, STATE_PAUSED)
+        self._screen_capture_btn.setEnabled(live or self._screencap_armed)
 
     # ---- transcript playback API used by MainApp -------------------------
 
