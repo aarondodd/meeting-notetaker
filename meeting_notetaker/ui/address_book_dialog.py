@@ -344,6 +344,29 @@ class AddressBookDialog(QDialog):
         self._refresh_list()
         self._refresh_suggestions()
 
+    def keyPressEvent(self, event) -> None:
+        """Close the dialog on Enter, matching the Close button.
+
+        Pressing Enter in a field used to do nothing (no default button
+        in the QDialogButtonBox), which Aaron flagged as confusing
+        (2026-05-28). Now Enter calls reject() so the user can finish
+        a field with Tab/Enter and dismiss the editor without reaching
+        for the mouse.
+
+        QPlainTextEdit (the Notes input) consumes Enter natively for
+        newline insertion, so this only fires when focus is on a
+        QLineEdit or another non-consuming widget.
+        """
+        from PyQt6.QtCore import Qt  # noqa: PLC0415
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            # Any field with editingFinished wiring has already fired
+            # by the time the key event reaches the dialog -- Qt
+            # delivers editingFinished before propagating the key
+            # press up the parent chain.
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
     # ---- public API ----
     def select_contact(self, contact_id: int) -> None:
         """Select the row for ``contact_id`` if present in the list.

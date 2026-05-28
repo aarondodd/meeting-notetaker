@@ -236,3 +236,27 @@ def test_no_badge_for_unenriched_contact(qt_app, store):
         assert dlg._detail_name.text() == "Plain Jane"  # noqa: SLF001
     finally:
         dlg.deleteLater()
+
+
+def test_enter_key_closes_dialog(qt_app, store):
+    """Pressing Enter in the dialog closes it (reject). Matches the
+    Close button behavior so users can dismiss with the keyboard
+    after finishing a field (2026-05-28 feedback)."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtCore import QEvent
+    store.create_contact("Bob Smith")
+    dlg = AddressBookDialog(store)
+    closed = []
+    dlg.finished.connect(closed.append)
+    try:
+        dlg._list.setCurrentRow(0)  # noqa: SLF001
+        event = QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Return,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        dlg.keyPressEvent(event)
+        # finished signal carries the result code; reject() emits 0.
+        assert closed == [0]
+    finally:
+        dlg.deleteLater()
