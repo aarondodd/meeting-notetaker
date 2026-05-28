@@ -30,6 +30,8 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
+from .coord_translation import get_cursor_physical_pos
+
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +95,13 @@ class RegionPicker(QWidget):
         self.setGeometry(virtual_rect)
         self._start: Optional[QPoint] = None
         self._end: Optional[QPoint] = None
+        # Physical-pixel positions captured at press + release via
+        # Win32 GetCursorPos. The widget-local Qt coords (above)
+        # drive the on-screen rectangle preview; the physical
+        # coords drive the actual capture so mixed-DPI multi-monitor
+        # picks land on the correct pixels (issue #49).
+        self._start_physical: Optional[QPoint] = None
+        self._end_physical: Optional[QPoint] = None
         self._result: Optional[QRect] = None
         # Help label pinned to the top so the user knows what to do.
         # Layered as a child QLabel so it paints over the dim overlay
@@ -147,6 +156,13 @@ class RegionPicker(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._start = event.pos()
             self._end = event.pos()
+            # Pin the physical cursor position at the moment of
+            # press so a mixed-DPI multi-monitor pick captures the
+            # right pixels regardless of which DPR Qt picked for
+            # the widget. Win32-only; None on other platforms +
+            # the fallback math in mouseReleaseEvent handles that.
+            self._start_physical = get_cursor_physical_pos()
+            self._end_physical = self._start_physical
             self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -158,6 +174,7 @@ class RegionPicker(QWidget):
         if event.button() != Qt.MouseButton.LeftButton or self._start is None:
             return
         self._end = event.pos()
+        self._end_physical = get_cursor_physical_pos()
         rect_widget = QRect(self._start, self._end).normalized()
         # Need at least a few pixels in each dimension; sub-pixel clicks
         # are accidental and should cancel rather than commit.
@@ -169,36 +186,50 @@ class RegionPicker(QWidget):
                 rect_widget.width(), rect_widget.height(),
             )
         else:
-            # Translate widget-local coords back to absolute screen coords.
-            origin = self._virtual_desktop_rect().topLeft()
-            rect_screen = QRect(
-                rect_widget.topLeft() + origin,
-                rect_widget.size(),
-            )
+            # Prefer the physical-pixel rect from Win32 GetCursorPos
+            # (issue #49 fix). Falls back to the Qt widget-coord
+            # translation when GetCursorPos returns None -- e.g.,
+            # Linux/macOS dev environments where the fallback is
+            # correct because there's no mixed-DPI multi-monitor
+            # math going wrong in the first place.
+            if (
+                self._start_physical is not None
+                and self._end_physical is not None
+            ):
+                rect_screen = QRect(
+                    self._start_physical, self._end_physical,
+                ).normalized()
+                coord_source = "physical (GetCursorPos)"
+            else:
+                origin = self._virtual_desktop_rect().topLeft()
+                rect_screen = QRect(
+                    rect_widget.topLeft() + origin,
+                    rect_widget.size(),
+                )
+                coord_source = "Qt logical (fallback)"
             self._result = rect_screen
-            # Diagnostic (issue #49). Logs the input mouse positions,
-            # the widget-local rect, the origin used for translation,
-            # the resulting absolute-screen rect, plus which Qt screen
-            # the rect's top-left lands on + that screen's
-            # devicePixelRatio. Reproducing the bug means matching
-            # these numbers against the captured PNG's offset.
+            # Diagnostic (issue #49). Logs both coord systems we
+            # observed -- the widget-local rect, the GetCursorPos
+            # physical positions when available, the final rect we
+            # return, and which Qt screen contains its top-left.
             tl_screen = QGuiApplication.screenAt(rect_screen.topLeft())
             tl_dpr = tl_screen.devicePixelRatio() if tl_screen else None
-            br_screen = QGuiApplication.screenAt(rect_screen.bottomRight())
-            br_dpr = br_screen.devicePixelRatio() if br_screen else None
             log.info(
                 "RegionPicker release: rect_widget=(%d,%d,%dx%d) "
-                "origin=(%d,%d) rect_screen=(%d,%d,%dx%d) "
-                "tl_screen=%s tl_dpr=%s br_screen=%s br_dpr=%s",
+                "physical_start=%s physical_end=%s "
+                "rect_screen=(%d,%d,%dx%d) source=%s "
+                "tl_screen=%s tl_dpr=%s",
                 rect_widget.x(), rect_widget.y(),
                 rect_widget.width(), rect_widget.height(),
-                origin.x(), origin.y(),
+                f"({self._start_physical.x()},{self._start_physical.y()})"
+                if self._start_physical else "n/a",
+                f"({self._end_physical.x()},{self._end_physical.y()})"
+                if self._end_physical else "n/a",
                 rect_screen.x(), rect_screen.y(),
                 rect_screen.width(), rect_screen.height(),
+                coord_source,
                 tl_screen.name() if tl_screen else "n/a",
                 f"{tl_dpr:.3f}" if tl_dpr is not None else "n/a",
-                br_screen.name() if br_screen else "n/a",
-                f"{br_dpr:.3f}" if br_dpr is not None else "n/a",
             )
         self.region_selected.emit(self._result)
         self.close()

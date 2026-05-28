@@ -20,6 +20,8 @@ from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPaintEvent, QPen
 from PyQt6.QtWidgets import QWidget
 
+from .coord_translation import physical_rect_to_qt_logical_rect
+
 
 log = logging.getLogger(__name__)
 
@@ -56,35 +58,42 @@ class ArmedRegionOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # `region` is in PHYSICAL pixels (matches what mss captures
+        # from). Qt's setGeometry expects logical pixels -- convert
+        # using the DPR of the screen the region's top-left lives
+        # on. Issue #49 fix.
+        logical_region = physical_rect_to_qt_logical_rect(region)
         # Geometry expands by the stroke width so the line itself isn't
         # clipped at the rectangle's edge.
         bleed = _OUTLINE_WIDTH + 1
         target = QRect(
-            region.x() - bleed,
-            region.y() - bleed,
-            region.width() + 2 * bleed,
-            region.height() + 2 * bleed,
+            logical_region.x() - bleed,
+            logical_region.y() - bleed,
+            logical_region.width() + 2 * bleed,
+            logical_region.height() + 2 * bleed,
         )
         # Diagnostic for the "overlay jumps to a different position"
-        # report (issue #49). Logs the input region, the target
-        # geometry we ask Qt for, and which screen the geometry's
-        # top-left lands on (with that screen's DPR). After show(),
-        # frameGeometry / geometry can drift from what we set,
-        # particularly on mixed-DPI multi-monitor setups -- we log
-        # again on show() below so any drift surfaces.
+        # report (issue #49). Logs the input physical region, the
+        # converted Qt logical region, the target widget geometry,
+        # and which Qt screen the target lands on. The showEvent
+        # logs the actual geometry Qt landed on so any post-show
+        # drift is visible too.
         tl_screen = QGuiApplication.screenAt(target.topLeft())
         tl_dpr = tl_screen.devicePixelRatio() if tl_screen else None
         log.info(
-            "ArmedRegionOverlay init: input_region=(%d,%d,%dx%d) "
-            "target=(%d,%d,%dx%d) screen=%s dpr=%s",
+            "ArmedRegionOverlay init: physical_region=(%d,%d,%dx%d) "
+            "logical_region=(%d,%d,%dx%d) target=(%d,%d,%dx%d) "
+            "screen=%s dpr=%s",
             region.x(), region.y(), region.width(), region.height(),
+            logical_region.x(), logical_region.y(),
+            logical_region.width(), logical_region.height(),
             target.x(), target.y(), target.width(), target.height(),
             tl_screen.name() if tl_screen else "n/a",
             f"{tl_dpr:.3f}" if tl_dpr is not None else "n/a",
         )
         self.setGeometry(target)
         self._inset_rect = QRect(
-            bleed, bleed, region.width(), region.height(),
+            bleed, bleed, logical_region.width(), logical_region.height(),
         )
 
     def showEvent(self, event) -> None:
