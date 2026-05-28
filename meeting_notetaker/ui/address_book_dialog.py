@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -51,6 +52,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -68,6 +70,9 @@ from ..models.classification import (
     ALL_ALIAS_KINDS,
     ClassificationStore,
     Contact,
+    ENRICH_SOURCE_LLM,
+    ENRICH_SOURCE_MANUAL,
+    ENRICH_SOURCE_OUTLOOK,
     SOURCE_DIARIZATION,
     SOURCE_MANUAL,
 )
@@ -79,6 +84,25 @@ _KIND_LABELS = {
     ALIAS_KIND_SHORT: "short",
     ALIAS_KIND_INITIAL: "initial",
     ALIAS_KIND_EMAIL: "email",
+}
+
+
+# Source emoji map for the rich-Contact-fields header badge (issue #51).
+# Aaron's spec was "unobtrusive single-character indicators"; one emoji
+# per known source value, blank when no enrichment has touched the
+# Contact yet. The badge sits next to the contact's display name in
+# the right-pane header so the user can see at a glance whether
+# manual edits, an Outlook pull, or an LLM extraction was the most
+# recent touch.
+_SOURCE_EMOJI = {
+    ENRICH_SOURCE_OUTLOOK: "\U0001F4E7",  # envelope (Outlook)
+    ENRICH_SOURCE_LLM: "\U0001F916",      # robot (LLM)
+    ENRICH_SOURCE_MANUAL: "✏️",  # pencil (manual edit)
+}
+_SOURCE_LABELS = {
+    ENRICH_SOURCE_OUTLOOK: "Outlook calendar",
+    ENRICH_SOURCE_LLM: "auto-extracted from synthesis",
+    ENRICH_SOURCE_MANUAL: "manually edited",
 }
 
 
@@ -198,6 +222,61 @@ class AddressBookDialog(QDialog):
         self._detail_meta = QLabel("", right)
         self._detail_meta.setStyleSheet("color: gray;")
         right_layout.addWidget(self._detail_meta)
+
+        # Rich addressbook fields (issue #51 Phase 1). Each input
+        # saves on focus-loss via editingFinished -- no Save button,
+        # the dialog has no concept of "dirty state" for these. The
+        # whole form is gated on contact selection; _refresh_details
+        # enables/disables.
+        self._fields_box = QGroupBox("Details", right)
+        fields_layout = QFormLayout(self._fields_box)
+        fields_layout.setContentsMargins(8, 8, 8, 8)
+        fields_layout.setVerticalSpacing(4)
+        self._title_input = QLineEdit(right)
+        self._title_input.setPlaceholderText("e.g. VP of Engineering")
+        self._title_input.editingFinished.connect(
+            lambda: self._on_field_edited("title", self._title_input.text())
+        )
+        fields_layout.addRow("Title:", self._title_input)
+        self._company_input = QLineEdit(right)
+        self._company_input.setPlaceholderText("e.g. Acme Corp")
+        self._company_input.editingFinished.connect(
+            lambda: self._on_field_edited("company", self._company_input.text())
+        )
+        fields_layout.addRow("Company:", self._company_input)
+        self._department_input = QLineEdit(right)
+        self._department_input.setPlaceholderText("e.g. Engineering")
+        self._department_input.editingFinished.connect(
+            lambda: self._on_field_edited(
+                "department", self._department_input.text(),
+            )
+        )
+        fields_layout.addRow("Department:", self._department_input)
+        self._email_input = QLineEdit(right)
+        self._email_input.setPlaceholderText("e.g. vp@acme.com (primary)")
+        self._email_input.editingFinished.connect(
+            lambda: self._on_field_edited(
+                "primary_email", self._email_input.text(),
+            )
+        )
+        fields_layout.addRow("Primary email:", self._email_input)
+        self._phone_input = QLineEdit(right)
+        self._phone_input.setPlaceholderText("e.g. +1-555-0100")
+        self._phone_input.editingFinished.connect(
+            lambda: self._on_field_edited("phone", self._phone_input.text())
+        )
+        fields_layout.addRow("Phone:", self._phone_input)
+        self._notes_input = QPlainTextEdit(right)
+        self._notes_input.setPlaceholderText(
+            "Free-form notes (preferences, context, anything)"
+        )
+        self._notes_input.setFixedHeight(64)
+        # QPlainTextEdit has no editingFinished signal; commit on
+        # focus-out via the focusOutEvent override-equivalent: connect
+        # to the textChanged signal but debounce via a timer.
+        self._notes_input.installEventFilter(self)
+        fields_layout.addRow("Notes:", self._notes_input)
+        right_layout.addWidget(self._fields_box)
 
         right_layout.addWidget(QLabel("Aliases:", right))
         self._alias_table = QTableWidget(right)
@@ -336,6 +415,78 @@ class AddressBookDialog(QDialog):
         cid = self._selected_contact_id()
         return self._store.get_contact(cid) if cid is not None else None
 
+    # ---- rich fields (issue #51 Phase 1) ----
+    def _populate_field_inputs(self, contact: Optional[Contact]) -> None:
+        """Push a Contact's rich-field values into the form inputs.
+
+        Signals are blocked while we set values so the editingFinished
+        handlers don't fire (we'd be saving the value we just read).
+        Called from _refresh_details whenever the selection changes.
+        """
+        widgets_text = (
+            (self._title_input, contact.title if contact else None),
+            (self._company_input, contact.company if contact else None),
+            (self._department_input, contact.department if contact else None),
+            (self._email_input, contact.primary_email if contact else None),
+            (self._phone_input, contact.phone if contact else None),
+        )
+        for widget, value in widgets_text:
+            widget.blockSignals(True)
+            try:
+                widget.setText(value or "")
+            finally:
+                widget.blockSignals(False)
+        self._notes_input.blockSignals(True)
+        try:
+            self._notes_input.setPlainText((contact.notes if contact else "") or "")
+        finally:
+            self._notes_input.blockSignals(False)
+        # Stash the as-loaded notes value so the focusOut commit can
+        # tell whether the user actually changed it.
+        self._notes_input_loaded_value = (contact.notes if contact else "") or ""
+
+    def _on_field_edited(self, field: str, value: str) -> None:
+        """Persist a single rich-field edit. Source = manual.
+
+        The user typing in the form is explicit + authoritative;
+        fill_empty_only stays False so empty values overwrite (the
+        user can clear a field by selecting + deleting).
+        """
+        contact = self._selected_contact()
+        if contact is None:
+            return
+        # Strip leading/trailing whitespace at save time so the DB
+        # never gets " VP " when the user typed it.
+        cleaned = value.strip()
+        # Map empty string back to NULL in the DB -- the field is
+        # nullable + the enrichment paths' "fill empty only" logic
+        # treats NULL + "" identically, so storing NULL is the
+        # cleaner representation of "no value".
+        store_value = cleaned if cleaned else None
+        self._store.update_contact_fields(
+            contact.id,
+            **{field: store_value},
+            source=ENRICH_SOURCE_MANUAL,
+        )
+        # Refresh the header badge if this was the first manual touch.
+        if contact.last_enriched_source != ENRICH_SOURCE_MANUAL:
+            self._refresh_details()
+
+    def eventFilter(self, obj, event):
+        """Commit notes-field edits on focus-out.
+
+        QPlainTextEdit has no editingFinished signal; we install
+        ourselves as an event filter to catch FocusOut on the notes
+        input and persist the change if the text differs from what
+        we loaded.
+        """
+        if obj is self._notes_input and event.type() == event.Type.FocusOut:
+            current = self._notes_input.toPlainText()
+            if current != getattr(self, "_notes_input_loaded_value", None):
+                self._on_field_edited("notes", current)
+                self._notes_input_loaded_value = current
+        return super().eventFilter(obj, event)
+
     # ---- details pane ----
     def _refresh_details(self) -> None:
         contact = self._selected_contact()
@@ -343,14 +494,30 @@ class AddressBookDialog(QDialog):
         for w in (
             self._rename_btn, self._merge_btn, self._delete_btn,
             self._alias_input, self._alias_kind_combo, self._add_alias_btn,
+            self._title_input, self._company_input, self._department_input,
+            self._email_input, self._phone_input, self._notes_input,
         ):
             w.setEnabled(enabled)
         if contact is None:
             self._detail_name.setText("(select a contact)")
             self._detail_meta.setText("")
             self._alias_table.setRowCount(0)
+            self._populate_field_inputs(None)
             return
-        self._detail_name.setText(contact.display_name)
+        # Header line: contact name + source emoji when enriched.
+        # The emoji is the badge Aaron asked for in his 2026-05-28
+        # spec -- envelope for Outlook, robot for LLM, pencil for
+        # manual edits. Tooltip on the name explains.
+        badge = _SOURCE_EMOJI.get(contact.last_enriched_source or "", "")
+        self._detail_name.setText(
+            f"{contact.display_name} {badge}".strip()
+        )
+        if badge:
+            self._detail_name.setToolTip(
+                f"Last touched: {_SOURCE_LABELS.get(contact.last_enriched_source, '')}"
+            )
+        else:
+            self._detail_name.setToolTip("")
         sessions = self._store.session_count_for_contact(contact.id)
         speaker_status = (
             "linked to a Speaker"
@@ -360,6 +527,7 @@ class AddressBookDialog(QDialog):
             f"{sessions} session(s); {speaker_status}; "
             f"created {contact.created_at[:10]}"
         )
+        self._populate_field_inputs(contact)
         aliases = self._store.list_aliases(contact.id)
         self._alias_table.setRowCount(len(aliases))
         for i, a in enumerate(aliases):
