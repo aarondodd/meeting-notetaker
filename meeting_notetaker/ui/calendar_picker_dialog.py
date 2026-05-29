@@ -10,7 +10,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -46,8 +47,17 @@ class CalendarPickerDialog(QDialog):
         self._list.itemDoubleClicked.connect(lambda _it: self._on_accept())
         layout.addWidget(self._list, 1)
 
-        self._status = QLabel("", self)
+        # Initial status set BEFORE the fetch so the user sees a loading
+        # message immediately. The actual fetch is deferred to the next
+        # event-loop tick (see __init__ tail) so the dialog gets a chance
+        # to paint -- otherwise the synchronous COM query runs on the
+        # same call stack as the setText and the user just sees a frozen
+        # blank dialog for the duration of the query.
+        self._status = QLabel("Loading from Outlook...", self)
         self._status.setWordWrap(True)
+        f = QFont(self._status.font())
+        f.setItalic(True)
+        self._status.setFont(f)
         layout.addWidget(self._status)
 
         buttons = QDialogButtonBox(
@@ -62,7 +72,12 @@ class CalendarPickerDialog(QDialog):
         layout.addWidget(buttons)
 
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
-        self._populate()
+        # Defer the blocking Outlook COM query to the next event-loop
+        # tick so the dialog (including the "Loading from Outlook..."
+        # status label) paints first. Without this, _populate runs on
+        # the same call stack as construction and the user stares at a
+        # frozen blank dialog for ~1-2 s while COM queries the GAL.
+        QTimer.singleShot(0, self._populate)
 
     # ---- public API --------------------------------------------------------
 
@@ -72,7 +87,9 @@ class CalendarPickerDialog(QDialog):
     # ---- internal ----------------------------------------------------------
 
     def _populate(self) -> None:
-        self._status.setText("Loading from Outlook...")
+        # The status label was set to "Loading from Outlook..." in
+        # __init__; we just run the fetch now. Errors and the no-results
+        # case update it below.
         try:
             self._meetings = fetch_remaining_today()
         except Exception as exc:

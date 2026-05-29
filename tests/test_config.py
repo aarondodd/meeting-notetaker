@@ -413,3 +413,20 @@ def test_unknown_synthesis_keys_in_toml_drop_cleanly(isolated_data_dir):
     loaded = Config.load()
     assert loaded.synthesis.automation_enabled is True
     assert loaded.synthesis.llm_target == "claude"
+
+
+def test_synthesis_default_template_name_defaults_to_empty():
+    """The global default-template setting starts empty so the runtime
+    falls back to the bundled default.md. Users set it via Settings >
+    Synthesis Prompts > Default template."""
+    from meeting_notetaker.utils.config import SynthesisConfig
+    assert SynthesisConfig().default_template_name == ""
+
+
+def test_synthesis_auto_extract_attendee_details_defaults_off():
+    """Attendee-details extraction is opt-in starting 2026-05-29.
+    The default was flipped from True to False after the appended
+    system-prompt was causing Claude to flag the synthesis as
+    embedded prompt injection."""
+    from meeting_notetaker.utils.config import SynthesisConfig
+    assert SynthesisConfig().auto_extract_attendee_details is False

@@ -73,7 +73,8 @@ def test_render_substitutes_user_name_placeholder():
 def test_render_user_name_placeholder_falls_back_to_me():
     body = "{{user_name}}"
     out = prompts_mod.render(
-        body, session_title="x", session_date="2026-05-15", transcript="", user_name=""
+        body, session_title="x", session_date="2026-05-15", transcript="",
+        user_name="", include_system_prompts=False,
     )
     assert out == "Me"
 

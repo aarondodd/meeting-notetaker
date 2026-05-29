@@ -63,6 +63,18 @@ ALL_ALIAS_KINDS = (
     ALIAS_KIND_INITIAL, ALIAS_KIND_EMAIL,
 )
 
+# Source tag for the rich Contact fields added in v0.7.2 (issue #51).
+# Recorded as a single column on the Contact row -- the value is the
+# source of the LAST enrichment pass that touched the rich fields,
+# enabling the "fill empty fields, never overwrite" logic at the
+# Outlook + LLM enrichment paths.
+ENRICH_SOURCE_MANUAL = "manual"
+ENRICH_SOURCE_OUTLOOK = "outlook"
+ENRICH_SOURCE_LLM = "llm"
+ALL_ENRICH_SOURCES = (
+    ENRICH_SOURCE_MANUAL, ENRICH_SOURCE_OUTLOOK, ENRICH_SOURCE_LLM,
+)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS series (
@@ -73,10 +85,31 @@ CREATE TABLE IF NOT EXISTS series (
 );
 
 CREATE TABLE IF NOT EXISTS contacts (
-    id            INTEGER PRIMARY KEY,
-    display_name  TEXT NOT NULL,
-    notes         TEXT DEFAULT '',
-    created_at    TEXT NOT NULL
+    id                      INTEGER PRIMARY KEY,
+    display_name            TEXT NOT NULL,
+    notes                   TEXT DEFAULT '',
+    -- v0.7.2 (issue #51) rich addressbook fields. All nullable;
+    -- additive ALTER TABLE migrations in _ensure_contact_rich_columns
+    -- handle databases created before this schema version.
+    title                   TEXT,
+    company                 TEXT,
+    department              TEXT,
+    primary_email           TEXT,
+    phone                   TEXT,
+    last_enriched_source    TEXT,
+    -- Per-field source tracking (issue #51 follow-up, 2026-05-28).
+    -- Each *_source column records which enrichment path most
+    -- recently wrote that specific field. NULL = never written or
+    -- written before the per-field migration. last_enriched_source
+    -- stays as the "any field" rollup so the name-cell badge has a
+    -- single value to show.
+    title_source            TEXT,
+    company_source          TEXT,
+    department_source       TEXT,
+    primary_email_source    TEXT,
+    phone_source            TEXT,
+    notes_source            TEXT,
+    created_at              TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS contact_aliases (
@@ -150,6 +183,34 @@ class Contact:
     id: int
     display_name: str
     notes: str = ""
+    # v0.7.2 rich addressbook fields (issue #51). All optional; NULL
+    # in the DB means "never populated", empty string means "user
+    # cleared it." The Outlook + LLM enrichment paths treat NULL and
+    # empty string identically (both mean "fill if you have a value
+    # to fill"), but the UI form distinguishes them so the user can
+    # explicitly clear a field if they want it left blank.
+    title: Optional[str] = None
+    company: Optional[str] = None
+    department: Optional[str] = None
+    primary_email: Optional[str] = None
+    phone: Optional[str] = None
+    # Source of the last automatic enrichment (Outlook fetch or LLM
+    # extraction). 'manual' means the user typed the most recent
+    # change. None when no field has been touched by any enrichment
+    # pass yet. Kept as the "any-field" rollup so the name-level
+    # badge has a single value to show -- per-field sources live on
+    # the {field}_source columns below.
+    last_enriched_source: Optional[str] = None
+    # Per-field source tracking (2026-05-28). Each field records the
+    # source that most recently wrote it: 'outlook' / 'llm' / 'manual'.
+    # NULL = field is empty OR was set before per-field migration
+    # (we can't reconstruct historical provenance).
+    title_source: Optional[str] = None
+    company_source: Optional[str] = None
+    department_source: Optional[str] = None
+    primary_email_source: Optional[str] = None
+    phone_source: Optional[str] = None
+    notes_source: Optional[str] = None
     created_at: str = ""
 
 
@@ -216,6 +277,78 @@ class ClassificationStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        # v0.7.2 (issue #51): add rich-addressbook columns to the
+        # contacts table on databases created before this release.
+        # Order matters: the legacy-DN sweep below references the
+        # per-field source column, which the migration adds.
+        self._ensure_contact_rich_columns()
+        # 2026-05-28: prior Outlook fetches stored the X.500
+        # legacyExchangeDN as primary_email for Exchange recipients.
+        # Sweep it out so the next enrichment can fill in the real
+        # SMTP address (fill_empty_only requires the field be empty).
+        self._sanitize_legacy_dn_emails()
+
+    def _sanitize_legacy_dn_emails(self) -> None:
+        """Clear primary_email values that hold an X.500 legacyExchangeDN.
+
+        Pre-fix Outlook fetches stored ``AddressEntry.Address`` directly,
+        which for Exchange recipients is the X.500 distinguished name
+        ('/o=ExchangeLabs/ou=Exchange Administrative Group .../cn=Recipients/cn=...').
+        That's a useless value; sweep it to NULL so the next Outlook
+        enrichment can fill in the real PrimarySmtpAddress via the
+        ``GetExchangeUser()`` code path. Cheap query -- WHERE LIKE
+        prefix match on a single column with at most a few hundred
+        rows in practice. Idempotent: a second run finds nothing.
+        """
+        try:
+            self._conn.execute(
+                "UPDATE contacts "
+                "SET primary_email = NULL, primary_email_source = NULL "
+                "WHERE primary_email LIKE '/o=%' "
+                "   OR primary_email LIKE '/O=%' "
+                "   OR primary_email LIKE '/cn=%' "
+                "   OR primary_email LIKE '/CN=%'"
+            )
+        except sqlite3.Error:
+            # Don't block store open if the sweep fails (e.g. on a
+            # legacy DB before the per-field columns migrated in).
+            pass
+
+    def _ensure_contact_rich_columns(self) -> None:
+        """Additive ALTER TABLE migration for the v0.7.2 Contact fields.
+
+        SQLite's CREATE TABLE IF NOT EXISTS doesn't touch tables that
+        already exist, so the columns declared in SCHEMA aren't applied
+        to pre-v0.7.2 databases. Mirror the pattern from
+        diarization/store.py:_ensure_contact_id_column -- query the
+        table's pragma_table_info, add any missing columns one at a
+        time. Each ALTER is a NOP on a fresh database (the column is
+        already there from CREATE TABLE).
+        """
+        existing = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(contacts)")
+        }
+        for col, decl in (
+            ("title", "TEXT"),
+            ("company", "TEXT"),
+            ("department", "TEXT"),
+            ("primary_email", "TEXT"),
+            ("phone", "TEXT"),
+            ("last_enriched_source", "TEXT"),
+            # Per-field source columns (2026-05-28). NULL means
+            # "unknown source" -- common for rows that existed before
+            # this migration; the next manual or enrichment touch fills
+            # the value in.
+            ("title_source", "TEXT"),
+            ("company_source", "TEXT"),
+            ("department_source", "TEXT"),
+            ("primary_email_source", "TEXT"),
+            ("phone_source", "TEXT"),
+            ("notes_source", "TEXT"),
+        ):
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE contacts ADD COLUMN {col} {decl}")
 
     def close(self) -> None:
         self._conn.close()
@@ -487,6 +620,92 @@ class ClassificationStore:
         self._conn.execute(
             "UPDATE contacts SET notes = ? WHERE id = ?", (notes, contact_id),
         )
+
+    # v0.7.2 (issue #51). The rich-field fields are independent enough
+    # that one setter per field would balloon; instead, accept kwargs +
+    # build the UPDATE dynamically. The whitelist keeps SQL injection
+    # off the table even though only this code calls it.
+    _RICH_FIELD_COLUMNS = frozenset({
+        "title", "company", "department", "primary_email", "phone",
+        "notes", "last_enriched_source",
+    })
+    # Fields that get per-field source tracking. last_enriched_source
+    # itself doesn't (it IS the rollup); the field-source columns are
+    # named "<field>_source" by convention.
+    _FIELDS_WITH_PER_FIELD_SOURCE = frozenset({
+        "title", "company", "department", "primary_email", "phone", "notes",
+    })
+
+    def update_contact_fields(
+        self,
+        contact_id: int,
+        *,
+        source: Optional[str] = None,
+        fill_empty_only: bool = False,
+        **fields: Optional[str],
+    ) -> None:
+        """Update one or more Contact rich fields.
+
+        Pass any subset of:
+            title, company, department, primary_email, phone, notes.
+
+        ``source`` is the value to store in ``last_enriched_source``
+        (one of ENRICH_SOURCE_*). Defaults to ENRICH_SOURCE_MANUAL
+        when omitted -- the Address Book dialog passes nothing; the
+        Outlook + LLM enrichment paths pass their respective source.
+
+        ``fill_empty_only=True`` is the load-bearing flag for
+        automatic enrichment paths: only apply each field when the
+        existing value is NULL or empty. Never overwrites a value
+        the user (or a prior enrichment) already set. The Address
+        Book form passes False -- explicit user edits always win.
+        """
+        if not fields:
+            return
+        unknown = set(fields) - self._RICH_FIELD_COLUMNS
+        if unknown:
+            raise ValueError(f"unknown contact field(s): {sorted(unknown)}")
+        if fill_empty_only:
+            existing_row = self._conn.execute(
+                "SELECT * FROM contacts WHERE id = ?", (contact_id,),
+            ).fetchone()
+            if existing_row is None:
+                return
+            applied: dict[str, Optional[str]] = {}
+            for col, new_val in fields.items():
+                if new_val is None or str(new_val).strip() == "":
+                    continue  # nothing to fill from
+                current = existing_row[col] if col in existing_row.keys() else None
+                if current is None or str(current).strip() == "":
+                    applied[col] = new_val
+            fields = applied
+            if not fields:
+                return
+        effective_source = source or ENRICH_SOURCE_MANUAL
+        # Build "col = ?" pairs in deterministic order so the args
+        # list stays aligned with the SQL placeholders.
+        cols = sorted(fields.keys())
+        set_clauses = [f"{col} = ?" for col in cols]
+        params = [fields[col] for col in cols]
+        # Per-field source tracking: every touched field gets its
+        # source column written alongside the value. Empty/None values
+        # clear the source too (no value -> no source). Done before
+        # appending the rollup so column order stays deterministic.
+        for col in cols:
+            if col not in self._FIELDS_WITH_PER_FIELD_SOURCE:
+                continue
+            value = fields[col]
+            value_set = value is not None and str(value).strip() != ""
+            set_clauses.append(f"{col}_source = ?")
+            params.append(effective_source if value_set else None)
+        # Always update last_enriched_source so we can tell who
+        # touched the contact last. Setter is the Address Book form
+        # by default -> manual; Outlook + LLM paths pass their tag.
+        set_clauses.append("last_enriched_source = ?")
+        params.append(effective_source)
+        params.append(contact_id)
+        sql = f"UPDATE contacts SET {', '.join(set_clauses)} WHERE id = ?"
+        self._conn.execute(sql, params)
 
     def merge_contacts(self, source_id: int, target_id: int) -> None:
         """Reassign every alias + session link from source -> target,
@@ -994,10 +1213,27 @@ def _row_to_series(row: sqlite3.Row) -> Series:
 
 
 def _row_to_contact(row: sqlite3.Row) -> Contact:
+    keys = set(row.keys())
+
+    def _opt(col: str):
+        return row[col] if col in keys else None
+
     return Contact(
         id=row["id"],
         display_name=row["display_name"],
-        notes=row["notes"] if "notes" in row.keys() else "",
+        notes=row["notes"] if "notes" in keys else "",
+        title=_opt("title"),
+        company=_opt("company"),
+        department=_opt("department"),
+        primary_email=_opt("primary_email"),
+        phone=_opt("phone"),
+        last_enriched_source=_opt("last_enriched_source"),
+        title_source=_opt("title_source"),
+        company_source=_opt("company_source"),
+        department_source=_opt("department_source"),
+        primary_email_source=_opt("primary_email_source"),
+        phone_source=_opt("phone_source"),
+        notes_source=_opt("notes_source"),
         created_at=row["created_at"],
     )
 

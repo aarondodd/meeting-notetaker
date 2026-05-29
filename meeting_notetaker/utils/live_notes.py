@@ -132,6 +132,124 @@ def format_attendee_list(attendees: Iterable[str]) -> str:
     return ", ".join(names)
 
 
+def replace_attendees_section_with_table(
+    body: str,
+    contacts,
+) -> str:
+    """Swap the bullet list under `# Attendees` for a Markdown table.
+
+    Issue #51 Phase 5. ``contacts`` is a sequence of Contact-shaped
+    objects (must carry display_name + title/company/department/
+    primary_email/phone). When any contact has any rich field set,
+    the bullet list under the Attendees heading is replaced with a
+    Markdown table; otherwise the body is returned unchanged. The
+    caller (PDF export path) decides when to invoke this via the
+    auto-detect rule documented in `should_render_attendees_as_table`.
+
+    The table includes only columns where at least one contact has
+    data (we don't pad an entire empty Phone column when no one has
+    a phone number on file). Empty cells render as a single space
+    so the Markdown converter doesn't collapse the row.
+    """
+    contacts = list(contacts or [])
+    if not contacts:
+        return body
+    table_md = _format_attendee_table_markdown(contacts)
+    if not table_md:
+        return body
+    lines = body.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        heading = _HEADING_RE.match(lines[i])
+        if heading and heading.group(1).strip().lower() == "attendees":
+            # Emit the heading line as-is.
+            out.append(lines[i])
+            i += 1
+            # Skip any bullet / blank lines that constitute the
+            # current section until we hit the next heading or
+            # end-of-body.
+            while i < len(lines):
+                next_heading = _HEADING_RE.match(lines[i])
+                if next_heading:
+                    break
+                if (
+                    _BULLET_RE.match(lines[i])
+                    or lines[i].strip() == ""
+                ):
+                    i += 1
+                    continue
+                # Non-bullet content under Attendees? Preserve it +
+                # stop consuming.
+                break
+            # Insert the table, then a trailing blank line so the
+            # next heading isn't glued to the table.
+            out.append("")
+            out.append(table_md)
+            out.append("")
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def should_render_attendees_as_table(contacts) -> bool:
+    """Auto-detect rule for the PDF rich-table option.
+
+    Returns True when at least one contact has at least one rich
+    field set (title / company / department / primary_email / phone).
+    Bullet list is the right shape when there's nothing to show in
+    the additional columns -- avoids a single-column table that's
+    just the names with extra formatting.
+    """
+    for c in contacts or []:
+        if (
+            getattr(c, "title", None)
+            or getattr(c, "company", None)
+            or getattr(c, "department", None)
+            or getattr(c, "primary_email", None)
+            or getattr(c, "phone", None)
+        ):
+            return True
+    return False
+
+
+def _format_attendee_table_markdown(contacts) -> str:
+    """Render contacts as a Markdown table.
+
+    Only columns with at least one non-empty cell make it into the
+    output. Name is always present. Empty cells are a single space
+    so the GitHub-flavored Markdown converter doesn't collapse the
+    row visually.
+    """
+    columns: list[tuple[str, str]] = [("Name", "display_name")]
+    for header, attr in (
+        ("Title", "title"),
+        ("Company", "company"),
+        ("Department", "department"),
+        ("Email", "primary_email"),
+        ("Phone", "phone"),
+    ):
+        if any(
+            (getattr(c, attr, None) or "").strip()
+            for c in contacts
+        ):
+            columns.append((header, attr))
+    if len(columns) == 1:
+        # Only names; not worth a table. Caller falls back to bullets.
+        return ""
+    header_row = "| " + " | ".join(h for h, _ in columns) + " |"
+    sep_row = "|" + "|".join("---" for _ in columns) + "|"
+    rows = [header_row, sep_row]
+    for c in contacts:
+        cells = []
+        for _, attr in columns:
+            v = getattr(c, attr, None)
+            cells.append((v or " ").strip() or " ")
+        rows.append("| " + " | ".join(cells) + " |")
+    return "\n".join(rows)
+
+
 def has_user_content(body: str) -> bool:
     """True if the user has written anything beyond the seeded template."""
     if not body:

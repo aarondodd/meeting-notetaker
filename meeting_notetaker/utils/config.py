@@ -194,6 +194,25 @@ class SynthesisConfig:
     # synthesized notes accumulate inside the named project rather
     # than flooding the user's default chat list. Empty == no project.
     claude_project_id: str = ""
+    # v0.7.2 (issue #51 Phase 4): append an attendee-details
+    # extraction request to every synthesis prompt. Off by default
+    # (2026-05-29) -- the request adds noticeable bulk to the
+    # prompt and the value is small for the common case where
+    # Outlook calendar enrichment already populated the attendees'
+    # rich fields. User opts in via Settings > Synthesis Prompts
+    # when they want LLM backfill from in-meeting mentions.
+    auto_extract_attendee_details: bool = False
+    # When True, the "## Attendee Details (auto-extracted)" appendix
+    # is removed from the saved notes.md after parsing. Default OFF
+    # so the user can see what the LLM extracted (transparency); flip
+    # ON if the appendix is cluttering shared synthesis exports.
+    strip_attendee_appendix: bool = False
+    # Default prompt-template filename used by sessions that don't
+    # have a per-session override. Empty string falls back to
+    # "default.md" (the bundled generic template). Settings >
+    # Synthesis Prompts exposes a dropdown listing the templates
+    # actually present in the user's prompts folder.
+    default_template_name: str = ""
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

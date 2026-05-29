@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -51,6 +52,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -68,6 +70,9 @@ from ..models.classification import (
     ALL_ALIAS_KINDS,
     ClassificationStore,
     Contact,
+    ENRICH_SOURCE_LLM,
+    ENRICH_SOURCE_MANUAL,
+    ENRICH_SOURCE_OUTLOOK,
     SOURCE_DIARIZATION,
     SOURCE_MANUAL,
 )
@@ -79,6 +84,25 @@ _KIND_LABELS = {
     ALIAS_KIND_SHORT: "short",
     ALIAS_KIND_INITIAL: "initial",
     ALIAS_KIND_EMAIL: "email",
+}
+
+
+# Source-marker glyphs for the rich-Contact-fields per-field labels.
+# Unicode MODIFIER LETTER CAPITAL X code points render as superscript
+# letters in most fonts -- text glyphs that inherit color and weight
+# from the surrounding label, so they read as a subtle annotation
+# rather than a separate UI element. Switched from color emoji on
+# 2026-05-28 (Aaron flagged the color emoji as distracting). Hover
+# tooltip names the source in plain English via _SOURCE_LABELS.
+_SOURCE_BADGE = {
+    ENRICH_SOURCE_OUTLOOK: "ᴼ",  # superscript O
+    ENRICH_SOURCE_LLM: "ᴸ",      # superscript L
+    ENRICH_SOURCE_MANUAL: "ᴹ",   # superscript M
+}
+_SOURCE_LABELS = {
+    ENRICH_SOURCE_OUTLOOK: "Outlook calendar",
+    ENRICH_SOURCE_LLM: "auto-extracted from synthesis",
+    ENRICH_SOURCE_MANUAL: "manually edited",
 }
 
 
@@ -199,6 +223,76 @@ class AddressBookDialog(QDialog):
         self._detail_meta.setStyleSheet("color: gray;")
         right_layout.addWidget(self._detail_meta)
 
+        # Rich addressbook fields (issue #51 Phase 1). Each input
+        # saves on focus-loss via editingFinished -- no Save button,
+        # the dialog has no concept of "dirty state" for these. The
+        # whole form is gated on contact selection; _refresh_details
+        # enables/disables.
+        self._fields_box = QGroupBox("Details", right)
+        fields_layout = QFormLayout(self._fields_box)
+        fields_layout.setContentsMargins(8, 8, 8, 8)
+        fields_layout.setVerticalSpacing(4)
+        # Per-field label widgets: kept as references so we can append
+        # the source emoji when _populate_field_inputs runs. Labels live
+        # in self._field_labels keyed by field name; updated to e.g.
+        # "Title 📧:" when Outlook last wrote that field.
+        self._field_labels: dict[str, QLabel] = {}
+        self._title_input = QLineEdit(right)
+        self._title_input.setPlaceholderText("e.g. VP of Engineering")
+        self._title_input.editingFinished.connect(
+            lambda: self._on_field_edited("title", self._title_input.text())
+        )
+        self._field_labels["title"] = QLabel("Title:", right)
+        fields_layout.addRow(self._field_labels["title"], self._title_input)
+        self._company_input = QLineEdit(right)
+        self._company_input.setPlaceholderText("e.g. Acme Corp")
+        self._company_input.editingFinished.connect(
+            lambda: self._on_field_edited("company", self._company_input.text())
+        )
+        self._field_labels["company"] = QLabel("Company:", right)
+        fields_layout.addRow(self._field_labels["company"], self._company_input)
+        self._department_input = QLineEdit(right)
+        self._department_input.setPlaceholderText("e.g. Engineering")
+        self._department_input.editingFinished.connect(
+            lambda: self._on_field_edited(
+                "department", self._department_input.text(),
+            )
+        )
+        self._field_labels["department"] = QLabel("Department:", right)
+        fields_layout.addRow(
+            self._field_labels["department"], self._department_input,
+        )
+        self._email_input = QLineEdit(right)
+        self._email_input.setPlaceholderText("e.g. vp@acme.com (primary)")
+        self._email_input.editingFinished.connect(
+            lambda: self._on_field_edited(
+                "primary_email", self._email_input.text(),
+            )
+        )
+        self._field_labels["primary_email"] = QLabel("Primary email:", right)
+        fields_layout.addRow(
+            self._field_labels["primary_email"], self._email_input,
+        )
+        self._phone_input = QLineEdit(right)
+        self._phone_input.setPlaceholderText("e.g. +1-555-0100")
+        self._phone_input.editingFinished.connect(
+            lambda: self._on_field_edited("phone", self._phone_input.text())
+        )
+        self._field_labels["phone"] = QLabel("Phone:", right)
+        fields_layout.addRow(self._field_labels["phone"], self._phone_input)
+        self._notes_input = QPlainTextEdit(right)
+        self._notes_input.setPlaceholderText(
+            "Free-form notes (preferences, context, anything)"
+        )
+        self._notes_input.setFixedHeight(64)
+        # QPlainTextEdit has no editingFinished signal; commit on
+        # focus-out via the focusOutEvent override-equivalent: connect
+        # to the textChanged signal but debounce via a timer.
+        self._notes_input.installEventFilter(self)
+        self._field_labels["notes"] = QLabel("Notes:", right)
+        fields_layout.addRow(self._field_labels["notes"], self._notes_input)
+        right_layout.addWidget(self._fields_box)
+
         right_layout.addWidget(QLabel("Aliases:", right))
         self._alias_table = QTableWidget(right)
         self._alias_table.setColumnCount(4)
@@ -249,6 +343,46 @@ class AddressBookDialog(QDialog):
 
         self._refresh_list()
         self._refresh_suggestions()
+
+    def keyPressEvent(self, event) -> None:
+        """Close the dialog on Enter, matching the Close button.
+
+        Pressing Enter in a field used to do nothing (no default button
+        in the QDialogButtonBox), which Aaron flagged as confusing
+        (2026-05-28). Now Enter calls reject() so the user can finish
+        a field with Tab/Enter and dismiss the editor without reaching
+        for the mouse.
+
+        QPlainTextEdit (the Notes input) consumes Enter natively for
+        newline insertion, so this only fires when focus is on a
+        QLineEdit or another non-consuming widget.
+        """
+        from PyQt6.QtCore import Qt  # noqa: PLC0415
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            # Any field with editingFinished wiring has already fired
+            # by the time the key event reaches the dialog -- Qt
+            # delivers editingFinished before propagating the key
+            # press up the parent chain.
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
+    # ---- public API ----
+    def select_contact(self, contact_id: int) -> None:
+        """Select the row for ``contact_id`` if present in the list.
+
+        Used by the attendee-drawer click path (issue #51 Phase 3)
+        to open the dialog already focused on a specific contact.
+        No-op when the contact is filtered out or doesn't exist.
+        """
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is None:
+                continue
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if data is not None and int(data) == int(contact_id):
+                self._list.setCurrentRow(i)
+                return
 
     # ---- list refresh / filter ----
     def _refresh_list(self) -> None:
@@ -336,6 +470,126 @@ class AddressBookDialog(QDialog):
         cid = self._selected_contact_id()
         return self._store.get_contact(cid) if cid is not None else None
 
+    # ---- rich fields (issue #51 Phase 1) ----
+    def _populate_field_inputs(self, contact: Optional[Contact]) -> None:
+        """Push a Contact's rich-field values into the form inputs.
+
+        Signals are blocked while we set values so the editingFinished
+        handlers don't fire (we'd be saving the value we just read).
+        Called from _refresh_details whenever the selection changes.
+        """
+        widgets_text = (
+            (self._title_input, contact.title if contact else None),
+            (self._company_input, contact.company if contact else None),
+            (self._department_input, contact.department if contact else None),
+            (self._email_input, contact.primary_email if contact else None),
+            (self._phone_input, contact.phone if contact else None),
+        )
+        for widget, value in widgets_text:
+            widget.blockSignals(True)
+            try:
+                widget.setText(value or "")
+            finally:
+                widget.blockSignals(False)
+        self._notes_input.blockSignals(True)
+        try:
+            self._notes_input.setPlainText((contact.notes if contact else "") or "")
+        finally:
+            self._notes_input.blockSignals(False)
+        # Stash the as-loaded notes value so the focusOut commit can
+        # tell whether the user actually changed it.
+        self._notes_input_loaded_value = (contact.notes if contact else "") or ""
+        self._refresh_field_source_labels(contact)
+
+    def _refresh_field_source_labels(self, contact) -> None:
+        """Append the per-field source emoji to each form label.
+
+        Empty fields keep the bare label ("Title:"). Fields with a
+        value whose source is known append the corresponding emoji
+        ("Title 📧:" for Outlook). Hover tooltip names the source.
+        Called by _populate_field_inputs + after every save so the
+        badge tracks the most recent state without a re-select.
+        """
+        base_labels = {
+            "title": "Title:",
+            "company": "Company:",
+            "department": "Department:",
+            "primary_email": "Primary email:",
+            "phone": "Phone:",
+            "notes": "Notes:",
+        }
+        source_attrs = {
+            "title": "title_source",
+            "company": "company_source",
+            "department": "department_source",
+            "primary_email": "primary_email_source",
+            "phone": "phone_source",
+            "notes": "notes_source",
+        }
+        for field, base in base_labels.items():
+            label = self._field_labels.get(field)
+            if label is None:
+                continue
+            source = (
+                getattr(contact, source_attrs[field], None)
+                if contact is not None else None
+            )
+            badge = _SOURCE_BADGE.get(source or "", "")
+            if badge:
+                label.setText(f"{base} {badge}")
+                label.setToolTip(_SOURCE_LABELS.get(source, ""))
+            else:
+                label.setText(base)
+                label.setToolTip("")
+
+    def _on_field_edited(self, field: str, value: str) -> None:
+        """Persist a single rich-field edit. Source = manual.
+
+        The user typing in the form is explicit + authoritative;
+        fill_empty_only stays False so empty values overwrite (the
+        user can clear a field by selecting + deleting).
+        """
+        contact = self._selected_contact()
+        if contact is None:
+            return
+        # Strip leading/trailing whitespace at save time so the DB
+        # never gets " VP " when the user typed it.
+        cleaned = value.strip()
+        # Map empty string back to NULL in the DB -- the field is
+        # nullable + the enrichment paths' "fill empty only" logic
+        # treats NULL + "" identically, so storing NULL is the
+        # cleaner representation of "no value".
+        store_value = cleaned if cleaned else None
+        self._store.update_contact_fields(
+            contact.id,
+            **{field: store_value},
+            source=ENRICH_SOURCE_MANUAL,
+        )
+        # Refresh the header badge if this was the first manual touch.
+        # Also refresh per-field labels so the ᴹ on the edited field
+        # appears without waiting for a re-select.
+        if contact.last_enriched_source != ENRICH_SOURCE_MANUAL:
+            self._refresh_details()
+        else:
+            refreshed = self._store.get_contact(contact.id)
+            if refreshed is not None:
+                self._refresh_field_source_labels(refreshed)
+
+    def eventFilter(self, obj, event):
+        """Commit notes-field edits on focus-out.
+
+        QPlainTextEdit has no editingFinished signal; we install
+        ourselves as an event filter to catch FocusOut on the notes
+        input and persist the change if the text differs from what
+        we loaded.
+        """
+        if obj is self._notes_input and event.type() == event.Type.FocusOut:
+            current = self._notes_input.toPlainText()
+            if current != getattr(self, "_notes_input_loaded_value", None):
+                self._on_field_edited("notes", current)
+                self._notes_input_loaded_value = current
+        return super().eventFilter(obj, event)
+
     # ---- details pane ----
     def _refresh_details(self) -> None:
         contact = self._selected_contact()
@@ -343,14 +597,30 @@ class AddressBookDialog(QDialog):
         for w in (
             self._rename_btn, self._merge_btn, self._delete_btn,
             self._alias_input, self._alias_kind_combo, self._add_alias_btn,
+            self._title_input, self._company_input, self._department_input,
+            self._email_input, self._phone_input, self._notes_input,
         ):
             w.setEnabled(enabled)
         if contact is None:
             self._detail_name.setText("(select a contact)")
             self._detail_meta.setText("")
             self._alias_table.setRowCount(0)
+            self._populate_field_inputs(None)
             return
-        self._detail_name.setText(contact.display_name)
+        # Header line: contact name + source emoji when enriched.
+        # The emoji is the badge Aaron asked for in his 2026-05-28
+        # spec -- envelope for Outlook, robot for LLM, pencil for
+        # manual edits. Tooltip on the name explains.
+        badge = _SOURCE_BADGE.get(contact.last_enriched_source or "", "")
+        self._detail_name.setText(
+            f"{contact.display_name} {badge}".strip()
+        )
+        if badge:
+            self._detail_name.setToolTip(
+                f"Last touched: {_SOURCE_LABELS.get(contact.last_enriched_source, '')}"
+            )
+        else:
+            self._detail_name.setToolTip("")
         sessions = self._store.session_count_for_contact(contact.id)
         speaker_status = (
             "linked to a Speaker"
@@ -360,6 +630,7 @@ class AddressBookDialog(QDialog):
             f"{sessions} session(s); {speaker_status}; "
             f"created {contact.created_at[:10]}"
         )
+        self._populate_field_inputs(contact)
         aliases = self._store.list_aliases(contact.id)
         self._alias_table.setRowCount(len(aliases))
         for i, a in enumerate(aliases):

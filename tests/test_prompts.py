@@ -55,13 +55,19 @@ def test_render_substitutes_three_placeholders(isolated_data_dir):
 
 def test_render_leaves_unknown_placeholders_intact(isolated_data_dir):
     body = "{{session_title}} -- {{unknown_thing}}"
-    out = prompts_mod.render(body, session_title="X", session_date="2026-05-15", transcript="")
+    # include_system_prompts=False isolates the substitution behavior;
+    # appendix injection is tested separately in test_prompts_system_appendix.
+    out = prompts_mod.render(
+        body, session_title="X", session_date="2026-05-15",
+        transcript="", include_system_prompts=False,
+    )
     assert out == "X -- {{unknown_thing}}"
 
 
 def test_render_accepts_pre_formatted_date_string(isolated_data_dir):
     out = prompts_mod.render(
-        "{{date}}", session_title="x", session_date="custom", transcript=""
+        "{{date}}", session_title="x", session_date="custom",
+        transcript="", include_system_prompts=False,
     )
     assert out == "custom"
 

@@ -153,3 +153,110 @@ def test_dialog_suggestions_hidden_with_clean_catalog(qt_app, store):
         assert dlg._suggestions_group.isHidden()  # noqa: SLF001
     finally:
         dlg.deleteLater()
+
+
+# ---- rich fields form (issue #51 Phase 1) ----------------------------------
+
+
+def test_rich_field_inputs_populate_from_selected_contact(qt_app, store):
+    """Selecting a contact whose rich fields are set must surface
+    those values in the form inputs."""
+    from meeting_notetaker.models.classification import ENRICH_SOURCE_OUTLOOK
+    bob = store.create_contact("Bob Smith")
+    store.update_contact_fields(
+        bob.id,
+        title="CEO",
+        company="Bobco",
+        department="Executive",
+        primary_email="bob@bobco.com",
+        phone="+1-555-0100",
+        source=ENRICH_SOURCE_OUTLOOK,
+    )
+    dlg = AddressBookDialog(store)
+    try:
+        dlg._list.setCurrentRow(0)  # noqa: SLF001
+        assert dlg._title_input.text() == "CEO"  # noqa: SLF001
+        assert dlg._company_input.text() == "Bobco"  # noqa: SLF001
+        assert dlg._department_input.text() == "Executive"  # noqa: SLF001
+        assert dlg._email_input.text() == "bob@bobco.com"  # noqa: SLF001
+        assert dlg._phone_input.text() == "+1-555-0100"  # noqa: SLF001
+        # Source badge present in the header text (superscript O for
+        # Outlook, per the 2026-05-28 switch from emoji to small caps).
+        header = dlg._detail_name.text()  # noqa: SLF001
+        assert "Bob Smith" in header
+        assert "ᴼ" in header, f"expected superscript O badge in header, got {header!r}"
+    finally:
+        dlg.deleteLater()
+
+
+def test_rich_field_edit_persists_to_store(qt_app, store):
+    """Typing in a form field + tabbing out should save the value
+    via editingFinished. We simulate by setting text + calling the
+    handler directly (Qt-event simulation is brittle in headless)."""
+    from meeting_notetaker.models.classification import ENRICH_SOURCE_MANUAL
+    bob = store.create_contact("Bob Smith")
+    dlg = AddressBookDialog(store)
+    try:
+        dlg._list.setCurrentRow(0)  # noqa: SLF001
+        # Simulate the user typing in the title field + tabbing out.
+        dlg._title_input.setText("VP of Engineering")  # noqa: SLF001
+        dlg._on_field_edited("title", "VP of Engineering")  # noqa: SLF001
+        # Persisted to the store.
+        updated = store.get_contact(bob.id)
+        assert updated.title == "VP of Engineering"
+        # Source is manual when the user edits via the form.
+        assert updated.last_enriched_source == ENRICH_SOURCE_MANUAL
+    finally:
+        dlg.deleteLater()
+
+
+def test_rich_field_empty_input_clears_value(qt_app, store):
+    """Clearing a field (empty string) stores NULL, not empty string,
+    so the enrichment paths' 'fill empty fields' logic treats it as
+    available for re-filling."""
+    bob = store.create_contact("Bob Smith")
+    store.update_contact_fields(bob.id, title="VP")
+    dlg = AddressBookDialog(store)
+    try:
+        dlg._list.setCurrentRow(0)  # noqa: SLF001
+        dlg._title_input.setText("")  # noqa: SLF001
+        dlg._on_field_edited("title", "")  # noqa: SLF001
+        assert store.get_contact(bob.id).title is None
+    finally:
+        dlg.deleteLater()
+
+
+def test_no_badge_for_unenriched_contact(qt_app, store):
+    """A contact with last_enriched_source = NULL renders just the
+    name; no trailing whitespace from a missing badge."""
+    store.create_contact("Plain Jane")
+    dlg = AddressBookDialog(store)
+    try:
+        dlg._list.setCurrentRow(0)  # noqa: SLF001
+        assert dlg._detail_name.text() == "Plain Jane"  # noqa: SLF001
+    finally:
+        dlg.deleteLater()
+
+
+def test_enter_key_closes_dialog(qt_app, store):
+    """Pressing Enter in the dialog closes it (reject). Matches the
+    Close button behavior so users can dismiss with the keyboard
+    after finishing a field (2026-05-28 feedback)."""
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtCore import QEvent
+    store.create_contact("Bob Smith")
+    dlg = AddressBookDialog(store)
+    closed = []
+    dlg.finished.connect(closed.append)
+    try:
+        dlg._list.setCurrentRow(0)  # noqa: SLF001
+        event = QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Return,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        dlg.keyPressEvent(event)
+        # finished signal carries the result code; reject() emits 0.
+        assert closed == [0]
+    finally:
+        dlg.deleteLater()

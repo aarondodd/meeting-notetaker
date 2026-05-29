@@ -41,6 +41,16 @@ log = logging.getLogger(__name__)
 class CalendarAttendee:
     name: str = ""
     email: str = ""
+    # v0.7.2 (issue #51): Outlook's AddressEntry exposes these for
+    # attendees resolved against the GAL (Global Address List) or
+    # the user's Outlook contacts. External invitees (vendor email
+    # addresses with no AddressEntry) get empty strings. Threaded
+    # through to resolve_attendees_batch + applied via
+    # update_contact_fields(fill_empty_only=True) so existing
+    # Contact values are never overwritten.
+    title: str = ""
+    company: str = ""
+    department: str = ""
 
     @property
     def display(self) -> str:
@@ -312,16 +322,248 @@ def fetch_remaining_today(now: Optional[datetime] = None) -> list[MeetingInfo]:
     return [m for m in candidates if m.end_time > now]
 
 
+def _looks_like_legacy_dn(value: str) -> bool:
+    """True when a string looks like an X.500 legacyExchangeDN.
+
+    Exchange recipients have an `Address` of the form
+    '/o=ExchangeLabs/ou=Exchange Administrative Group (.../cn=Recipients/cn=...'
+    -- not a useful email value to store. We detect + reject these so
+    the fallback path can hunt for a real SMTP address.
+    """
+    if not value:
+        return False
+    v = value.strip().lower()
+    return v.startswith("/o=") or v.startswith("/cn=")
+
+
+# MAPI property tags used as a fallback when GetExchangeUser() returns
+# None (cached Exchange mode without offline GAL, certain hybrid setups).
+# The Recipient's PropertyAccessor surfaces these via the proptag URL.
+# Reference: docs.microsoft.com/en-us/office/client-developer/outlook/
+# pia/how-to-display-properties-not-shown-in-the-outlook-object-model
+_PR_SMTP_ADDRESS = (
+    "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+)
+_PR_TITLE = "http://schemas.microsoft.com/mapi/proptag/0x3A17001F"
+_PR_COMPANY_NAME = "http://schemas.microsoft.com/mapi/proptag/0x3A16001F"
+_PR_DEPARTMENT_NAME = "http://schemas.microsoft.com/mapi/proptag/0x3A18001F"
+
+
+def _proptag_get(accessor, proptag: str) -> str:
+    try:
+        value = accessor.GetProperty(proptag)
+    except Exception:
+        return ""
+    return str(value or "").strip()
+
+
+def _resolve_recipient_fields(recipient) -> dict:
+    """Pull name / email / title / company / department from a Recipient.
+
+    Three-tier resolution because Exchange COM is uncooperative:
+
+      1. Call Recipient.Resolve() first. Unresolved recipients have an
+         AddressEntry but GetExchangeUser() returns None until the
+         recipient is resolved against the GAL. Resolve() is idempotent
+         on already-resolved recipients.
+
+      2. AddressEntry.GetExchangeUser() -- when it returns an object,
+         it's authoritative for both the SMTP address and the
+         JobTitle/CompanyName/Department triplet. AddressEntry.Address
+         for an Exchange recipient is the X.500 legacyExchangeDN
+         (/o=ExchangeLabs/.../cn=Recipients/cn=...), useless as an
+         email value.
+
+      3. PropertyAccessor fallback. Cached Exchange mode without an
+         offline GAL (or some hybrid setups) makes GetExchangeUser()
+         return None even for resolved Exchange users. The MAPI
+         PropertyAccessor on the Recipient itself exposes PR_SMTP_ADDRESS
+         + PR_TITLE + PR_COMPANY_NAME + PR_DEPARTMENT_NAME without
+         needing the ExchangeUser object.
+
+      4. AddressEntry direct fields as the final fallback for SMTP
+         external attendees who have a direct .Address email.
+
+    Final guard: any email value that still looks like an X.500 DN
+    gets dropped (better to record no email than a useless one).
+
+    Each step is wrapped so a flaky COM call never crashes the fetch.
+    Logs each recipient's resolution path at debug level so users
+    troubleshooting empty-fields can pinpoint where their environment
+    diverges.
+    """
+    name = str(getattr(recipient, "Name", "") or "").strip()
+    email = ""
+    title = ""
+    company = ""
+    department = ""
+    # Track which resolution paths fired for debug logging.
+    path_taken: list[str] = []
+
+    # Step 1: Resolve. Best-effort; if Resolve fails we still try
+    # the downstream paths since AddressEntry may already be populated.
+    try:
+        recipient.Resolve()
+        try:
+            resolved_flag = bool(getattr(recipient, "Resolved", False))
+            path_taken.append(f"resolved={resolved_flag}")
+        except Exception:
+            pass
+    except Exception:
+        path_taken.append("resolve_failed")
+
+    try:
+        ae = recipient.AddressEntry
+    except Exception:
+        ae = None
+    if ae is None:
+        path_taken.append("no_address_entry")
+        log.info(
+            "recipient resolve [%s]: %s", name, ",".join(path_taken) or "none",
+        )
+        return {
+            "name": name, "email": email,
+            "title": title, "company": company, "department": department,
+        }
+    # Diagnostic: capture the AddressEntry type so we can correlate
+    # empty-field cases with the AddressEntryUserType / Type combo
+    # they're coming from on FHB Exchange Online.
+    try:
+        ae_type = str(getattr(ae, "Type", "") or "")
+        if ae_type:
+            path_taken.append(f"type={ae_type}")
+    except Exception:
+        pass
+    try:
+        user_type = getattr(ae, "AddressEntryUserType", None)
+        if user_type is not None:
+            path_taken.append(f"user_type={user_type}")
+    except Exception:
+        pass
+
+    # Step 2: GetExchangeUser() -- authoritative when it works.
+    exchange_user = None
+    try:
+        exchange_user = ae.GetExchangeUser()
+    except Exception:
+        exchange_user = None
+    if exchange_user is not None:
+        path_taken.append("exchange_user")
+        try:
+            email = str(
+                getattr(exchange_user, "PrimarySmtpAddress", "") or ""
+            ).strip()
+        except Exception:
+            email = ""
+        try:
+            title = str(getattr(exchange_user, "JobTitle", "") or "").strip()
+        except Exception:
+            title = ""
+        try:
+            company = str(getattr(exchange_user, "CompanyName", "") or "").strip()
+        except Exception:
+            company = ""
+        try:
+            department = str(
+                getattr(exchange_user, "Department", "") or ""
+            ).strip()
+        except Exception:
+            department = ""
+
+    # Step 3a: Recipient.PropertyAccessor fallback for any field still
+    # empty. Works even when GetExchangeUser() returned None.
+    missing = not (email and title and company and department)
+    if missing:
+        accessor = None
+        try:
+            accessor = recipient.PropertyAccessor
+        except Exception:
+            accessor = None
+        if accessor is not None:
+            path_taken.append("recipient_pa")
+            if not email:
+                v = _proptag_get(accessor, _PR_SMTP_ADDRESS)
+                if v and not _looks_like_legacy_dn(v):
+                    email = v
+            if not title:
+                title = _proptag_get(accessor, _PR_TITLE)
+            if not company:
+                company = _proptag_get(accessor, _PR_COMPANY_NAME)
+            if not department:
+                department = _proptag_get(accessor, _PR_DEPARTMENT_NAME)
+
+    # Step 3b: AddressEntry.PropertyAccessor. Some Exchange Online +
+    # cached-mode configurations don't expose the proptags on the
+    # Recipient but do on the AddressEntry. Catches the case where
+    # GetExchangeUser() returns an object with empty fields AND the
+    # Recipient's PA also comes back blank.
+    missing = not (email and title and company and department)
+    if missing:
+        ae_accessor = None
+        try:
+            ae_accessor = ae.PropertyAccessor
+        except Exception:
+            ae_accessor = None
+        if ae_accessor is not None:
+            path_taken.append("ae_pa")
+            if not email:
+                v = _proptag_get(ae_accessor, _PR_SMTP_ADDRESS)
+                if v and not _looks_like_legacy_dn(v):
+                    email = v
+            if not title:
+                title = _proptag_get(ae_accessor, _PR_TITLE)
+            if not company:
+                company = _proptag_get(ae_accessor, _PR_COMPANY_NAME)
+            if not department:
+                department = _proptag_get(ae_accessor, _PR_DEPARTMENT_NAME)
+
+    # Step 4: direct AddressEntry fields. Last-resort for SMTP external
+    # attendees who never had an ExchangeUser to begin with.
+    if not email:
+        try:
+            raw_email = str(getattr(ae, "Address", "") or "").strip()
+        except Exception:
+            raw_email = ""
+        if raw_email and not _looks_like_legacy_dn(raw_email):
+            email = raw_email
+            path_taken.append("ae_address")
+    if not title:
+        try:
+            title = str(getattr(ae, "JobTitle", "") or "").strip()
+        except Exception:
+            title = ""
+    if not company:
+        try:
+            company = str(getattr(ae, "CompanyName", "") or "").strip()
+        except Exception:
+            company = ""
+    if not department:
+        try:
+            department = str(getattr(ae, "Department", "") or "").strip()
+        except Exception:
+            department = ""
+
+    # Final guard: never let an X.500 DN escape as an email value.
+    if _looks_like_legacy_dn(email):
+        email = ""
+
+    log.info(
+        "recipient resolve [%s]: paths=%s email=%r title=%r company=%r dept=%r",
+        name, ",".join(path_taken) or "none",
+        email or "", title or "", company or "", department or "",
+    )
+    return {
+        "name": name, "email": email,
+        "title": title, "company": company, "department": department,
+    }
+
+
 def _item_to_info(item) -> MeetingInfo:
     attendees: list[CalendarAttendee] = []
     try:
         for r in item.Recipients:
-            attendees.append(
-                CalendarAttendee(
-                    name=str(getattr(r, "Name", "") or "").strip(),
-                    email=str(getattr(r, "Address", "") or "").strip(),
-                )
-            )
+            fields = _resolve_recipient_fields(r)
+            attendees.append(CalendarAttendee(**fields))
     except Exception:
         log.debug("recipients parse failed", exc_info=True)
 

@@ -13,11 +13,17 @@ it's armed. Hiding the widget tears the overlay down cleanly.
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from PyQt6.QtCore import QRect, Qt
-from PyQt6.QtGui import QColor, QPainter, QPaintEvent, QPen
+from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QPaintEvent, QPen
 from PyQt6.QtWidgets import QWidget
+
+from .coord_translation import physical_rect_to_qt_logical_rect
+
+
+log = logging.getLogger(__name__)
 
 
 # Color + stroke width for the persistent outline. The same cyan the
@@ -52,18 +58,64 @@ class ArmedRegionOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # `region` is in PHYSICAL pixels (matches what mss captures
+        # from). Qt's setGeometry expects logical pixels -- convert
+        # using the DPR of the screen the region's top-left lives
+        # on. Issue #49 fix.
+        logical_region = physical_rect_to_qt_logical_rect(region)
         # Geometry expands by the stroke width so the line itself isn't
         # clipped at the rectangle's edge.
         bleed = _OUTLINE_WIDTH + 1
-        self.setGeometry(
-            region.x() - bleed,
-            region.y() - bleed,
-            region.width() + 2 * bleed,
-            region.height() + 2 * bleed,
+        target = QRect(
+            logical_region.x() - bleed,
+            logical_region.y() - bleed,
+            logical_region.width() + 2 * bleed,
+            logical_region.height() + 2 * bleed,
         )
+        # Diagnostic for the "overlay jumps to a different position"
+        # report (issue #49). Logs the input physical region, the
+        # converted Qt logical region, the target widget geometry,
+        # and which Qt screen the target lands on. The showEvent
+        # logs the actual geometry Qt landed on so any post-show
+        # drift is visible too.
+        tl_screen = QGuiApplication.screenAt(target.topLeft())
+        tl_dpr = tl_screen.devicePixelRatio() if tl_screen else None
+        log.info(
+            "ArmedRegionOverlay init: physical_region=(%d,%d,%dx%d) "
+            "logical_region=(%d,%d,%dx%d) target=(%d,%d,%dx%d) "
+            "screen=%s dpr=%s",
+            region.x(), region.y(), region.width(), region.height(),
+            logical_region.x(), logical_region.y(),
+            logical_region.width(), logical_region.height(),
+            target.x(), target.y(), target.width(), target.height(),
+            tl_screen.name() if tl_screen else "n/a",
+            f"{tl_dpr:.3f}" if tl_dpr is not None else "n/a",
+        )
+        self.setGeometry(target)
         self._inset_rect = QRect(
-            bleed, bleed, region.width(), region.height(),
+            bleed, bleed, logical_region.width(), logical_region.height(),
         )
+
+    def showEvent(self, event) -> None:
+        """Log the actual geometry Qt landed on after show.
+
+        Issue #49: on a 100%-scale monitor with a 125%-scale sibling,
+        the overlay's setGeometry input vs the painted position can
+        diverge -- Qt re-interprets coordinates when the widget is
+        first realized on a screen with a different DPR than the one
+        it was conceptually positioned over. Capturing actual_geo
+        here shows that drift directly in the log.
+        """
+        actual = self.geometry()
+        frame = self.frameGeometry()
+        log.info(
+            "ArmedRegionOverlay shown: actual_geo=(%d,%d,%dx%d) "
+            "frame_geo=(%d,%d,%dx%d) screen=%s",
+            actual.x(), actual.y(), actual.width(), actual.height(),
+            frame.x(), frame.y(), frame.width(), frame.height(),
+            (self.screen().name() if self.screen() else "n/a"),
+        )
+        super().showEvent(event)
 
     # ------------------------------------------------------------------
 

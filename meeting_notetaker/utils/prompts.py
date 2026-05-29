@@ -85,6 +85,56 @@ def _bundled_prompts_dir() -> Path:
     return resource_path("prompts")
 
 
+def _system_prompts_dir() -> Path:
+    """Issue #51 Phase 4: app-injected system prompts.
+
+    Distinct from the user-managed templates in `prompts/`. These
+    are appended to every render() output (when enabled) and aren't
+    seeded to the user's prompts directory -- they're internal to
+    the app and shouldn't be editable from the user's prompts UI.
+    """
+    return resource_path("system_prompts")
+
+
+def _load_system_prompt_bodies() -> list[str]:
+    """Return every system prompt body, sorted by filename.
+
+    Sorted for determinism: the prompt assembly should be stable
+    across runs so the cached behaviors (LLM seeing the same input
+    twice -> same response shape) hold.
+    """
+    sysdir = _system_prompts_dir()
+    if not sysdir.is_dir():
+        return []
+    bodies: list[str] = []
+    for p in sorted(sysdir.glob("*.md")):
+        try:
+            bodies.append(p.read_text(encoding="utf-8"))
+        except OSError:
+            # Skip unreadable system prompts rather than failing the
+            # whole synthesis. The miss surfaces as "no appendix
+            # extracted" which is recoverable.
+            continue
+    return bodies
+
+
+# Separator between the user's chosen template and any opt-in
+# auxiliary requests appended via the system-prompts dir.
+# Originally an HTML comment sentinel ("<!-- mn:system-prompts -->")
+# but that caused Claude to flag the appended content as embedded
+# prompt-injection -- the sentinel + the imperative tone read as
+# spoofed system instructions inside a transcript paste. Rewritten
+# 2026-05-29 as a plain blank-line separator; the appended content
+# itself is now first-person user voice ("Also, please also do X")
+# so Claude sees a coherent two-part user request instead of
+# user-text-plus-something-else. See issue #51 thread + the
+# attendee_details_appendix.md rewrite for the matching content fix.
+_SYSTEM_PROMPT_SEPARATOR = "\n\n"
+# Legacy alias retained for any external test that imports the old
+# name. New code should reference _SYSTEM_PROMPT_SEPARATOR.
+_SYSTEM_PROMPT_SENTINEL = _SYSTEM_PROMPT_SEPARATOR
+
+
 def seed_user_prompts(user_dir: Path | None = None) -> int:
     """Copy bundled prompt templates into the user directory if missing or stale.
 
@@ -149,6 +199,7 @@ def render(
     live_notes: str = "",
     attendees: list[str] | None = None,
     user_name: str = "",
+    include_system_prompts: bool = True,
 ) -> str:
     """Substitute the prompt placeholders.
 
@@ -186,7 +237,7 @@ def render(
     name = (user_name or "").strip()
     user_name_str = name or DEFAULT_USER_LABEL
     transcript_for_prompt = rewrite_user_label(transcript, name)
-    return (
+    rendered = (
         body
         .replace("{{session_title}}", session_title)
         .replace("{{date}}", date_str)
@@ -195,3 +246,13 @@ def render(
         .replace("{{attendees}}", attendees_str)
         .replace("{{user_name}}", user_name_str)
     )
+    if include_system_prompts:
+        system_bodies = _load_system_prompt_bodies()
+        if system_bodies:
+            rendered = (
+                rendered.rstrip()
+                + _SYSTEM_PROMPT_SEPARATOR
+                + "\n\n".join(b.strip() for b in system_bodies)
+                + "\n"
+            )
+    return rendered

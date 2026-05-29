@@ -232,3 +232,327 @@ def test_fetch_remaining_today_end_of_day_still_safe(monkeypatch):
     fetch_remaining_today(now=datetime(2026, 5, 17, 23, 59, 30))
     assert captured["end"].hour == 23
     assert captured["end"] >= captured["start"]
+
+
+# ---- _resolve_recipient_fields (2026-05-28) --------------------------------
+#
+# COM Recipient/AddressEntry/ExchangeUser are duck-typed via simple
+# Fake* classes here. The resolver is the only place we touch those
+# attributes, so end-to-end coverage at this layer is sufficient.
+
+
+class _FakeExchangeUser:
+    def __init__(
+        self, *,
+        primary_smtp="", job_title="", company="", department="",
+    ):
+        self.PrimarySmtpAddress = primary_smtp
+        self.JobTitle = job_title
+        self.CompanyName = company
+        self.Department = department
+
+
+class _FakeAddressEntry:
+    """AddressEntry stand-in.
+
+    `exchange_user` is the object returned by GetExchangeUser(); pass
+    None to simulate an SMTP/external entry where the call returns
+    None (in real COM it would raise or return None).
+    """
+
+    def __init__(
+        self, *,
+        address="", title="", company="", department="",
+        exchange_user=None, raise_on_get_exchange=False,
+    ):
+        self.Address = address
+        self.JobTitle = title
+        self.CompanyName = company
+        self.Department = department
+        self._exchange_user = exchange_user
+        self._raise_on_get_exchange = raise_on_get_exchange
+
+    def GetExchangeUser(self):
+        if self._raise_on_get_exchange:
+            raise RuntimeError("GetExchangeUser failed")
+        return self._exchange_user
+
+
+class _FakeRecipient:
+    def __init__(self, *, name="", address_entry=None):
+        self.Name = name
+        self.AddressEntry = address_entry
+
+
+def test_resolve_exchange_user_returns_primary_smtp_not_legacy_dn():
+    """For an Exchange recipient, the resolver pulls PrimarySmtpAddress
+    from GetExchangeUser() and ignores the X.500 AddressEntry.Address."""
+    legacy_dn = (
+        "/o=ExchangeLabs/ou=Exchange Administrative Group "
+        "(FYDIBOHF23SPDLT)/cn=Recipients/cn=user-guid"
+    )
+    rec = _FakeRecipient(
+        name="Bob Smith",
+        address_entry=_FakeAddressEntry(
+            address=legacy_dn,
+            exchange_user=_FakeExchangeUser(
+                primary_smtp="bob@fhb.com",
+                job_title="VP Engineering",
+                company="First Hawaiian Bank",
+                department="EDA",
+            ),
+        ),
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["name"] == "Bob Smith"
+    assert fields["email"] == "bob@fhb.com"
+    assert "/o=" not in fields["email"]
+    assert fields["title"] == "VP Engineering"
+    assert fields["company"] == "First Hawaiian Bank"
+    assert fields["department"] == "EDA"
+
+
+def test_resolve_smtp_external_uses_address_entry_address():
+    """External SMTP attendees: no ExchangeUser, but AddressEntry.Address
+    holds a real email. The resolver returns it verbatim."""
+    rec = _FakeRecipient(
+        name="External Vendor",
+        address_entry=_FakeAddressEntry(
+            address="vendor@external.com",
+            exchange_user=None,
+        ),
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["email"] == "vendor@external.com"
+    assert fields["title"] == ""
+    assert fields["company"] == ""
+
+
+def test_resolve_get_exchange_user_failure_falls_back():
+    """If GetExchangeUser raises, the resolver falls back to direct
+    AddressEntry fields. Email guard still drops X.500 DN values."""
+    rec = _FakeRecipient(
+        name="Bob",
+        address_entry=_FakeAddressEntry(
+            address="bob@bobco.com",  # SMTP-style, accepted
+            title="CEO",
+            company="Bobco",
+            raise_on_get_exchange=True,
+        ),
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["email"] == "bob@bobco.com"
+    assert fields["title"] == "CEO"
+    assert fields["company"] == "Bobco"
+
+
+def test_resolve_drops_legacy_dn_even_in_fallback():
+    """If GetExchangeUser fails AND AddressEntry.Address is a legacy
+    DN, the resolver returns empty email rather than a useless DN."""
+    legacy_dn = "/o=ExchangeLabs/ou=Group/cn=Recipients/cn=bob"
+    rec = _FakeRecipient(
+        name="Bob",
+        address_entry=_FakeAddressEntry(
+            address=legacy_dn,
+            raise_on_get_exchange=True,
+        ),
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["email"] == ""
+    assert fields["name"] == "Bob"  # name still recovered
+
+
+def test_resolve_handles_no_address_entry():
+    """Recipient with AddressEntry=None returns name-only fields."""
+    rec = _FakeRecipient(name="Bob", address_entry=None)
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields == {
+        "name": "Bob", "email": "",
+        "title": "", "company": "", "department": "",
+    }
+
+
+def test_looks_like_legacy_dn_recognizes_known_prefixes():
+    """The detector matches /o=, /O=, /cn=, /CN= prefixes; rejects
+    plain SMTP addresses and empty strings."""
+    f = outlook_calendar._looks_like_legacy_dn
+    assert f("/o=ExchangeLabs/ou=Group/cn=Recipients/cn=user") is True
+    assert f("/O=ExchangeLabs/...") is True
+    assert f("/cn=user") is True
+    assert f("/CN=user") is True
+    assert f("bob@fhb.com") is False
+    assert f("") is False
+    assert f(None) is False
+
+
+# ---- PropertyAccessor + Resolve paths (2026-05-28 followup) ----------------
+
+
+class _FakePropertyAccessor:
+    """Stand-in for Recipient.PropertyAccessor.
+
+    Maps proptag URLs -> returned values. Missing keys raise so the
+    real path's exception swallow is exercised.
+    """
+
+    def __init__(self, mapping=None):
+        self._mapping = mapping or {}
+
+    def GetProperty(self, proptag):
+        if proptag not in self._mapping:
+            raise RuntimeError("property not available")
+        return self._mapping[proptag]
+
+
+class _FakeRecipientWithResolve:
+    """Recipient stand-in that records whether Resolve() was called.
+
+    Test hook for the step-1 path that resolves unresolved recipients
+    against the GAL before any AddressEntry access.
+    """
+
+    def __init__(self, *, name="", address_entry=None, accessor=None):
+        self.Name = name
+        self.AddressEntry = address_entry
+        self.PropertyAccessor = accessor
+        self.resolve_calls = 0
+
+    def Resolve(self):
+        self.resolve_calls += 1
+
+
+def test_resolve_calls_recipient_resolve_first():
+    """Recipient.Resolve() runs before AddressEntry access so an
+    unresolved attendee gets a chance to be matched against the GAL."""
+    ae = _FakeAddressEntry(
+        exchange_user=_FakeExchangeUser(
+            primary_smtp="bob@fhb.com", job_title="VP",
+            company="FHB", department="EDA",
+        ),
+    )
+    rec = _FakeRecipientWithResolve(name="Bob", address_entry=ae)
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert rec.resolve_calls == 1
+    assert fields["email"] == "bob@fhb.com"
+    assert fields["title"] == "VP"
+
+
+def test_property_accessor_fills_when_exchange_user_returns_none():
+    """The known-bad path: GetExchangeUser() returns None (cached
+    Exchange / no offline GAL). PropertyAccessor fills the fields
+    via MAPI proptags so the user still gets enrichment."""
+    accessor = _FakePropertyAccessor({
+        outlook_calendar._PR_SMTP_ADDRESS: "bob@fhb.com",
+        outlook_calendar._PR_TITLE: "VP Engineering",
+        outlook_calendar._PR_COMPANY_NAME: "First Hawaiian Bank",
+        outlook_calendar._PR_DEPARTMENT_NAME: "EDA",
+    })
+    ae = _FakeAddressEntry(
+        address="/o=ExchangeLabs/ou=g/cn=r/cn=bob",  # X.500 garbage
+        exchange_user=None,  # the failure mode we're testing
+    )
+    rec = _FakeRecipientWithResolve(
+        name="Bob", address_entry=ae, accessor=accessor,
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["email"] == "bob@fhb.com"
+    assert "/o=" not in fields["email"]
+    assert fields["title"] == "VP Engineering"
+    assert fields["company"] == "First Hawaiian Bank"
+    assert fields["department"] == "EDA"
+
+
+def test_property_accessor_fills_missing_fields_only():
+    """When ExchangeUser provided some fields but not all, the
+    PropertyAccessor backs only the empties -- doesn't overwrite."""
+    accessor = _FakePropertyAccessor({
+        outlook_calendar._PR_TITLE: "PROPACCESSOR_TITLE",  # would overwrite
+        outlook_calendar._PR_COMPANY_NAME: "PROPACCESSOR_COMPANY",
+        outlook_calendar._PR_DEPARTMENT_NAME: "EDA",  # fills empty
+    })
+    ae = _FakeAddressEntry(
+        exchange_user=_FakeExchangeUser(
+            primary_smtp="bob@fhb.com",
+            job_title="VP",  # already set, must NOT be overwritten
+            company="FHB",
+            department="",  # empty, PropertyAccessor fills
+        ),
+    )
+    rec = _FakeRecipientWithResolve(
+        name="Bob", address_entry=ae, accessor=accessor,
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["title"] == "VP"  # preserved
+    assert fields["company"] == "FHB"  # preserved
+    assert fields["department"] == "EDA"  # filled
+
+
+def test_property_accessor_skips_legacy_dn_email():
+    """If the PropertyAccessor returns a legacy DN (shouldn't happen
+    in practice, but defensive), the guard drops it rather than
+    accepting a useless string."""
+    accessor = _FakePropertyAccessor({
+        outlook_calendar._PR_SMTP_ADDRESS: "/o=ExchangeLabs/ou=g/cn=r/cn=bob",
+    })
+    ae = _FakeAddressEntry(exchange_user=None)
+    rec = _FakeRecipientWithResolve(
+        name="Bob", address_entry=ae, accessor=accessor,
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["email"] == ""
+
+
+def test_resolve_handles_resolve_call_raising():
+    """Recipient.Resolve() raises (offline, GAL unavailable). The
+    downstream paths still run and may still recover fields."""
+    class _RaisingRecipient:
+        Name = "Bob"
+        def __init__(self):
+            self.AddressEntry = _FakeAddressEntry(
+                exchange_user=_FakeExchangeUser(
+                    primary_smtp="bob@fhb.com", job_title="VP",
+                ),
+            )
+        def Resolve(self):
+            raise RuntimeError("offline")
+
+    fields = outlook_calendar._resolve_recipient_fields(_RaisingRecipient())
+    assert fields["email"] == "bob@fhb.com"
+    assert fields["title"] == "VP"
+
+
+def test_address_entry_property_accessor_fills_when_others_empty():
+    """When GetExchangeUser() returns an object with empty fields AND
+    Recipient.PropertyAccessor also comes back blank, the
+    AddressEntry.PropertyAccessor is the last automatic fallback.
+
+    This is the FHB Exchange Online + cached-mode failure mode Aaron
+    hit on 2026-05-28 -- ExchangeUser came back but with empty
+    title/company, Recipient.PA also empty, ae_pa fills in."""
+    # ExchangeUser exists but every field is empty/None.
+    eu = _FakeExchangeUser(
+        primary_smtp="", job_title="", company="", department="",
+    )
+    ae_accessor = _FakePropertyAccessor({
+        outlook_calendar._PR_SMTP_ADDRESS: "bob@fhb.com",
+        outlook_calendar._PR_TITLE: "VP Engineering",
+        outlook_calendar._PR_COMPANY_NAME: "First Hawaiian Bank",
+        outlook_calendar._PR_DEPARTMENT_NAME: "EDA",
+    })
+
+    class _AEWithPA(_FakeAddressEntry):
+        def __init__(self, *args, ae_accessor=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.PropertyAccessor = ae_accessor
+
+    ae = _AEWithPA(exchange_user=eu, ae_accessor=ae_accessor)
+    # Recipient PA returns nothing -- the gap the ae_pa fills.
+    empty_accessor = _FakePropertyAccessor({})
+    rec = _FakeRecipientWithResolve(
+        name="Bob", address_entry=ae, accessor=empty_accessor,
+    )
+    fields = outlook_calendar._resolve_recipient_fields(rec)
+    assert fields["email"] == "bob@fhb.com"
+    assert fields["title"] == "VP Engineering"
+    assert fields["company"] == "First Hawaiian Bank"
+    assert fields["department"] == "EDA"

@@ -8,6 +8,7 @@ import logging
 import secrets
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -635,6 +636,15 @@ class MainApp(QObject):
         # tight markdown.
         from .automation.markdown_normalize import normalize_synthesis_markdown
         markdown = normalize_synthesis_markdown(markdown)
+        # Parse + apply the LLM-extracted attendee details appendix
+        # (issue #51 Phase 4). Done BEFORE save_notes so the parsed
+        # data is independent of the save path's success. Strip
+        # behavior is gated on a config flag; default keeps the
+        # appendix visible so the user can see what was extracted.
+        self._apply_attendee_details_appendix(session_id, markdown)
+        if self.config.synthesis.strip_attendee_appendix:
+            from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
+            markdown = strip_appendix(markdown)
         try:
             archive_path = TranscriptStore(session_id).save_notes(
                 markdown, archive_existing=True
@@ -782,21 +792,23 @@ class MainApp(QObject):
         except ValueError:
             when = datetime.now().astimezone()
 
-        # Pick the prompt template based on the session's saved
-        # choice (set via the SessionView dropdown), falling back to
-        # the bundled "default" template when the session has no
-        # explicit selection. Per-session choice persists in
-        # metadata.json.
-        chosen_name = store.read_prompt_template_name()
+        # Pick the prompt template using the three-tier fallback:
+        # 1. session's saved choice (SessionView dropdown)
+        # 2. global Settings default_template_name
+        # 3. bundled "default" template (or first available)
         templates = prompts_mod.list_templates()
+
+        def _find(name: str):
+            return next((t for t in templates if t.name == name), None)
+
         chosen = None
+        chosen_name = store.read_prompt_template_name()
         if chosen_name:
-            chosen = next((t for t in templates if t.name == chosen_name), None)
+            chosen = _find(chosen_name)
+        if chosen is None and self.config.synthesis.default_template_name:
+            chosen = _find(self.config.synthesis.default_template_name)
         if chosen is None:
-            chosen = next(
-                (t for t in templates if t.name == "default"),
-                templates[0] if templates else None,
-            )
+            chosen = _find("default") or (templates[0] if templates else None)
         if chosen is None:
             QMessageBox.warning(
                 self.window, "Synthesis Automation",
@@ -810,6 +822,9 @@ class MainApp(QObject):
             transcript=transcript,
             live_notes=live_notes,
             user_name=self.config.ui.user_name,
+            include_system_prompts=(
+                self.config.synthesis.auto_extract_attendee_details
+            ),
         )
 
         request_id = secrets.token_hex(8)
@@ -1046,8 +1061,6 @@ class MainApp(QObject):
         sv.add_topic_requested.connect(self._on_add_topic_requested)
         sv.remove_topic_requested.connect(self._on_remove_topic_requested)
         sv.accept_topic_requested.connect(self._on_accept_topic_requested)
-        sv.add_person_requested.connect(self._on_add_person_requested)
-        sv.remove_person_requested.connect(self._on_remove_person_requested)
         sv.set_series_requested.connect(self._on_set_series_requested)
         sv.highlights_changed.connect(self._on_session_highlights_changed)
 
@@ -1091,6 +1104,9 @@ class MainApp(QObject):
         sv.screencap_insert_clicked.connect(self._on_screencap_insert)
         sv.screencap_auto_toggled.connect(self._on_auto_capture_toggled)
         sv.delete_screenshot_clicked.connect(self._on_delete_screenshot)
+        # v0.7.2 (#51 Phase 3): drawer row-click opens the Address
+        # Book filtered to that contact.
+        sv.contact_clicked_in_drawer.connect(self._on_drawer_contact_clicked)
         # Transcript playback wiring. The player bar fires play / pause /
         # seek; MainApp owns the single AudioPlayer and routes them.
         sv.transcript_play_clicked.connect(self._on_transcript_play)
@@ -1325,6 +1341,10 @@ class MainApp(QObject):
             content.template_names, selected=content.selected_template,
         )
         sv.set_attendee_names(parse_attendees(content.live_notes))
+        # Push the session's Contact list into the attendee-details
+        # drawer (issue #51 Phase 3). Cheap query; refreshed again
+        # whenever attendee sync re-runs (see _sync_attendees_to_people).
+        self._refresh_session_contacts_in_drawer(content.session_id)
         # Highlights: total_ms is 0 until the audio player finishes
         # its own async load and fires set_player_total_ms. The
         # highlight bar disables interaction cleanly at total_ms=0
@@ -1536,12 +1556,17 @@ class MainApp(QObject):
         4. Whatever attendee.display falls back to (raw email or
            "(unknown)").
         """
-        # Step 1: explicit name.
+        # Step 1: explicit name. Even when we have a name, we still
+        # run email-based contact resolution + Outlook enrichment
+        # (issue #51 Phase 2) so the Contact's title/company/etc.
+        # get populated. Resolution + enrichment are best-effort;
+        # display name comes back from the name field directly.
         name = (getattr(attendee, "name", "") or "").strip()
+        email = (getattr(attendee, "email", "") or "").strip()
+        self._enrich_contact_for_calendar_attendee(attendee, email)
         if name:
             return name
-        # Step 2 + 3: email-driven resolution.
-        email = (getattr(attendee, "email", "") or "").strip()
+        # Step 2 + 3: email-driven resolution for the display name.
         if email and self.classification is not None:
             try:
                 from .utils.contact_resolution import (  # noqa: PLC0415
@@ -1562,6 +1587,52 @@ class MainApp(QObject):
                 )
         # Step 4: fall back to the existing display logic.
         return getattr(attendee, "display", "") or email or ""
+
+    def _enrich_contact_for_calendar_attendee(self, attendee, email: str) -> None:
+        """Apply Outlook-pulled rich fields to the Contact, if any.
+
+        Issue #51 Phase 2. CalendarAttendee carries title/company/
+        department from the Outlook AddressEntry (GAL or user
+        contacts). Resolve the Contact via email when we have one
+        OR by name otherwise, then call
+        enrich_contact_from_calendar_attendee with fill_empty_only=True.
+        Existing user values stay intact; new values populate NULL
+        fields and flip last_enriched_source to 'outlook'.
+
+        Best-effort: any exception falls through silently so a
+        calendar-seed flow never errors over enrichment.
+        """
+        if self.classification is None:
+            return
+        # Need either a name or email to find/create the Contact.
+        name = (getattr(attendee, "name", "") or "").strip()
+        if not name and not email:
+            return
+        try:
+            from .utils.contact_resolution import (  # noqa: PLC0415
+                enrich_contact_from_calendar_attendee,
+                resolve_calendar_attendee,
+            )
+            # 2026-05-28: resolve_calendar_attendee unifies email +
+            # name lookup AND auto-merges any pre-existing duplicate
+            # Contact rows for the same person into one canonical
+            # row. Prior implementation called resolve_attendee_email
+            # in isolation, which created stub Contacts named after
+            # the email local-part; the attendee-by-name sync then
+            # created a second bare Contact. Both paths now route
+            # through the same resolver.
+            result = resolve_calendar_attendee(
+                self.classification, name=name, email=email,
+            )
+            if result is None:
+                return
+            enrich_contact_from_calendar_attendee(
+                self.classification, result.contact.id, attendee,
+            )
+        except Exception:
+            log.exception(
+                "calendar enrichment failed for %r / %r", name, email,
+            )
 
     def _align_created_at_to_meeting(
         self, session_id: str, info: MeetingInfo
@@ -1705,6 +1776,14 @@ class MainApp(QObject):
             ).astimezone()
         except ValueError:
             when = datetime.now().astimezone()
+        # Pre-selection fallback chain: per-session override (set via
+        # the SessionView dropdown) -> global Settings default ->
+        # bundled "default.md". The dialog itself does its own lookup
+        # by name, so we just hand it the best candidate.
+        initial_name = (
+            store.read_prompt_template_name()
+            or self.config.synthesis.default_template_name
+        )
         dialog = GeneratePromptDialog(
             session_title=session.title,
             session_date=when,
@@ -1712,10 +1791,10 @@ class MainApp(QObject):
             live_notes=live_notes,
             user_name=self.config.ui.user_name,
             templates=prompts_mod.list_templates(),
-            # Pre-select the session's saved template (set via the
-            # SessionView dropdown). User can still override per-
-            # generation by changing the picker inside this dialog.
-            initial_template_name=store.read_prompt_template_name(),
+            initial_template_name=initial_name,
+            include_system_prompts=(
+                self.config.synthesis.auto_extract_attendee_details
+            ),
             parent=self.window,
         )
         dialog.exec()
@@ -2277,11 +2356,10 @@ class MainApp(QObject):
             # Region was disarmed while the timer was pending; stop.
             self._stop_auto_capture(session_id)
             return
-        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
         from .screencap.dedup import dhash_path, is_dedup_match  # noqa: PLC0415
         from .utils.paths import session_screenshots_dir  # noqa: PLC0415
         dst_dir = session_screenshots_dir(session_id)
-        saved = capture_region_to_file(region, dst_dir)
+        saved = self._capture_region_hiding_overlay(region, dst_dir)
         if saved is None:
             log.warning("auto-capture: capture_region_to_file returned None")
             return
@@ -2323,11 +2401,10 @@ class MainApp(QObject):
                 timeout_ms=5000,
             )
             return
-        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
         from .screencap.dedup import dhash_path  # noqa: PLC0415
         from .utils.paths import session_screenshots_dir  # noqa: PLC0415
         dst_dir = session_screenshots_dir(session_id)
-        saved = capture_region_to_file(region, dst_dir)
+        saved = self._capture_region_hiding_overlay(region, dst_dir)
         if saved is None:
             self.window.status(
                 "Screen capture failed (see log).", timeout_ms=5000,
@@ -2351,6 +2428,35 @@ class MainApp(QObject):
         self.window.status(
             f"Screenshot saved: {saved.name}", timeout_ms=4000,
         )
+
+    def _capture_region_hiding_overlay(self, region, dst_dir):
+        """Hide the armed-region outline, take the screenshot, restore.
+
+        mss reads the OS-composited screen state, which includes our
+        cyan ArmedRegionOverlay outline -- so without this dance the
+        outline ends up in every captured PNG. Hiding the widget
+        before the grab + processing the hide event + a short sleep
+        gives the Windows compositor a frame to redraw the area
+        underneath. Restoring after the grab leaves the on-screen
+        outline as before for the rest of the armed session.
+        """
+        from .screencap.capture import capture_region_to_file  # noqa: PLC0415
+        overlay = self._armed_region_overlay
+        was_visible = overlay is not None and overlay.isVisible()
+        if was_visible:
+            overlay.hide()
+            QApplication.processEvents()
+            # ~50 ms gives the OS compositor a frame to repaint the
+            # region underneath the overlay before mss's BitBlt
+            # pulls the screen state. Shorter intervals occasionally
+            # leave a ghost on Windows; 50 ms is the smallest
+            # reliable value we've found in practice.
+            time.sleep(0.05)
+        try:
+            return capture_region_to_file(region, dst_dir)
+        finally:
+            if was_visible and overlay is not None:
+                overlay.show()
 
     def _on_delete_screenshot(self, session_id: str, path) -> None:
         try:
@@ -2912,6 +3018,18 @@ class MainApp(QObject):
         except ValueError:
             session_when = None
         sdir = session_dir(session_id)
+        # v0.7.2 #51 Phase 5: fetch the session's linked Contacts so the
+        # PDF render path can swap the Attendees bullet list for a rich
+        # table when any contact has detail fields populated.
+        session_contacts_for_pdf: list = []
+        if self.classification is not None:
+            try:
+                session_contacts_for_pdf = [
+                    sc.contact
+                    for sc in self.classification.contacts_for_session(session_id)
+                ]
+            except Exception:
+                log.exception("contact fetch failed for export PDF: %s", session_id)
         notes_pdf_path = None
         synthesis_pdf_path = None
         try:
@@ -2924,6 +3042,7 @@ class MainApp(QObject):
                     session_title=session.title or "session",
                     tab_label="My Notes",
                     session_date=session_when,
+                    session_contacts=session_contacts_for_pdf,
                 )
             if synthesis_md.strip():
                 synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
@@ -2934,6 +3053,7 @@ class MainApp(QObject):
                     session_title=session.title or "session",
                     tab_label="Synthesis",
                     session_date=session_when,
+                    session_contacts=session_contacts_for_pdf,
                 )
         except Exception:
             log.exception("PDF pre-render failed for %s", session_id)
@@ -3336,6 +3456,125 @@ class MainApp(QObject):
             )
         except Exception:
             log.exception("attendee sync failed for %s", session_id)
+            return
+        # Push the resolved contacts into the attendee-details drawer
+        # so the table refreshes inline as the user edits My Notes.
+        # Issue #51 Phase 3.
+        if (
+            self.window.session_view._session is not None  # noqa: SLF001
+            and self.window.session_view._session.id == session_id  # noqa: SLF001
+        ):
+            self._refresh_session_contacts_in_drawer(session_id)
+
+    def _apply_attendee_details_appendix(self, session_id: str, markdown: str) -> None:
+        """Parse + apply the LLM "Attendee Details" appendix.
+
+        Issue #51 Phase 4. Resolves each appendix entry's name to a
+        Contact via the same resolver attendee-list typing uses,
+        then fills missing rich fields via update_contact_fields
+        with fill_empty_only=True + source=llm.
+
+        Best-effort; any exception logs + returns -- the synthesis
+        save proceeds regardless.
+        """
+        if self.classification is None:
+            return
+        if not self.config.synthesis.auto_extract_attendee_details:
+            return
+        try:
+            from .models.classification import ENRICH_SOURCE_LLM  # noqa: PLC0415
+            from .utils.attendee_appendix import parse_appendix  # noqa: PLC0415
+            from .utils.contact_resolution import (  # noqa: PLC0415
+                resolve_attendee_email, resolve_attendee_text,
+            )
+            entries = parse_appendix(markdown)
+            if not entries:
+                return
+            applied_count = 0
+            for entry in entries:
+                # Prefer email-based resolution when the LLM gave us
+                # an email -- it's the most unambiguous identifier.
+                result = None
+                if entry.email:
+                    result = resolve_attendee_email(self.classification, entry.email)
+                if result is None and entry.name:
+                    result = resolve_attendee_text(self.classification, entry.name)
+                if result is None:
+                    continue
+                fields: dict[str, str] = {}
+                if entry.title:
+                    fields["title"] = entry.title
+                if entry.company:
+                    fields["company"] = entry.company
+                if entry.department:
+                    fields["department"] = entry.department
+                if entry.email:
+                    fields["primary_email"] = entry.email
+                if entry.phone:
+                    fields["phone"] = entry.phone
+                if not fields:
+                    continue
+                self.classification.update_contact_fields(
+                    result.contact.id,
+                    source=ENRICH_SOURCE_LLM,
+                    fill_empty_only=True,
+                    **fields,
+                )
+                applied_count += 1
+            if applied_count:
+                log.info(
+                    "attendee appendix applied: %d entries for session %s",
+                    applied_count, session_id,
+                )
+        except Exception:
+            log.exception(
+                "attendee appendix application failed for %s", session_id,
+            )
+
+    def _refresh_session_contacts_in_drawer(self, session_id: str) -> None:
+        """Pull the session's linked Contacts + push them into the
+        SessionView's drawer widgets (issue #51 Phase 3).
+
+        Used both on session-select (initial paint) and after
+        attendee sync (live updates while the user types in My Notes).
+        Cheap query; called on every keystroke in the worst case
+        but bounded by the My Notes debounce so it doesn't fire
+        more than a few times a second.
+        """
+        if self.classification is None:
+            return
+        try:
+            session_contacts = self.classification.contacts_for_session(
+                session_id,
+            )
+            contacts = [sc.contact for sc in session_contacts]
+        except Exception:
+            log.exception("drawer refresh failed for %s", session_id)
+            return
+        self.window.session_view.set_session_contacts(contacts)
+
+    def _on_drawer_contact_clicked(self, contact_id: int) -> None:
+        """Open the Address Book filtered to a specific contact
+        (issue #51 Phase 3). Bridges the drawer's row-click signal
+        through to the existing _on_address_book handler with a
+        pre-selected contact id."""
+        if self.classification is None:
+            return
+        speaker_store = open_speaker_store()
+        try:
+            dialog = AddressBookDialog(
+                self.classification, parent=self.window,
+                speaker_store=speaker_store,
+            )
+            dialog.select_contact(contact_id)
+            dialog.exec()
+        finally:
+            speaker_store.close()
+        # After the dialog closes the drawer may need to reflect
+        # any field edits the user made.
+        sv = self.window.session_view
+        if sv._session is not None:  # noqa: SLF001
+            self._refresh_session_contacts_in_drawer(sv._session.id)  # noqa: SLF001
 
     def _extract_topics_for_session(self, session_id: str, body: str) -> None:
         """Run the deterministic extractor over synthesis text + push
@@ -3491,36 +3730,6 @@ class MainApp(QObject):
             self.classification.set_topic_accepted(session_id, topic_id, True)
         except Exception:
             log.exception("accept_topic failed for %s/%s", session_id, topic_id)
-        self._refresh_session_classification(session_id)
-
-    def _on_add_person_requested(self, session_id: str, name: str) -> None:
-        if self.classification is None or not name:
-            return
-        try:
-            # Manual chip-bar add: same smart resolution as the
-            # attendee-sync path so a typed "BS" hits the Bob Smith
-            # Contact via its alias rather than creating a new
-            # "BS" Contact.
-            from .utils.contact_resolution import resolve_attendee_text  # noqa: PLC0415
-            result = resolve_attendee_text(
-                self.classification, name, source=SOURCE_MANUAL,
-            )
-            if result is not None:
-                self.classification.add_session_contact(
-                    session_id, result.contact.id, source=SOURCE_MANUAL,
-                )
-        except Exception:
-            log.exception("add_person failed for %s/%s", session_id, name)
-        self._refresh_session_classification(session_id)
-        self._refresh_classification_choices()
-
-    def _on_remove_person_requested(self, session_id: str, person_id: int) -> None:
-        if self.classification is None:
-            return
-        try:
-            self.classification.remove_session_contact(session_id, person_id)
-        except Exception:
-            log.exception("remove_person failed for %s/%s", session_id, person_id)
         self._refresh_session_classification(session_id)
 
     def _on_set_series_requested(self, session_id: str, series_name: str) -> None:

@@ -684,6 +684,58 @@ class SettingsDialog(QDialog):
         )
         prompts_blurb.setWordWrap(True)
         prompts_layout.addWidget(prompts_blurb)
+
+        # Default template picker. Sessions that don't have a per-session
+        # template override (set via the SessionView dropdown) use this
+        # value. Blank entry means "use the bundled default.md".
+        default_row = QHBoxLayout()
+        default_row.addWidget(QLabel("Default template:", self))
+        self._default_template_picker = QComboBox(self)
+        self._default_template_picker.addItem(
+            "default (bundled generic template)", "",
+        )
+        try:
+            from ..utils import prompts as _prompts_mod  # noqa: PLC0415
+            for tpl in _prompts_mod.list_templates():
+                self._default_template_picker.addItem(tpl.display_name, tpl.name)
+        except Exception:
+            # If the prompts folder isn't readable for some reason, leave
+            # the picker with just the bundled-default fallback entry.
+            pass
+        current_default = self._config.synthesis.default_template_name or ""
+        idx = self._default_template_picker.findData(current_default)
+        if idx >= 0:
+            self._default_template_picker.setCurrentIndex(idx)
+        self._default_template_picker.setToolTip(
+            "Used by new sessions that haven't picked a template via the "
+            "session view's Template dropdown."
+        )
+        default_row.addWidget(self._default_template_picker, 1)
+        prompts_layout.addLayout(default_row)
+
+        # Attendee details extraction toggle (issue #51 Phase 4).
+        # Off by default -- the request appends a paragraph asking the
+        # LLM to also extract per-attendee details into a JSON appendix
+        # the app parses. Aaron's 2026-05-29 feedback: keep this opt-in
+        # since Outlook calendar enrichment already covers the common
+        # case and the appended ask adds prompt bulk.
+        self._extract_attendees = QCheckBox(
+            "Ask the LLM to also extract attendee details (title / "
+            "company / email / phone) into a structured appendix",
+            self,
+        )
+        self._extract_attendees.setChecked(
+            self._config.synthesis.auto_extract_attendee_details
+        )
+        self._extract_attendees.setToolTip(
+            "When ON, every synthesis prompt includes a paragraph "
+            "asking the LLM to pull per-attendee details out of the "
+            "meeting content and emit a final '## Attendee Details "
+            "(auto-extracted)' JSON section. The app reads that and "
+            "fills in any Contact fields you don't already have."
+        )
+        prompts_layout.addWidget(self._extract_attendees)
+
         prompts_row = QHBoxLayout()
         self._open_prompts_btn = QPushButton("Open Prompts Folder", self)
         self._open_prompts_btn.clicked.connect(self._open_prompts_folder)
@@ -742,6 +794,12 @@ class SettingsDialog(QDialog):
         )
         self._config.synthesis.claude_project_id = (
             self._claude_project_id.text().strip()
+        )
+        self._config.synthesis.auto_extract_attendee_details = (
+            self._extract_attendees.isChecked()
+        )
+        self._config.synthesis.default_template_name = (
+            self._default_template_picker.currentData() or ""
         )
         self.accept()
 

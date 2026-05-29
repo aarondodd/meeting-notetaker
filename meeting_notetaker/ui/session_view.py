@@ -42,6 +42,7 @@ from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
 from ..models.highlights import HighlightSet
 from .attachments_tab import AttachmentsTab
+from .attendee_details_drawer import AttendeeDetailsDrawer
 from .attendee_sidebar import AttendeeSidebar
 from .classification_bar import ClassificationBar
 from .find_bar import FindBar
@@ -108,8 +109,6 @@ class SessionView(QWidget):
     add_topic_requested = pyqtSignal(str, str)            # session_id, name
     remove_topic_requested = pyqtSignal(str, int)         # session_id, topic_id
     accept_topic_requested = pyqtSignal(str, int)         # session_id, topic_id
-    add_person_requested = pyqtSignal(str, str)           # session_id, name
-    remove_person_requested = pyqtSignal(str, int)        # session_id, person_id
     set_series_requested = pyqtSignal(str, str)           # session_id, series_name ("" clears)
     # Highlight bar mutations (v0.7.0+). The bar carries the whole
     # HighlightSet to keep the signal-fired writes atomic.
@@ -129,6 +128,10 @@ class SessionView(QWidget):
     screencap_capture_clicked = pyqtSignal(str)           # session_id
     screencap_insert_clicked = pyqtSignal(str)            # session_id
     screencap_auto_toggled = pyqtSignal(str, bool)        # session_id, enabled
+    # v0.7.2 (issue #51 Phase 3): user clicked a contact in the
+    # attendee-details drawer; MainApp opens the Address Book
+    # filtered to that contact.
+    contact_clicked_in_drawer = pyqtSignal(int)           # contact_id
     # Right-click on a Slides thumbnail / full view: delete the file.
     delete_screenshot_clicked = pyqtSignal(str, Path)     # session_id, path
     # Transcript-pane playback control. The bar fires these for the
@@ -172,6 +175,11 @@ class SessionView(QWidget):
         # click Stop or the recording ends. Drives both the toggle
         # button text and the My Notes sidebar enablement.
         self._screencap_armed = False
+        # Cached session-contact list for the PDF rich-table option
+        # (issue #51 Phase 5). Populated by set_session_contacts;
+        # _build_print_document reads it to decide whether to swap
+        # the bullet list with a Markdown table.
+        self._session_contacts: list = []
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -370,7 +378,20 @@ class SessionView(QWidget):
             "bulleted list. Click Preview to render Markdown, Edit to resume writing."
         )
         self._live_notes_editor.textChanged.connect(self._on_live_notes_changed)
-        self._tabs.addTab(self._live_notes_editor, "My Notes")
+        # v0.7.2 (issue #51 Phase 3): wrap the My Notes editor in a
+        # page that carries the attendee-details drawer above it.
+        # The page becomes the tab widget; tab-comparison sites
+        # below use _live_notes_page (the wrapper) rather than the
+        # editor directly.
+        self._live_notes_drawer = AttendeeDetailsDrawer(self)
+        self._live_notes_drawer.contact_clicked.connect(self._on_drawer_contact_clicked)
+        self._live_notes_page = QWidget(self)
+        live_notes_layout = QVBoxLayout(self._live_notes_page)
+        live_notes_layout.setContentsMargins(0, 0, 0, 0)
+        live_notes_layout.setSpacing(2)
+        live_notes_layout.addWidget(self._live_notes_drawer)
+        live_notes_layout.addWidget(self._live_notes_editor, 1)
+        self._tabs.addTab(self._live_notes_page, "My Notes")
 
         # Synthesis is editable (v0.5). Uses LiveNotesWidget for the same
         # Markdown edit/preview toggle + image-paste affordances as the
@@ -384,7 +405,17 @@ class SessionView(QWidget):
             "source, Preview to read it back rendered. Saved continuously."
         )
         self._notes_view.textChanged.connect(self._on_notes_changed)
-        self._tabs.addTab(self._notes_view, "Synthesis")
+        # Same wrap pattern for the Synthesis tab; the drawer
+        # appears above the LLM-synthesized notes editor too.
+        self._notes_drawer = AttendeeDetailsDrawer(self)
+        self._notes_drawer.contact_clicked.connect(self._on_drawer_contact_clicked)
+        self._notes_page = QWidget(self)
+        notes_layout = QVBoxLayout(self._notes_page)
+        notes_layout.setContentsMargins(0, 0, 0, 0)
+        notes_layout.setSpacing(2)
+        notes_layout.addWidget(self._notes_drawer)
+        notes_layout.addWidget(self._notes_view, 1)
+        self._tabs.addTab(self._notes_page, "Synthesis")
 
         # Slides: per-session captured screenshots. Thumbnail grid +
         # full-view nav with right-click Copy / Delete / Open. Sits
@@ -616,8 +647,6 @@ class SessionView(QWidget):
         self._classification_bar.add_topic_requested.connect(self.add_topic_requested.emit)
         self._classification_bar.remove_topic_requested.connect(self.remove_topic_requested.emit)
         self._classification_bar.accept_topic_requested.connect(self.accept_topic_requested.emit)
-        self._classification_bar.add_person_requested.connect(self.add_person_requested.emit)
-        self._classification_bar.remove_person_requested.connect(self.remove_person_requested.emit)
         self._classification_bar.set_series_requested.connect(self.set_series_requested.emit)
 
         self._set_buttons_for_state(STATE_NEW, has_transcript=False, has_notes=False)
@@ -737,6 +766,34 @@ class SessionView(QWidget):
         whenever the live_notes '# Attendees' section changes."""
         self._attendee_sidebar.set_attendees(names)
 
+    def set_session_contacts(self, contacts) -> None:
+        """Push the resolved Contact list into the My Notes + Synthesis
+        attendee-details drawers. Issue #51 Phase 3.
+
+        MainApp calls this whenever the session's attendee links
+        change (after a resolve pass) -- typically after
+        _sync_attendees_to_people, after a calendar seed, or after
+        the LLM appendix extraction fills in fields.
+
+        Also cached on the session view for the PDF-export rich-table
+        rule (#51 Phase 5): _build_print_document checks this list to
+        decide whether the printable markdown's Attendees section
+        should be a Markdown table or the original bullet list.
+        """
+        contacts = list(contacts or [])
+        self._session_contacts = contacts
+        self._live_notes_drawer.set_contacts(contacts)
+        self._notes_drawer.set_contacts(contacts)
+
+    def _on_drawer_contact_clicked(self, contact_id: int) -> None:
+        """Bridge a drawer-row click up to MainApp.
+
+        Both drawers share this slot since they emit the same signal
+        shape; MainApp opens the Address Book filtered to that
+        contact.
+        """
+        self.contact_clicked_in_drawer.emit(contact_id)
+
     def set_speaker_tag_counts(self, counts: dict[str, int]) -> None:
         """Refresh the sidebar's per-name tag-count badges."""
         self._attendee_sidebar.set_counts(counts)
@@ -764,14 +821,16 @@ class SessionView(QWidget):
             self._right_column.setVisible(False)
             return
         current = self._tabs.currentWidget()
+        # Comparison uses the page wrappers since v0.7.2 #51 Phase 3
+        # wraps the editors in containers with the attendee drawer.
         on_transcript_or_notes = current in (
-            self._transcript_view, self._live_notes_editor,
+            self._transcript_view, self._live_notes_page,
         )
         self._right_column.setVisible(on_transcript_or_notes)
         # The screencap sidebar belongs to My Notes only; hide it on
         # the Transcript tab even though the column is shown for the
         # attendee tag controls.
-        self._screencap_sidebar.setVisible(current is self._live_notes_editor)
+        self._screencap_sidebar.setVisible(current is self._live_notes_page)
 
     # ---- screen-capture API used by MainApp ------------------------------
 
@@ -782,6 +841,14 @@ class SessionView(QWidget):
         or clicks Stop Screen Capture / the recording ends (-> False).
         Keeping the visible state in one place avoids the toggle button
         and the sidebar drifting out of sync.
+
+        On arm we also switch the active tab to My Notes -- that's
+        where the screencap sidebar lives, and without the switch the
+        user has to manually click into My Notes before the Capture /
+        Insert / Auto-capture controls are visible (the sidebar's
+        visibility is gated on `current tab is My Notes` in
+        _refresh_sidebar_visibility, and arming alone doesn't trigger
+        that refresh).
         """
         self._screencap_armed = armed
         self._screencap_sidebar.set_armed(armed)
@@ -789,6 +856,10 @@ class SessionView(QWidget):
             "Stop Screen Capture" if armed else "Start Screen Capture"
         )
         self._refresh_screencap_button_enabled()
+        if armed and self._tabs.currentWidget() is not self._live_notes_page:
+            # setCurrentWidget triggers _on_tab_changed which calls
+            # _refresh_sidebar_visibility, surfacing the sidebar.
+            self._tabs.setCurrentWidget(self._live_notes_page)
 
     def is_screencap_armed(self) -> bool:
         return self._screencap_armed
@@ -1538,9 +1609,9 @@ class SessionView(QWidget):
         current = self._tabs.currentWidget()
         if current is self._transcript_view:
             return "transcript"
-        if current is self._live_notes_editor:
+        if current is self._live_notes_page:
             return "live_notes"
-        if current is self._notes_view:
+        if current is self._notes_page:
             return "notes"
         if current is self._previous_view:
             return "previous"
@@ -1840,10 +1911,10 @@ class SessionView(QWidget):
             self._export_pdf_btn.setEnabled(False)
             return
         current = self._tabs.currentWidget()
-        if current is self._live_notes_editor:
+        if current is self._live_notes_page:
             self._print_btn.setEnabled(True)
             self._export_pdf_btn.setEnabled(True)
-        elif current is self._notes_view:
+        elif current is self._notes_page:
             self._print_btn.setEnabled(has_notes)
             self._export_pdf_btn.setEnabled(has_notes)
         else:
@@ -1865,10 +1936,10 @@ class SessionView(QWidget):
         from .print_document import PrintTextDocument
 
         current = self._tabs.currentWidget()
-        if current is self._live_notes_editor:
+        if current is self._live_notes_page:
             markdown_source = self._live_notes_editor.toPlainText()
             tab_label = "My Notes"
-        elif current is self._notes_view:
+        elif current is self._notes_page:
             markdown_source = self._notes_view.toPlainText()
             tab_label = "Synthesis"
         else:
@@ -1889,11 +1960,26 @@ class SessionView(QWidget):
             except ValueError:
                 session_when = None
 
+        # v0.7.2 #51 Phase 5: when the session has at least one
+        # contact with rich-field data, replace the bullet attendee
+        # list with a Markdown table so the PDF shows title /
+        # company / email / phone columns. Auto-detect rule --
+        # bullet list stays when nothing rich is on file.
+        from ..utils.live_notes import (  # noqa: PLC0415
+            replace_attendees_section_with_table,
+            should_render_attendees_as_table,
+        )
+        body_for_print = markdown_source
+        if should_render_attendees_as_table(self._session_contacts):
+            body_for_print = replace_attendees_section_with_table(
+                markdown_source, self._session_contacts,
+            )
+
         printable = build_print_markdown(
             session_title=self._session.title,
             tab_label=tab_label,
             session_date=session_when,
-            body=markdown_source,
+            body=body_for_print,
         )
 
         sdir = session_dir(self._session.id)
