@@ -9,14 +9,15 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.1. End-to-end capture, transcription, synthesis,
+> **Status:** v0.7.2. End-to-end capture, transcription, synthesis,
 > screen capture, retained-audio playback + export, and transcript-
-> synchronized playback all working. v0.7.1 is a stability + UX
-> release focused on the audio pipeline: a long-recording garbling
-> bug that had been present since v0.6.5 is fixed, the synthesis
-> output matches manual paste from Claude.ai exactly, the post-
-> refinement and Outlook-polling main-thread stalls are gone, and
-> session-switching on multi-hour meetings is now responsive.
+> synchronized playback all working. v0.7.2 expands the Contact model
+> with rich addressbook fields (title / company / department / email /
+> phone / notes) that auto-populate from Outlook calendar invites
+> via the Exchange GAL, surfaces them in a collapsible drawer above
+> the My Notes and Synthesis editors, and bundles a stack of polish
+> fixes (multi-monitor screen-capture coords, calendar-picker loading
+> indicator, Address Book Enter-to-close, attendee auto-merge).
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -39,6 +40,67 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.2
+
+Rich attendee data + a quieter, less-cluttered classification surface.
+v0.7.0/0.7.1 functionality is unchanged; the Contact model gains real
+detail and the Outlook calendar path knows how to find it.
+
+- **Rich Contact fields.** Every Contact in the Address Book now
+  carries Title, Company, Department, Primary Email, Phone, and free-
+  form Notes alongside its display name and aliases. Existing
+  databases migrate transparently on first launch.
+- **Outlook calendar auto-enrichment.** When you pick a meeting from
+  the calendar dialog, Meeting Notetaker resolves each attendee
+  through `Recipient.Resolve()` -> `AddressEntry.GetExchangeUser()`
+  -> the recipient's MAPI `PropertyAccessor` to pull the real SMTP
+  address and the Exchange-listed title/company/department onto the
+  Contact. Hybrid / cached-mode quirks where one path returns blanks
+  fall through to the next so most attendees come back populated.
+  X.500 `legacyExchangeDN` values previously stored as email
+  (`/o=ExchangeLabs/...`) get swept out on store open so the next
+  Outlook fetch fills the real email.
+- **Attendee Details drawer** above My Notes and Synthesis. A
+  collapsible table shows the linked Contacts with Name, Title,
+  Company, Email, Notes columns + a per-row Edit button that opens
+  the Address Book filtered to that contact. Drawer auto-expands the
+  My Notes tab when the screen-capture overlay arms so the sidebar
+  is visible immediately.
+- **Per-field source tracking.** Each rich field records which path
+  most recently wrote it (Outlook / LLM / manual). Address Book
+  labels and drawer cells carry a small superscript letter as an
+  unobtrusive cue (`ᴼ` / `ᴸ` / `ᴹ`); hover tooltips name the source
+  in plain English.
+- **Calendar attendee auto-merge.** When the calendar path resolves a
+  person across both email and name lookups, duplicate Contact rows
+  collapse into one canonical row. Pre-merge data isn't lost: each
+  duplicate's rich fields fold into the survivor before the merge
+  drops the duplicate. Eliminates the "three rows for the same
+  person" pattern that the prior split email/name paths produced.
+- **Calendar picker loading indicator.** "Loading from Outlook..."
+  status text now actually paints before the COM query begins, so
+  the 1-2 s GAL fetch is visible work rather than a frozen blank
+  dialog. The COM query also runs deferred to the next event-loop
+  tick.
+- **People button removed from the classification bar.** The drawer
+  + the live-notes `# Attendees` list (which auto-syncs to the
+  session's Contact links on every keystroke) cover the same data
+  surface with a richer view. The bar is now Series | Topics.
+- **Settings: Synthesis Prompts** gains a Default template dropdown
+  (used by sessions that don't override it via the session view
+  picker) and an opt-in checkbox to ask the LLM to also extract
+  attendee details into a structured appendix the app parses back
+  into Contact fields. The appendix request is off by default --
+  Outlook enrichment covers the common case and the appended
+  paragraph adds prompt bulk you may not want.
+- **UX polish.** Address Book dialog closes on Enter (matches Close
+  button); attendee drawer has no row-hover / row-select highlight
+  so the table reads as a read-only summary; multi-monitor
+  screen-capture coords are now physical pixels via Win32
+  `GetCursorPos` so the overlay rectangle matches the captured
+  region across mixed-DPI setups; the cyan overlay box is hidden
+  during capture so it doesn't appear in the screenshot.
 
 ## What's new in v0.7.1
 
