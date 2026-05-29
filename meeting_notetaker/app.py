@@ -792,21 +792,23 @@ class MainApp(QObject):
         except ValueError:
             when = datetime.now().astimezone()
 
-        # Pick the prompt template based on the session's saved
-        # choice (set via the SessionView dropdown), falling back to
-        # the bundled "default" template when the session has no
-        # explicit selection. Per-session choice persists in
-        # metadata.json.
-        chosen_name = store.read_prompt_template_name()
+        # Pick the prompt template using the three-tier fallback:
+        # 1. session's saved choice (SessionView dropdown)
+        # 2. global Settings default_template_name
+        # 3. bundled "default" template (or first available)
         templates = prompts_mod.list_templates()
+
+        def _find(name: str):
+            return next((t for t in templates if t.name == name), None)
+
         chosen = None
+        chosen_name = store.read_prompt_template_name()
         if chosen_name:
-            chosen = next((t for t in templates if t.name == chosen_name), None)
+            chosen = _find(chosen_name)
+        if chosen is None and self.config.synthesis.default_template_name:
+            chosen = _find(self.config.synthesis.default_template_name)
         if chosen is None:
-            chosen = next(
-                (t for t in templates if t.name == "default"),
-                templates[0] if templates else None,
-            )
+            chosen = _find("default") or (templates[0] if templates else None)
         if chosen is None:
             QMessageBox.warning(
                 self.window, "Synthesis Automation",
@@ -820,6 +822,9 @@ class MainApp(QObject):
             transcript=transcript,
             live_notes=live_notes,
             user_name=self.config.ui.user_name,
+            include_system_prompts=(
+                self.config.synthesis.auto_extract_attendee_details
+            ),
         )
 
         request_id = secrets.token_hex(8)
@@ -1771,6 +1776,14 @@ class MainApp(QObject):
             ).astimezone()
         except ValueError:
             when = datetime.now().astimezone()
+        # Pre-selection fallback chain: per-session override (set via
+        # the SessionView dropdown) -> global Settings default ->
+        # bundled "default.md". The dialog itself does its own lookup
+        # by name, so we just hand it the best candidate.
+        initial_name = (
+            store.read_prompt_template_name()
+            or self.config.synthesis.default_template_name
+        )
         dialog = GeneratePromptDialog(
             session_title=session.title,
             session_date=when,
@@ -1778,10 +1791,10 @@ class MainApp(QObject):
             live_notes=live_notes,
             user_name=self.config.ui.user_name,
             templates=prompts_mod.list_templates(),
-            # Pre-select the session's saved template (set via the
-            # SessionView dropdown). User can still override per-
-            # generation by changing the picker inside this dialog.
-            initial_template_name=store.read_prompt_template_name(),
+            initial_template_name=initial_name,
+            include_system_prompts=(
+                self.config.synthesis.auto_extract_attendee_details
+            ),
             parent=self.window,
         )
         dialog.exec()

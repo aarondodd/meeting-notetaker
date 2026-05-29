@@ -194,25 +194,29 @@ def test_find_appendix_span_none_when_missing():
 # ---- prompts.render() + system-prompt injection ----------------------------
 
 
-def test_render_appends_system_prompts_by_default():
-    """The default render() output contains the system-prompt sentinel
-    + the attendee-details appendix instruction."""
+def test_render_appends_system_prompts_when_opted_in():
+    """include_system_prompts=True appends the bundled appendix
+    instruction in plain first-person voice. The HTML-comment sentinel
+    was removed on 2026-05-29 -- it was causing Claude to flag the
+    appended content as prompt injection inside the pasted transcript."""
     out = prompts_mod.render(
         "user template", session_title="x", session_date="2026-05-15",
-        transcript="",
+        transcript="", include_system_prompts=True,
     )
-    # Sentinel separates user template from system prompts.
-    assert "<!-- mn:system-prompts -->" in out
-    # The bundled attendee-details system prompt mentions the heading.
+    # Bundled attendee-details appendix appears in the output.
     assert "Attendee Details (auto-extracted)" in out
+    # No HTML-comment sentinel surfaces in the rendered text.
+    assert "mn:system-prompts" not in out
+    assert "<!--" not in out.split("user template", 1)[1]
 
 
 def test_render_omits_system_prompts_when_opted_out():
     """include_system_prompts=False -> output is just the substituted
-    user template, identical to pre-#51 behavior."""
+    user template, identical to pre-#51 behavior. This is the runtime
+    default starting 2026-05-29 -- users opt in via Settings."""
     out = prompts_mod.render(
         "user template", session_title="x", session_date="2026-05-15",
         transcript="", include_system_prompts=False,
     )
     assert out == "user template"
-    assert "mn:system-prompts" not in out
+    assert "Attendee Details" not in out

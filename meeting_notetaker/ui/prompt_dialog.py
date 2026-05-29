@@ -42,6 +42,7 @@ class GeneratePromptDialog(QDialog):
         live_notes: str = "",
         user_name: str = "",
         initial_template_name: str = "",
+        include_system_prompts: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -55,6 +56,7 @@ class GeneratePromptDialog(QDialog):
         self._live_notes = live_notes
         self._user_name = user_name
         self._templates = list(templates)
+        self._include_system_prompts = include_system_prompts
 
         layout = QVBoxLayout(self)
 
@@ -116,6 +118,7 @@ class GeneratePromptDialog(QDialog):
             transcript=self._transcript,
             live_notes=self._live_notes,
             user_name=self._user_name,
+            include_system_prompts=self._include_system_prompts,
         )
         self._preview.setPlainText(rendered)
 

@@ -118,11 +118,21 @@ def _load_system_prompt_bodies() -> list[str]:
     return bodies
 
 
-# Sentinel marking the start of system-prompt content in a rendered
-# prompt. The LLM doesn't act on the sentinel but its presence helps
-# downstream code distinguish the user's chosen template from the
-# app-injected fragments. Issue #51 Phase 4.
-_SYSTEM_PROMPT_SENTINEL = "\n\n<!-- mn:system-prompts -->\n\n"
+# Separator between the user's chosen template and any opt-in
+# auxiliary requests appended via the system-prompts dir.
+# Originally an HTML comment sentinel ("<!-- mn:system-prompts -->")
+# but that caused Claude to flag the appended content as embedded
+# prompt-injection -- the sentinel + the imperative tone read as
+# spoofed system instructions inside a transcript paste. Rewritten
+# 2026-05-29 as a plain blank-line separator; the appended content
+# itself is now first-person user voice ("Also, please also do X")
+# so Claude sees a coherent two-part user request instead of
+# user-text-plus-something-else. See issue #51 thread + the
+# attendee_details_appendix.md rewrite for the matching content fix.
+_SYSTEM_PROMPT_SEPARATOR = "\n\n"
+# Legacy alias retained for any external test that imports the old
+# name. New code should reference _SYSTEM_PROMPT_SEPARATOR.
+_SYSTEM_PROMPT_SENTINEL = _SYSTEM_PROMPT_SEPARATOR
 
 
 def seed_user_prompts(user_dir: Path | None = None) -> int:
@@ -241,7 +251,7 @@ def render(
         if system_bodies:
             rendered = (
                 rendered.rstrip()
-                + _SYSTEM_PROMPT_SENTINEL
+                + _SYSTEM_PROMPT_SEPARATOR
                 + "\n\n".join(b.strip() for b in system_bodies)
                 + "\n"
             )
