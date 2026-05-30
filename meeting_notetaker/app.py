@@ -620,32 +620,39 @@ class MainApp(QObject):
         }
         return labels.get(event, "")
 
-    def _handle_synthesis_result(self, session_id: str, markdown: str, target: str) -> None:
-        # Clear the in-progress indicator first so the banner is gone
-        # by the time any modal dialogs surface.
-        self.window.session_view.set_synthesis_in_progress(session_id, False)
-        if not markdown.strip():
-            QMessageBox.warning(
-                self.window,
-                "Synthesis Automation",
-                "The extension returned an empty response. Try again, or "
-                "fall back to the manual Generate / Paste flow by disabling "
-                "automation in Settings.",
-            )
-            return
+    def _apply_synthesis_result(
+        self,
+        session_id: str,
+        markdown: str,
+        *,
+        archive_existing: bool,
+    ) -> Optional[Path]:
+        """Shared post-processing for a freshly received synthesis.
+
+        Runs the markdown normalization + LLM-appendix extraction +
+        sidecar persistence + optional strip + save + search re-index
+        + view reload, then returns the archive path (or None if no
+        prior synthesis was archived). Both the Chrome-extension flow
+        (``_handle_synthesis_result``) and the manual paste flow
+        (``_on_paste_notes``) call this so the two paths produce
+        identical on-disk state; without the shared call the manual
+        flow used to skip the attendee-details fill, the sidecar
+        write, the strip toggle, and the loose-list normalization.
+
+        Raises ``OSError`` on save failure -- the caller is expected
+        to display a path-appropriate dialog.
+        """
         # Tighten Claude's loose-list serialization (issue #42).
         # Claude.ai's Copy button writes a blank line between every
         # bullet + multiple blank lines between sections; the user-
         # expected source view (matching browser text-selection paste)
         # is tight-list. No-op for any target that already returns
         # tight markdown.
-        from .automation.markdown_normalize import normalize_synthesis_markdown
+        from .automation.markdown_normalize import normalize_synthesis_markdown  # noqa: PLC0415
         markdown = normalize_synthesis_markdown(markdown)
         # Parse + apply the LLM-extracted attendee details appendix
         # (issue #51 Phase 4). Done BEFORE save_notes so the parsed
-        # data is independent of the save path's success. Strip
-        # behavior is gated on a config flag; default keeps the
-        # appendix visible so the user can see what was extracted.
+        # data is independent of the save path's success.
         self._apply_attendee_details_appendix(session_id, markdown)
         # Persist the four LLM appendices to the sidecar BEFORE the
         # optional strip pass so the data is preserved regardless of
@@ -668,23 +675,45 @@ class MainApp(QObject):
             from .utils.invite_mentions import (  # noqa: PLC0415
                 strip_appendix as strip_invite_mentions,
             )
-            # All four LLM-generated appendices ride the same
-            # Settings toggle. They're each opt-out "show me what
-            # was extracted" surfaces; if the user wants notes.md
-            # clean, they want them all gone. The Appendix tray
-            # stays populated because the sidecar
-            # (notes.appendices.json) was written above before this
-            # strip pass ran (#64 sidecar followup).
+            # All four LLM-generated appendices ride the same Settings
+            # toggle. They're each opt-out "show me what was
+            # extracted" surfaces; if the user wants notes.md clean,
+            # they want them all gone. The Appendix tray stays
+            # populated because the sidecar was written above before
+            # this strip pass ran (#64 sidecar followup).
             markdown = strip_appendix(markdown)
             markdown = strip_topic_appendix(markdown)
             markdown = strip_attendee_context(markdown)
             markdown = strip_invite_mentions(markdown)
-        try:
-            archive_path = TranscriptStore(session_id).save_notes(
-                markdown, archive_existing=True
+        archive_path = TranscriptStore(session_id).save_notes(
+            markdown, archive_existing=archive_existing,
+        )
+        self.store.update_session(session_id, has_notes=True)
+        self._reindex_search_for(session_id)
+        # Reload the SessionView so the Synthesis tab shows the new
+        # body + the tray re-reads from the freshly-written sidecar.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:
+            self._on_session_selected(session_id)
+        return archive_path
+
+    def _handle_synthesis_result(self, session_id: str, markdown: str, target: str) -> None:
+        # Clear the in-progress indicator first so the banner is gone
+        # by the time any modal dialogs surface.
+        self.window.session_view.set_synthesis_in_progress(session_id, False)
+        if not markdown.strip():
+            QMessageBox.warning(
+                self.window,
+                "Synthesis Automation",
+                "The extension returned an empty response. Try again, or "
+                "fall back to the manual Generate / Paste flow by disabling "
+                "automation in Settings.",
             )
-            self.store.update_session(session_id, has_notes=True)
-            self._reindex_search_for(session_id)
+            return
+        try:
+            archive_path = self._apply_synthesis_result(
+                session_id, markdown, archive_existing=True,
+            )
         except OSError:
             log.exception("save_notes failed for %s", session_id)
             QMessageBox.critical(
@@ -694,10 +723,6 @@ class MainApp(QObject):
                 "details.",
             )
             return
-        # Reload the SessionView so the Synthesis tab shows the new body.
-        sv = self.window.session_view
-        if sv._session is not None and sv._session.id == session_id:
-            self._on_session_selected(session_id)
         if archive_path:
             self.window.status(
                 f"Synthesis received. Prior notes archived to {archive_path.name}",
@@ -2327,7 +2352,6 @@ class MainApp(QObject):
         session = self.store.get_session(session_id)
         if session is None:
             return
-        store = TranscriptStore(session_id)
         dialog = PasteNotesDialog(current_notes="", parent=self.window)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
@@ -2335,12 +2359,25 @@ class MainApp(QObject):
         if not body.strip():
             QMessageBox.information(self.window, "Paste Notes", "Nothing to save (empty input).")
             return
-        archive_path = store.save_notes(body, archive_existing=dialog.archive_existing)
-        self.store.update_session(session_id, has_notes=True)
-        self._reindex_search_for(session_id)
-        # Fresh synthesis -> fresh topic suggestions.
-        self._extract_topics_for_session(session_id, body)
-        self._on_session_selected(session_id)
+        # Route through the shared synthesis post-processor so the
+        # manual paste-back gets identical handling to the Chrome-
+        # extension flow: markdown normalize, Attendee Details
+        # appendix application to Contact fields, sidecar
+        # persistence of all four LLM appendices, strip toggle,
+        # save, search re-index, view reload, topic extraction (via
+        # the reload's _on_session_content_loaded handler).
+        try:
+            archive_path = self._apply_synthesis_result(
+                session_id, body,
+                archive_existing=dialog.archive_existing,
+            )
+        except OSError:
+            log.exception("save_notes failed for %s", session_id)
+            QMessageBox.critical(
+                self.window, "Paste Notes",
+                "Couldn't save the notes to disk; see the log for details.",
+            )
+            return
         if archive_path:
             self.window.status(f"Notes saved. Prior notes archived to {archive_path.name}", timeout_ms=8000)
         else:
