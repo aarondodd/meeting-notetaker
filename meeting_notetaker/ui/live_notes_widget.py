@@ -83,6 +83,12 @@ class LiveNotesWidget(QWidget):
         # matching the PDF export. The source text isn't touched --
         # editing stays bullet-based (#56).
         self._session_contacts: list = []
+        # Pre-parsed AppendixData for the preview transform (#64).
+        # SessionView's _refresh_appendix_trays builds this from the
+        # current notes + live_notes + session attachments and
+        # hands it here. None disables the appendix injection (e.g.
+        # before a session is loaded).
+        self._appendix_data = None
         self._toolbar = QToolBar(self)
         self._toolbar.setMovable(False)
         self._toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
@@ -140,24 +146,47 @@ class LiveNotesWidget(QWidget):
                 self._preview_text(self._editor.toPlainText())
             )
 
+    def set_appendix_data(self, data) -> None:
+        """Drive the preview-time Appendix injection (#64).
+
+        SessionView's _refresh_appendix_trays parses the current
+        notes + live_notes + session attachments and hands an
+        AppendixData payload here. The preview pane then renders
+        the unified ``## Appendix (auto-extracted)`` section in
+        place of the raw JSON appendix blocks.
+        """
+        self._appendix_data = data
+        if self.is_in_preview():
+            self._preview.setMarkdown(
+                self._preview_text(self._editor.toPlainText())
+            )
+
     def _preview_text(self, source: str) -> str:
-        """Apply preview-time transformations (Attendees table swap).
+        """Apply preview-time transformations.
+
+        Currently two layered transforms, applied in order:
+          1. Attendees bullet list -> rich-fields table (#56)
+          2. Raw JSON appendices -> rendered ``## Appendix`` (#64)
 
         Source-text mutation lives here -- callers always pass the
-        unmodified user buffer. Currently only handles the #56
-        Attendees-to-table swap; future preview-only transformations
-        (e.g. inline image alt-text expansion) belong here too."""
-        if not self._session_contacts:
-            return source
-        from ..utils.live_notes import (  # noqa: PLC0415
-            replace_attendees_section_with_table,
-            should_render_attendees_as_table,
-        )
-        if not should_render_attendees_as_table(self._session_contacts):
-            return source
-        return replace_attendees_section_with_table(
-            source, self._session_contacts,
-        )
+        unmodified user buffer.
+        """
+        out = source
+        # #56: Attendees table swap.
+        if self._session_contacts:
+            from ..utils.live_notes import (  # noqa: PLC0415
+                replace_attendees_section_with_table,
+                should_render_attendees_as_table,
+            )
+            if should_render_attendees_as_table(self._session_contacts):
+                out = replace_attendees_section_with_table(
+                    out, self._session_contacts,
+                )
+        # #64: Appendix injection.
+        if self._appendix_data is not None:
+            from ..utils.appendix_transform import inject_appendix  # noqa: PLC0415
+            out = inject_appendix(out, self._appendix_data)
+        return out
 
     def find_target(self) -> QWidget:
         """Return the active widget for Ctrl+F to bind to.

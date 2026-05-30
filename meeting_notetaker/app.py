@@ -647,12 +647,23 @@ class MainApp(QObject):
             from .utils.topic_appendix import (  # noqa: PLC0415
                 strip_appendix as strip_topic_appendix,
             )
-            # Both LLM-generated appendices ride the same Settings
-            # toggle (#57). They're both opt-out "show me what was
-            # extracted" surfaces; if the user wants the synthesis
-            # clean, they want both gone.
+            from .utils.attendee_context import (  # noqa: PLC0415
+                strip_appendix as strip_attendee_context,
+            )
+            from .utils.invite_mentions import (  # noqa: PLC0415
+                strip_appendix as strip_invite_mentions,
+            )
+            # All four LLM-generated appendices ride the same
+            # Settings toggle (#57 + #63 + #64). They're each
+            # opt-out "show me what was extracted" surfaces; if the
+            # user wants the synthesis clean, they want them all
+            # gone. Heads-up: with strip ON, the Appendix tray
+            # will be empty because it reads from notes.md (Aaron
+            # picked the "read from raw" option in #64).
             markdown = strip_appendix(markdown)
             markdown = strip_topic_appendix(markdown)
+            markdown = strip_attendee_context(markdown)
+            markdown = strip_invite_mentions(markdown)
         try:
             archive_path = TranscriptStore(session_id).save_notes(
                 markdown, archive_existing=True
@@ -1355,6 +1366,22 @@ class MainApp(QObject):
         # drawer (issue #51 Phase 3). Cheap query; refreshed again
         # whenever attendee sync re-runs (see _sync_attendees_to_people).
         self._refresh_session_contacts_in_drawer(content.session_id)
+        # Issue #64: hydrate the Appendix tray's Session Attachments
+        # section. The tray reads JSON appendices + scans for links
+        # itself off the editors' current text, but the attachment
+        # list lives in a separate store -- push it in explicitly.
+        try:
+            from .models.attachments import AttachmentsStore  # noqa: PLC0415
+            store = AttachmentsStore(content.session_id)
+            sv.set_session_attachment_names([
+                rec.display_name for rec in store.list()
+            ])
+        except Exception:
+            log.exception(
+                "attachments fetch for appendix tray failed: %s",
+                content.session_id,
+            )
+            sv.set_session_attachment_names([])
         # Highlights: total_ms is 0 until the audio player finishes
         # its own async load and fires set_player_total_ms. The
         # highlight bar disables interaction cleanly at total_ms=0
@@ -3101,6 +3128,26 @@ class MainApp(QObject):
                 ]
             except Exception:
                 log.exception("contact fetch failed for export PDF: %s", session_id)
+        # #64: parse JSON appendices + scrape links + load
+        # attachment names into an AppendixData payload the PDF
+        # render path uses to inject the rendered "## Appendix
+        # (auto-extracted)" section in both PDFs.
+        try:
+            from .utils.appendix_transform import collect_from_markdown  # noqa: PLC0415
+            attach_store = AttachmentsStore(session_id)
+            attachment_names = [
+                rec.display_name for rec in attach_store.list()
+            ]
+        except Exception:
+            log.exception(
+                "attachment names for PDF appendix failed: %s", session_id,
+            )
+            attachment_names = []
+        appendix_data = collect_from_markdown(
+            notes_text=synthesis_md or "",
+            live_notes_text=notes_md or "",
+            session_attachments=attachment_names,
+        )
         notes_pdf_path = None
         synthesis_pdf_path = None
         try:
@@ -3114,6 +3161,7 @@ class MainApp(QObject):
                     tab_label="My Notes",
                     session_date=session_when,
                     session_contacts=session_contacts_for_pdf,
+                    appendix_data=appendix_data,
                 )
             if synthesis_md.strip():
                 synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
@@ -3125,6 +3173,7 @@ class MainApp(QObject):
                     tab_label="Synthesis",
                     session_date=session_when,
                     session_contacts=session_contacts_for_pdf,
+                    appendix_data=appendix_data,
                 )
         except Exception:
             log.exception("PDF pre-render failed for %s", session_id)

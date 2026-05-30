@@ -42,6 +42,7 @@ from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
 from ..models.highlights import HighlightSet
 from .attachments_tab import AttachmentsTab
+from .appendix_tray import AppendixTray
 from .attendee_details_drawer import AttendeeDetailsDrawer
 from .attendee_sidebar import AttendeeSidebar
 from .classification_bar import ClassificationBar
@@ -385,12 +386,18 @@ class SessionView(QWidget):
         # editor directly.
         self._live_notes_drawer = AttendeeDetailsDrawer(self)
         self._live_notes_drawer.contact_clicked.connect(self._on_drawer_contact_clicked)
+        # Issue #64: Appendix tray below the editor mirrors the
+        # attendee drawer pattern. Surfaces every auto-extracted
+        # appendix (attendee details, topics, context, referenced
+        # attachments) plus links and session attachments.
+        self._live_notes_appendix = AppendixTray(self)
         self._live_notes_page = QWidget(self)
         live_notes_layout = QVBoxLayout(self._live_notes_page)
         live_notes_layout.setContentsMargins(0, 0, 0, 0)
         live_notes_layout.setSpacing(2)
         live_notes_layout.addWidget(self._live_notes_drawer)
         live_notes_layout.addWidget(self._live_notes_editor, 1)
+        live_notes_layout.addWidget(self._live_notes_appendix)
         self._tabs.addTab(self._live_notes_page, "My Notes")
 
         # Synthesis is editable (v0.5). Uses LiveNotesWidget for the same
@@ -409,12 +416,15 @@ class SessionView(QWidget):
         # appears above the LLM-synthesized notes editor too.
         self._notes_drawer = AttendeeDetailsDrawer(self)
         self._notes_drawer.contact_clicked.connect(self._on_drawer_contact_clicked)
+        # Same Appendix tray pattern below the Synthesis editor.
+        self._notes_appendix = AppendixTray(self)
         self._notes_page = QWidget(self)
         notes_layout = QVBoxLayout(self._notes_page)
         notes_layout.setContentsMargins(0, 0, 0, 0)
         notes_layout.setSpacing(2)
         notes_layout.addWidget(self._notes_drawer)
         notes_layout.addWidget(self._notes_view, 1)
+        notes_layout.addWidget(self._notes_appendix)
         self._tabs.addTab(self._notes_page, "Synthesis")
 
         # Slides: per-session captured screenshots. Thumbnail grid +
@@ -771,6 +781,42 @@ class SessionView(QWidget):
         """Refresh the sidebar's attendee list. Called by the controller
         whenever the live_notes '# Attendees' section changes."""
         self._attendee_sidebar.set_attendees(names)
+
+    def set_session_attachment_names(self, names) -> None:
+        """Push the current session's attachment display names into
+        the Appendix tray so the Session Attachments section stays
+        in sync with AttachmentsStore (#64). MainApp calls this on
+        session select + after attachments are added or removed.
+        """
+        names = list(names or [])
+        self._session_attachment_names = names
+        self._refresh_appendix_trays()
+
+    def _refresh_appendix_trays(self) -> None:
+        """Re-parse both editors' markdown + push the merged
+        AppendixData payload into both trays.
+
+        Cheap: a few regex scans across in-memory strings. Runs on
+        session select, after paste-back, after attachments change,
+        and on each live-notes save flush.
+        """
+        from ..utils.appendix_transform import collect_from_markdown  # noqa: PLC0415
+        notes_text = self._notes_view.toPlainText()
+        live_notes_text = self._live_notes_editor.toPlainText()
+        data = collect_from_markdown(
+            notes_text=notes_text,
+            live_notes_text=live_notes_text,
+            session_attachments=getattr(
+                self, "_session_attachment_names", [],
+            ),
+        )
+        self._live_notes_appendix.set_data(data)
+        self._notes_appendix.set_data(data)
+        # Both editors also use this data for their preview-pane
+        # transform so the rendered preview shows the "## Appendix
+        # (auto-extracted)" section directly.
+        self._live_notes_editor.set_appendix_data(data)
+        self._notes_view.set_appendix_data(data)
 
     def set_session_contacts(self, contacts) -> None:
         """Push the resolved Contact list into the My Notes + Synthesis
@@ -1370,6 +1416,9 @@ class SessionView(QWidget):
         # Flip to preview mode when there's actually content to read,
         # otherwise keep the editor focused (matching set_session).
         self._notes_view.set_preview_mode(bool(text.strip()))
+        # New synthesis content can introduce JSON appendices + new
+        # links; refresh the tray + preview transform (#64).
+        self._refresh_appendix_trays()
 
     def set_previous_notes(self, paths: list) -> None:
         self._previous_view.set_archives(paths)
@@ -1419,6 +1468,9 @@ class SessionView(QWidget):
             return
         body = self._notes_view.toPlainText()
         self.synthesis_notes_changed.emit(self._session.id, body)
+        # Synthesis edits may add / remove links + change the
+        # appendix JSON blocks; keep the tray in sync (#64).
+        self._refresh_appendix_trays()
 
     def _on_live_notes_changed(self) -> None:
         if self._suppress_live_notes_signal:
@@ -1432,6 +1484,9 @@ class SessionView(QWidget):
             return
         body = self._live_notes_editor.toPlainText()
         self.live_notes_changed.emit(self._session.id, body)
+        # Live-notes edits may add or remove links the appendix
+        # tray's Links section surfaces; refresh (#64).
+        self._refresh_appendix_trays()
 
     # ---- internal handlers -------------------------------------------------
 
@@ -1695,6 +1750,19 @@ class SessionView(QWidget):
         # Forward upward; MainApp may want to update an indicator
         # on the session list (e.g. paperclip glyph).
         self.attachments_changed.emit(session_id)
+        # Pull the latest attachment names + refresh the appendix
+        # tray so the Session Attachments section stays current
+        # (#64).
+        try:
+            from ..models.attachments import AttachmentsStore  # noqa: PLC0415
+            store = AttachmentsStore(session_id)
+            names = [rec.display_name for rec in store.list()]
+            self.set_session_attachment_names(names)
+        except Exception:
+            # Refresh failures shouldn't disrupt the user-visible
+            # add/remove flow; the tray just won't update until the
+            # next session-select.
+            pass
 
     def set_session_highlights(
         self,
