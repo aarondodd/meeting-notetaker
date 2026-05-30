@@ -321,6 +321,7 @@ def export_highlights_audio(
     *,
     audio_gap_ms: int = DEFAULT_AUDIO_GAP_MS,
     progress: Optional[Callable[[int], None]] = None,
+    status: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Concatenate the audio inside each highlight range, separated
     by `audio_gap_ms` of silence, into a single file at dst_path.
@@ -365,6 +366,13 @@ def export_highlights_audio(
     mixed = _mix_to_max_length(decoded).astype(np.float32, copy=False)
     np.clip(mixed, -1.0, 1.0, out=mixed)
 
+    # Slicing is fast (just numpy indexing); reserve only the first
+    # 20% of the progress budget for it so the encode phase has room
+    # to move the bar. Previously slicing got 0..100 and the slow
+    # encode pass ran silently at 100% (#52).
+    _SLICE_PHASE_END = 20
+    if status is not None:
+        status("Slicing highlights")
     pieces: list[np.ndarray] = []
     gap_samples = int(audio_gap_ms * _TARGET_RATE / 1000)
     silent_gap = np.zeros(gap_samples, dtype=np.float32)
@@ -379,12 +387,16 @@ def export_highlights_audio(
         pieces.append(mixed[start_samp:end_samp])
         if progress is not None:
             done = seg.source_highlight_index + 1
-            pct = int(done * 100 / max(1, len(highlights)))
+            pct = int(done * _SLICE_PHASE_END / max(1, len(highlights)))
             progress(pct)
 
     concatenated = (
         np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
     )
+    if status is not None:
+        status("Encoding audio")
+    if progress is not None:
+        progress(_SLICE_PHASE_END)
     _encode_mono_float32(
         concatenated,
         dst_path=dst_path,
@@ -412,6 +424,8 @@ def export_highlights_video(
     session_title: str = "",
     session_started_at_iso: str = "",
     progress: Optional[Callable[[int], None]] = None,
+    status: Optional[Callable[[str], None]] = None,
+    quality: Optional[str] = None,
 ) -> None:
     """Render a highlights-only MP4 with title + jump interstitials.
 
@@ -436,10 +450,12 @@ def export_highlights_video(
     """
     from .video_export import (
         _TARGET_AUDIO_RATE, _TARGET_FPS, _TARGET_HEIGHT, _TARGET_WIDTH,
-        _AUDIO_BIT_RATE, _VIDEO_BIT_RATE,
+        _FRAME_PHASE_END, _AUDIO_PHASE_END,
         _decode_audio_to_mono, _mix_to_max_length,
-        _scale_screenshot_letterbox,
+        _resolve_quality, _scale_screenshot_letterbox,
     )
+
+    video_bps, audio_bps = _resolve_quality(quality)
     from ..screencap.timestamps import current_screenshot_for_position
 
     session_subtitle = format_recorded_on_subtitle(session_started_at_iso)
@@ -466,6 +482,8 @@ def export_highlights_video(
         len(highlights), len(screenshots), dst_path,
     )
 
+    if status is not None:
+        status("Decoding audio")
     # ---- decode + slice + concat audio (matches highlight slicing
     # used in the audio-only export above) ----
     decoded = [_decode_audio_to_mono(p, _TARGET_AUDIO_RATE) for p in sources]
@@ -517,21 +535,35 @@ def export_highlights_video(
         v_stream.width = _TARGET_WIDTH
         v_stream.height = _TARGET_HEIGHT
         v_stream.pix_fmt = "yuv420p"
-        v_stream.bit_rate = _VIDEO_BIT_RATE
+        v_stream.bit_rate = video_bps
         v_stream.codec_context.gop_size = _TARGET_FPS * 2
         a_stream = out_container.add_stream("aac", rate=_TARGET_AUDIO_RATE)
         a_stream.layout = "mono"
-        a_stream.bit_rate = _AUDIO_BIT_RATE
+        a_stream.bit_rate = audio_bps
 
+        if status is not None:
+            status("Encoding video frames")
         _encode_highlight_video(
             out_container, v_stream, plan, screenshots,
             total_video_frames, progress=progress,
             current_screenshot_for_position=current_screenshot_for_position,
             scale_screenshot=_scale_screenshot_letterbox,
+            progress_end=_FRAME_PHASE_END,
         )
+        if status is not None:
+            status("Encoding audio")
         _encode_audio_buffer(
             out_container, a_stream, output_audio, _TARGET_AUDIO_RATE,
+            progress=progress,
+            progress_start=_FRAME_PHASE_END,
+            progress_end=_AUDIO_PHASE_END,
         )
+        if status is not None:
+            status("Finalizing container")
+        out_container.close()
+        out_container = None
+        if progress is not None:
+            progress(100)
     except Exception:
         log.exception("export_highlights_video failed; cleaning up")
         if out_container is not None:
@@ -564,6 +596,7 @@ def _encode_highlight_video(
     progress: Optional[Callable[[int], None]],
     current_screenshot_for_position,
     scale_screenshot,
+    progress_end: int = 100,
 ) -> None:
     """Frame-by-frame slideshow encode for the highlight output.
 
@@ -602,7 +635,7 @@ def _encode_highlight_video(
                     out_container.mux(packet)
                 frame_idx += 1
                 if progress is not None and total_frames > 0:
-                    pct = int(frame_idx * 100 / total_frames)
+                    pct = int(frame_idx * progress_end / total_frames)
                     if pct != last_progress_pct:
                         progress(pct)
                         last_progress_pct = pct
@@ -630,7 +663,7 @@ def _encode_highlight_video(
                 out_container.mux(packet)
             frame_idx += 1
             if progress is not None and total_frames > 0:
-                pct = int(frame_idx * 100 / total_frames)
+                pct = int(frame_idx * progress_end / total_frames)
                 if pct != last_progress_pct:
                     progress(pct)
                     last_progress_pct = pct
@@ -639,7 +672,7 @@ def _encode_highlight_video(
     for packet in v_stream.encode(None):
         out_container.mux(packet)
     if progress is not None:
-        progress(100)
+        progress(progress_end)
 
 
 # Auto-fit constraints for interstitial cards. The text fills the
@@ -961,14 +994,25 @@ def _wrap_text(text: str, font, draw, max_width: int) -> list[str]:
 
 def _encode_audio_buffer(
     out_container, a_stream, buffer: np.ndarray, rate: int,
+    *,
+    progress: Optional[Callable[[int], None]] = None,
+    progress_start: int = 0,
+    progress_end: int = 100,
 ) -> None:
     """Stream a mono float32 PCM buffer through AAC -> MP4. Mirrors
     video_export._encode_audio (kept here to avoid the cross-module
-    dependency edge case)."""
+    dependency edge case).
+
+    Optional progress reporting maps buffer position to the
+    [progress_start, progress_end] range so the orchestrator bar
+    moves during the audio mux pass (issue #52)."""
     import av  # noqa: PLC0415
     from av.audio.frame import AudioFrame  # noqa: PLC0415
 
     chunk_frames = rate  # 1 sec per chunk
+    total = max(1, buffer.size)
+    span = max(0, progress_end - progress_start)
+    last_pct = -1
     for i in range(0, buffer.size, chunk_frames):
         chunk = buffer[i : i + chunk_frames]
         frame = AudioFrame.from_ndarray(
@@ -978,5 +1022,12 @@ def _encode_audio_buffer(
         frame.pts = i
         for packet in a_stream.encode(frame):
             out_container.mux(packet)
+        if progress is not None and span > 0:
+            pct = progress_start + int(i * span / total)
+            if pct != last_pct:
+                progress(pct)
+                last_pct = pct
     for packet in a_stream.encode(None):
         out_container.mux(packet)
+    if progress is not None:
+        progress(progress_end)

@@ -41,14 +41,40 @@ _TARGET_WIDTH = 1920
 _TARGET_HEIGHT = 1080
 _TARGET_FPS = 30
 _TARGET_AUDIO_RATE = 48_000
-_AUDIO_BIT_RATE = 96_000
-_VIDEO_BIT_RATE = 2_500_000
 
 # Cap subtitle cue duration so an inaudible-but-on-screen line
 # doesn't sit there forever. The transcript itself will move on
 # at the next line's timestamp; this is the upper bound for the
 # final line of a meeting (where there's no "next" cue).
 _MAX_CUE_SECONDS = 8.0
+
+
+# Phase budget (cumulative percent) reserved by export_video so the
+# overall progress bar doesn't hit 100% before audio mux + close
+# actually finish. Frame encode is the dominant phase (issue #52).
+_FRAME_PHASE_END = 85
+_AUDIO_PHASE_END = 92
+# (close is the rest, 92..100)
+
+
+# Quality presets (issue #54). The user-facing setting maps to a
+# (video_bit_rate, audio_bit_rate) tuple here; export_video honors
+# whichever the caller passes via the `quality` kwarg. The bundled
+# names are the keys the Settings dialog exposes; unknown values
+# fall back to "medium".
+QUALITY_PRESETS: dict[str, tuple[int, int]] = {
+    "low":    (   600_000,  64_000),
+    "medium": ( 1_500_000,  96_000),
+    "high":   ( 2_500_000, 128_000),
+}
+DEFAULT_QUALITY = "medium"
+
+
+def _resolve_quality(quality: Optional[str]) -> tuple[int, int]:
+    """Return (video_bps, audio_bps) for the given preset name."""
+    return QUALITY_PRESETS.get(
+        (quality or DEFAULT_QUALITY).lower(), QUALITY_PRESETS[DEFAULT_QUALITY],
+    )
 
 
 def export_video(
@@ -59,6 +85,8 @@ def export_video(
     dst_path: Path,
     *,
     progress: Optional[Callable[[int], None]] = None,
+    status: Optional[Callable[[str], None]] = None,
+    quality: Optional[str] = None,
 ) -> None:
     """Render the session into an MP4 slideshow video at dst_path.
 
@@ -87,6 +115,10 @@ def export_video(
         len(screenshots), len(sources), dst_path,
     )
 
+    video_bps, audio_bps = _resolve_quality(quality)
+
+    if status is not None:
+        status("Decoding audio")
     # ----- decode + mix audio --------------------------------------
     decoded = [_decode_audio_to_mono(p, _TARGET_AUDIO_RATE) for p in sources]
     mixed = _mix_to_max_length(decoded).astype(np.float32, copy=False)
@@ -130,20 +162,34 @@ def export_video(
         v_stream.width = _TARGET_WIDTH
         v_stream.height = _TARGET_HEIGHT
         v_stream.pix_fmt = "yuv420p"
-        v_stream.bit_rate = _VIDEO_BIT_RATE
+        v_stream.bit_rate = video_bps
         # H.264 baseline-ish: GOP every 2 s keeps seek-to-here in
         # players cheap without bloating the file.
         v_stream.codec_context.gop_size = _TARGET_FPS * 2
 
         a_stream = out_container.add_stream("aac", rate=_TARGET_AUDIO_RATE)
         a_stream.layout = "mono"
-        a_stream.bit_rate = _AUDIO_BIT_RATE
+        a_stream.bit_rate = audio_bps
 
+        if status is not None:
+            status("Encoding video frames")
         _encode_video(
             out_container, v_stream, screenshots,
             total_video_frames, progress=progress,
+            progress_end=_FRAME_PHASE_END,
         )
-        _encode_audio(out_container, a_stream, mixed)
+        if status is not None:
+            status("Encoding audio")
+        _encode_audio(
+            out_container, a_stream, mixed, progress=progress,
+            progress_start=_FRAME_PHASE_END, progress_end=_AUDIO_PHASE_END,
+        )
+        if status is not None:
+            status("Finalizing container")
+        out_container.close()
+        out_container = None
+        if progress is not None:
+            progress(100)
     except Exception:
         log.exception("export_video: render failed for %s", dst_path)
         if out_container is not None:
@@ -172,6 +218,7 @@ def _encode_video(
     total_video_frames: int,
     *,
     progress: Optional[Callable[[int], None]],
+    progress_end: int = 100,
 ) -> None:
     """Frame-by-frame slideshow encode driven by sticky-latest lookup.
 
@@ -215,7 +262,7 @@ def _encode_video(
             out_container.mux(packet)
 
         if progress is not None and total_video_frames > 0:
-            pct = int(frame_idx * 100 / total_video_frames)
+            pct = int(frame_idx * progress_end / total_video_frames)
             if pct != last_progress_pct:
                 progress(pct)
                 last_progress_pct = pct
@@ -224,15 +271,31 @@ def _encode_video(
     for packet in v_stream.encode(None):
         out_container.mux(packet)
     if progress is not None:
-        progress(100)
+        progress(progress_end)
 
 
-def _encode_audio(out_container, a_stream, mixed: np.ndarray) -> None:
-    """Chunk the mixed float32 mono buffer through AAC -> MP4."""
+def _encode_audio(
+    out_container, a_stream, mixed: np.ndarray,
+    *,
+    progress: Optional[Callable[[int], None]] = None,
+    progress_start: int = 0,
+    progress_end: int = 100,
+) -> None:
+    """Chunk the mixed float32 mono buffer through AAC -> MP4.
+
+    Optional progress reporting maps the input-buffer position to the
+    [progress_start, progress_end] range so the orchestrator's bar
+    keeps moving during the audio mux pass (issue #52). Without this,
+    the bar froze at the end of the video frame loop while the audio
+    pass and libx264 finalize ran silently.
+    """
     import av  # noqa: PLC0415
     from av.audio.frame import AudioFrame  # noqa: PLC0415
 
     chunk_frames = _TARGET_AUDIO_RATE  # 1 sec per chunk
+    total = max(1, mixed.size)
+    span = max(0, progress_end - progress_start)
+    last_pct = -1
     for i in range(0, mixed.size, chunk_frames):
         chunk = mixed[i : i + chunk_frames]
         frame = AudioFrame.from_ndarray(
@@ -242,8 +305,15 @@ def _encode_audio(out_container, a_stream, mixed: np.ndarray) -> None:
         frame.pts = i
         for packet in a_stream.encode(frame):
             out_container.mux(packet)
+        if progress is not None and span > 0:
+            pct = progress_start + int(i * span / total)
+            if pct != last_pct:
+                progress(pct)
+                last_pct = pct
     for packet in a_stream.encode(None):
         out_container.mux(packet)
+    if progress is not None:
+        progress(progress_end)
 
 
 def _scale_screenshot_letterbox(path: Path) -> np.ndarray:

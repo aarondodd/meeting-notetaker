@@ -213,6 +213,13 @@ class SynthesisConfig:
     # Synthesis Prompts exposes a dropdown listing the templates
     # actually present in the user's prompts folder.
     default_template_name: str = ""
+    # MP4 quality preset for the export paths -- low / medium / high
+    # (issue #54). "medium" defaults to ~1.5 Mbps video + 96 kbps
+    # audio, which is appropriate for slideshow-style screenshot
+    # content while keeping file sizes manageable. "high" preserves
+    # the pre-#54 behavior (2.5 Mbps + 128 kbps) for users who want
+    # the larger files. Settings dialog exposes a dropdown.
+    video_quality: str = "medium"
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

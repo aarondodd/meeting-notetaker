@@ -81,6 +81,39 @@ def test_picker_set_during_population_does_not_emit_change_signal(qt_app):
     )
 
 
+def test_picker_placeholder_reflects_settings_default(qt_app):
+    """The first entry's label surfaces the Settings default name so
+    the user sees which template will actually be used when no
+    session-level override is set (#55). Data role stays empty so the
+    resolution chain still runs at synthesis time."""
+    from meeting_notetaker.ui.session_view import SessionView
+
+    sv = SessionView()
+    sv.set_prompt_templates(
+        ["default", "standup", "one-on-one"],
+        selected="",
+        settings_default="one-on-one",
+    )
+    picker = sv._prompt_template_picker  # noqa: SLF001
+    assert picker.itemText(0) == "(default: one-on-one)"
+    assert picker.itemData(0) == ""
+    # Selection should land on the placeholder when nothing's saved.
+    assert picker.currentIndex() == 0
+    assert sv.selected_prompt_template() == ""
+
+
+def test_picker_placeholder_when_settings_default_empty(qt_app):
+    """Empty Settings default -> the original "(default)" label is
+    preserved (the placeholder still resolves to default.md via the
+    runtime chain)."""
+    from meeting_notetaker.ui.session_view import SessionView
+
+    sv = SessionView()
+    sv.set_prompt_templates(["default", "standup"], settings_default="")
+    picker = sv._prompt_template_picker  # noqa: SLF001
+    assert picker.itemText(0) == "(default)"
+
+
 def test_picker_emits_on_user_change(qt_app):
     """When the user picks a different template, the change signal
     fires with the new template name."""

@@ -50,18 +50,39 @@ ALL_HIGHLIGHTS_MODES = (
 
 
 # Per-phase progress weights. They sum to 100; the orchestrator
-# linear-interpolates inside each phase.
+# linear-interpolates inside each phase. zip_pack was 1 (issue #52)
+# but the zip itself can take 5-30s on a large session, so the bar
+# would jump from 99 to 100 without reflecting that work; raised to
+# 5 with per-file progress reporting inside the zip loop.
 _PHASE_WEIGHTS: dict[str, int] = {
     "my_notes_pdf": 10,
     "synthesis_pdf": 10,
     "transcript_txt": 2,
-    "audio_full": 22,
-    "audio_highlights": 12,
-    "video_full": 25,
-    "video_highlights": 14,
+    "audio_full": 20,
+    "audio_highlights": 10,
+    "video_full": 24,
+    "video_highlights": 13,
     "attachments_copy": 2,
     "screenshots_copy": 2,
-    "zip_pack": 1,
+    "zip_pack": 7,
+}
+
+
+# Human-readable status messages surfaced by the orchestrator. Each
+# entry is shown via the optional `status` callback before the phase
+# starts. The progress dialog appends them to its scrolling log
+# (#53).
+_PHASE_STATUS: dict[str, str] = {
+    "my_notes_pdf": "Copying my-notes.pdf",
+    "synthesis_pdf": "Copying synthesis.pdf",
+    "transcript_txt": "Writing transcript.txt",
+    "audio_full": "Encoding recording.mp3",
+    "audio_highlights": "Encoding highlights.mp3",
+    "video_full": "Rendering recording.mp4",
+    "video_highlights": "Rendering highlights.mp4",
+    "attachments_copy": "Copying attachments",
+    "screenshots_copy": "Copying screenshots",
+    "zip_pack": "Packing zip archive",
 }
 
 
@@ -91,6 +112,10 @@ class PackageOptions:
     attachments: list  # list[(Path, display_name)]
     highlights: list  # list[Highlight] -- empty when none
     highlights_mode: str = HIGHLIGHTS_MODE_FULL
+    # Video quality preset for the MP4 outputs (low / medium / high).
+    # See audio.video_export.QUALITY_PRESETS. None falls back to
+    # whatever the encoder considers default. Issue #54.
+    video_quality: Optional[str] = None
 
 
 def build_session_package(
@@ -98,12 +123,19 @@ def build_session_package(
     dst_zip_path: Path,
     *,
     progress: Optional[Callable[[int], None]] = None,
+    status: Optional[Callable[[str], None]] = None,
 ) -> Path:
     """Run the full pipeline and write a ZIP to `dst_zip_path`.
 
     Raises on encoder / I/O failure; partial output is removed
     before re-raising so the user never ends up with a junk archive.
     Returns `dst_zip_path` on success.
+
+    Optional ``status`` callback receives a one-line description of
+    the current phase whenever the orchestrator transitions (e.g.
+    "Encoding recording.mp4"). The dialog plumbing turns these into
+    a scrolling log so the user can see what's happening during a
+    long export (#53).
     """
     dst_zip_path = Path(dst_zip_path)
     if options.highlights_mode not in ALL_HIGHLIGHTS_MODES:
@@ -116,6 +148,10 @@ def build_session_package(
         # Track cumulative progress across phases.
         completed = 0
 
+        # Phases that already announced themselves via status() so we
+        # don't double-emit on the inner-progress callback path.
+        announced: set[str] = set()
+
         def step(phase: str, pct_within: int = 100) -> None:
             nonlocal completed
             weight = _PHASE_WEIGHTS.get(phase, 0)
@@ -124,6 +160,11 @@ def build_session_package(
             total_pct = completed + local_pct
             if progress is not None:
                 progress(min(100, total_pct))
+            if status is not None and phase not in announced:
+                msg = _PHASE_STATUS.get(phase)
+                if msg:
+                    status(msg)
+                announced.add(phase)
             if inner >= 100:
                 completed = min(100, completed + weight)
 
@@ -168,7 +209,16 @@ def build_session_package(
             )
         )
 
+        # Per-phase status sub-callback. When the encoder emits its
+        # own sub-phase status (e.g. "Encoding audio"), pipe it
+        # through to the top-level status callback so it shows up in
+        # the dialog log alongside the phase banner.
+        def sub_status(phase_label: str, msg: str) -> None:
+            if status is not None and msg:
+                status(f"  {msg}")
+
         if sources_exist and emit_full:
+            step("audio_full", 0)
             _export_full_audio(
                 options.mic_path, options.sys_path,
                 audio_dir / "recording.mp3",
@@ -178,28 +228,34 @@ def build_session_package(
             step("audio_full")
 
         if sources_exist and emit_highlights:
+            step("audio_highlights", 0)
             _export_highlights_audio(
                 options.mic_path, options.sys_path,
                 options.highlights,
                 audio_dir / "highlights.mp3",
                 lambda p: step("audio_highlights", p),
+                status=lambda m: sub_status("audio_highlights", m),
             )
         else:
             step("audio_highlights")
 
         if sources_exist and screenshots_exist and emit_full:
             video_dir.mkdir(parents=True, exist_ok=True)
+            step("video_full", 0)
             _export_full_video(
                 options.mic_path, options.sys_path,
                 options.screenshots, options.transcript_text,
                 video_dir / "recording.mp4",
                 lambda p: step("video_full", p),
+                status=lambda m: sub_status("video_full", m),
+                quality=options.video_quality,
             )
         else:
             step("video_full")
 
         if sources_exist and screenshots_exist and emit_highlights:
             video_dir.mkdir(parents=True, exist_ok=True)
+            step("video_highlights", 0)
             _export_highlights_video(
                 options.mic_path, options.sys_path,
                 options.screenshots, options.transcript_text,
@@ -207,6 +263,8 @@ def build_session_package(
                 session_title=options.session_title,
                 session_started_at_iso=options.session_started_at_iso,
                 progress=lambda p: step("video_highlights", p),
+                status=lambda m: sub_status("video_highlights", m),
+                quality=options.video_quality,
             )
         else:
             step("video_highlights")
@@ -229,15 +287,25 @@ def build_session_package(
         step("screenshots_copy")
 
         # ---- Zip ----
+        step("zip_pack", 0)
         if dst_zip_path.exists():
             dst_zip_path.unlink()
+        files_to_zip = [
+            p for p in sorted(work_dir.rglob("*")) if p.is_file()
+        ]
+        total_files = len(files_to_zip) or 1
         with zipfile.ZipFile(
             dst_zip_path, "w", zipfile.ZIP_DEFLATED,
         ) as zf:
-            for path in sorted(work_dir.rglob("*")):
-                if path.is_file():
-                    zf.write(path, path.relative_to(work_dir))
-        step("zip_pack")
+            for idx, path in enumerate(files_to_zip, start=1):
+                zf.write(path, path.relative_to(work_dir))
+                # Report incremental progress so the bar doesn't sit
+                # at 99% during a long zip operation (#52). Cap the
+                # inner pct at 99 here -- we only call 100 after the
+                # zip handle has actually closed below.
+                inner = min(99, int(idx * 100 / total_files))
+                step("zip_pack", inner)
+        step("zip_pack", 100)
 
         if progress is not None:
             progress(100)
@@ -329,18 +397,26 @@ def _export_full_audio(mic, sys_, dst: Path, progress) -> None:
     progress(100)
 
 
-def _export_highlights_audio(mic, sys_, highlights, dst: Path, progress) -> None:
+def _export_highlights_audio(
+    mic, sys_, highlights, dst: Path, progress, *, status=None,
+) -> None:
     from ..audio.highlights_export import export_highlights_audio
-    export_highlights_audio(mic, sys_, highlights, dst, progress=progress)
+    export_highlights_audio(
+        mic, sys_, highlights, dst,
+        progress=progress, status=status,
+    )
 
 
 def _export_full_video(
     mic, sys_, screenshots, transcript_text, dst: Path, progress,
+    *,
+    status=None,
+    quality=None,
 ) -> None:
     from ..audio.video_export import export_video
     export_video(
         mic, sys_, screenshots, transcript_text, dst,
-        progress=progress,
+        progress=progress, status=status, quality=quality,
     )
     # SRT sidecar is auto-emitted by export_video; ensure it lands
     # in the same directory as the .mp4 with a deterministic name.
@@ -356,6 +432,8 @@ def _export_highlights_video(
     session_title: str,
     session_started_at_iso: str,
     progress,
+    status=None,
+    quality=None,
 ) -> None:
     from ..audio.highlights_export import export_highlights_video
     export_highlights_video(
@@ -364,6 +442,8 @@ def _export_highlights_video(
         session_title=session_title,
         session_started_at_iso=session_started_at_iso,
         progress=progress,
+        status=status,
+        quality=quality,
     )
 
 

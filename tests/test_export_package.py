@@ -128,12 +128,17 @@ def patched_heavies():
             progress(100)
         full_audio.side_effect = _write_audio_stub
 
-        def _write_hl_audio_stub(mic, sys_, highlights, dst, progress):
+        def _write_hl_audio_stub(
+            mic, sys_, highlights, dst, progress, *, status=None,
+        ):
             Path(dst).write_bytes(b"fake hl mp3")
             progress(100)
         hl_audio.side_effect = _write_hl_audio_stub
 
-        def _write_video_stub(mic, sys_, screenshots, transcript, dst, progress):
+        def _write_video_stub(
+            mic, sys_, screenshots, transcript, dst, progress,
+            *, status=None, quality=None,
+        ):
             Path(dst).write_bytes(b"fake mp4")
             progress(100)
         full_video.side_effect = _write_video_stub
@@ -141,6 +146,7 @@ def patched_heavies():
         def _write_hl_video_stub(
             mic, sys_, screenshots, transcript, highlights, dst,
             *, session_title, session_started_at_iso, progress,
+            status=None, quality=None,
         ):
             Path(dst).write_bytes(b"fake hl mp4")
             progress(100)

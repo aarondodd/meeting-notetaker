@@ -744,6 +744,46 @@ class SettingsDialog(QDialog):
         prompts_layout.addLayout(prompts_row)
         layout.addWidget(prompts_group)
 
+        # Export group ----------------------------------------------------
+        # MP4 quality preset for the per-session video exports + the
+        # full-session ZIP export (#54). Medium is the new default;
+        # users who want the v0.7.2-era file sizes pick High.
+        export_group = QGroupBox("Export", self)
+        export_form = QFormLayout(export_group)
+        export_blurb = QLabel(
+            "Quality preset for MP4 outputs (highlights, recording, "
+            "full-session export). Slideshow-style screenshot content "
+            "compresses well at low / medium; raise to high for "
+            "motion-heavy sessions or when archival fidelity matters.",
+            self,
+        )
+        export_blurb.setWordWrap(True)
+        export_form.addRow(export_blurb)
+        self._video_quality_picker = QComboBox(self)
+        self._video_quality_picker.addItem(
+            "Low -- 600 kbps video, 64 kbps audio (smallest)", "low",
+        )
+        self._video_quality_picker.addItem(
+            "Medium -- 1.5 Mbps video, 96 kbps audio (default)", "medium",
+        )
+        self._video_quality_picker.addItem(
+            "High -- 2.5 Mbps video, 128 kbps audio (largest)", "high",
+        )
+        current_quality = (
+            getattr(config.synthesis, "video_quality", "medium") or "medium"
+        )
+        idx = self._video_quality_picker.findData(current_quality)
+        if idx >= 0:
+            self._video_quality_picker.setCurrentIndex(idx)
+        self._video_quality_picker.setToolTip(
+            "Lower presets shrink the file dramatically -- a 1-hour "
+            "meeting drops from ~1.2 GB at High to ~300 MB at Low. "
+            "Every preset still produces an MP4 that plays in the "
+            "default Windows Media Player."
+        )
+        export_form.addRow("Video quality:", self._video_quality_picker)
+        layout.addWidget(export_group)
+
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(
@@ -800,6 +840,9 @@ class SettingsDialog(QDialog):
         )
         self._config.synthesis.default_template_name = (
             self._default_template_picker.currentData() or ""
+        )
+        self._config.synthesis.video_quality = (
+            self._video_quality_picker.currentData() or "medium"
         )
         self.accept()
 

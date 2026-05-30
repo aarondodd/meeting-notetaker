@@ -644,7 +644,15 @@ class MainApp(QObject):
         self._apply_attendee_details_appendix(session_id, markdown)
         if self.config.synthesis.strip_attendee_appendix:
             from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
+            from .utils.topic_appendix import (  # noqa: PLC0415
+                strip_appendix as strip_topic_appendix,
+            )
+            # Both LLM-generated appendices ride the same Settings
+            # toggle (#57). They're both opt-out "show me what was
+            # extracted" surfaces; if the user wants the synthesis
+            # clean, they want both gone.
             markdown = strip_appendix(markdown)
+            markdown = strip_topic_appendix(markdown)
         try:
             archive_path = TranscriptStore(session_id).save_notes(
                 markdown, archive_existing=True
@@ -1338,7 +1346,9 @@ class MainApp(QObject):
         sv.set_notes_text(content.notes)
         sv.set_previous_notes(content.previous_notes_paths)
         sv.set_prompt_templates(
-            content.template_names, selected=content.selected_template,
+            content.template_names,
+            selected=content.selected_template,
+            settings_default=self.config.synthesis.default_template_name,
         )
         sv.set_attendee_names(parse_attendees(content.live_notes))
         # Push the session's Contact list into the attendee-details
@@ -2843,10 +2853,12 @@ class MainApp(QObject):
                 highlights, target,
                 session_title=session.title,
                 session_started_at_iso=started_at_iso,
+                quality=self.config.synthesis.video_quality,
             )
         else:
             worker = _VideoExportWorker(
                 mic_path, sys_path, offsets, transcript_text, target,
+                quality=self.config.synthesis.video_quality,
             )
 
         def on_progress(pct: int) -> None:
@@ -2884,11 +2896,14 @@ class MainApp(QObject):
         from datetime import datetime  # noqa: PLC0415
 
         from PyQt6.QtWidgets import (  # noqa: PLC0415
-            QFileDialog, QMessageBox, QProgressDialog,
+            QFileDialog, QMessageBox,
         )
         from .models.attachments import AttachmentsStore  # noqa: PLC0415
         from .models.highlights import HighlightsStore  # noqa: PLC0415
         from .models.transcript import TranscriptStore  # noqa: PLC0415
+        from .ui.export_progress_dialog import (  # noqa: PLC0415
+            ExportProgressDialog,
+        )
         from .screencap.timestamps import screenshot_offsets  # noqa: PLC0415
         from .utils.export_package import (  # noqa: PLC0415
             HIGHLIGHTS_MODE_BOTH,
@@ -3071,26 +3086,18 @@ class MainApp(QObject):
             attachments=attachments_pairs,
             highlights=highlights,
             highlights_mode=highlights_mode,
+            video_quality=self.config.synthesis.video_quality,
         )
 
-        # Worker thread with determinate progress.
-        progress = QProgressDialog(
-            f"Building {target.name}...", None, 0, 100, self.window,
+        # ExportProgressDialog couples a determinate bar, a current
+        # phase label, and a scrolling log of every status emit from
+        # the worker (#53). The dialog is modal and non-cancellable
+        # by design.
+        progress = ExportProgressDialog(
+            self.window, f"Building {target.name}...",
         )
-        progress.setWindowTitle("Export full session")
-        progress.setMinimumDuration(0)
-        # setAutoClose + setAutoReset together caused stuttering on
-        # 100 (close + reset + setValue updates). Manage closing
-        # explicitly in on_done.
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.setCancelButton(None)
-        progress.setValue(0)
 
         worker = _ExportPackageWorker(options, target)
-
-        def on_progress(pct: int) -> None:
-            progress.setValue(pct)
 
         def on_done(err_msg: str) -> None:
             # Close the dialog before showing any follow-up message
@@ -3099,7 +3106,7 @@ class MainApp(QObject):
             # bug Aaron caught -- combining autoClose + autoReset
             # with an immediate post-close QMessageBox produced
             # transient ghost windows).
-            progress.close()
+            progress.close_with_result(err_msg)
             # Clean up the temp PDF dir; it's cheap to keep but
             # we're disciplined about temp leaks.
             try:
@@ -3121,7 +3128,8 @@ class MainApp(QObject):
             worker.wait()  # see comment in _on_export_mixed_audio
             worker.deleteLater()
 
-        worker.progress_changed.connect(on_progress)
+        worker.progress_changed.connect(progress.set_progress)
+        worker.status_changed.connect(progress.append_status)
         worker.finished_with_result.connect(on_done)
         progress.show()
         worker.start()
@@ -3631,6 +3639,27 @@ class MainApp(QObject):
             suggestions = extract_topics(
                 body or "", extra_stopwords=stopwords,
             )
+            # LLM-suggested topics from the Suggested Topics appendix
+            # (#57) get folded in BEFORE the deterministic ones so
+            # they rank earlier in the suggestion list. Dedupe is
+            # case-insensitive so the deterministic extractor doesn't
+            # re-surface a topic the LLM already named.
+            try:
+                from .utils.topic_appendix import (  # noqa: PLC0415
+                    parse_topic_appendix,
+                )
+                llm_topics = parse_topic_appendix(body or "")
+            except Exception:
+                log.exception(
+                    "LLM topic appendix parse failed for %s", session_id,
+                )
+                llm_topics = []
+            if llm_topics:
+                seen = {t.lower() for t in llm_topics}
+                deduped_extractor = [
+                    t for t in suggestions if t.lower() not in seen
+                ]
+                suggestions = llm_topics + deduped_extractor
             self.classification.replace_session_topic_suggestions(
                 session_id, suggestions,
             )
@@ -4751,6 +4780,7 @@ class _VideoExportWorker(QThread):
 
     def __init__(
         self, mic_path, sys_path, screenshots, transcript_text, target,
+        *, quality: str = "medium",
     ) -> None:
         super().__init__()
         self.setObjectName("VideoExportWorker")
@@ -4759,6 +4789,7 @@ class _VideoExportWorker(QThread):
         self._screenshots = screenshots
         self._transcript_text = transcript_text
         self._target = target
+        self._quality = quality
 
     def run(self) -> None:  # type: ignore[override]
         try:
@@ -4767,6 +4798,7 @@ class _VideoExportWorker(QThread):
                 self._mic, self._sys, self._screenshots,
                 self._transcript_text, self._target,
                 progress=self.progress_changed.emit,
+                quality=self._quality,
             )
             self.finished_with_result.emit("")
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
@@ -4815,6 +4847,7 @@ class _HighlightVideoExportWorker(QThread):
         *,
         session_title: str = "",
         session_started_at_iso: str = "",
+        quality: str = "medium",
     ) -> None:
         super().__init__()
         self.setObjectName("HighlightVideoExportWorker")
@@ -4826,6 +4859,7 @@ class _HighlightVideoExportWorker(QThread):
         self._target = target
         self._session_title = session_title
         self._session_started_at_iso = session_started_at_iso
+        self._quality = quality
 
     def run(self) -> None:  # type: ignore[override]
         try:
@@ -4836,6 +4870,7 @@ class _HighlightVideoExportWorker(QThread):
                 session_title=self._session_title,
                 session_started_at_iso=self._session_started_at_iso,
                 progress=self.progress_changed.emit,
+                quality=self._quality,
             )
             self.finished_with_result.emit("")
         except Exception as exc:  # noqa: BLE001
@@ -4843,9 +4878,16 @@ class _HighlightVideoExportWorker(QThread):
 
 
 class _ExportPackageWorker(QThread):
-    """Run utils.export_package.build_session_package off the GUI thread."""
+    """Run utils.export_package.build_session_package off the GUI thread.
+
+    `status_changed` is emitted on each phase transition (and on
+    encoder sub-phases like "Encoding audio" within an mp4 render).
+    The progress dialog plumbs these into a scrolling log so the
+    user can see what's happening during a long export (#53).
+    """
 
     progress_changed = pyqtSignal(int)
+    status_changed = pyqtSignal(str)
     finished_with_result = pyqtSignal(str)
 
     def __init__(self, options, target_path) -> None:
@@ -4860,6 +4902,7 @@ class _ExportPackageWorker(QThread):
             build_session_package(
                 self._options, self._target,
                 progress=self.progress_changed.emit,
+                status=self.status_changed.emit,
             )
             self.finished_with_result.emit("")
         except Exception as exc:  # noqa: BLE001

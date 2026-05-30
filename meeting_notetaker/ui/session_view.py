@@ -609,8 +609,14 @@ class SessionView(QWidget):
         self._attendee_sidebar.remove_last_requested.connect(
             self._on_attendee_remove_last_clicked
         )
-        right_column_layout.addWidget(self._attendee_sidebar)
-        right_column_layout.addStretch(1)
+        # Stretch factor 1 so the attendee sidebar grows to fill the
+        # remaining vertical space under the screencap sidebar. The
+        # sidebar's internal QScrollArea has its own stretch factor of
+        # 1, so the scroll viewport tracks the available height and only
+        # actually scrolls when the attendee list overflows. The earlier
+        # trailing addStretch(1) starved the sidebar of vertical room
+        # and made the scrollbar appear even for short lists (#58).
+        right_column_layout.addWidget(self._attendee_sidebar, 1)
         self._right_column = right_column
         self._right_column.setVisible(False)
         body_row.addWidget(self._right_column, 0)
@@ -784,6 +790,11 @@ class SessionView(QWidget):
         self._session_contacts = contacts
         self._live_notes_drawer.set_contacts(contacts)
         self._notes_drawer.set_contacts(contacts)
+        # Drive the Preview-pane Attendees-table substitution (#56)
+        # on both editors. The underlying markdown buffer is
+        # untouched; the swap only applies to the rendered preview.
+        self._live_notes_editor.set_session_contacts(contacts)
+        self._notes_view.set_session_contacts(contacts)
 
     def _on_drawer_contact_clicked(self, contact_id: int) -> None:
         """Bridge a drawer-row click up to MainApp.
@@ -1499,29 +1510,49 @@ class SessionView(QWidget):
                     has_notes=bool(self._session.has_notes),
                 )
 
-    def set_prompt_templates(self, template_names: list[str], selected: str = "") -> None:
+    def set_prompt_templates(
+        self,
+        template_names: list[str],
+        selected: str = "",
+        settings_default: str = "",
+    ) -> None:
         """Populate the prompt template picker.
 
-        ``template_names`` should be the list of available templates
-        (from prompts module). ``selected`` is the currently-saved
-        choice for this session ("" = use default). Caller is
-        expected to compute that from session metadata before invoking.
+        ``template_names`` is the list of available templates (from the
+        prompts module). ``selected`` is the currently-saved
+        per-session override ("" = no override; let the resolution
+        chain pick). ``settings_default`` is the global Settings
+        default; surfaced in the "(default)" entry's label so the user
+        sees which template will actually be used when no override is
+        set (#55).
 
         Block signals during population so the currentIndexChanged
         emit doesn't fire spurious save events at app-startup.
         """
         self._prompt_template_picker.blockSignals(True)
         self._prompt_template_picker.clear()
-        # First entry is always "(default)" -- empty string in data
-        # role -- so leaving the picker untouched on a new session
-        # uses the default template without forcing the user to pick.
-        self._prompt_template_picker.addItem("(default)", "")
+        # First entry is always the "(default)" placeholder -- empty
+        # string in data role -- so leaving the picker untouched on a
+        # new session uses whatever the resolution chain decides. The
+        # label includes the Settings default name when one is set so
+        # the user can tell what's about to run; if Settings is empty
+        # we fall back to "default" (the bundled template), matching
+        # the resolution chain in _on_send_to_llm.
+        resolved_default = (settings_default or "").strip() or "default"
+        if resolved_default == "default":
+            # No Settings override: the placeholder reads as the
+            # bundled "default" template directly, matching the prior
+            # UX.
+            placeholder_label = "(default)"
+        else:
+            placeholder_label = f"(default: {resolved_default})"
+        self._prompt_template_picker.addItem(placeholder_label, "")
         for name in template_names:
             if not name or name == "default":
-                # We surface the bundled default via the "(default)"
+                # We surface the bundled default via the placeholder
                 # entry above; skip the literal "default" template
                 # name to avoid the user seeing two entries that
-                # mean the same thing.
+                # both render the same template.
                 continue
             self._prompt_template_picker.addItem(name, name)
         # Restore selection.
