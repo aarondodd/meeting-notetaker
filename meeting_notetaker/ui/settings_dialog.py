@@ -782,6 +782,28 @@ class SettingsDialog(QDialog):
             "default Windows Media Player."
         )
         export_form.addRow("Video quality:", self._video_quality_picker)
+
+        # Full-session export packaging (#62). Off by default: write
+        # an uncompressed folder so the user can drop it on OneDrive
+        # / a shared drive without zip overhead. Toggle ON for the
+        # traditional single-zip output.
+        self._compress_full_export = QCheckBox(
+            "Compress full-session export into a single .zip file",
+            self,
+        )
+        self._compress_full_export.setChecked(
+            getattr(
+                config.synthesis, "compress_full_session_export", False,
+            )
+        )
+        self._compress_full_export.setToolTip(
+            "When ON, the full-session export bundles everything "
+            "into a single .zip the user picks the filename for. "
+            "When OFF (default), the export goes into a subfolder "
+            "under the user-chosen parent directory -- handy for "
+            "OneDrive / shared drives where unzipping isn't needed."
+        )
+        export_form.addRow(self._compress_full_export)
         layout.addWidget(export_group)
 
         layout.addStretch(1)
@@ -843,6 +865,9 @@ class SettingsDialog(QDialog):
         )
         self._config.synthesis.video_quality = (
             self._video_quality_picker.currentData() or "medium"
+        )
+        self._config.synthesis.compress_full_session_export = (
+            self._compress_full_export.isChecked()
         )
         self.accept()
 

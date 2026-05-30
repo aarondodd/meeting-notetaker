@@ -1,10 +1,8 @@
-"""Progress dialog for full-session export (issue #53).
+"""Progress dialog for full-session export (issue #53, #60).
 
-Replaces the bare QProgressDialog with a modal that pairs a
-determinate progress bar, a current-phase label, and a scrolling
-text log of every status message the orchestrator emits. The user
-can tell what the worker is doing while the bar moves through a
-long export.
+Pairs a determinate progress bar, a current-phase label, a Cancel
+button, and a scrolling text log of every status message the
+orchestrator emits.
 
 Pattern:
 
@@ -12,28 +10,34 @@ Pattern:
     worker.progress_changed.connect(dialog.set_progress)
     worker.status_changed.connect(dialog.append_status)
     worker.finished_with_result.connect(dialog.close_with_result)
+    dialog.cancel_requested.connect(worker.cancel)
     dialog.show()
 
-The dialog is non-cancellable -- export is brief enough that
-aborting mid-zip would leave temp files behind anyway. A pure
-informational close happens via `close_with_result`.
+The Cancel button flips into a disabled "Cancelling..." state once
+clicked; the dialog stays modal until the worker actually returns
+and the orchestrator deletes any partial output.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QProgressBar,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 
 class ExportProgressDialog(QDialog):
+    cancel_requested = pyqtSignal()
+
     def __init__(
         self,
         parent: Optional[QWidget],
@@ -44,7 +48,7 @@ class ExportProgressDialog(QDialog):
         self.setModal(True)
         self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
-        self.resize(520, 320)
+        self.resize(520, 340)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -77,6 +81,19 @@ class ExportProgressDialog(QDialog):
         self._log.setFont(font)
         layout.addWidget(self._log, 1)
 
+        # Cancel button row (#60). Distinct from the standard
+        # QDialogButtonBox so we can intercept the click + flip the
+        # button into a disabled "Cancelling..." state without
+        # dismissing the dialog -- the worker may still be cleaning
+        # up partial output for a few seconds after the request.
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self._cancel_btn = QPushButton("Cancel", self)
+        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
+        button_row.addWidget(self._cancel_btn)
+        layout.addLayout(button_row)
+        self._cancel_pending = False
+
     def set_progress(self, pct: int) -> None:
         # Clamp because some helpers emit -1 (no-op) or >100 if the
         # caller's math overshoots; the user shouldn't see that.
@@ -106,3 +123,26 @@ class ExportProgressDialog(QDialog):
         if err_msg:
             self.append_status(f"Failed: {err_msg}")
         self.accept()
+
+    def is_cancel_pending(self) -> bool:
+        """True after the user clicked Cancel but before the worker
+        has actually finished. MainApp consults this to decide
+        whether to show the post-completion error dialog."""
+        return self._cancel_pending
+
+    def _on_cancel_clicked(self) -> None:
+        if self._cancel_pending:
+            return
+        self._cancel_pending = True
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("Cancelling...")
+        self.append_status("Cancelling export...")
+        self.cancel_requested.emit()
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        # Escape triggers the same cancel path as the button so the
+        # keyboard shortcut works without an explicit close action.
+        if event.key() == Qt.Key.Key_Escape:
+            self._on_cancel_clicked()
+            return
+        super().keyPressEvent(event)

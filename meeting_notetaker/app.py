@@ -2543,6 +2543,7 @@ class MainApp(QObject):
             if self._audio_player is not None:
                 self._audio_player.close()
             self._player_loaded_session_id = None
+            self.window.session_view.set_player_loading_state(False)
             self.window.session_view.set_player_enabled(False)
             return
         files = session_audio_files(session_id)
@@ -2550,6 +2551,7 @@ class MainApp(QObject):
             if self._audio_player is not None and self._player_loaded_session_id:
                 self._audio_player.close()
                 self._player_loaded_session_id = None
+            self.window.session_view.set_player_loading_state(False)
             self.window.session_view.set_player_enabled(False)
             return
         # Separate the mic and sys halves out of the list. The path
@@ -2565,22 +2567,30 @@ class MainApp(QObject):
         # isn't ready, and so a long decode (1-3 s for a multi-hour
         # meeting) doesn't gray-out the whole window.
         self.window.session_view.set_player_enabled(False)
+        # Surface the in-flight decode so the player bar reads
+        # "Loading audio..." instead of "--:-- / --:--" -- without
+        # this, a multi-minute meeting's decode pause looked like
+        # the player was broken (#61).
+        self.window.session_view.set_player_loading_state(True)
         try:
             player.load(mic_path, sys_path)
         except Exception:
             log.exception("AudioPlayer.load raised")
+            self.window.session_view.set_player_loading_state(False)
             self._player_loaded_session_id = None
             return
         self._player_loaded_session_id = session_id
 
     def _on_player_loaded(self, total_ms: int) -> None:
         sv = self.window.session_view
+        sv.set_player_loading_state(False)
         sv.set_player_total_ms(total_ms)
         sv.set_player_position_ms(0)
         sv.set_player_is_playing(False)
         sv.set_player_enabled(True)
 
     def _on_player_load_failed(self, message: str) -> None:
+        self.window.session_view.set_player_loading_state(False)
         self.window.status(message, timeout_ms=5000)
         self.window.session_view.set_player_enabled(False)
         self._player_loaded_session_id = None
@@ -2714,29 +2724,42 @@ class MainApp(QObject):
         # report PyAV encoder progress per-frame across the thread
         # boundary. The dialog is modal so the user can't interact
         # with the rest of the app mid-encode (avoiding the
-        # session-deselect-during-encode race).
+        # session-deselect-during-encode race). Cancel (#60) is
+        # honored at the highlights-slicer + chunk boundaries; the
+        # full-recording mp3 path doesn't yet poll cancellation
+        # because it has no progress callback to attach the check
+        # to, so cancel on that path waits for the encoder to
+        # finish on its own (acceptable -- it's the fast path).
+        cancel_label = "Cancel" if highlight_mode == "highlights" else None
         progress = QProgressDialog(
             f"Exporting {target.name}...",
-            None,  # no Cancel button; PyAV encode isn't cleanly interruptible
+            cancel_label,
             0, 0, self.window,
         )
         progress.setWindowTitle("Export recording")
         progress.setMinimumDuration(0)
         progress.setAutoClose(True)
         progress.setAutoReset(True)
-        progress.setCancelButton(None)
+        if cancel_label is None:
+            progress.setCancelButton(None)
 
         if highlight_mode == "highlights":
             highlights = self._session_highlights(session_id).sorted_by_start()
             worker = _HighlightAudioExportWorker(
                 mic_path, sys_path, highlights, target,
             )
+            progress.canceled.connect(worker.cancel)
         else:
             worker = _AudioExportWorker(mic_path, sys_path, target)
 
         def on_done(err_msg: str) -> None:
             progress.cancel()
-            if err_msg:
+            cancelled = err_msg == _HighlightAudioExportWorker.CANCELLED_RESULT
+            if cancelled:
+                self.window.status(
+                    "Audio export cancelled.", timeout_ms=4000,
+                )
+            elif err_msg:
                 log.error("export_mixed failed: %s", err_msg)
                 QMessageBox.warning(
                     self.window, "Export recording",
@@ -2827,16 +2850,20 @@ class MainApp(QObject):
             log.exception("could not read transcript for %s", session_id)
             transcript_text = ""
 
+        # The "Cancel" label gives the user the abort button #60
+        # asks for; the encoder loops poll the worker's cancel flag
+        # at frame boundaries and raise ExportCancelled at the next
+        # checkpoint. Partial mp4 + sidecar SRT are deleted by
+        # video_export's cleanup path.
         progress = QProgressDialog(
             f"Rendering {target.name}...",
-            None,
+            "Cancel",
             0, 100, self.window,
         )
         progress.setWindowTitle("Export session as video")
         progress.setMinimumDuration(0)
         progress.setAutoClose(True)
         progress.setAutoReset(True)
-        progress.setCancelButton(None)
         progress.setValue(0)
 
         if highlight_mode == "highlights":
@@ -2866,7 +2893,12 @@ class MainApp(QObject):
 
         def on_done(err_msg: str) -> None:
             progress.cancel()
-            if err_msg:
+            cancelled = err_msg == _VideoExportWorker.CANCELLED_RESULT
+            if cancelled:
+                self.window.status(
+                    "Video export cancelled.", timeout_ms=4000,
+                )
+            elif err_msg:
                 log.error("export_video failed: %s", err_msg)
                 QMessageBox.warning(
                     self.window, "Export session as video",
@@ -2881,6 +2913,10 @@ class MainApp(QObject):
 
         worker.progress_changed.connect(on_progress)
         worker.finished_with_result.connect(on_done)
+        # QProgressDialog.canceled fires when the user clicks Cancel.
+        # The worker keeps running until the next checkpoint -- we
+        # just flag the cancel and let the encoder unwind.
+        progress.canceled.connect(worker.cancel)
         progress.show()
         worker.start()
 
@@ -2958,22 +2994,42 @@ class MainApp(QObject):
         else:
             highlights_mode = HIGHLIGHTS_MODE_FULL
 
-        # Save dialog with suggested filename.
+        # Save / folder picker. When compress is OFF (#62), prompt
+        # for a parent directory and build a subfolder under it
+        # named like the zip would have been. When ON, the original
+        # save-file flow with .zip suffix.
+        compress = self.config.synthesis.compress_full_session_export
         suggested = default_package_filename(
             session.title or "session",
             session.started_at or session.created_at or "",
         )
-        suggested_path = str(Path.home() / "Documents" / suggested)
-        path_str, _ = QFileDialog.getSaveFileName(
-            self.window, "Export full session",
-            suggested_path,
-            "ZIP archive (*.zip)",
-        )
-        if not path_str:
-            return
-        target = Path(path_str)
-        if target.suffix.lower() != ".zip":
-            target = target.with_suffix(".zip")
+        if compress:
+            suggested_path = str(Path.home() / "Documents" / suggested)
+            path_str, _ = QFileDialog.getSaveFileName(
+                self.window, "Export full session",
+                suggested_path,
+                "ZIP archive (*.zip)",
+            )
+            if not path_str:
+                return
+            target = Path(path_str)
+            if target.suffix.lower() != ".zip":
+                target = target.with_suffix(".zip")
+        else:
+            parent_dir = QFileDialog.getExistingDirectory(
+                self.window, "Choose a folder for the export",
+                str(Path.home() / "Documents"),
+            )
+            if not parent_dir:
+                return
+            # The .zip suffix is the part that distinguishes compressed
+            # output from folder output -- strip it for the subfolder
+            # name. default_package_filename always emits a name with
+            # the .zip suffix.
+            folder_name = suggested
+            if folder_name.lower().endswith(".zip"):
+                folder_name = folder_name[:-4]
+            target = Path(parent_dir) / folder_name
 
         # Gather inputs.
         store = TranscriptStore(session_id)
@@ -3090,14 +3146,15 @@ class MainApp(QObject):
         )
 
         # ExportProgressDialog couples a determinate bar, a current
-        # phase label, and a scrolling log of every status emit from
-        # the worker (#53). The dialog is modal and non-cancellable
-        # by design.
-        progress = ExportProgressDialog(
-            self.window, f"Building {target.name}...",
+        # phase label, a Cancel button (#60), and a scrolling log
+        # of every status emit from the worker (#53).
+        header = (
+            f"Building {target.name}.zip..." if compress
+            else f"Building {target.name}/..."
         )
+        progress = ExportProgressDialog(self.window, header)
 
-        worker = _ExportPackageWorker(options, target)
+        worker = _ExportPackageWorker(options, target, compress=compress)
 
         def on_done(err_msg: str) -> None:
             # Close the dialog before showing any follow-up message
@@ -3106,7 +3163,8 @@ class MainApp(QObject):
             # bug Aaron caught -- combining autoClose + autoReset
             # with an immediate post-close QMessageBox produced
             # transient ghost windows).
-            progress.close_with_result(err_msg)
+            cancelled = err_msg == _ExportPackageWorker.CANCELLED_RESULT
+            progress.close_with_result("" if cancelled else err_msg)
             # Clean up the temp PDF dir; it's cheap to keep but
             # we're disciplined about temp leaks.
             try:
@@ -3114,7 +3172,11 @@ class MainApp(QObject):
                 shutil.rmtree(pdf_temp_dir, ignore_errors=True)
             except Exception:
                 pass
-            if err_msg:
+            if cancelled:
+                self.window.status(
+                    "Full-session export cancelled.", timeout_ms=4000,
+                )
+            elif err_msg:
                 log.error("export_package failed: %s", err_msg)
                 QMessageBox.warning(
                     self.window, "Export full session",
@@ -3131,6 +3193,7 @@ class MainApp(QObject):
         worker.progress_changed.connect(progress.set_progress)
         worker.status_changed.connect(progress.append_status)
         worker.finished_with_result.connect(on_done)
+        progress.cancel_requested.connect(worker.cancel)
         progress.show()
         worker.start()
 
@@ -4778,6 +4841,10 @@ class _VideoExportWorker(QThread):
     progress_changed = pyqtSignal(int)
     finished_with_result = pyqtSignal(str)
 
+    # Sentinel reported via finished_with_result when the export was
+    # cancelled by the user (#60).
+    CANCELLED_RESULT = "<cancelled>"
+
     def __init__(
         self, mic_path, sys_path, screenshots, transcript_text, target,
         *, quality: str = "medium",
@@ -4790,8 +4857,14 @@ class _VideoExportWorker(QThread):
         self._transcript_text = transcript_text
         self._target = target
         self._quality = quality
+        import threading  # noqa: PLC0415
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:  # type: ignore[override]
+        from .utils.cancellation import ExportCancelled  # noqa: PLC0415
         try:
             from .audio.video_export import export_video  # noqa: PLC0415
             export_video(
@@ -4799,8 +4872,12 @@ class _VideoExportWorker(QThread):
                 self._transcript_text, self._target,
                 progress=self.progress_changed.emit,
                 quality=self._quality,
+                should_cancel=self._cancel_event.is_set,
             )
             self.finished_with_result.emit("")
+        except ExportCancelled:
+            log.info("video export cancelled by user")
+            self.finished_with_result.emit(self.CANCELLED_RESULT)
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
             self.finished_with_result.emit(str(exc))
 
@@ -4809,11 +4886,14 @@ class _HighlightAudioExportWorker(QThread):
     """Run audio/highlights_export.export_highlights_audio off the GUI thread.
 
     Mirrors _AudioExportWorker's signal shape -- empty string on
-    success, error message on failure.
+    success, error message on failure, CANCELLED_RESULT on user
+    cancel (#60).
     """
 
     progress_changed = pyqtSignal(int)
     finished_with_result = pyqtSignal(str)
+
+    CANCELLED_RESULT = "<cancelled>"
 
     def __init__(self, mic_path, sys_path, highlights, target) -> None:
         super().__init__()
@@ -4822,15 +4902,25 @@ class _HighlightAudioExportWorker(QThread):
         self._sys = sys_path
         self._highlights = highlights
         self._target = target
+        import threading  # noqa: PLC0415
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:  # type: ignore[override]
+        from .utils.cancellation import ExportCancelled  # noqa: PLC0415
         try:
             from .audio.highlights_export import export_highlights_audio  # noqa: PLC0415
             export_highlights_audio(
                 self._mic, self._sys, self._highlights, self._target,
                 progress=self.progress_changed.emit,
+                should_cancel=self._cancel_event.is_set,
             )
             self.finished_with_result.emit("")
+        except ExportCancelled:
+            log.info("highlight audio export cancelled by user")
+            self.finished_with_result.emit(self.CANCELLED_RESULT)
         except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
 
@@ -4840,6 +4930,8 @@ class _HighlightVideoExportWorker(QThread):
 
     progress_changed = pyqtSignal(int)
     finished_with_result = pyqtSignal(str)
+
+    CANCELLED_RESULT = "<cancelled>"
 
     def __init__(
         self, mic_path, sys_path, screenshots, transcript_text,
@@ -4860,8 +4952,14 @@ class _HighlightVideoExportWorker(QThread):
         self._session_title = session_title
         self._session_started_at_iso = session_started_at_iso
         self._quality = quality
+        import threading  # noqa: PLC0415
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:  # type: ignore[override]
+        from .utils.cancellation import ExportCancelled  # noqa: PLC0415
         try:
             from .audio.highlights_export import export_highlights_video  # noqa: PLC0415
             export_highlights_video(
@@ -4871,8 +4969,12 @@ class _HighlightVideoExportWorker(QThread):
                 session_started_at_iso=self._session_started_at_iso,
                 progress=self.progress_changed.emit,
                 quality=self._quality,
+                should_cancel=self._cancel_event.is_set,
             )
             self.finished_with_result.emit("")
+        except ExportCancelled:
+            log.info("highlights video export cancelled by user")
+            self.finished_with_result.emit(self.CANCELLED_RESULT)
         except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
 
@@ -4884,27 +4986,57 @@ class _ExportPackageWorker(QThread):
     encoder sub-phases like "Encoding audio" within an mp4 render).
     The progress dialog plumbs these into a scrolling log so the
     user can see what's happening during a long export (#53).
+
+    Cancellation (#60): MainApp connects the dialog's
+    cancel_requested signal to `cancel()`. The worker flips a
+    threading.Event that the encoder loops poll periodically; on
+    the next checkpoint they raise ExportCancelled. The exception
+    propagates out, the orchestrator deletes partial output, and
+    the worker emits `<cancelled>` as the result so the dialog
+    can suppress the post-completion error message.
     """
 
     progress_changed = pyqtSignal(int)
     status_changed = pyqtSignal(str)
     finished_with_result = pyqtSignal(str)
 
-    def __init__(self, options, target_path) -> None:
+    # Sentinel reported via finished_with_result when the export was
+    # cancelled by the user (vs. failed). Callers check for this
+    # exact string before treating the result as an error.
+    CANCELLED_RESULT = "<cancelled>"
+
+    def __init__(self, options, target_path, *, compress: bool = True) -> None:
         super().__init__()
         self.setObjectName("ExportPackageWorker")
         self._options = options
         self._target = target_path
+        self._compress = compress
+        import threading  # noqa: PLC0415
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        """Request cancellation. Safe to call from the GUI thread.
+
+        Encoder loops poll `_cancel_event.is_set` at frame / chunk
+        boundaries and raise ExportCancelled when set.
+        """
+        self._cancel_event.set()
 
     def run(self) -> None:  # type: ignore[override]
+        from .utils.cancellation import ExportCancelled  # noqa: PLC0415
         try:
             from .utils.export_package import build_session_package  # noqa: PLC0415
             build_session_package(
                 self._options, self._target,
                 progress=self.progress_changed.emit,
                 status=self.status_changed.emit,
+                should_cancel=self._cancel_event.is_set,
+                compress=self._compress,
             )
             self.finished_with_result.emit("")
+        except ExportCancelled:
+            log.info("export package cancelled by user")
+            self.finished_with_result.emit(self.CANCELLED_RESULT)
         except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
 

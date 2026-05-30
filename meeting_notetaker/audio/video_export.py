@@ -87,6 +87,7 @@ def export_video(
     progress: Optional[Callable[[int], None]] = None,
     status: Optional[Callable[[str], None]] = None,
     quality: Optional[str] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Render the session into an MP4 slideshow video at dst_path.
 
@@ -177,12 +178,14 @@ def export_video(
             out_container, v_stream, screenshots,
             total_video_frames, progress=progress,
             progress_end=_FRAME_PHASE_END,
+            should_cancel=should_cancel,
         )
         if status is not None:
             status("Encoding audio")
         _encode_audio(
             out_container, a_stream, mixed, progress=progress,
             progress_start=_FRAME_PHASE_END, progress_end=_AUDIO_PHASE_END,
+            should_cancel=should_cancel,
         )
         if status is not None:
             status("Finalizing container")
@@ -190,8 +193,12 @@ def export_video(
         out_container = None
         if progress is not None:
             progress(100)
-    except Exception:
-        log.exception("export_video: render failed for %s", dst_path)
+    except Exception as exc:
+        from ..utils.cancellation import ExportCancelled  # noqa: PLC0415
+        if isinstance(exc, ExportCancelled):
+            log.info("export_video: cancelled, removing %s", dst_path)
+        else:
+            log.exception("export_video: render failed for %s", dst_path)
         if out_container is not None:
             try:
                 out_container.close()
@@ -201,6 +208,14 @@ def export_video(
         if dst_path.exists():
             try:
                 dst_path.unlink()
+            except OSError:
+                pass
+        # Also remove the SRT sidecar so a cancelled export leaves no
+        # partial artifacts behind.
+        srt = dst_path.with_suffix(".srt")
+        if srt.exists():
+            try:
+                srt.unlink()
             except OSError:
                 pass
         raise
@@ -219,6 +234,7 @@ def _encode_video(
     *,
     progress: Optional[Callable[[int], None]],
     progress_end: int = 100,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Frame-by-frame slideshow encode driven by sticky-latest lookup.
 
@@ -230,6 +246,8 @@ def _encode_video(
     """
     import av  # noqa: PLC0415
 
+    from ..utils.cancellation import raise_if_cancelled  # noqa: PLC0415
+
     black_frame = np.zeros(
         (_TARGET_HEIGHT, _TARGET_WIDTH, 3), dtype=np.uint8,
     )
@@ -238,7 +256,15 @@ def _encode_video(
     last_array: np.ndarray = black_frame
     last_progress_pct = -1
 
+    # Check cancellation every N frames -- often enough that a cancel
+    # click feels instant (~1s on a 30fps timeline) but rare enough
+    # that the per-frame work doesn't pay the Python function call
+    # tax in the inner loop.
+    _CANCEL_CHECK_INTERVAL = 30
+
     for frame_idx in range(total_video_frames):
+        if frame_idx % _CANCEL_CHECK_INTERVAL == 0:
+            raise_if_cancelled(should_cancel, "video encode")
         t_ms = int(frame_idx * 1000 / _TARGET_FPS)
         current_path = current_screenshot_for_position(screenshots, t_ms)
         if current_path != last_path:
@@ -280,6 +306,7 @@ def _encode_audio(
     progress: Optional[Callable[[int], None]] = None,
     progress_start: int = 0,
     progress_end: int = 100,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Chunk the mixed float32 mono buffer through AAC -> MP4.
 
@@ -292,11 +319,14 @@ def _encode_audio(
     import av  # noqa: PLC0415
     from av.audio.frame import AudioFrame  # noqa: PLC0415
 
+    from ..utils.cancellation import raise_if_cancelled  # noqa: PLC0415
+
     chunk_frames = _TARGET_AUDIO_RATE  # 1 sec per chunk
     total = max(1, mixed.size)
     span = max(0, progress_end - progress_start)
     last_pct = -1
     for i in range(0, mixed.size, chunk_frames):
+        raise_if_cancelled(should_cancel, "audio encode")
         chunk = mixed[i : i + chunk_frames]
         frame = AudioFrame.from_ndarray(
             chunk.reshape(1, -1), format="flt", layout="mono",

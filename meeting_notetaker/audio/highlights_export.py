@@ -322,6 +322,7 @@ def export_highlights_audio(
     audio_gap_ms: int = DEFAULT_AUDIO_GAP_MS,
     progress: Optional[Callable[[int], None]] = None,
     status: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Concatenate the audio inside each highlight range, separated
     by `audio_gap_ms` of silence, into a single file at dst_path.
@@ -366,6 +367,8 @@ def export_highlights_audio(
     mixed = _mix_to_max_length(decoded).astype(np.float32, copy=False)
     np.clip(mixed, -1.0, 1.0, out=mixed)
 
+    from ..utils.cancellation import raise_if_cancelled  # noqa: PLC0415
+
     # Slicing is fast (just numpy indexing); reserve only the first
     # 20% of the progress budget for it so the encode phase has room
     # to move the bar. Previously slicing got 0..100 and the slow
@@ -377,6 +380,7 @@ def export_highlights_audio(
     gap_samples = int(audio_gap_ms * _TARGET_RATE / 1000)
     silent_gap = np.zeros(gap_samples, dtype=np.float32)
     for seg in plan:
+        raise_if_cancelled(should_cancel, "highlights audio")
         if seg.kind == SEGMENT_JUMP:
             pieces.append(silent_gap)
             continue
@@ -397,12 +401,23 @@ def export_highlights_audio(
         status("Encoding audio")
     if progress is not None:
         progress(_SLICE_PHASE_END)
-    _encode_mono_float32(
-        concatenated,
-        dst_path=dst_path,
-        codec_name=codec_name,
-        container_format=container_format,
-    )
+    raise_if_cancelled(should_cancel, "highlights audio")
+    try:
+        _encode_mono_float32(
+            concatenated,
+            dst_path=dst_path,
+            codec_name=codec_name,
+            container_format=container_format,
+        )
+    except Exception:
+        # Clean up partial output for both real failures and the
+        # cancellation paths in _encode_mono_float32.
+        if dst_path.exists():
+            try:
+                dst_path.unlink()
+            except OSError:
+                pass
+        raise
     if progress is not None:
         progress(100)
 
@@ -426,6 +441,7 @@ def export_highlights_video(
     progress: Optional[Callable[[int], None]] = None,
     status: Optional[Callable[[str], None]] = None,
     quality: Optional[str] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Render a highlights-only MP4 with title + jump interstitials.
 
@@ -549,6 +565,7 @@ def export_highlights_video(
             current_screenshot_for_position=current_screenshot_for_position,
             scale_screenshot=_scale_screenshot_letterbox,
             progress_end=_FRAME_PHASE_END,
+            should_cancel=should_cancel,
         )
         if status is not None:
             status("Encoding audio")
@@ -557,6 +574,7 @@ def export_highlights_video(
             progress=progress,
             progress_start=_FRAME_PHASE_END,
             progress_end=_AUDIO_PHASE_END,
+            should_cancel=should_cancel,
         )
         if status is not None:
             status("Finalizing container")
@@ -564,8 +582,12 @@ def export_highlights_video(
         out_container = None
         if progress is not None:
             progress(100)
-    except Exception:
-        log.exception("export_highlights_video failed; cleaning up")
+    except Exception as exc:
+        from ..utils.cancellation import ExportCancelled  # noqa: PLC0415
+        if isinstance(exc, ExportCancelled):
+            log.info("export_highlights_video: cancelled, removing %s", dst_path)
+        else:
+            log.exception("export_highlights_video failed; cleaning up")
         if out_container is not None:
             try:
                 out_container.close()
@@ -575,6 +597,13 @@ def export_highlights_video(
         if dst_path.exists():
             try:
                 dst_path.unlink()
+            except OSError:
+                pass
+        # SRT sidecar cleanup matches the full-video path.
+        srt = dst_path.with_suffix(".srt")
+        if srt.exists():
+            try:
+                srt.unlink()
             except OSError:
                 pass
         raise
@@ -597,6 +626,7 @@ def _encode_highlight_video(
     current_screenshot_for_position,
     scale_screenshot,
     progress_end: int = 100,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Frame-by-frame slideshow encode for the highlight output.
 
@@ -607,6 +637,8 @@ def _encode_highlight_video(
     """
     import av  # noqa: PLC0415
     from .video_export import _TARGET_FPS, _TARGET_HEIGHT, _TARGET_WIDTH
+
+    from ..utils.cancellation import raise_if_cancelled  # noqa: PLC0415
 
     black_frame = np.zeros(
         (_TARGET_HEIGHT, _TARGET_WIDTH, 3), dtype=np.uint8,
@@ -619,8 +651,11 @@ def _encode_highlight_video(
     interstitial_cache: dict[tuple[str, str], np.ndarray] = {}
     last_progress_pct = -1
 
+    _CANCEL_CHECK_INTERVAL = 30
+
     frame_idx = 0
     for seg in plan:
+        raise_if_cancelled(should_cancel, "highlights video")
         seg_frames = int(seg.duration_ms * _TARGET_FPS / 1000)
         if seg.kind in (SEGMENT_TITLE, SEGMENT_JUMP):
             cache_key = (seg.label, seg.subtitle)
@@ -634,6 +669,8 @@ def _encode_highlight_video(
                 for packet in v_stream.encode(av_frame):
                     out_container.mux(packet)
                 frame_idx += 1
+                if frame_idx % _CANCEL_CHECK_INTERVAL == 0:
+                    raise_if_cancelled(should_cancel, "highlights video")
                 if progress is not None and total_frames > 0:
                     pct = int(frame_idx * progress_end / total_frames)
                     if pct != last_progress_pct:
@@ -662,6 +699,8 @@ def _encode_highlight_video(
             for packet in v_stream.encode(av_frame):
                 out_container.mux(packet)
             frame_idx += 1
+            if frame_idx % _CANCEL_CHECK_INTERVAL == 0:
+                raise_if_cancelled(should_cancel, "highlights video")
             if progress is not None and total_frames > 0:
                 pct = int(frame_idx * progress_end / total_frames)
                 if pct != last_progress_pct:
@@ -998,6 +1037,7 @@ def _encode_audio_buffer(
     progress: Optional[Callable[[int], None]] = None,
     progress_start: int = 0,
     progress_end: int = 100,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Stream a mono float32 PCM buffer through AAC -> MP4. Mirrors
     video_export._encode_audio (kept here to avoid the cross-module
@@ -1009,11 +1049,14 @@ def _encode_audio_buffer(
     import av  # noqa: PLC0415
     from av.audio.frame import AudioFrame  # noqa: PLC0415
 
+    from ..utils.cancellation import raise_if_cancelled  # noqa: PLC0415
+
     chunk_frames = rate  # 1 sec per chunk
     total = max(1, buffer.size)
     span = max(0, progress_end - progress_start)
     last_pct = -1
     for i in range(0, buffer.size, chunk_frames):
+        raise_if_cancelled(should_cancel, "highlights audio mux")
         chunk = buffer[i : i + chunk_frames]
         frame = AudioFrame.from_ndarray(
             chunk.reshape(1, -1), format="flt", layout="mono",

@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from .cancellation import ExportCancelled, raise_if_cancelled
+
 
 log = logging.getLogger(__name__)
 
@@ -124,12 +126,23 @@ def build_session_package(
     *,
     progress: Optional[Callable[[int], None]] = None,
     status: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    compress: bool = True,
 ) -> Path:
-    """Run the full pipeline and write a ZIP to `dst_zip_path`.
+    """Run the full pipeline and write the package to `dst_zip_path`.
 
     Raises on encoder / I/O failure; partial output is removed
     before re-raising so the user never ends up with a junk archive.
-    Returns `dst_zip_path` on success.
+    Returns the final output path on success.
+
+    When ``compress`` is True (default): writes a single zip file
+    at ``dst_zip_path``.
+
+    When ``compress`` is False (#62): writes the contents to a
+    DIRECTORY at ``dst_zip_path`` (the caller is expected to pass
+    a path without the ``.zip`` suffix in this mode; the function
+    creates the directory if it doesn't exist). The zip phase is
+    replaced with a per-file move from the staging dir into place.
 
     Optional ``status`` callback receives a one-line description of
     the current phase whenever the orchestrator transitions (e.g.
@@ -218,6 +231,7 @@ def build_session_package(
                 status(f"  {msg}")
 
         if sources_exist and emit_full:
+            raise_if_cancelled(should_cancel, "full audio")
             step("audio_full", 0)
             _export_full_audio(
                 options.mic_path, options.sys_path,
@@ -228,6 +242,7 @@ def build_session_package(
             step("audio_full")
 
         if sources_exist and emit_highlights:
+            raise_if_cancelled(should_cancel, "highlights audio")
             step("audio_highlights", 0)
             _export_highlights_audio(
                 options.mic_path, options.sys_path,
@@ -235,12 +250,14 @@ def build_session_package(
                 audio_dir / "highlights.mp3",
                 lambda p: step("audio_highlights", p),
                 status=lambda m: sub_status("audio_highlights", m),
+                should_cancel=should_cancel,
             )
         else:
             step("audio_highlights")
 
         if sources_exist and screenshots_exist and emit_full:
             video_dir.mkdir(parents=True, exist_ok=True)
+            raise_if_cancelled(should_cancel, "full video")
             step("video_full", 0)
             _export_full_video(
                 options.mic_path, options.sys_path,
@@ -249,12 +266,14 @@ def build_session_package(
                 lambda p: step("video_full", p),
                 status=lambda m: sub_status("video_full", m),
                 quality=options.video_quality,
+                should_cancel=should_cancel,
             )
         else:
             step("video_full")
 
         if sources_exist and screenshots_exist and emit_highlights:
             video_dir.mkdir(parents=True, exist_ok=True)
+            raise_if_cancelled(should_cancel, "highlights video")
             step("video_highlights", 0)
             _export_highlights_video(
                 options.mic_path, options.sys_path,
@@ -265,6 +284,7 @@ def build_session_package(
                 progress=lambda p: step("video_highlights", p),
                 status=lambda m: sub_status("video_highlights", m),
                 quality=options.video_quality,
+                should_cancel=should_cancel,
             )
         else:
             step("video_highlights")
@@ -286,34 +306,77 @@ def build_session_package(
                     shutil.copy2(src_path, shots_dst / src_path.name)
         step("screenshots_copy")
 
-        # ---- Zip ----
-        step("zip_pack", 0)
-        if dst_zip_path.exists():
-            dst_zip_path.unlink()
-        files_to_zip = [
-            p for p in sorted(work_dir.rglob("*")) if p.is_file()
-        ]
-        total_files = len(files_to_zip) or 1
-        with zipfile.ZipFile(
-            dst_zip_path, "w", zipfile.ZIP_DEFLATED,
-        ) as zf:
-            for idx, path in enumerate(files_to_zip, start=1):
-                zf.write(path, path.relative_to(work_dir))
-                # Report incremental progress so the bar doesn't sit
-                # at 99% during a long zip operation (#52). Cap the
-                # inner pct at 99 here -- we only call 100 after the
-                # zip handle has actually closed below.
+        # ---- Final write: zip or folder copy -----------------------
+        raise_if_cancelled(should_cancel, "package output")
+        if compress:
+            step("zip_pack", 0)
+            if dst_zip_path.exists():
+                dst_zip_path.unlink()
+            files_to_zip = [
+                p for p in sorted(work_dir.rglob("*")) if p.is_file()
+            ]
+            total_files = len(files_to_zip) or 1
+            with zipfile.ZipFile(
+                dst_zip_path, "w", zipfile.ZIP_DEFLATED,
+            ) as zf:
+                for idx, path in enumerate(files_to_zip, start=1):
+                    raise_if_cancelled(should_cancel, "zip pack")
+                    zf.write(path, path.relative_to(work_dir))
+                    # Report incremental progress so the bar doesn't
+                    # sit at 99% during a long zip operation (#52).
+                    inner = min(99, int(idx * 100 / total_files))
+                    step("zip_pack", inner)
+            step("zip_pack", 100)
+        else:
+            # Folder mode (#62): copy work_dir contents into the
+            # destination directory. The destination is the FINAL
+            # subfolder name (caller-resolved), not a parent. We
+            # write into a sibling .tmp dir first and atomically
+            # rename so a cancellation can't leave a half-populated
+            # output directory at the user's chosen path.
+            step("zip_pack", 0)
+            files_to_copy = [
+                p for p in sorted(work_dir.rglob("*")) if p.is_file()
+            ]
+            total_files = len(files_to_copy) or 1
+            staging = dst_zip_path.with_name(dst_zip_path.name + ".tmp")
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True, exist_ok=True)
+            for idx, path in enumerate(files_to_copy, start=1):
+                raise_if_cancelled(should_cancel, "folder copy")
+                rel = path.relative_to(work_dir)
+                target = staging / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
                 inner = min(99, int(idx * 100 / total_files))
                 step("zip_pack", inner)
-        step("zip_pack", 100)
+            # Atomic-ish rename. If the destination already exists
+            # (user picked an existing folder), remove it first.
+            if dst_zip_path.exists():
+                shutil.rmtree(dst_zip_path, ignore_errors=True)
+            staging.rename(dst_zip_path)
+            step("zip_pack", 100)
 
         if progress is not None:
             progress(100)
         return dst_zip_path
     except Exception:
+        # Clean both the final destination (if partially written)
+        # and any folder-mode staging tmpdir so a cancelled or
+        # failed export leaves nothing behind.
         if dst_zip_path.exists():
             try:
-                dst_zip_path.unlink()
+                if dst_zip_path.is_dir():
+                    shutil.rmtree(dst_zip_path, ignore_errors=True)
+                else:
+                    dst_zip_path.unlink()
+            except OSError:
+                pass
+        staging = dst_zip_path.with_name(dst_zip_path.name + ".tmp")
+        if staging.exists():
+            try:
+                shutil.rmtree(staging, ignore_errors=True)
             except OSError:
                 pass
         raise

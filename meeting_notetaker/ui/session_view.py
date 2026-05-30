@@ -961,6 +961,16 @@ class SessionView(QWidget):
         if not enabled:
             self._clear_transcript_highlight()
 
+    def set_player_loading_state(self, loading: bool) -> None:
+        """Forward the AudioPlayer's "decode in flight" cue to both
+        player bars (#61). The bars stay disabled while loading; the
+        time label flips to "Loading audio...". Clears when set to
+        False, but caller should follow up with set_player_enabled
+        (or another set_player_loading_state(False)) to settle the
+        idle vs ready labels."""
+        self._player_bar.set_loading_state(loading)
+        self._slides_view.set_player_loading_state(loading)
+
     def set_player_total_ms(self, total_ms: int) -> None:
         self._player_bar.set_total_ms(total_ms)
         self._slides_view.set_player_total_ms(total_ms)

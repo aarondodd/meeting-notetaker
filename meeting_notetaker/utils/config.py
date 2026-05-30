@@ -220,6 +220,12 @@ class SynthesisConfig:
     # the pre-#54 behavior (2.5 Mbps + 128 kbps) for users who want
     # the larger files. Settings dialog exposes a dropdown.
     video_quality: str = "medium"
+    # Full-session export packaging (issue #62). When False, the
+    # export writes contents to a subfolder under the user-chosen
+    # parent directory (no zip step). When True, the original
+    # behavior -- single .zip file. Off by default since OneDrive
+    # / shared-drive use cases dominate over emailed zips.
+    compress_full_session_export: bool = False
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

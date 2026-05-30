@@ -129,7 +129,8 @@ def patched_heavies():
         full_audio.side_effect = _write_audio_stub
 
         def _write_hl_audio_stub(
-            mic, sys_, highlights, dst, progress, *, status=None,
+            mic, sys_, highlights, dst, progress,
+            *, status=None, should_cancel=None,
         ):
             Path(dst).write_bytes(b"fake hl mp3")
             progress(100)
@@ -137,7 +138,7 @@ def patched_heavies():
 
         def _write_video_stub(
             mic, sys_, screenshots, transcript, dst, progress,
-            *, status=None, quality=None,
+            *, status=None, quality=None, should_cancel=None,
         ):
             Path(dst).write_bytes(b"fake mp4")
             progress(100)
@@ -146,7 +147,7 @@ def patched_heavies():
         def _write_hl_video_stub(
             mic, sys_, screenshots, transcript, highlights, dst,
             *, session_title, session_started_at_iso, progress,
-            status=None, quality=None,
+            status=None, quality=None, should_cancel=None,
         ):
             Path(dst).write_bytes(b"fake hl mp4")
             progress(100)
@@ -158,6 +159,52 @@ def patched_heavies():
             "full_video": full_video,
             "hl_video": hl_video,
         }
+
+
+def test_build_folder_export_writes_loose_files(tmp_path, patched_heavies):
+    """compress=False writes the export to a folder at the
+    destination path rather than a single .zip. The folder
+    contains the same files a zip would have included (#62)."""
+    options = _stub_options(tmp_path)
+    dst = tmp_path / "session-folder"
+    result = build_session_package(options, dst, compress=False)
+    assert result == dst
+    assert dst.is_dir()
+    assert (dst / "my-notes.pdf").exists()
+    assert (dst / "synthesis.pdf").exists()
+    assert (dst / "transcript.txt").exists()
+
+
+def test_build_folder_export_overwrites_existing_dir(tmp_path, patched_heavies):
+    """Picking a destination that already exists replaces it,
+    matching the zip overwrite-on-write behavior. Stale files
+    from a prior export do not survive into the new output."""
+    options = _stub_options(tmp_path)
+    dst = tmp_path / "session-folder"
+    dst.mkdir()
+    (dst / "stale.txt").write_text("from prior export")
+    build_session_package(options, dst, compress=False)
+    assert not (dst / "stale.txt").exists()
+
+
+def test_build_folder_export_cleans_staging_on_failure(tmp_path, patched_heavies):
+    """A failure mid-write leaves no .tmp staging dir behind."""
+    options = _stub_options(tmp_path)
+    dst = tmp_path / "session-folder"
+
+    # Force a failure inside the helper exposed via _copy_attachments.
+    from unittest.mock import patch as _patch
+    with _patch(
+        "meeting_notetaker.utils.export_package._copy_attachments",
+        side_effect=RuntimeError("synthetic failure"),
+    ):
+        options.attachments = [(tmp_path / "att.txt", "att.txt")]
+        (tmp_path / "att.txt").write_text("payload")
+        with pytest.raises(RuntimeError):
+            build_session_package(options, dst, compress=False)
+    # Neither the .tmp staging dir nor a partial destination
+    # survives.
+    assert not (tmp_path / "session-folder.tmp").exists()
 
 
 def test_build_zip_with_only_notes(tmp_path, patched_heavies):

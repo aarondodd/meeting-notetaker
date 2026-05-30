@@ -36,6 +36,10 @@ class TranscriptPlayerBar(QWidget):
         # update the slider from a position-tick; otherwise the value
         # change re-emits seek_ms_requested and the player flutters.
         self._suppress_slider_signal = False
+        # Tri-state: "loading" overrides "--:-- / --:--" so the user
+        # sees a positive cue that the decode is in flight (#61). The
+        # slider + button stay disabled either way.
+        self._loading = False
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
@@ -69,6 +73,27 @@ class TranscriptPlayerBar(QWidget):
             self.set_total_ms(0)
             self.set_position_ms(0)
             self.set_is_playing(False)
+        else:
+            # Clear any lingering "Loading audio..." label once
+            # playback is actually ready.
+            self._loading = False
+            self._refresh_time_label(self._slider.value())
+
+    def set_loading_state(self, loading: bool) -> None:
+        """Visual cue that the decode worker is in flight (#61).
+
+        Controls stay disabled (no playback action is valid mid-
+        decode) but the time label switches from the broken-looking
+        \"--:-- / --:--\" to \"Loading audio...\" so the user knows
+        the bar isn't broken.
+        """
+        self._loading = bool(loading)
+        if self._loading:
+            self._play_btn.setEnabled(False)
+            self._slider.setEnabled(False)
+            self._time_label.setText("Loading audio...")
+        else:
+            self._refresh_time_label(self._slider.value())
 
     def set_total_ms(self, total_ms: int) -> None:
         self._total_ms = max(0, int(total_ms))
@@ -128,6 +153,11 @@ class TranscriptPlayerBar(QWidget):
         self.seek_ms_requested.emit(int(self._slider.value()))
 
     def _refresh_time_label(self, position_ms: int) -> None:
+        if self._loading:
+            # Don't clobber the loading cue with the "--:-- / --:--"
+            # placeholder when an internal position update fires
+            # during decode.
+            return
         if self._total_ms <= 0:
             self._time_label.setText("--:-- / --:--")
             return
