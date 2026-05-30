@@ -804,6 +804,49 @@ class SettingsDialog(QDialog):
             "OneDrive / shared drives where unzipping isn't needed."
         )
         export_form.addRow(self._compress_full_export)
+
+        # Appendix-inclusion defaults (#65/#66 followup). These set
+        # which Appendix sub-sections come pre-checked in the
+        # AppendixInclusionDialog that fires before every PDF /
+        # Print / full-session export. Aaron's chosen defaults
+        # surface the user-curated context surfaces (attendee
+        # context + documents + links) and suppress the noisier
+        # per-person field dump and topic-suggestion list.
+        appendix_blurb = QLabel(
+            "Default Appendix sections to include when exporting "
+            "(PDF / Print / full-session). Individual exports can "
+            "still override these via the pre-export prompt.",
+            self,
+        )
+        appendix_blurb.setWordWrap(True)
+        export_form.addRow(appendix_blurb)
+        self._appendix_export_include = QCheckBox("Include Appendix", self)
+        af = self._appendix_export_include.font()
+        af.setBold(True)
+        self._appendix_export_include.setFont(af)
+        self._appendix_export_include.setChecked(
+            getattr(config.synthesis, "appendix_export_include", True),
+        )
+        self._appendix_export_include.toggled.connect(
+            self._on_appendix_export_master_toggled,
+        )
+        export_form.addRow(self._appendix_export_include)
+        self._appendix_section_checkboxes: dict[str, QCheckBox] = {}
+        # Each row: config field name, label, current default.
+        for field_name, label, attr in (
+            ("appendix_export_attendee_context",       "    Attendee Context",       "appendix_export_attendee_context"),
+            ("appendix_export_attendee_details",       "    Attendee Details",       "appendix_export_attendee_details"),
+            ("appendix_export_topics",                 "    Suggested Topics",       "appendix_export_topics"),
+            ("appendix_export_referenced_attachments", "    Referenced Attachments", "appendix_export_referenced_attachments"),
+            ("appendix_export_session_attachments",    "    Session Attachments",    "appendix_export_session_attachments"),
+            ("appendix_export_links",                  "    Links",                  "appendix_export_links"),
+        ):
+            cb = QCheckBox(label, self)
+            cb.setChecked(getattr(config.synthesis, attr, True))
+            cb.setEnabled(self._appendix_export_include.isChecked())
+            export_form.addRow(cb)
+            self._appendix_section_checkboxes[field_name] = cb
+
         layout.addWidget(export_group)
 
         layout.addStretch(1)
@@ -869,7 +912,19 @@ class SettingsDialog(QDialog):
         self._config.synthesis.compress_full_session_export = (
             self._compress_full_export.isChecked()
         )
+        self._config.synthesis.appendix_export_include = (
+            self._appendix_export_include.isChecked()
+        )
+        for field, cb in self._appendix_section_checkboxes.items():
+            setattr(self._config.synthesis, field, cb.isChecked())
         self.accept()
+
+    def _on_appendix_export_master_toggled(self, on: bool) -> None:
+        """Enable / disable the per-section checkboxes alongside the
+        master toggle so unchecking "Include Appendix" visibly
+        greys out every section."""
+        for cb in self._appendix_section_checkboxes.values():
+            cb.setEnabled(on)
 
     def _open_prompts_folder(self) -> None:
         path = prompts_dir()

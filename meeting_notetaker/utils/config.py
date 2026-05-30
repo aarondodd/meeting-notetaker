@@ -226,6 +226,20 @@ class SynthesisConfig:
     # behavior -- single .zip file. Off by default since OneDrive
     # / shared-drive use cases dominate over emailed zips.
     compress_full_session_export: bool = False
+    # Default checkbox state for the AppendixInclusionDialog
+    # (#65/#66 followup). The user-facing rationale Aaron picked:
+    # surface the curated context surfaces (attendee context,
+    # session + LLM-mentioned documents, links) by default but
+    # keep the noisier per-person field dumps + topic suggestions
+    # off so a fresh PDF / ZIP doesn't bury the synthesis under
+    # appendix bulk.
+    appendix_export_include: bool = True
+    appendix_export_attendee_context: bool = True
+    appendix_export_attendee_details: bool = False
+    appendix_export_topics: bool = False
+    appendix_export_referenced_attachments: bool = True
+    appendix_export_session_attachments: bool = True
+    appendix_export_links: bool = True
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

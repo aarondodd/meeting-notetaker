@@ -190,6 +190,49 @@ def test_master_recheck_only_restores_populated(qt_app):
         dlg.deleteLater()
 
 
+def test_defaults_kwarg_pre_checks_user_saved_state(qt_app):
+    """Settings-saved AppendixInclusion gets pre-checked into the
+    dialog (#65/#66 followup). Aaron's defaults: attendee context
+    + documents + links ON; details + topics OFF."""
+    saved = AppendixInclusion(
+        include_appendix=True,
+        include_attendee_context=True,
+        include_attendee_details=False,
+        include_topics=False,
+        include_referenced_attachments=True,
+        include_session_attachments=True,
+        include_links=True,
+    )
+    dlg = AppendixInclusionDialog(_populated(), defaults=saved)
+    try:
+        cb = dlg._sections  # noqa: SLF001
+        assert cb["attendee_context"].isChecked()
+        assert not cb["attendee_details"].isChecked()
+        assert not cb["topics"].isChecked()
+        assert cb["referenced_attachments"].isChecked()
+        assert cb["session_attachments"].isChecked()
+        assert cb["links"].isChecked()
+        # Saved default-off sections are still ENABLED so the user
+        # can opt back in on a one-off export.
+        assert cb["attendee_details"].isEnabled()
+    finally:
+        dlg.deleteLater()
+
+
+def test_defaults_master_off_disables_subsections(qt_app):
+    """A saved master-off default opens with everything off + disabled,
+    matching the runtime master-uncheck behavior."""
+    saved = AppendixInclusion.all_off()
+    dlg = AppendixInclusionDialog(_populated(), defaults=saved)
+    try:
+        assert not dlg._master.isChecked()  # noqa: SLF001
+        for cb in dlg._sections.values():  # noqa: SLF001
+            assert not cb.isChecked()
+            assert not cb.isEnabled()
+    finally:
+        dlg.deleteLater()
+
+
 def test_inclusion_reflects_user_uncheck(qt_app):
     """Unchecking one section's checkbox excludes only that
     section from the returned inclusion."""

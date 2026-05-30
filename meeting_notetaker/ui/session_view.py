@@ -185,6 +185,11 @@ class SessionView(QWidget):
         # _build_print_document reads it to decide whether to swap
         # the bullet list with a Markdown table.
         self._session_contacts: list = []
+        # User's Settings-saved AppendixInclusion defaults for the
+        # per-tab Export PDF + Print flow. None -> dialog uses
+        # "every populated section on". MainApp.set_appendix_export_defaults
+        # plumbs the saved config into this field.
+        self._appendix_export_defaults = None
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -791,6 +796,14 @@ class SessionView(QWidget):
         """Refresh the sidebar's attendee list. Called by the controller
         whenever the live_notes '# Attendees' section changes."""
         self._attendee_sidebar.set_attendees(names)
+
+    def set_appendix_export_defaults(self, defaults) -> None:
+        """Push the user's Settings-saved AppendixInclusion defaults
+        into the SessionView so the per-tab Export PDF / Print
+        flow pre-checks the right boxes. MainApp calls this on
+        construction + after every Settings save. ``defaults`` may
+        be None to fall back to the dialog's "all on" defaults."""
+        self._appendix_export_defaults = defaults
 
     def set_session_attachment_names(self, names) -> None:
         """Push the current session's attachment display names into
@@ -2060,7 +2073,12 @@ class SessionView(QWidget):
             self._print_btn.setEnabled(False)
             self._export_pdf_btn.setEnabled(False)
 
-    def _build_print_document(self, *, ask_appendix_inclusion: bool = True):
+    def _build_print_document(
+        self,
+        *,
+        ask_appendix_inclusion: bool = True,
+        appendix_defaults=None,
+    ):
         """Render the active tab into a QTextDocument bound to the session dir.
 
         Returns (doc, tab_label) or (None, "") if the active tab can't be
@@ -2149,6 +2167,7 @@ class SessionView(QWidget):
             dlg = AppendixInclusionDialog(
                 appendix_data,
                 export_label=f"{tab_label} export",
+                defaults=appendix_defaults,
                 parent=self,
             )
             if dlg.exec() != AppendixInclusionDialog.DialogCode.Accepted:
@@ -2174,7 +2193,9 @@ class SessionView(QWidget):
 
     def _on_print(self) -> None:
         """Print the active tab via QPrinter."""
-        doc, tab_label = self._build_print_document()
+        doc, tab_label = self._build_print_document(
+            appendix_defaults=self._appendix_export_defaults,
+        )
         if doc is None or self._session is None:
             return
         from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
@@ -2196,7 +2217,9 @@ class SessionView(QWidget):
         annotation), where the Windows Print-to-PDF driver typically
         rasterizes both away.
         """
-        doc, tab_label = self._build_print_document()
+        doc, tab_label = self._build_print_document(
+            appendix_defaults=self._appendix_export_defaults,
+        )
         if doc is None or self._session is None:
             return
         from PyQt6.QtWidgets import QFileDialog, QMessageBox

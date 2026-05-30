@@ -111,8 +111,16 @@ class AppendixInclusionDialog(QDialog):
         data: AppendixData,
         *,
         export_label: str = "export",
+        defaults: Optional["AppendixInclusion"] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
+        """Construct the dialog.
+
+        ``defaults`` is the user's saved Settings preference for
+        which sections to pre-check (Settings > Export > Appendix
+        defaults). Passed as ``None`` -> every populated section
+        defaults to ON, every empty section disabled.
+        """
         super().__init__(parent)
         self.setWindowTitle("Appendix sections to include")
         self.setModal(True)
@@ -131,8 +139,10 @@ class AppendixInclusionDialog(QDialog):
         blurb.setWordWrap(True)
         outer.addWidget(blurb)
 
+        defaults = defaults or AppendixInclusion.all_on()
+
         self._master = QCheckBox("Include Appendix", self)
-        self._master.setChecked(True)
+        self._master.setChecked(defaults.include_appendix)
         font = self._master.font()
         font.setBold(True)
         self._master.setFont(font)
@@ -140,23 +150,27 @@ class AppendixInclusionDialog(QDialog):
         outer.addWidget(self._master)
 
         self._sections: dict[str, QCheckBox] = {}
-        # Section key, label, current count from the live data.
+        # Each row: section key, label, live count, default-on flag.
         section_specs = [
-            ("attendee_context",       "Attendee Context",       len(data.attendee_context)),
-            ("attendee_details",       "Attendee Details",       len(data.attendee_details)),
-            ("topics",                 "Suggested Topics",       len(data.topics)),
-            ("referenced_attachments", "Referenced Attachments", len(data.referenced_attachments)),
-            ("session_attachments",    "Session Attachments",    len(data.session_attachments)),
-            ("links",                  "Links",                  len(data.links)),
+            ("attendee_context",       "Attendee Context",       len(data.attendee_context),       defaults.include_attendee_context),
+            ("attendee_details",       "Attendee Details",       len(data.attendee_details),       defaults.include_attendee_details),
+            ("topics",                 "Suggested Topics",       len(data.topics),                 defaults.include_topics),
+            ("referenced_attachments", "Referenced Attachments", len(data.referenced_attachments), defaults.include_referenced_attachments),
+            ("session_attachments",    "Session Attachments",    len(data.session_attachments),    defaults.include_session_attachments),
+            ("links",                  "Links",                  len(data.links),                  defaults.include_links),
         ]
-        for key, label, count in section_specs:
+        master_on = defaults.include_appendix
+        for key, label, count, default_on in section_specs:
             display = (
                 f"    {label} ({count})" if count
                 else f"    {label} (empty)"
             )
             cb = QCheckBox(display, self)
-            cb.setChecked(count > 0)
-            cb.setEnabled(count > 0)
+            # Checkbox starts checked when (1) Settings says so AND
+            # (2) master is on AND (3) the section has entries.
+            # Empty sections are disabled regardless of Settings.
+            cb.setEnabled(count > 0 and master_on)
+            cb.setChecked(count > 0 and master_on and default_on)
             outer.addWidget(cb)
             self._sections[key] = cb
 

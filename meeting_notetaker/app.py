@@ -367,6 +367,11 @@ class MainApp(QObject):
         self.window.session_view.set_screencap_auto_interval(
             int(self.config.ui.screen_capture_auto_interval_sec)
         )
+        # Push the user's saved appendix-inclusion defaults so the
+        # Export PDF + Print dialogs pre-check the right boxes.
+        self.window.session_view.set_appendix_export_defaults(
+            self._appendix_export_defaults_from_config(),
+        )
         # Restore the persisted Transcript-playback split percentage so
         # the user's preferred ratio applies the first time playback
         # engages this session.
@@ -3263,6 +3268,7 @@ class MainApp(QObject):
         inc_dlg = AppendixInclusionDialog(
             appendix_data,
             export_label="full-session export",
+            defaults=self._appendix_export_defaults_from_config(),
             parent=self.window,
         )
         if inc_dlg.exec() != AppendixInclusionDialog.DialogCode.Accepted:
@@ -4147,7 +4153,27 @@ class MainApp(QObject):
         self.window.session_view.set_screencap_auto_interval(
             int(self.config.ui.screen_capture_auto_interval_sec)
         )
+        # Push the appendix-inclusion defaults so the per-tab
+        # Export PDF + Print dialogs reflect the new settings.
+        self.window.session_view.set_appendix_export_defaults(
+            self._appendix_export_defaults_from_config(),
+        )
         self.window.status("Settings saved.", timeout_ms=4000)
+
+    def _appendix_export_defaults_from_config(self):
+        """Build the AppendixInclusion the per-export dialog should
+        pre-check, derived from the Settings-saved booleans."""
+        from .ui.appendix_inclusion_dialog import AppendixInclusion  # noqa: PLC0415
+        s = self.config.synthesis
+        return AppendixInclusion(
+            include_appendix=s.appendix_export_include,
+            include_attendee_context=s.appendix_export_attendee_context,
+            include_attendee_details=s.appendix_export_attendee_details,
+            include_topics=s.appendix_export_topics,
+            include_referenced_attachments=s.appendix_export_referenced_attachments,
+            include_session_attachments=s.appendix_export_session_attachments,
+            include_links=s.appendix_export_links,
+        )
 
     # ---- status bar indicators -------------------------------------------
 

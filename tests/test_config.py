@@ -430,3 +430,35 @@ def test_synthesis_auto_extract_attendee_details_defaults_off():
     embedded prompt injection."""
     from meeting_notetaker.utils.config import SynthesisConfig
     assert SynthesisConfig().auto_extract_attendee_details is False
+
+
+def test_appendix_export_defaults_match_aarons_chosen_set():
+    """Aaron's explicit defaults (2026-05-30): Appendix master + the
+    user-curated context surfaces (attendee context + session and
+    LLM-mentioned documents + links) default ON; the noisier
+    Attendee Details + Suggested Topics default OFF."""
+    from meeting_notetaker.utils.config import SynthesisConfig
+    s = SynthesisConfig()
+    assert s.appendix_export_include is True
+    assert s.appendix_export_attendee_context is True
+    assert s.appendix_export_attendee_details is False
+    assert s.appendix_export_topics is False
+    assert s.appendix_export_referenced_attachments is True
+    assert s.appendix_export_session_attachments is True
+    assert s.appendix_export_links is True
+
+
+def test_appendix_export_defaults_round_trip(isolated_data_dir):
+    """User toggles in Settings persist across restarts."""
+    cfg = Config()
+    cfg.synthesis.appendix_export_attendee_details = True
+    cfg.synthesis.appendix_export_topics = True
+    cfg.synthesis.appendix_export_links = False
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.synthesis.appendix_export_attendee_details is True
+    assert loaded.synthesis.appendix_export_topics is True
+    assert loaded.synthesis.appendix_export_links is False
+    # Defaults for fields the test didn't touch survive.
+    assert loaded.synthesis.appendix_export_include is True
+    assert loaded.synthesis.appendix_export_attendee_context is True
