@@ -642,6 +642,16 @@ class MainApp(QObject):
         # behavior is gated on a config flag; default keeps the
         # appendix visible so the user can see what was extracted.
         self._apply_attendee_details_appendix(session_id, markdown)
+        # Persist the four LLM appendices to the sidecar BEFORE the
+        # optional strip pass so the data is preserved regardless of
+        # the strip toggle (#64 sidecar followup).
+        try:
+            from .utils.appendix_store import AppendixStore  # noqa: PLC0415
+            AppendixStore(session_id).save_from_notes(markdown)
+        except Exception:
+            log.exception(
+                "appendix sidecar write failed: %s", session_id,
+            )
         if self.config.synthesis.strip_attendee_appendix:
             from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
             from .utils.topic_appendix import (  # noqa: PLC0415
@@ -654,12 +664,12 @@ class MainApp(QObject):
                 strip_appendix as strip_invite_mentions,
             )
             # All four LLM-generated appendices ride the same
-            # Settings toggle (#57 + #63 + #64). They're each
-            # opt-out "show me what was extracted" surfaces; if the
-            # user wants the synthesis clean, they want them all
-            # gone. Heads-up: with strip ON, the Appendix tray
-            # will be empty because it reads from notes.md (Aaron
-            # picked the "read from raw" option in #64).
+            # Settings toggle. They're each opt-out "show me what
+            # was extracted" surfaces; if the user wants notes.md
+            # clean, they want them all gone. The Appendix tray
+            # stays populated because the sidecar
+            # (notes.appendices.json) was written above before this
+            # strip pass ran (#64 sidecar followup).
             markdown = strip_appendix(markdown)
             markdown = strip_topic_appendix(markdown)
             markdown = strip_attendee_context(markdown)
@@ -3128,12 +3138,13 @@ class MainApp(QObject):
                 ]
             except Exception:
                 log.exception("contact fetch failed for export PDF: %s", session_id)
-        # #64: parse JSON appendices + scrape links + load
-        # attachment names into an AppendixData payload the PDF
-        # render path uses to inject the rendered "## Appendix
-        # (auto-extracted)" section in both PDFs.
+        # #64: build the AppendixData payload the PDF render path
+        # uses to inject the rendered "## Appendix (auto-extracted)"
+        # section. Uses the sidecar-backed collector so a stripped
+        # synthesis still produces the full appendix (sidecar
+        # followup).
         try:
-            from .utils.appendix_transform import collect_from_markdown  # noqa: PLC0415
+            from .utils.appendix_store import collect_for_session  # noqa: PLC0415
             attach_store = AttachmentsStore(session_id)
             attachment_names = [
                 rec.display_name for rec in attach_store.list()
@@ -3143,7 +3154,8 @@ class MainApp(QObject):
                 "attachment names for PDF appendix failed: %s", session_id,
             )
             attachment_names = []
-        appendix_data = collect_from_markdown(
+        appendix_data = collect_for_session(
+            session_id=session_id,
             notes_text=synthesis_md or "",
             live_notes_text=notes_md or "",
             session_attachments=attachment_names,

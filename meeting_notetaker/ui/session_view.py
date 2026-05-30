@@ -793,17 +793,22 @@ class SessionView(QWidget):
         self._refresh_appendix_trays()
 
     def _refresh_appendix_trays(self) -> None:
-        """Re-parse both editors' markdown + push the merged
-        AppendixData payload into both trays.
+        """Rebuild the AppendixData payload + push it into the trays.
 
-        Cheap: a few regex scans across in-memory strings. Runs on
-        session select, after paste-back, after attachments change,
-        and on each live-notes save flush.
+        Reads the four LLM appendix sections from the sidecar
+        (``notes.appendices.json``) so the strip-on-save toggle no
+        longer empties the tray. Falls back to parsing notes.md for
+        any section the sidecar doesn't carry (sessions that
+        predate the sidecar migration). Links + session attachments
+        are computed fresh from the in-memory editor text and the
+        cached attachment list.
         """
-        from ..utils.appendix_transform import collect_from_markdown  # noqa: PLC0415
+        from ..utils.appendix_store import collect_for_session  # noqa: PLC0415
         notes_text = self._notes_view.toPlainText()
         live_notes_text = self._live_notes_editor.toPlainText()
-        data = collect_from_markdown(
+        session_id = self._session.id if self._session is not None else None
+        data = collect_for_session(
+            session_id=session_id,
             notes_text=notes_text,
             live_notes_text=live_notes_text,
             session_attachments=getattr(
@@ -1468,8 +1473,17 @@ class SessionView(QWidget):
             return
         body = self._notes_view.toPlainText()
         self.synthesis_notes_changed.emit(self._session.id, body)
-        # Synthesis edits may add / remove links + change the
-        # appendix JSON blocks; keep the tray in sync (#64).
+        # Synthesis edits may add / remove appendix JSON blocks;
+        # re-parse + persist to the sidecar so the tray + preview
+        # transform pick up the change without round-tripping
+        # through the save loop (#64 + sidecar followup).
+        try:
+            from ..utils.appendix_store import AppendixStore  # noqa: PLC0415
+            AppendixStore(self._session.id).save_from_notes(body)
+        except Exception:
+            # Sidecar persistence is best-effort; the tray will fall
+            # back to parsing the in-memory text on the next refresh.
+            pass
         self._refresh_appendix_trays()
 
     def _on_live_notes_changed(self) -> None:
@@ -2083,6 +2097,28 @@ class SessionView(QWidget):
             body_for_print = replace_attendees_section_with_table(
                 markdown_source, self._session_contacts,
             )
+
+        # #64: replace the raw LLM JSON appendix blocks with the
+        # rendered "## Appendix (auto-extracted)" table view so the
+        # per-tab PDF / Print output matches what the in-app preview
+        # shows. Without this the raw JSON code blocks land verbatim
+        # in the PDF + the auto-extracted heading is missing.
+        from ..utils.appendix_store import collect_for_session  # noqa: PLC0415
+        from ..utils.appendix_transform import inject_appendix  # noqa: PLC0415
+        # Pull the same sidecar-backed payload the tray uses so the
+        # injection picks up sections that have been stripped from
+        # notes.md.
+        notes_md = self._notes_view.toPlainText()
+        live_md = self._live_notes_editor.toPlainText()
+        appendix_data = collect_for_session(
+            session_id=self._session.id,
+            notes_text=notes_md,
+            live_notes_text=live_md,
+            session_attachments=getattr(
+                self, "_session_attachment_names", [],
+            ),
+        )
+        body_for_print = inject_appendix(body_for_print, appendix_data)
 
         printable = build_print_markdown(
             session_title=self._session.title,
