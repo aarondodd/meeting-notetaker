@@ -13,10 +13,41 @@ from pathlib import Path
 import pytest
 
 from meeting_notetaker.audio.video_export import (
+    DEFAULT_QUALITY,
+    QUALITY_PRESETS,
     _ms_to_srt,
+    _resolve_quality,
     _scale_screenshot_letterbox,
     _transcript_to_srt,
 )
+
+
+def test_quality_presets_have_low_medium_high():
+    """The Settings dropdown depends on these three names; pin them so
+    a future encoder refactor doesn't silently drop one (#54)."""
+    assert set(QUALITY_PRESETS) == {"low", "medium", "high"}
+    # Bit-rates must be monotonically increasing across presets.
+    low = QUALITY_PRESETS["low"]
+    med = QUALITY_PRESETS["medium"]
+    high = QUALITY_PRESETS["high"]
+    assert low[0] < med[0] < high[0], "video bit_rate ladder broken"
+    assert low[1] <= med[1] <= high[1], "audio bit_rate ladder broken"
+
+
+def test_resolve_quality_falls_back_to_default():
+    """Unknown / empty / None quality strings should resolve to the
+    default preset so config drift never breaks a render."""
+    expected = QUALITY_PRESETS[DEFAULT_QUALITY]
+    assert _resolve_quality(None) == expected
+    assert _resolve_quality("") == expected
+    assert _resolve_quality("bogus") == expected
+
+
+def test_resolve_quality_is_case_insensitive():
+    """Settings values may come back as "Medium" if a future UI uses
+    title-case; resolution must still match."""
+    assert _resolve_quality("MEDIUM") == QUALITY_PRESETS["medium"]
+    assert _resolve_quality("Low") == QUALITY_PRESETS["low"]
 
 
 def test_ms_to_srt_zero():

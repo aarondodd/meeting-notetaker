@@ -367,6 +367,11 @@ class MainApp(QObject):
         self.window.session_view.set_screencap_auto_interval(
             int(self.config.ui.screen_capture_auto_interval_sec)
         )
+        # Push the user's saved appendix-inclusion defaults so the
+        # Export PDF + Print dialogs pre-check the right boxes.
+        self.window.session_view.set_appendix_export_defaults(
+            self._appendix_export_defaults_from_config(),
+        )
         # Restore the persisted Transcript-playback split percentage so
         # the user's preferred ratio applies the first time playback
         # engages this session.
@@ -642,9 +647,38 @@ class MainApp(QObject):
         # behavior is gated on a config flag; default keeps the
         # appendix visible so the user can see what was extracted.
         self._apply_attendee_details_appendix(session_id, markdown)
+        # Persist the four LLM appendices to the sidecar BEFORE the
+        # optional strip pass so the data is preserved regardless of
+        # the strip toggle (#64 sidecar followup).
+        try:
+            from .utils.appendix_store import AppendixStore  # noqa: PLC0415
+            AppendixStore(session_id).save_from_notes(markdown)
+        except Exception:
+            log.exception(
+                "appendix sidecar write failed: %s", session_id,
+            )
         if self.config.synthesis.strip_attendee_appendix:
             from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
+            from .utils.topic_appendix import (  # noqa: PLC0415
+                strip_appendix as strip_topic_appendix,
+            )
+            from .utils.attendee_context import (  # noqa: PLC0415
+                strip_appendix as strip_attendee_context,
+            )
+            from .utils.invite_mentions import (  # noqa: PLC0415
+                strip_appendix as strip_invite_mentions,
+            )
+            # All four LLM-generated appendices ride the same
+            # Settings toggle. They're each opt-out "show me what
+            # was extracted" surfaces; if the user wants notes.md
+            # clean, they want them all gone. The Appendix tray
+            # stays populated because the sidecar
+            # (notes.appendices.json) was written above before this
+            # strip pass ran (#64 sidecar followup).
             markdown = strip_appendix(markdown)
+            markdown = strip_topic_appendix(markdown)
+            markdown = strip_attendee_context(markdown)
+            markdown = strip_invite_mentions(markdown)
         try:
             archive_path = TranscriptStore(session_id).save_notes(
                 markdown, archive_existing=True
@@ -1082,6 +1116,7 @@ class MainApp(QObject):
         sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
         sv.review_speakers_clicked.connect(self._on_review_speakers)
+        sv.appendix_edit_requested.connect(self._on_appendix_edit_requested)
         sv.restore_previous_notes_clicked.connect(self._on_restore_previous_notes)
         sv.delete_previous_notes_clicked.connect(self._on_delete_previous_notes)
         sv.prompt_template_changed.connect(self._on_prompt_template_changed)
@@ -1338,13 +1373,31 @@ class MainApp(QObject):
         sv.set_notes_text(content.notes)
         sv.set_previous_notes(content.previous_notes_paths)
         sv.set_prompt_templates(
-            content.template_names, selected=content.selected_template,
+            content.template_names,
+            selected=content.selected_template,
+            settings_default=self.config.synthesis.default_template_name,
         )
         sv.set_attendee_names(parse_attendees(content.live_notes))
         # Push the session's Contact list into the attendee-details
         # drawer (issue #51 Phase 3). Cheap query; refreshed again
         # whenever attendee sync re-runs (see _sync_attendees_to_people).
         self._refresh_session_contacts_in_drawer(content.session_id)
+        # Issue #64: hydrate the Appendix tray's Session Attachments
+        # section. The tray reads JSON appendices + scans for links
+        # itself off the editors' current text, but the attachment
+        # list lives in a separate store -- push it in explicitly.
+        try:
+            from .models.attachments import AttachmentsStore  # noqa: PLC0415
+            store = AttachmentsStore(content.session_id)
+            sv.set_session_attachment_names([
+                rec.display_name for rec in store.list()
+            ])
+        except Exception:
+            log.exception(
+                "attachments fetch for appendix tray failed: %s",
+                content.session_id,
+            )
+            sv.set_session_attachment_names([])
         # Highlights: total_ms is 0 until the audio player finishes
         # its own async load and fires set_player_total_ms. The
         # highlight bar disables interaction cleanly at total_ms=0
@@ -1894,6 +1947,98 @@ class MainApp(QObject):
                 f"{unknown_count} unlabeled -- click Review Speakers to label"
             )
         self.window.status("; ".join(msg_parts) + ".", timeout_ms=10000)
+
+    def _on_appendix_edit_requested(self, session_id: str) -> None:
+        """Open the AppendixEditDialog seeded from the sidecar.
+
+        On accept: write the edited entries back to the sidecar and
+        re-render the raw JSON blocks inside notes.md so the
+        debounced _flush_notes pass doesn't immediately stomp the
+        edits with the LLM's original.
+        """
+        from .ui.appendix_edit_dialog import AppendixEditDialog  # noqa: PLC0415
+        from .utils.appendix_store import (  # noqa: PLC0415
+            AppendixStore,
+            regenerate_notes_json,
+        )
+        store = AppendixStore(session_id)
+        ctx, details, topics, referenced = store.load_as_dataclasses()
+        # Fall back to parsing notes.md in case the sidecar is
+        # absent (sessions predating the sidecar migration).
+        if not (ctx or details or topics or referenced):
+            try:
+                notes_md = TranscriptStore(session_id).read_notes()
+                from .utils.attendee_appendix import parse_appendix  # noqa: PLC0415
+                from .utils.attendee_context import (  # noqa: PLC0415
+                    parse_attendee_context,
+                )
+                from .utils.invite_mentions import (  # noqa: PLC0415
+                    parse_invite_mentions,
+                )
+                from .utils.topic_appendix import (  # noqa: PLC0415
+                    parse_topic_appendix,
+                )
+                ctx = parse_attendee_context(notes_md)
+                details = parse_appendix(notes_md)
+                topics = parse_topic_appendix(notes_md)
+                referenced = parse_invite_mentions(notes_md)
+            except Exception:
+                log.exception(
+                    "appendix edit dialog seed-fallback failed: %s",
+                    session_id,
+                )
+        dialog = AppendixEditDialog(
+            attendee_context=ctx,
+            attendee_details=details,
+            topics=topics,
+            referenced_attachments=referenced,
+            parent=self.window,
+        )
+        if dialog.exec() != AppendixEditDialog.DialogCode.Accepted:
+            return
+        edited_ctx = dialog.attendee_context()
+        edited_details = dialog.attendee_details()
+        edited_topics = dialog.topics()
+        edited_referenced = dialog.referenced_attachments()
+        # Persist to sidecar first -- if the notes.md regenerate
+        # fails, the sidecar still has the truthful state.
+        store.save(
+            attendee_context=edited_ctx,
+            attendee_details=edited_details,
+            topics=edited_topics,
+            referenced_attachments=edited_referenced,
+        )
+        # Update notes.md so the LLM's original JSON blocks don't
+        # round-trip back into the sidecar via the next
+        # _flush_notes. Skipped when the synthesis on disk is
+        # already empty -- no JSON blocks to overwrite.
+        try:
+            tstore = TranscriptStore(session_id)
+            current_notes = tstore.read_notes()
+            updated_notes = regenerate_notes_json(
+                current_notes,
+                attendee_context=edited_ctx,
+                attendee_details=edited_details,
+                topics=edited_topics,
+                referenced_attachments=edited_referenced,
+            )
+            if updated_notes != current_notes:
+                tstore.save_notes(updated_notes, archive_existing=False)
+                # Push the updated text into the open SessionView so
+                # the editor + tray reflect the change immediately
+                # without waiting for the next session-switch.
+                sv = self.window.session_view
+                if sv._session is not None and sv._session.id == session_id:  # noqa: SLF001
+                    sv.set_notes_text(updated_notes)
+        except Exception:
+            log.exception(
+                "appendix edit notes.md regenerate failed: %s",
+                session_id,
+            )
+        # Refresh the trays + preview against the new sidecar.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:  # noqa: SLF001
+            sv._refresh_appendix_trays()  # noqa: SLF001
 
     def _on_review_speakers(self, session_id: str) -> None:
         """Manual review walker. Reads diarization.json for the session."""
@@ -2533,6 +2678,7 @@ class MainApp(QObject):
             if self._audio_player is not None:
                 self._audio_player.close()
             self._player_loaded_session_id = None
+            self.window.session_view.set_player_loading_state(False)
             self.window.session_view.set_player_enabled(False)
             return
         files = session_audio_files(session_id)
@@ -2540,6 +2686,7 @@ class MainApp(QObject):
             if self._audio_player is not None and self._player_loaded_session_id:
                 self._audio_player.close()
                 self._player_loaded_session_id = None
+            self.window.session_view.set_player_loading_state(False)
             self.window.session_view.set_player_enabled(False)
             return
         # Separate the mic and sys halves out of the list. The path
@@ -2555,22 +2702,30 @@ class MainApp(QObject):
         # isn't ready, and so a long decode (1-3 s for a multi-hour
         # meeting) doesn't gray-out the whole window.
         self.window.session_view.set_player_enabled(False)
+        # Surface the in-flight decode so the player bar reads
+        # "Loading audio..." instead of "--:-- / --:--" -- without
+        # this, a multi-minute meeting's decode pause looked like
+        # the player was broken (#61).
+        self.window.session_view.set_player_loading_state(True)
         try:
             player.load(mic_path, sys_path)
         except Exception:
             log.exception("AudioPlayer.load raised")
+            self.window.session_view.set_player_loading_state(False)
             self._player_loaded_session_id = None
             return
         self._player_loaded_session_id = session_id
 
     def _on_player_loaded(self, total_ms: int) -> None:
         sv = self.window.session_view
+        sv.set_player_loading_state(False)
         sv.set_player_total_ms(total_ms)
         sv.set_player_position_ms(0)
         sv.set_player_is_playing(False)
         sv.set_player_enabled(True)
 
     def _on_player_load_failed(self, message: str) -> None:
+        self.window.session_view.set_player_loading_state(False)
         self.window.status(message, timeout_ms=5000)
         self.window.session_view.set_player_enabled(False)
         self._player_loaded_session_id = None
@@ -2704,29 +2859,42 @@ class MainApp(QObject):
         # report PyAV encoder progress per-frame across the thread
         # boundary. The dialog is modal so the user can't interact
         # with the rest of the app mid-encode (avoiding the
-        # session-deselect-during-encode race).
+        # session-deselect-during-encode race). Cancel (#60) is
+        # honored at the highlights-slicer + chunk boundaries; the
+        # full-recording mp3 path doesn't yet poll cancellation
+        # because it has no progress callback to attach the check
+        # to, so cancel on that path waits for the encoder to
+        # finish on its own (acceptable -- it's the fast path).
+        cancel_label = "Cancel" if highlight_mode == "highlights" else None
         progress = QProgressDialog(
             f"Exporting {target.name}...",
-            None,  # no Cancel button; PyAV encode isn't cleanly interruptible
+            cancel_label,
             0, 0, self.window,
         )
         progress.setWindowTitle("Export recording")
         progress.setMinimumDuration(0)
         progress.setAutoClose(True)
         progress.setAutoReset(True)
-        progress.setCancelButton(None)
+        if cancel_label is None:
+            progress.setCancelButton(None)
 
         if highlight_mode == "highlights":
             highlights = self._session_highlights(session_id).sorted_by_start()
             worker = _HighlightAudioExportWorker(
                 mic_path, sys_path, highlights, target,
             )
+            progress.canceled.connect(worker.cancel)
         else:
             worker = _AudioExportWorker(mic_path, sys_path, target)
 
         def on_done(err_msg: str) -> None:
             progress.cancel()
-            if err_msg:
+            cancelled = err_msg == _HighlightAudioExportWorker.CANCELLED_RESULT
+            if cancelled:
+                self.window.status(
+                    "Audio export cancelled.", timeout_ms=4000,
+                )
+            elif err_msg:
                 log.error("export_mixed failed: %s", err_msg)
                 QMessageBox.warning(
                     self.window, "Export recording",
@@ -2817,16 +2985,20 @@ class MainApp(QObject):
             log.exception("could not read transcript for %s", session_id)
             transcript_text = ""
 
+        # The "Cancel" label gives the user the abort button #60
+        # asks for; the encoder loops poll the worker's cancel flag
+        # at frame boundaries and raise ExportCancelled at the next
+        # checkpoint. Partial mp4 + sidecar SRT are deleted by
+        # video_export's cleanup path.
         progress = QProgressDialog(
             f"Rendering {target.name}...",
-            None,
+            "Cancel",
             0, 100, self.window,
         )
         progress.setWindowTitle("Export session as video")
         progress.setMinimumDuration(0)
         progress.setAutoClose(True)
         progress.setAutoReset(True)
-        progress.setCancelButton(None)
         progress.setValue(0)
 
         if highlight_mode == "highlights":
@@ -2843,10 +3015,12 @@ class MainApp(QObject):
                 highlights, target,
                 session_title=session.title,
                 session_started_at_iso=started_at_iso,
+                quality=self.config.synthesis.video_quality,
             )
         else:
             worker = _VideoExportWorker(
                 mic_path, sys_path, offsets, transcript_text, target,
+                quality=self.config.synthesis.video_quality,
             )
 
         def on_progress(pct: int) -> None:
@@ -2854,7 +3028,12 @@ class MainApp(QObject):
 
         def on_done(err_msg: str) -> None:
             progress.cancel()
-            if err_msg:
+            cancelled = err_msg == _VideoExportWorker.CANCELLED_RESULT
+            if cancelled:
+                self.window.status(
+                    "Video export cancelled.", timeout_ms=4000,
+                )
+            elif err_msg:
                 log.error("export_video failed: %s", err_msg)
                 QMessageBox.warning(
                     self.window, "Export session as video",
@@ -2869,6 +3048,10 @@ class MainApp(QObject):
 
         worker.progress_changed.connect(on_progress)
         worker.finished_with_result.connect(on_done)
+        # QProgressDialog.canceled fires when the user clicks Cancel.
+        # The worker keeps running until the next checkpoint -- we
+        # just flag the cancel and let the encoder unwind.
+        progress.canceled.connect(worker.cancel)
         progress.show()
         worker.start()
 
@@ -2884,11 +3067,14 @@ class MainApp(QObject):
         from datetime import datetime  # noqa: PLC0415
 
         from PyQt6.QtWidgets import (  # noqa: PLC0415
-            QFileDialog, QMessageBox, QProgressDialog,
+            QFileDialog, QMessageBox,
         )
         from .models.attachments import AttachmentsStore  # noqa: PLC0415
         from .models.highlights import HighlightsStore  # noqa: PLC0415
         from .models.transcript import TranscriptStore  # noqa: PLC0415
+        from .ui.export_progress_dialog import (  # noqa: PLC0415
+            ExportProgressDialog,
+        )
         from .screencap.timestamps import screenshot_offsets  # noqa: PLC0415
         from .utils.export_package import (  # noqa: PLC0415
             HIGHLIGHTS_MODE_BOTH,
@@ -2943,22 +3129,42 @@ class MainApp(QObject):
         else:
             highlights_mode = HIGHLIGHTS_MODE_FULL
 
-        # Save dialog with suggested filename.
+        # Save / folder picker. When compress is OFF (#62), prompt
+        # for a parent directory and build a subfolder under it
+        # named like the zip would have been. When ON, the original
+        # save-file flow with .zip suffix.
+        compress = self.config.synthesis.compress_full_session_export
         suggested = default_package_filename(
             session.title or "session",
             session.started_at or session.created_at or "",
         )
-        suggested_path = str(Path.home() / "Documents" / suggested)
-        path_str, _ = QFileDialog.getSaveFileName(
-            self.window, "Export full session",
-            suggested_path,
-            "ZIP archive (*.zip)",
-        )
-        if not path_str:
-            return
-        target = Path(path_str)
-        if target.suffix.lower() != ".zip":
-            target = target.with_suffix(".zip")
+        if compress:
+            suggested_path = str(Path.home() / "Documents" / suggested)
+            path_str, _ = QFileDialog.getSaveFileName(
+                self.window, "Export full session",
+                suggested_path,
+                "ZIP archive (*.zip)",
+            )
+            if not path_str:
+                return
+            target = Path(path_str)
+            if target.suffix.lower() != ".zip":
+                target = target.with_suffix(".zip")
+        else:
+            parent_dir = QFileDialog.getExistingDirectory(
+                self.window, "Choose a folder for the export",
+                str(Path.home() / "Documents"),
+            )
+            if not parent_dir:
+                return
+            # The .zip suffix is the part that distinguishes compressed
+            # output from folder output -- strip it for the subfolder
+            # name. default_package_filename always emits a name with
+            # the .zip suffix.
+            folder_name = suggested
+            if folder_name.lower().endswith(".zip"):
+                folder_name = folder_name[:-4]
+            target = Path(parent_dir) / folder_name
 
         # Gather inputs.
         store = TranscriptStore(session_id)
@@ -3030,6 +3236,44 @@ class MainApp(QObject):
                 ]
             except Exception:
                 log.exception("contact fetch failed for export PDF: %s", session_id)
+        # #64: build the AppendixData payload the PDF render path
+        # uses to inject the rendered "## Appendix (auto-extracted)"
+        # section. Uses the sidecar-backed collector so a stripped
+        # synthesis still produces the full appendix (sidecar
+        # followup).
+        try:
+            from .utils.appendix_store import collect_for_session  # noqa: PLC0415
+            attach_store = AttachmentsStore(session_id)
+            attachment_names = [
+                rec.display_name for rec in attach_store.list()
+            ]
+        except Exception:
+            log.exception(
+                "attachment names for PDF appendix failed: %s", session_id,
+            )
+            attachment_names = []
+        appendix_data = collect_for_session(
+            session_id=session_id,
+            notes_text=synthesis_md or "",
+            live_notes_text=notes_md or "",
+            session_attachments=attachment_names,
+        )
+        # Prompt the user for which Appendix sub-sections to bundle.
+        # Cancel aborts the whole export so the file dialog choice +
+        # highlights mode pick aren't wasted.
+        from .ui.appendix_inclusion_dialog import (  # noqa: PLC0415
+            AppendixInclusionDialog,
+            apply_inclusion,
+        )
+        inc_dlg = AppendixInclusionDialog(
+            appendix_data,
+            export_label="full-session export",
+            defaults=self._appendix_export_defaults_from_config(),
+            parent=self.window,
+        )
+        if inc_dlg.exec() != AppendixInclusionDialog.DialogCode.Accepted:
+            return
+        appendix_data = apply_inclusion(appendix_data, inc_dlg.inclusion())
         notes_pdf_path = None
         synthesis_pdf_path = None
         try:
@@ -3043,6 +3287,7 @@ class MainApp(QObject):
                     tab_label="My Notes",
                     session_date=session_when,
                     session_contacts=session_contacts_for_pdf,
+                    appendix_data=appendix_data,
                 )
             if synthesis_md.strip():
                 synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
@@ -3054,6 +3299,7 @@ class MainApp(QObject):
                     tab_label="Synthesis",
                     session_date=session_when,
                     session_contacts=session_contacts_for_pdf,
+                    appendix_data=appendix_data,
                 )
         except Exception:
             log.exception("PDF pre-render failed for %s", session_id)
@@ -3071,26 +3317,19 @@ class MainApp(QObject):
             attachments=attachments_pairs,
             highlights=highlights,
             highlights_mode=highlights_mode,
+            video_quality=self.config.synthesis.video_quality,
         )
 
-        # Worker thread with determinate progress.
-        progress = QProgressDialog(
-            f"Building {target.name}...", None, 0, 100, self.window,
+        # ExportProgressDialog couples a determinate bar, a current
+        # phase label, a Cancel button (#60), and a scrolling log
+        # of every status emit from the worker (#53).
+        header = (
+            f"Building {target.name}.zip..." if compress
+            else f"Building {target.name}/..."
         )
-        progress.setWindowTitle("Export full session")
-        progress.setMinimumDuration(0)
-        # setAutoClose + setAutoReset together caused stuttering on
-        # 100 (close + reset + setValue updates). Manage closing
-        # explicitly in on_done.
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.setCancelButton(None)
-        progress.setValue(0)
+        progress = ExportProgressDialog(self.window, header)
 
-        worker = _ExportPackageWorker(options, target)
-
-        def on_progress(pct: int) -> None:
-            progress.setValue(pct)
+        worker = _ExportPackageWorker(options, target, compress=compress)
 
         def on_done(err_msg: str) -> None:
             # Close the dialog before showing any follow-up message
@@ -3099,7 +3338,8 @@ class MainApp(QObject):
             # bug Aaron caught -- combining autoClose + autoReset
             # with an immediate post-close QMessageBox produced
             # transient ghost windows).
-            progress.close()
+            cancelled = err_msg == _ExportPackageWorker.CANCELLED_RESULT
+            progress.close_with_result("" if cancelled else err_msg)
             # Clean up the temp PDF dir; it's cheap to keep but
             # we're disciplined about temp leaks.
             try:
@@ -3107,7 +3347,11 @@ class MainApp(QObject):
                 shutil.rmtree(pdf_temp_dir, ignore_errors=True)
             except Exception:
                 pass
-            if err_msg:
+            if cancelled:
+                self.window.status(
+                    "Full-session export cancelled.", timeout_ms=4000,
+                )
+            elif err_msg:
                 log.error("export_package failed: %s", err_msg)
                 QMessageBox.warning(
                     self.window, "Export full session",
@@ -3121,8 +3365,10 @@ class MainApp(QObject):
             worker.wait()  # see comment in _on_export_mixed_audio
             worker.deleteLater()
 
-        worker.progress_changed.connect(on_progress)
+        worker.progress_changed.connect(progress.set_progress)
+        worker.status_changed.connect(progress.append_status)
         worker.finished_with_result.connect(on_done)
+        progress.cancel_requested.connect(worker.cancel)
         progress.show()
         worker.start()
 
@@ -3631,6 +3877,27 @@ class MainApp(QObject):
             suggestions = extract_topics(
                 body or "", extra_stopwords=stopwords,
             )
+            # LLM-suggested topics from the Suggested Topics appendix
+            # (#57) get folded in BEFORE the deterministic ones so
+            # they rank earlier in the suggestion list. Dedupe is
+            # case-insensitive so the deterministic extractor doesn't
+            # re-surface a topic the LLM already named.
+            try:
+                from .utils.topic_appendix import (  # noqa: PLC0415
+                    parse_topic_appendix,
+                )
+                llm_topics = parse_topic_appendix(body or "")
+            except Exception:
+                log.exception(
+                    "LLM topic appendix parse failed for %s", session_id,
+                )
+                llm_topics = []
+            if llm_topics:
+                seen = {t.lower() for t in llm_topics}
+                deduped_extractor = [
+                    t for t in suggestions if t.lower() not in seen
+                ]
+                suggestions = llm_topics + deduped_extractor
             self.classification.replace_session_topic_suggestions(
                 session_id, suggestions,
             )
@@ -3886,7 +4153,27 @@ class MainApp(QObject):
         self.window.session_view.set_screencap_auto_interval(
             int(self.config.ui.screen_capture_auto_interval_sec)
         )
+        # Push the appendix-inclusion defaults so the per-tab
+        # Export PDF + Print dialogs reflect the new settings.
+        self.window.session_view.set_appendix_export_defaults(
+            self._appendix_export_defaults_from_config(),
+        )
         self.window.status("Settings saved.", timeout_ms=4000)
+
+    def _appendix_export_defaults_from_config(self):
+        """Build the AppendixInclusion the per-export dialog should
+        pre-check, derived from the Settings-saved booleans."""
+        from .ui.appendix_inclusion_dialog import AppendixInclusion  # noqa: PLC0415
+        s = self.config.synthesis
+        return AppendixInclusion(
+            include_appendix=s.appendix_export_include,
+            include_attendee_context=s.appendix_export_attendee_context,
+            include_attendee_details=s.appendix_export_attendee_details,
+            include_topics=s.appendix_export_topics,
+            include_referenced_attachments=s.appendix_export_referenced_attachments,
+            include_session_attachments=s.appendix_export_session_attachments,
+            include_links=s.appendix_export_links,
+        )
 
     # ---- status bar indicators -------------------------------------------
 
@@ -4749,8 +5036,13 @@ class _VideoExportWorker(QThread):
     progress_changed = pyqtSignal(int)
     finished_with_result = pyqtSignal(str)
 
+    # Sentinel reported via finished_with_result when the export was
+    # cancelled by the user (#60).
+    CANCELLED_RESULT = "<cancelled>"
+
     def __init__(
         self, mic_path, sys_path, screenshots, transcript_text, target,
+        *, quality: str = "medium",
     ) -> None:
         super().__init__()
         self.setObjectName("VideoExportWorker")
@@ -4759,16 +5051,28 @@ class _VideoExportWorker(QThread):
         self._screenshots = screenshots
         self._transcript_text = transcript_text
         self._target = target
+        self._quality = quality
+        import threading  # noqa: PLC0415
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:  # type: ignore[override]
+        from .utils.cancellation import ExportCancelled  # noqa: PLC0415
         try:
             from .audio.video_export import export_video  # noqa: PLC0415
             export_video(
                 self._mic, self._sys, self._screenshots,
                 self._transcript_text, self._target,
                 progress=self.progress_changed.emit,
+                quality=self._quality,
+                should_cancel=self._cancel_event.is_set,
             )
             self.finished_with_result.emit("")
+        except ExportCancelled:
+            log.info("video export cancelled by user")
+            self.finished_with_result.emit(self.CANCELLED_RESULT)
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user verbatim
             self.finished_with_result.emit(str(exc))
 
@@ -4777,11 +5081,14 @@ class _HighlightAudioExportWorker(QThread):
     """Run audio/highlights_export.export_highlights_audio off the GUI thread.
 
     Mirrors _AudioExportWorker's signal shape -- empty string on
-    success, error message on failure.
+    success, error message on failure, CANCELLED_RESULT on user
+    cancel (#60).
     """
 
     progress_changed = pyqtSignal(int)
     finished_with_result = pyqtSignal(str)
+
+    CANCELLED_RESULT = "<cancelled>"
 
     def __init__(self, mic_path, sys_path, highlights, target) -> None:
         super().__init__()
@@ -4790,15 +5097,25 @@ class _HighlightAudioExportWorker(QThread):
         self._sys = sys_path
         self._highlights = highlights
         self._target = target
+        import threading  # noqa: PLC0415
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:  # type: ignore[override]
+        from .utils.cancellation import ExportCancelled  # noqa: PLC0415
         try:
             from .audio.highlights_export import export_highlights_audio  # noqa: PLC0415
             export_highlights_audio(
                 self._mic, self._sys, self._highlights, self._target,
                 progress=self.progress_changed.emit,
+                should_cancel=self._cancel_event.is_set,
             )
             self.finished_with_result.emit("")
+        except ExportCancelled:
+            log.info("highlight audio export cancelled by user")
+            self.finished_with_result.emit(self.CANCELLED_RESULT)
         except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
 
@@ -4809,12 +5126,15 @@ class _HighlightVideoExportWorker(QThread):
     progress_changed = pyqtSignal(int)
     finished_with_result = pyqtSignal(str)
 
+    CANCELLED_RESULT = "<cancelled>"
+
     def __init__(
         self, mic_path, sys_path, screenshots, transcript_text,
         highlights, target,
         *,
         session_title: str = "",
         session_started_at_iso: str = "",
+        quality: str = "medium",
     ) -> None:
         super().__init__()
         self.setObjectName("HighlightVideoExportWorker")
@@ -4826,8 +5146,15 @@ class _HighlightVideoExportWorker(QThread):
         self._target = target
         self._session_title = session_title
         self._session_started_at_iso = session_started_at_iso
+        self._quality = quality
+        import threading  # noqa: PLC0415
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
 
     def run(self) -> None:  # type: ignore[override]
+        from .utils.cancellation import ExportCancelled  # noqa: PLC0415
         try:
             from .audio.highlights_export import export_highlights_video  # noqa: PLC0415
             export_highlights_video(
@@ -4836,32 +5163,75 @@ class _HighlightVideoExportWorker(QThread):
                 session_title=self._session_title,
                 session_started_at_iso=self._session_started_at_iso,
                 progress=self.progress_changed.emit,
+                quality=self._quality,
+                should_cancel=self._cancel_event.is_set,
             )
             self.finished_with_result.emit("")
+        except ExportCancelled:
+            log.info("highlights video export cancelled by user")
+            self.finished_with_result.emit(self.CANCELLED_RESULT)
         except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
 
 
 class _ExportPackageWorker(QThread):
-    """Run utils.export_package.build_session_package off the GUI thread."""
+    """Run utils.export_package.build_session_package off the GUI thread.
+
+    `status_changed` is emitted on each phase transition (and on
+    encoder sub-phases like "Encoding audio" within an mp4 render).
+    The progress dialog plumbs these into a scrolling log so the
+    user can see what's happening during a long export (#53).
+
+    Cancellation (#60): MainApp connects the dialog's
+    cancel_requested signal to `cancel()`. The worker flips a
+    threading.Event that the encoder loops poll periodically; on
+    the next checkpoint they raise ExportCancelled. The exception
+    propagates out, the orchestrator deletes partial output, and
+    the worker emits `<cancelled>` as the result so the dialog
+    can suppress the post-completion error message.
+    """
 
     progress_changed = pyqtSignal(int)
+    status_changed = pyqtSignal(str)
     finished_with_result = pyqtSignal(str)
 
-    def __init__(self, options, target_path) -> None:
+    # Sentinel reported via finished_with_result when the export was
+    # cancelled by the user (vs. failed). Callers check for this
+    # exact string before treating the result as an error.
+    CANCELLED_RESULT = "<cancelled>"
+
+    def __init__(self, options, target_path, *, compress: bool = True) -> None:
         super().__init__()
         self.setObjectName("ExportPackageWorker")
         self._options = options
         self._target = target_path
+        self._compress = compress
+        import threading  # noqa: PLC0415
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        """Request cancellation. Safe to call from the GUI thread.
+
+        Encoder loops poll `_cancel_event.is_set` at frame / chunk
+        boundaries and raise ExportCancelled when set.
+        """
+        self._cancel_event.set()
 
     def run(self) -> None:  # type: ignore[override]
+        from .utils.cancellation import ExportCancelled  # noqa: PLC0415
         try:
             from .utils.export_package import build_session_package  # noqa: PLC0415
             build_session_package(
                 self._options, self._target,
                 progress=self.progress_changed.emit,
+                status=self.status_changed.emit,
+                should_cancel=self._cancel_event.is_set,
+                compress=self._compress,
             )
             self.finished_with_result.emit("")
+        except ExportCancelled:
+            log.info("export package cancelled by user")
+            self.finished_with_result.emit(self.CANCELLED_RESULT)
         except Exception as exc:  # noqa: BLE001
             self.finished_with_result.emit(str(exc))
 

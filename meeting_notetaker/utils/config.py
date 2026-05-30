@@ -213,6 +213,33 @@ class SynthesisConfig:
     # Synthesis Prompts exposes a dropdown listing the templates
     # actually present in the user's prompts folder.
     default_template_name: str = ""
+    # MP4 quality preset for the export paths -- low / medium / high
+    # (issue #54). "medium" defaults to ~1.5 Mbps video + 96 kbps
+    # audio, which is appropriate for slideshow-style screenshot
+    # content while keeping file sizes manageable. "high" preserves
+    # the pre-#54 behavior (2.5 Mbps + 128 kbps) for users who want
+    # the larger files. Settings dialog exposes a dropdown.
+    video_quality: str = "medium"
+    # Full-session export packaging (issue #62). When False, the
+    # export writes contents to a subfolder under the user-chosen
+    # parent directory (no zip step). When True, the original
+    # behavior -- single .zip file. Off by default since OneDrive
+    # / shared-drive use cases dominate over emailed zips.
+    compress_full_session_export: bool = False
+    # Default checkbox state for the AppendixInclusionDialog
+    # (#65/#66 followup). The user-facing rationale Aaron picked:
+    # surface the curated context surfaces (attendee context,
+    # session + LLM-mentioned documents, links) by default but
+    # keep the noisier per-person field dumps + topic suggestions
+    # off so a fresh PDF / ZIP doesn't bury the synthesis under
+    # appendix bulk.
+    appendix_export_include: bool = True
+    appendix_export_attendee_context: bool = True
+    appendix_export_attendee_details: bool = False
+    appendix_export_topics: bool = False
+    appendix_export_referenced_attachments: bool = True
+    appendix_export_session_attachments: bool = True
+    appendix_export_links: bool = True
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

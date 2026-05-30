@@ -162,6 +162,10 @@ class SlidesWidget(QWidget):
         self._player_bar.set_enabled_state(enabled)
         self._audio_available = bool(enabled)
 
+    def set_player_loading_state(self, loading: bool) -> None:
+        """Show "Loading audio..." while the AudioPlayer decodes (#61)."""
+        self._player_bar.set_loading_state(loading)
+
     def set_player_total_ms(self, total_ms: int) -> None:
         self._player_bar.set_total_ms(total_ms)
 

@@ -744,6 +744,111 @@ class SettingsDialog(QDialog):
         prompts_layout.addLayout(prompts_row)
         layout.addWidget(prompts_group)
 
+        # Export group ----------------------------------------------------
+        # MP4 quality preset for the per-session video exports + the
+        # full-session ZIP export (#54). Medium is the new default;
+        # users who want the v0.7.2-era file sizes pick High.
+        export_group = QGroupBox("Export", self)
+        export_form = QFormLayout(export_group)
+        export_blurb = QLabel(
+            "Quality preset for MP4 outputs (highlights, recording, "
+            "full-session export). Slideshow-style screenshot content "
+            "compresses well at low / medium; raise to high for "
+            "motion-heavy sessions or when archival fidelity matters.",
+            self,
+        )
+        export_blurb.setWordWrap(True)
+        export_form.addRow(export_blurb)
+        self._video_quality_picker = QComboBox(self)
+        self._video_quality_picker.addItem(
+            "Low -- 600 kbps video, 64 kbps audio (smallest)", "low",
+        )
+        self._video_quality_picker.addItem(
+            "Medium -- 1.5 Mbps video, 96 kbps audio (default)", "medium",
+        )
+        self._video_quality_picker.addItem(
+            "High -- 2.5 Mbps video, 128 kbps audio (largest)", "high",
+        )
+        current_quality = (
+            getattr(config.synthesis, "video_quality", "medium") or "medium"
+        )
+        idx = self._video_quality_picker.findData(current_quality)
+        if idx >= 0:
+            self._video_quality_picker.setCurrentIndex(idx)
+        self._video_quality_picker.setToolTip(
+            "Lower presets shrink the file dramatically -- a 1-hour "
+            "meeting drops from ~1.2 GB at High to ~300 MB at Low. "
+            "Every preset still produces an MP4 that plays in the "
+            "default Windows Media Player."
+        )
+        export_form.addRow("Video quality:", self._video_quality_picker)
+
+        # Full-session export packaging (#62). Off by default: write
+        # an uncompressed folder so the user can drop it on OneDrive
+        # / a shared drive without zip overhead. Toggle ON for the
+        # traditional single-zip output.
+        self._compress_full_export = QCheckBox(
+            "Compress full-session export into a single .zip file",
+            self,
+        )
+        self._compress_full_export.setChecked(
+            getattr(
+                config.synthesis, "compress_full_session_export", False,
+            )
+        )
+        self._compress_full_export.setToolTip(
+            "When ON, the full-session export bundles everything "
+            "into a single .zip the user picks the filename for. "
+            "When OFF (default), the export goes into a subfolder "
+            "under the user-chosen parent directory -- handy for "
+            "OneDrive / shared drives where unzipping isn't needed."
+        )
+        export_form.addRow(self._compress_full_export)
+
+        # Appendix-inclusion defaults (#65/#66 followup). These set
+        # which Appendix sub-sections come pre-checked in the
+        # AppendixInclusionDialog that fires before every PDF /
+        # Print / full-session export. Aaron's chosen defaults
+        # surface the user-curated context surfaces (attendee
+        # context + documents + links) and suppress the noisier
+        # per-person field dump and topic-suggestion list.
+        appendix_blurb = QLabel(
+            "Default Appendix sections to include when exporting "
+            "(PDF / Print / full-session). Individual exports can "
+            "still override these via the pre-export prompt.",
+            self,
+        )
+        appendix_blurb.setWordWrap(True)
+        export_form.addRow(appendix_blurb)
+        self._appendix_export_include = QCheckBox("Include Appendix", self)
+        af = self._appendix_export_include.font()
+        af.setBold(True)
+        self._appendix_export_include.setFont(af)
+        self._appendix_export_include.setChecked(
+            getattr(config.synthesis, "appendix_export_include", True),
+        )
+        self._appendix_export_include.toggled.connect(
+            self._on_appendix_export_master_toggled,
+        )
+        export_form.addRow(self._appendix_export_include)
+        self._appendix_section_checkboxes: dict[str, QCheckBox] = {}
+        # Each row: config field name, label, current default.
+        for field_name, label, attr in (
+            ("appendix_export_attendee_context",       "    Attendee Context",       "appendix_export_attendee_context"),
+            ("appendix_export_attendee_details",       "    Attendee Details",       "appendix_export_attendee_details"),
+            ("appendix_export_topics",                 "    Suggested Topics",       "appendix_export_topics"),
+            ("appendix_export_referenced_attachments", "    Referenced Attachments", "appendix_export_referenced_attachments"),
+            ("appendix_export_session_attachments",    "    Session Attachments",    "appendix_export_session_attachments"),
+            ("appendix_export_links",                  "    Links",                  "appendix_export_links"),
+        ):
+            cb = QCheckBox(label, self)
+            cb.setChecked(getattr(config.synthesis, attr, True))
+            cb.setEnabled(self._appendix_export_include.isChecked())
+            export_form.addRow(cb)
+            self._appendix_section_checkboxes[field_name] = cb
+
+        layout.addWidget(export_group)
+
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(
@@ -801,7 +906,25 @@ class SettingsDialog(QDialog):
         self._config.synthesis.default_template_name = (
             self._default_template_picker.currentData() or ""
         )
+        self._config.synthesis.video_quality = (
+            self._video_quality_picker.currentData() or "medium"
+        )
+        self._config.synthesis.compress_full_session_export = (
+            self._compress_full_export.isChecked()
+        )
+        self._config.synthesis.appendix_export_include = (
+            self._appendix_export_include.isChecked()
+        )
+        for field, cb in self._appendix_section_checkboxes.items():
+            setattr(self._config.synthesis, field, cb.isChecked())
         self.accept()
+
+    def _on_appendix_export_master_toggled(self, on: bool) -> None:
+        """Enable / disable the per-section checkboxes alongside the
+        master toggle so unchecking "Include Appendix" visibly
+        greys out every section."""
+        for cb in self._appendix_section_checkboxes.values():
+            cb.setEnabled(on)
 
     def _open_prompts_folder(self) -> None:
         path = prompts_dir()

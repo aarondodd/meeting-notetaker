@@ -42,6 +42,7 @@ from ..utils.export import build_print_markdown, default_export_filename
 from ..utils.paths import session_dir
 from ..models.highlights import HighlightSet
 from .attachments_tab import AttachmentsTab
+from .appendix_tray import AppendixTray
 from .attendee_details_drawer import AttendeeDetailsDrawer
 from .attendee_sidebar import AttendeeSidebar
 from .classification_bar import ClassificationBar
@@ -116,6 +117,10 @@ class SessionView(QWidget):
     # Attachments tab forwards (issue #29) -- MainApp persists +
     # refreshes derived state on change.
     attachments_changed = pyqtSignal(str)                 # session_id
+    # User clicked Edit... on the Appendix tray; MainApp opens the
+    # AppendixEditDialog. Kept as a signal so the tray + dialog
+    # imports don't leak into session_view's import surface.
+    appendix_edit_requested = pyqtSignal(str)             # session_id
     attachments_split_changed = pyqtSignal(str)           # session_id, base64 splitter state forwarded via signal
     # Screen-capture lifecycle. start_screen_capture_clicked carries the
     # session id; MainApp shows the first-time popup (if needed) and
@@ -180,6 +185,11 @@ class SessionView(QWidget):
         # _build_print_document reads it to decide whether to swap
         # the bullet list with a Markdown table.
         self._session_contacts: list = []
+        # User's Settings-saved AppendixInclusion defaults for the
+        # per-tab Export PDF + Print flow. None -> dialog uses
+        # "every populated section on". MainApp.set_appendix_export_defaults
+        # plumbs the saved config into this field.
+        self._appendix_export_defaults = None
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -385,12 +395,21 @@ class SessionView(QWidget):
         # editor directly.
         self._live_notes_drawer = AttendeeDetailsDrawer(self)
         self._live_notes_drawer.contact_clicked.connect(self._on_drawer_contact_clicked)
+        # Issue #64: Appendix tray below the editor mirrors the
+        # attendee drawer pattern. Surfaces every auto-extracted
+        # appendix (attendee details, topics, context, referenced
+        # attachments) plus links and session attachments.
+        self._live_notes_appendix = AppendixTray(self)
+        self._live_notes_appendix.edit_requested.connect(
+            self._on_appendix_edit_requested,
+        )
         self._live_notes_page = QWidget(self)
         live_notes_layout = QVBoxLayout(self._live_notes_page)
         live_notes_layout.setContentsMargins(0, 0, 0, 0)
         live_notes_layout.setSpacing(2)
         live_notes_layout.addWidget(self._live_notes_drawer)
         live_notes_layout.addWidget(self._live_notes_editor, 1)
+        live_notes_layout.addWidget(self._live_notes_appendix)
         self._tabs.addTab(self._live_notes_page, "My Notes")
 
         # Synthesis is editable (v0.5). Uses LiveNotesWidget for the same
@@ -409,12 +428,18 @@ class SessionView(QWidget):
         # appears above the LLM-synthesized notes editor too.
         self._notes_drawer = AttendeeDetailsDrawer(self)
         self._notes_drawer.contact_clicked.connect(self._on_drawer_contact_clicked)
+        # Same Appendix tray pattern below the Synthesis editor.
+        self._notes_appendix = AppendixTray(self)
+        self._notes_appendix.edit_requested.connect(
+            self._on_appendix_edit_requested,
+        )
         self._notes_page = QWidget(self)
         notes_layout = QVBoxLayout(self._notes_page)
         notes_layout.setContentsMargins(0, 0, 0, 0)
         notes_layout.setSpacing(2)
         notes_layout.addWidget(self._notes_drawer)
         notes_layout.addWidget(self._notes_view, 1)
+        notes_layout.addWidget(self._notes_appendix)
         self._tabs.addTab(self._notes_page, "Synthesis")
 
         # Slides: per-session captured screenshots. Thumbnail grid +
@@ -609,8 +634,14 @@ class SessionView(QWidget):
         self._attendee_sidebar.remove_last_requested.connect(
             self._on_attendee_remove_last_clicked
         )
-        right_column_layout.addWidget(self._attendee_sidebar)
-        right_column_layout.addStretch(1)
+        # Stretch factor 1 so the attendee sidebar grows to fill the
+        # remaining vertical space under the screencap sidebar. The
+        # sidebar's internal QScrollArea has its own stretch factor of
+        # 1, so the scroll viewport tracks the available height and only
+        # actually scrolls when the attendee list overflows. The earlier
+        # trailing addStretch(1) starved the sidebar of vertical room
+        # and made the scrollbar appear even for short lists (#58).
+        right_column_layout.addWidget(self._attendee_sidebar, 1)
         self._right_column = right_column
         self._right_column.setVisible(False)
         body_row.addWidget(self._right_column, 0)
@@ -766,6 +797,55 @@ class SessionView(QWidget):
         whenever the live_notes '# Attendees' section changes."""
         self._attendee_sidebar.set_attendees(names)
 
+    def set_appendix_export_defaults(self, defaults) -> None:
+        """Push the user's Settings-saved AppendixInclusion defaults
+        into the SessionView so the per-tab Export PDF / Print
+        flow pre-checks the right boxes. MainApp calls this on
+        construction + after every Settings save. ``defaults`` may
+        be None to fall back to the dialog's "all on" defaults."""
+        self._appendix_export_defaults = defaults
+
+    def set_session_attachment_names(self, names) -> None:
+        """Push the current session's attachment display names into
+        the Appendix tray so the Session Attachments section stays
+        in sync with AttachmentsStore (#64). MainApp calls this on
+        session select + after attachments are added or removed.
+        """
+        names = list(names or [])
+        self._session_attachment_names = names
+        self._refresh_appendix_trays()
+
+    def _refresh_appendix_trays(self) -> None:
+        """Rebuild the AppendixData payload + push it into the trays.
+
+        Reads the four LLM appendix sections from the sidecar
+        (``notes.appendices.json``) so the strip-on-save toggle no
+        longer empties the tray. Falls back to parsing notes.md for
+        any section the sidecar doesn't carry (sessions that
+        predate the sidecar migration). Links + session attachments
+        are computed fresh from the in-memory editor text and the
+        cached attachment list.
+        """
+        from ..utils.appendix_store import collect_for_session  # noqa: PLC0415
+        notes_text = self._notes_view.toPlainText()
+        live_notes_text = self._live_notes_editor.toPlainText()
+        session_id = self._session.id if self._session is not None else None
+        data = collect_for_session(
+            session_id=session_id,
+            notes_text=notes_text,
+            live_notes_text=live_notes_text,
+            session_attachments=getattr(
+                self, "_session_attachment_names", [],
+            ),
+        )
+        self._live_notes_appendix.set_data(data)
+        self._notes_appendix.set_data(data)
+        # Both editors also use this data for their preview-pane
+        # transform so the rendered preview shows the "## Appendix
+        # (auto-extracted)" section directly.
+        self._live_notes_editor.set_appendix_data(data)
+        self._notes_view.set_appendix_data(data)
+
     def set_session_contacts(self, contacts) -> None:
         """Push the resolved Contact list into the My Notes + Synthesis
         attendee-details drawers. Issue #51 Phase 3.
@@ -784,6 +864,11 @@ class SessionView(QWidget):
         self._session_contacts = contacts
         self._live_notes_drawer.set_contacts(contacts)
         self._notes_drawer.set_contacts(contacts)
+        # Drive the Preview-pane Attendees-table substitution (#56)
+        # on both editors. The underlying markdown buffer is
+        # untouched; the swap only applies to the rendered preview.
+        self._live_notes_editor.set_session_contacts(contacts)
+        self._notes_view.set_session_contacts(contacts)
 
     def _on_drawer_contact_clicked(self, contact_id: int) -> None:
         """Bridge a drawer-row click up to MainApp.
@@ -949,6 +1034,16 @@ class SessionView(QWidget):
         self._slides_view.set_player_enabled(enabled)
         if not enabled:
             self._clear_transcript_highlight()
+
+    def set_player_loading_state(self, loading: bool) -> None:
+        """Forward the AudioPlayer's "decode in flight" cue to both
+        player bars (#61). The bars stay disabled while loading; the
+        time label flips to "Loading audio...". Clears when set to
+        False, but caller should follow up with set_player_enabled
+        (or another set_player_loading_state(False)) to settle the
+        idle vs ready labels."""
+        self._player_bar.set_loading_state(loading)
+        self._slides_view.set_player_loading_state(loading)
 
     def set_player_total_ms(self, total_ms: int) -> None:
         self._player_bar.set_total_ms(total_ms)
@@ -1349,6 +1444,9 @@ class SessionView(QWidget):
         # Flip to preview mode when there's actually content to read,
         # otherwise keep the editor focused (matching set_session).
         self._notes_view.set_preview_mode(bool(text.strip()))
+        # New synthesis content can introduce JSON appendices + new
+        # links; refresh the tray + preview transform (#64).
+        self._refresh_appendix_trays()
 
     def set_previous_notes(self, paths: list) -> None:
         self._previous_view.set_archives(paths)
@@ -1398,6 +1496,18 @@ class SessionView(QWidget):
             return
         body = self._notes_view.toPlainText()
         self.synthesis_notes_changed.emit(self._session.id, body)
+        # Synthesis edits may add / remove appendix JSON blocks;
+        # re-parse + persist to the sidecar so the tray + preview
+        # transform pick up the change without round-tripping
+        # through the save loop (#64 + sidecar followup).
+        try:
+            from ..utils.appendix_store import AppendixStore  # noqa: PLC0415
+            AppendixStore(self._session.id).save_from_notes(body)
+        except Exception:
+            # Sidecar persistence is best-effort; the tray will fall
+            # back to parsing the in-memory text on the next refresh.
+            pass
+        self._refresh_appendix_trays()
 
     def _on_live_notes_changed(self) -> None:
         if self._suppress_live_notes_signal:
@@ -1411,6 +1521,9 @@ class SessionView(QWidget):
             return
         body = self._live_notes_editor.toPlainText()
         self.live_notes_changed.emit(self._session.id, body)
+        # Live-notes edits may add or remove links the appendix
+        # tray's Links section surfaces; refresh (#64).
+        self._refresh_appendix_trays()
 
     # ---- internal handlers -------------------------------------------------
 
@@ -1499,29 +1612,49 @@ class SessionView(QWidget):
                     has_notes=bool(self._session.has_notes),
                 )
 
-    def set_prompt_templates(self, template_names: list[str], selected: str = "") -> None:
+    def set_prompt_templates(
+        self,
+        template_names: list[str],
+        selected: str = "",
+        settings_default: str = "",
+    ) -> None:
         """Populate the prompt template picker.
 
-        ``template_names`` should be the list of available templates
-        (from prompts module). ``selected`` is the currently-saved
-        choice for this session ("" = use default). Caller is
-        expected to compute that from session metadata before invoking.
+        ``template_names`` is the list of available templates (from the
+        prompts module). ``selected`` is the currently-saved
+        per-session override ("" = no override; let the resolution
+        chain pick). ``settings_default`` is the global Settings
+        default; surfaced in the "(default)" entry's label so the user
+        sees which template will actually be used when no override is
+        set (#55).
 
         Block signals during population so the currentIndexChanged
         emit doesn't fire spurious save events at app-startup.
         """
         self._prompt_template_picker.blockSignals(True)
         self._prompt_template_picker.clear()
-        # First entry is always "(default)" -- empty string in data
-        # role -- so leaving the picker untouched on a new session
-        # uses the default template without forcing the user to pick.
-        self._prompt_template_picker.addItem("(default)", "")
+        # First entry is always the "(default)" placeholder -- empty
+        # string in data role -- so leaving the picker untouched on a
+        # new session uses whatever the resolution chain decides. The
+        # label includes the Settings default name when one is set so
+        # the user can tell what's about to run; if Settings is empty
+        # we fall back to "default" (the bundled template), matching
+        # the resolution chain in _on_send_to_llm.
+        resolved_default = (settings_default or "").strip() or "default"
+        if resolved_default == "default":
+            # No Settings override: the placeholder reads as the
+            # bundled "default" template directly, matching the prior
+            # UX.
+            placeholder_label = "(default)"
+        else:
+            placeholder_label = f"(default: {resolved_default})"
+        self._prompt_template_picker.addItem(placeholder_label, "")
         for name in template_names:
             if not name or name == "default":
-                # We surface the bundled default via the "(default)"
+                # We surface the bundled default via the placeholder
                 # entry above; skip the literal "default" template
                 # name to avoid the user seeing two entries that
-                # mean the same thing.
+                # both render the same template.
                 continue
             self._prompt_template_picker.addItem(name, name)
         # Restore selection.
@@ -1650,10 +1783,29 @@ class SessionView(QWidget):
     def attachments_tab(self) -> AttachmentsTab:
         return self._attachments_tab
 
+    def _on_appendix_edit_requested(self) -> None:
+        """Bubble the tray's Edit click up to MainApp for handling."""
+        if self._session is None:
+            return
+        self.appendix_edit_requested.emit(self._session.id)
+
     def _on_attachments_changed(self, session_id: str) -> None:
         # Forward upward; MainApp may want to update an indicator
         # on the session list (e.g. paperclip glyph).
         self.attachments_changed.emit(session_id)
+        # Pull the latest attachment names + refresh the appendix
+        # tray so the Session Attachments section stays current
+        # (#64).
+        try:
+            from ..models.attachments import AttachmentsStore  # noqa: PLC0415
+            store = AttachmentsStore(session_id)
+            names = [rec.display_name for rec in store.list()]
+            self.set_session_attachment_names(names)
+        except Exception:
+            # Refresh failures shouldn't disrupt the user-visible
+            # add/remove flow; the tray just won't update until the
+            # next session-select.
+            pass
 
     def set_session_highlights(
         self,
@@ -1921,7 +2073,12 @@ class SessionView(QWidget):
             self._print_btn.setEnabled(False)
             self._export_pdf_btn.setEnabled(False)
 
-    def _build_print_document(self):
+    def _build_print_document(
+        self,
+        *,
+        ask_appendix_inclusion: bool = True,
+        appendix_defaults=None,
+    ):
         """Render the active tab into a QTextDocument bound to the session dir.
 
         Returns (doc, tab_label) or (None, "") if the active tab can't be
@@ -1930,6 +2087,12 @@ class SessionView(QWidget):
         loadResource() call -- QTextDocument's own setBaseUrl is only
         honored on the first call, which produced broken-image icons in
         printed PDFs.
+
+        When ``ask_appendix_inclusion`` is True (default for the user-
+        facing Export PDF + Print buttons), pops the inclusion dialog
+        so the user picks which Appendix sub-sections land in the
+        output. Cancelling the dialog returns (None, "") so the
+        caller treats it like a normal abort.
         """
         if self._session is None:
             return None, ""
@@ -1975,6 +2138,47 @@ class SessionView(QWidget):
                 markdown_source, self._session_contacts,
             )
 
+        # #64: replace the raw LLM JSON appendix blocks with the
+        # rendered "## Appendix (auto-extracted)" table view so the
+        # per-tab PDF / Print output matches what the in-app preview
+        # shows. Without this the raw JSON code blocks land verbatim
+        # in the PDF + the auto-extracted heading is missing.
+        from ..utils.appendix_store import collect_for_session  # noqa: PLC0415
+        from ..utils.appendix_transform import inject_appendix  # noqa: PLC0415
+        from .appendix_inclusion_dialog import (  # noqa: PLC0415
+            AppendixInclusion,
+            AppendixInclusionDialog,
+            apply_inclusion,
+        )
+        # Pull the same sidecar-backed payload the tray uses so the
+        # injection picks up sections that have been stripped from
+        # notes.md.
+        notes_md = self._notes_view.toPlainText()
+        live_md = self._live_notes_editor.toPlainText()
+        appendix_data = collect_for_session(
+            session_id=self._session.id,
+            notes_text=notes_md,
+            live_notes_text=live_md,
+            session_attachments=getattr(
+                self, "_session_attachment_names", [],
+            ),
+        )
+        if ask_appendix_inclusion:
+            dlg = AppendixInclusionDialog(
+                appendix_data,
+                export_label=f"{tab_label} export",
+                defaults=appendix_defaults,
+                parent=self,
+            )
+            if dlg.exec() != AppendixInclusionDialog.DialogCode.Accepted:
+                return None, ""
+            inclusion = dlg.inclusion()
+        else:
+            inclusion = AppendixInclusion.all_on()
+        body_for_print = inject_appendix(
+            body_for_print, apply_inclusion(appendix_data, inclusion),
+        )
+
         printable = build_print_markdown(
             session_title=self._session.title,
             tab_label=tab_label,
@@ -1989,7 +2193,9 @@ class SessionView(QWidget):
 
     def _on_print(self) -> None:
         """Print the active tab via QPrinter."""
-        doc, tab_label = self._build_print_document()
+        doc, tab_label = self._build_print_document(
+            appendix_defaults=self._appendix_export_defaults,
+        )
         if doc is None or self._session is None:
             return
         from PyQt6.QtPrintSupport import QPrintDialog, QPrinter
@@ -2011,7 +2217,9 @@ class SessionView(QWidget):
         annotation), where the Windows Print-to-PDF driver typically
         rasterizes both away.
         """
-        doc, tab_label = self._build_print_document()
+        doc, tab_label = self._build_print_document(
+            appendix_defaults=self._appendix_export_defaults,
+        )
         if doc is None or self._session is None:
             return
         from PyQt6.QtWidgets import QFileDialog, QMessageBox

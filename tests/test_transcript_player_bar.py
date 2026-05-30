@@ -94,6 +94,47 @@ def test_set_position_does_not_emit_seek(qt_app):
     assert captured == []
 
 
+def test_loading_state_shows_label_and_keeps_disabled(qt_app):
+    """While the AudioPlayer's decode worker is in flight (#61), the
+    bar's time label reads "Loading audio..." instead of the broken-
+    looking "--:-- / --:--" placeholder. Controls stay disabled."""
+    bar = TranscriptPlayerBar()
+    bar.set_loading_state(True)
+    assert bar._time_label.text() == "Loading audio..."  # noqa: SLF001
+    assert not bar._play_btn.isEnabled()  # noqa: SLF001
+    assert not bar._slider.isEnabled()  # noqa: SLF001
+
+
+def test_clearing_loading_state_returns_to_idle_label(qt_app):
+    bar = TranscriptPlayerBar()
+    bar.set_loading_state(True)
+    bar.set_loading_state(False)
+    assert bar._time_label.text() == "--:-- / --:--"  # noqa: SLF001
+
+
+def test_set_enabled_clears_loading_label(qt_app):
+    """Becoming enabled (decode finished, audio ready) clears the
+    Loading label even if the caller forgets the explicit
+    set_loading_state(False)."""
+    bar = TranscriptPlayerBar()
+    bar.set_loading_state(True)
+    bar.set_total_ms(60_000)
+    bar.set_enabled_state(True)
+    # Label now reflects the actual time, not "Loading audio...".
+    assert "Loading" not in bar._time_label.text()  # noqa: SLF001
+    assert "/" in bar._time_label.text()  # noqa: SLF001
+
+
+def test_loading_label_survives_internal_position_update(qt_app):
+    """A position-tick during decode mustn't clobber the loading
+    cue with the "--:-- / --:--" placeholder."""
+    bar = TranscriptPlayerBar()
+    bar.set_loading_state(True)
+    bar.set_position_ms(0)
+    bar.set_total_ms(0)
+    assert bar._time_label.text() == "Loading audio..."  # noqa: SLF001
+
+
 def test_fmt_ms_short_and_long_forms():
     assert _fmt_ms(0) == "0:00"
     assert _fmt_ms(5_500) == "0:05"
