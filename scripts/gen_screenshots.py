@@ -147,6 +147,41 @@ The team aligned quickly on security-first routing. Sam confirmed the security r
 ## Risks / open questions
 - Warehouse-side audit logging coverage is not yet enumerated.
 - Parallel-approval for the read tier depends on leadership signoff; if denied, we lose the analyst-time argument.
+
+## Attendee Context (auto-extracted)
+
+```json
+[
+  {"name": "Alex Chen", "observation": "Drove the security-routing decision; took both follow-up action items."},
+  {"name": "Sam Patel", "observation": "Owns the read-tier review currently in flight; deferred to Alex on rollout sequencing."},
+  {"name": "Jordan Lee", "observation": "Raised the parallel-approval ask; will surface to leadership."}
+]
+```
+
+## Attendee Details (auto-extracted)
+
+```json
+[
+  {"name": "Alex Chen", "title": "Senior Engineer", "company": "Acme", "email": "alex@acme.com"},
+  {"name": "Sam Patel", "title": "Security Lead", "company": "Acme"},
+  {"name": "Jordan Lee", "title": "Analyst Tooling Lead", "company": "Acme"}
+]
+```
+
+## Suggested Topics (auto-extracted)
+
+```json
+["Security review queue", "Read-tier parallel approval", "Warehouse audit-log gap"]
+```
+
+## Referenced Attachments (auto-extracted)
+
+```json
+[
+  {"name": "Q3 rollout doc", "context": "Alex will append the auditability addendum here"},
+  {"name": "Migration design v3", "context": "Sam referenced section 4 on the read-tier review path"}
+]
+```
 """
 
 SAMPLE_PASTE_BODY = """\
@@ -276,6 +311,15 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
 # ---------------------------------------------------------------------------
 
 
+def _seed_appendix_sidecar() -> None:
+    """Persist the sample synthesis's four LLM appendices to the
+    sidecar so the AppendixTray populates and the preview-time
+    inject_appendix renders the unified ``## Appendix`` section.
+    Imitates what _handle_synthesis_result does at paste-back."""
+    from meeting_notetaker.utils.appendix_store import AppendixStore
+    AppendixStore(SESSION_ID).save_from_notes(SAMPLE_SYNTHESIS)
+
+
 def shot_main_transcript() -> None:
     # v0.6.5 tab order with the Slides tab landed:
     # 0 My Notes, 1 Synthesis, 2 Slides, 3 Previous Notes, 4 Transcript.
@@ -287,19 +331,25 @@ def shot_main_transcript() -> None:
 
 
 def shot_main_my_notes_edit() -> None:
+    _seed_appendix_sidecar()
     win = _build_main_window()
     win.session_view._tabs.setCurrentIndex(0)
     # Force edit mode (template-seeded notes default to preview when populated).
     win.session_view._live_notes_editor.set_preview_mode(False)
+    # Push the seeded sidecar through so the Appendix tray's header
+    # shows the populated count.
+    win.session_view._refresh_appendix_trays()
     QApplication.processEvents()
     _grab(win, "02-main-my-notes-edit.png", autosize=False)
     win.close()
 
 
 def shot_main_my_notes_preview() -> None:
+    _seed_appendix_sidecar()
     win = _build_main_window()
     win.session_view._tabs.setCurrentIndex(0)
     win.session_view._live_notes_editor.set_preview_mode(True)
+    win.session_view._refresh_appendix_trays()
     QApplication.processEvents()
     _grab(win, "03-main-my-notes-preview.png", autosize=False)
     win.close()
@@ -311,8 +361,29 @@ def shot_main_synthesis() -> None:
     # Synthesis defaults to preview mode in set_session; explicit set is a no-op
     # but keeps the assumption in the script obvious.
     win.session_view._notes_view.set_preview_mode(True)
+    # Persist the seeded appendix data so the tray's sidecar load
+    # path populates -- mirrors what paste-back does at runtime.
+    _seed_appendix_sidecar()
+    win.session_view._refresh_appendix_trays()
     QApplication.processEvents()
     _grab(win, "04-main-synthesis.png", autosize=False)
+    win.close()
+
+
+def shot_main_synthesis_appendix_expanded() -> None:
+    """Synthesis tab with the Appendix tray expanded so the per-
+    section tables are visible. Mirrors what a user sees after a
+    paste-back populated all four LLM appendices + the session
+    has attachments + the notes carry links."""
+    _seed_appendix_sidecar()
+    win = _build_main_window()
+    win.session_view._tabs.setCurrentIndex(1)
+    win.session_view._notes_view.set_preview_mode(True)
+    win.session_view._refresh_appendix_trays()
+    # Expand the tray so its sub-sections are visible.
+    win.session_view._notes_appendix.set_expanded(True)
+    QApplication.processEvents()
+    _grab(win, "18-main-appendix-expanded.png", autosize=False)
     win.close()
 
 
@@ -662,6 +733,93 @@ def shot_automation_install_dialog() -> None:
     dlg.close()
 
 
+def shot_appendix_edit_dialog() -> None:
+    """The tabbed editor for the four LLM appendix sections.
+    Seed with the same sample data so every tab has rows + the
+    user can see the editable table shape."""
+    from meeting_notetaker.ui.appendix_edit_dialog import AppendixEditDialog
+    from meeting_notetaker.utils.appendix_store import AppendixStore
+    _seed_appendix_sidecar()
+    ctx, det, topics, ref = AppendixStore(SESSION_ID).load_as_dataclasses()
+    dlg = AppendixEditDialog(
+        attendee_context=ctx,
+        attendee_details=det,
+        topics=topics,
+        referenced_attachments=ref,
+    )
+    # Land on the Attendee Context tab so the table view is visible
+    # (the dialog defaults to the first tab anyway, but pin it
+    # explicitly so future tab-order changes don't surprise the
+    # screenshot).
+    dlg._tabs.setCurrentIndex(0)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "19-dialog-appendix-edit.png", autosize=False)
+    dlg.close()
+
+
+def shot_appendix_inclusion_dialog() -> None:
+    """Pre-export checkbox prompt -- master Include Appendix +
+    six sub-sections. Seeded with realistic counts so each row
+    shows '(N)' instead of '(empty)'."""
+    from meeting_notetaker.ui.appendix_inclusion_dialog import (
+        AppendixInclusion,
+        AppendixInclusionDialog,
+    )
+    from meeting_notetaker.utils.appendix_store import collect_for_session
+    _seed_appendix_sidecar()
+    data = collect_for_session(
+        session_id=SESSION_ID,
+        notes_text=SAMPLE_SYNTHESIS,
+        live_notes_text=SAMPLE_LIVE_NOTES,
+        session_attachments=[
+            "Agenda - Q3 Platform Sync.txt", "Migration design - v3.pdf",
+        ],
+    )
+    # Use Aaron's chosen defaults so the screenshot reflects what
+    # a new user sees on first export.
+    defaults = AppendixInclusion(
+        include_appendix=True,
+        include_attendee_context=True,
+        include_attendee_details=False,
+        include_topics=False,
+        include_referenced_attachments=True,
+        include_session_attachments=True,
+        include_links=True,
+    )
+    dlg = AppendixInclusionDialog(
+        data, export_label="PDF export", defaults=defaults,
+    )
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "20-dialog-appendix-inclusion.png", autosize=False)
+    dlg.close()
+
+
+def shot_export_progress_dialog() -> None:
+    """Full-session ExportProgressDialog with the status log + cancel
+    button visible. Drives the dialog through a few realistic
+    status emits so the log isn't empty."""
+    from meeting_notetaker.ui.export_progress_dialog import ExportProgressDialog
+    dlg = ExportProgressDialog(None, "Building example-session.zip...")
+    dlg.set_progress(62)
+    for line in (
+        "Copying my-notes.pdf",
+        "Copying synthesis.pdf",
+        "Writing transcript.txt",
+        "Encoding recording.mp3",
+        "Rendering recording.mp4",
+        "  Encoding video frames",
+        "  Encoding audio",
+        "Packing zip archive",
+    ):
+        dlg.append_status(line)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "21-dialog-export-progress.png", autosize=False)
+    dlg.close()
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -682,6 +840,11 @@ def main() -> int:
     shot_manage_dialog()
     shot_main_synthesis_automation_enabled()
     shot_automation_install_dialog()
+    # v0.7.3 surfaces (#64 + #65 + #66 + sidecar).
+    shot_main_synthesis_appendix_expanded()
+    shot_appendix_edit_dialog()
+    shot_appendix_inclusion_dialog()
+    shot_export_progress_dialog()
     print("done.")
     return 0
 

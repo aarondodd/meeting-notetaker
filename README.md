@@ -9,15 +9,19 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.2. End-to-end capture, transcription, synthesis,
+> **Status:** v0.7.3. End-to-end capture, transcription, synthesis,
 > screen capture, retained-audio playback + export, and transcript-
-> synchronized playback all working. v0.7.2 expands the Contact model
-> with rich addressbook fields (title / company / department / email /
-> phone / notes) that auto-populate from Outlook calendar invites
-> via the Exchange GAL, surfaces them in a collapsible drawer above
-> the My Notes and Synthesis editors, and bundles a stack of polish
-> fixes (multi-monitor screen-capture coords, calendar-picker loading
-> indicator, Address Book Enter-to-close, attendee auto-merge).
+> synchronized playback all working. v0.7.3 layers a unified Appendix
+> system on top of the v0.7.2 Contact model: four new structured
+> LLM-emitted sections (Attendee Context, Attendee Details, Suggested
+> Topics, Referenced Attachments) get parsed into a sidecar JSON
+> store, surfaced in a collapsible tray below the My Notes + Synthesis
+> editors, edited via a tabular dialog, and bundled into preview / PDF
+> / ZIP exports as a clean Markdown table view. Pre-export prompts
+> let the user pick which Appendix sections to include (configurable
+> defaults in Settings); cancel buttons + a status-log dialog cover
+> long-running exports; folder-mode replaces the zip step when the
+> user is dropping output on OneDrive or a shared drive.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -40,6 +44,128 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.3
+
+Unified Appendix system, better long-running export UX, and a stack
+of bug fixes the v0.7.2 thread surfaced. Everything in v0.7.2 still
+works the same way; the v0.7.3 additions layer on top.
+
+- **Appendix tray** below the My Notes + Synthesis editors. Six
+  collapsible sections render whatever the session carries:
+  *Attendee Context* (LLM observations about who participated and
+  how), *Attendee Details* (title / company / email / phone, same
+  rich-field model as the drawer at the top), *Suggested Topics*,
+  *Referenced Attachments* (documents the LLM noticed were
+  referenced in the call), *Session Attachments* (live mirror of
+  the Attachments tab), and *Links* (every URL across My Notes and
+  Synthesis, deduped). Empty sections drop out so the tray header
+  reflects only what's present.
+
+  ![Synthesis with Appendix tray expanded](docs/screenshots/18-main-appendix-expanded.png)
+
+- **Bundled system prompts** ask Claude (or whichever chatbot you
+  route through) to emit the four LLM appendices as structured
+  JSON code blocks at the bottom of the synthesis. The app parses
+  them, persists into a `notes.appendices.json` sidecar in the
+  session directory, and renders the tray + the Markdown
+  preview / PDF / ZIP exports off the parsed data. The raw JSON
+  blocks stay in `notes.md` by default; turning on the
+  strip-attendee-appendix Settings toggle removes them from the
+  saved file -- the sidecar still has the data so the tray stays
+  populated.
+
+- **Edit / delete LLM appendix entries.** An "Edit..." button on
+  the tray header opens a tabbed dialog with one editable table
+  per LLM section. Add Row / Delete Selected buttons cover the
+  destructive operations; OK persists to the sidecar AND
+  re-renders the JSON blocks inside `notes.md` so the next
+  debounced save can't stomp the user's edits.
+
+  ![Edit Appendix dialog](docs/screenshots/19-dialog-appendix-edit.png)
+
+- **Pre-export Appendix inclusion prompt** before every PDF /
+  Print / full-session export. Master "Include Appendix" toggle +
+  six per-section checkboxes (sections with zero entries show as
+  disabled "(empty)" so it's clear they're not a choice).
+  Defaults live in Settings -- the bundled choice surfaces the
+  user-curated context surfaces (Attendee Context + documents +
+  Links) and suppresses the noisier per-person dump and topic
+  suggestions, but every checkbox is individually configurable.
+
+  ![Appendix inclusion prompt](docs/screenshots/20-dialog-appendix-inclusion.png)
+
+- **Full-session export folder mode.** A new Settings toggle
+  (default OFF) decides whether the full-session export writes a
+  single `.zip` or an uncompressed subfolder under a user-chosen
+  parent directory. Folder mode is the better fit for OneDrive /
+  shared-drive destinations where the recipient doesn't want to
+  unzip a multi-hundred-MB archive. The app stages output via a
+  sibling `.tmp` directory and renames into place so a cancelled
+  export never leaves a half-populated destination behind.
+
+- **Cancel button on every export dialog.** Per-session video /
+  audio exports and the full-session export now expose a working
+  Cancel button. Encoder loops poll a cancellation flag at frame /
+  chunk boundaries and unwind cleanly; partial `.mp4` / `.srt` /
+  `.zip` / folder output gets deleted before the dialog reports
+  back. Status-bar message reads "... cancelled." instead of the
+  generic failure dialog.
+
+  ![Export progress dialog](docs/screenshots/21-dialog-export-progress.png)
+
+- **Custom ExportProgressDialog for the full-session path.** Bar
+  + current-phase label + scrolling activity log of every status
+  message the worker emits ("Rendering recording.mp4", "Encoding
+  audio", "Packing zip archive"). The log makes a 5-10 minute
+  export feel like progress instead of a frozen modal.
+
+- **MP4 quality presets.** Settings > Export gains a low / medium
+  / high picker. The default flipped from the v0.7.2-era fixed
+  2.5 Mbps (~1.2 GB / hour) to medium (~700 MB / hour). Low
+  (~300 MB / hour) is the right pick for slideshow-style
+  screenshot content; high preserves the old behavior for users
+  who want it.
+
+- **Preview pane attendee table** -- the My Notes and Synthesis
+  preview panes apply the same Attendees-bullets-to-rich-fields-
+  table transformation the PDF export uses, so the user can see
+  what the PDF will look like without exporting first.
+
+- **LLM-suggested topics** merged into the classification bar.
+  The existing deterministic noun-phrase extractor still runs; the
+  LLM-surfaced topics rank ahead of it so the user sees the
+  curated suggestions first.
+
+- **Player bar loading cue.** The transcript-pane scrubber now
+  reads "Loading audio..." while the AudioPlayer decode pass
+  runs (was a confusingly disabled-looking blank dialog for the
+  first few seconds of a long recording).
+
+- **Settings default prompt template surfacing.** The session-view
+  prompt dropdown's placeholder now reflects the Settings choice
+  -- e.g. "(default: one-on-one)" -- so the user can tell at a
+  glance which template will run. The resolution semantics stay
+  the same; the picker just stops lying about what's actually
+  going to happen.
+
+- **Attendee tag sidebar fills the right column.** Click-to-tag
+  speaker buttons in the My Notes recording sidebar now expand to
+  fill the full vertical space; scrollbar only appears when the
+  attendee list overflows the available height.
+
+- **Bug fixes from the v0.7.3 thread:** the full-session export
+  no longer hits 100% prematurely (audio mux + container close
+  used to run silently after the bar reached the top of its
+  budget); per-tab PDF export now applies the same Appendix
+  injection the in-app preview shows (was emitting raw JSON
+  blocks).
+
+The full v0.7.3 set lands as a single release; the GitHub issues
+list (#52 -- #66) tracks individual items if you want the change-log
+granularity. The repo's `default.md` prompt also got a conciseness
+pass during this release -- the bundled prompt produces denser,
+key-points-up-front Notes sections out of the box.
 
 ## What's new in v0.7.2
 
