@@ -34,6 +34,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
+from . import attendee_appendix as _attendee_appendix_mod
+from . import attendee_context as _attendee_context_mod
+from . import invite_mentions as _invite_mentions_mod
+from . import topic_appendix as _topic_appendix_mod
 from .attendee_appendix import AttendeeAppendixEntry, parse_appendix
 from .attendee_context import (
     AttendeeContextEntry,
@@ -187,6 +191,89 @@ class AppendixStore:
             if isinstance(d, dict) and (d.get("name") or "").strip()
         ]
         return ctx, details, topics, referenced
+
+
+def regenerate_notes_json(
+    notes_markdown: str,
+    *,
+    attendee_context: list[AttendeeContextEntry],
+    attendee_details: list[AttendeeAppendixEntry],
+    topics: list[str],
+    referenced_attachments: list[InviteMentionEntry],
+) -> str:
+    """Replace the raw LLM appendix JSON blocks in ``notes_markdown``
+    with freshly-rendered blocks built from the supplied entries.
+
+    Used by the AppendixEditDialog (#followup) so a user edit /
+    delete in the dialog flows back into ``notes.md`` -- otherwise
+    the next debounced ``_flush_notes`` would re-parse the
+    untouched LLM blocks and stomp the sidecar.
+
+    Sections with zero entries get no block (the heading disappears
+    too). The four blocks land in a consistent order at the
+    bottom of the document so a user-written ``## Appendix``
+    further up is preserved.
+    """
+    body = notes_markdown or ""
+    body = _attendee_context_mod.strip_appendix(body)
+    body = _attendee_appendix_mod.strip_appendix(body)
+    body = _topic_appendix_mod.strip_appendix(body)
+    body = _invite_mentions_mod.strip_appendix(body)
+    blocks: list[str] = []
+    if attendee_context:
+        blocks.append(_render_context_block(attendee_context))
+    if attendee_details:
+        blocks.append(_render_details_block(attendee_details))
+    if topics:
+        blocks.append(_render_topics_block(topics))
+    if referenced_attachments:
+        blocks.append(_render_referenced_block(referenced_attachments))
+    if not blocks:
+        return body.rstrip() + "\n"
+    body = body.rstrip()
+    if body:
+        body = body + "\n\n"
+    return body + "\n\n".join(blocks) + "\n"
+
+
+def _render_context_block(entries) -> str:
+    payload = [
+        {"name": e.name, "observation": e.observation}
+        for e in entries
+    ]
+    return _wrap_block("Attendee Context", payload)
+
+
+def _render_details_block(entries) -> str:
+    payload = []
+    for e in entries:
+        obj: dict = {"name": e.name}
+        for k in ("title", "company", "department", "email", "phone"):
+            v = getattr(e, k, "")
+            if v:
+                obj[k] = v
+        payload.append(obj)
+    return _wrap_block("Attendee Details", payload)
+
+
+def _render_topics_block(topics) -> str:
+    return _wrap_block("Suggested Topics", list(topics))
+
+
+def _render_referenced_block(entries) -> str:
+    payload = [
+        {"name": e.name, "context": e.context}
+        for e in entries
+    ]
+    return _wrap_block("Referenced Attachments", payload)
+
+
+def _wrap_block(section: str, payload) -> str:
+    pretty = json.dumps(payload, indent=2, ensure_ascii=False)
+    return (
+        f"## {section} (auto-extracted)\n\n"
+        f"```json\n{pretty}\n```"
+    )
 
 
 def collect_for_session(

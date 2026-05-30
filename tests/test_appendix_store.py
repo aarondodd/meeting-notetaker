@@ -16,6 +16,7 @@ from meeting_notetaker.utils.appendix_store import (
     AppendixStore,
     SIDECAR_FILENAME,
     collect_for_session,
+    regenerate_notes_json,
 )
 from meeting_notetaker.utils.attendee_appendix import AttendeeAppendixEntry
 from meeting_notetaker.utils.attendee_context import AttendeeContextEntry
@@ -231,6 +232,85 @@ def test_collect_for_session_with_no_session_id_falls_back():
         session_attachments=[],
     )
     assert data.topics == ["x"]
+
+
+def test_regenerate_notes_json_replaces_existing_blocks():
+    """The dialog persistence path strips raw appendix blocks +
+    appends fresh ones rendered from the edited entries."""
+    source = """# TL;DR
+synthesis body
+
+## Attendee Context (auto-extracted)
+
+```json
+[{"name": "OLD", "observation": "stale"}]
+```
+
+## Suggested Topics (auto-extracted)
+
+```json
+["old topic"]
+```
+"""
+    out = regenerate_notes_json(
+        source,
+        attendee_context=[
+            AttendeeContextEntry(name="Bob", observation="fresh"),
+        ],
+        attendee_details=[],
+        topics=["new topic"],
+        referenced_attachments=[],
+    )
+    # Synthesis body survives.
+    assert "synthesis body" in out
+    # Old entries gone.
+    assert "OLD" not in out
+    assert "old topic" not in out
+    # New entries present.
+    assert '"name": "Bob"' in out
+    assert '"fresh"' in out
+    assert '"new topic"' in out
+
+
+def test_regenerate_notes_json_omits_empty_sections():
+    """A section with zero entries doesn't get a heading +
+    code block, only the populated ones do."""
+    source = "# Title\nbody\n"
+    out = regenerate_notes_json(
+        source,
+        attendee_context=[
+            AttendeeContextEntry(name="Bob", observation="ok"),
+        ],
+        attendee_details=[],
+        topics=[],
+        referenced_attachments=[],
+    )
+    assert "Attendee Context (auto-extracted)" in out
+    assert "Attendee Details" not in out
+    assert "Suggested Topics" not in out
+    assert "Referenced Attachments" not in out
+
+
+def test_regenerate_notes_json_with_all_empty_strips_appendices():
+    """All sections empty -> existing blocks vanish and nothing
+    new gets appended (the dialog used to delete everything)."""
+    source = """body
+
+## Attendee Context (auto-extracted)
+
+```json
+[{"name": "x"}]
+```
+"""
+    out = regenerate_notes_json(
+        source,
+        attendee_context=[],
+        attendee_details=[],
+        topics=[],
+        referenced_attachments=[],
+    )
+    assert "Attendee Context" not in out
+    assert "body" in out
 
 
 def test_sidecar_filename_is_well_known():

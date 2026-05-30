@@ -1111,6 +1111,7 @@ class MainApp(QObject):
         sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
         sv.review_speakers_clicked.connect(self._on_review_speakers)
+        sv.appendix_edit_requested.connect(self._on_appendix_edit_requested)
         sv.restore_previous_notes_clicked.connect(self._on_restore_previous_notes)
         sv.delete_previous_notes_clicked.connect(self._on_delete_previous_notes)
         sv.prompt_template_changed.connect(self._on_prompt_template_changed)
@@ -1941,6 +1942,98 @@ class MainApp(QObject):
                 f"{unknown_count} unlabeled -- click Review Speakers to label"
             )
         self.window.status("; ".join(msg_parts) + ".", timeout_ms=10000)
+
+    def _on_appendix_edit_requested(self, session_id: str) -> None:
+        """Open the AppendixEditDialog seeded from the sidecar.
+
+        On accept: write the edited entries back to the sidecar and
+        re-render the raw JSON blocks inside notes.md so the
+        debounced _flush_notes pass doesn't immediately stomp the
+        edits with the LLM's original.
+        """
+        from .ui.appendix_edit_dialog import AppendixEditDialog  # noqa: PLC0415
+        from .utils.appendix_store import (  # noqa: PLC0415
+            AppendixStore,
+            regenerate_notes_json,
+        )
+        store = AppendixStore(session_id)
+        ctx, details, topics, referenced = store.load_as_dataclasses()
+        # Fall back to parsing notes.md in case the sidecar is
+        # absent (sessions predating the sidecar migration).
+        if not (ctx or details or topics or referenced):
+            try:
+                notes_md = TranscriptStore(session_id).read_notes()
+                from .utils.attendee_appendix import parse_appendix  # noqa: PLC0415
+                from .utils.attendee_context import (  # noqa: PLC0415
+                    parse_attendee_context,
+                )
+                from .utils.invite_mentions import (  # noqa: PLC0415
+                    parse_invite_mentions,
+                )
+                from .utils.topic_appendix import (  # noqa: PLC0415
+                    parse_topic_appendix,
+                )
+                ctx = parse_attendee_context(notes_md)
+                details = parse_appendix(notes_md)
+                topics = parse_topic_appendix(notes_md)
+                referenced = parse_invite_mentions(notes_md)
+            except Exception:
+                log.exception(
+                    "appendix edit dialog seed-fallback failed: %s",
+                    session_id,
+                )
+        dialog = AppendixEditDialog(
+            attendee_context=ctx,
+            attendee_details=details,
+            topics=topics,
+            referenced_attachments=referenced,
+            parent=self.window,
+        )
+        if dialog.exec() != AppendixEditDialog.DialogCode.Accepted:
+            return
+        edited_ctx = dialog.attendee_context()
+        edited_details = dialog.attendee_details()
+        edited_topics = dialog.topics()
+        edited_referenced = dialog.referenced_attachments()
+        # Persist to sidecar first -- if the notes.md regenerate
+        # fails, the sidecar still has the truthful state.
+        store.save(
+            attendee_context=edited_ctx,
+            attendee_details=edited_details,
+            topics=edited_topics,
+            referenced_attachments=edited_referenced,
+        )
+        # Update notes.md so the LLM's original JSON blocks don't
+        # round-trip back into the sidecar via the next
+        # _flush_notes. Skipped when the synthesis on disk is
+        # already empty -- no JSON blocks to overwrite.
+        try:
+            tstore = TranscriptStore(session_id)
+            current_notes = tstore.read_notes()
+            updated_notes = regenerate_notes_json(
+                current_notes,
+                attendee_context=edited_ctx,
+                attendee_details=edited_details,
+                topics=edited_topics,
+                referenced_attachments=edited_referenced,
+            )
+            if updated_notes != current_notes:
+                tstore.save_notes(updated_notes, archive_existing=False)
+                # Push the updated text into the open SessionView so
+                # the editor + tray reflect the change immediately
+                # without waiting for the next session-switch.
+                sv = self.window.session_view
+                if sv._session is not None and sv._session.id == session_id:  # noqa: SLF001
+                    sv.set_notes_text(updated_notes)
+        except Exception:
+            log.exception(
+                "appendix edit notes.md regenerate failed: %s",
+                session_id,
+            )
+        # Refresh the trays + preview against the new sidecar.
+        sv = self.window.session_view
+        if sv._session is not None and sv._session.id == session_id:  # noqa: SLF001
+            sv._refresh_appendix_trays()  # noqa: SLF001
 
     def _on_review_speakers(self, session_id: str) -> None:
         """Manual review walker. Reads diarization.json for the session."""
@@ -3160,6 +3253,21 @@ class MainApp(QObject):
             live_notes_text=notes_md or "",
             session_attachments=attachment_names,
         )
+        # Prompt the user for which Appendix sub-sections to bundle.
+        # Cancel aborts the whole export so the file dialog choice +
+        # highlights mode pick aren't wasted.
+        from .ui.appendix_inclusion_dialog import (  # noqa: PLC0415
+            AppendixInclusionDialog,
+            apply_inclusion,
+        )
+        inc_dlg = AppendixInclusionDialog(
+            appendix_data,
+            export_label="full-session export",
+            parent=self.window,
+        )
+        if inc_dlg.exec() != AppendixInclusionDialog.DialogCode.Accepted:
+            return
+        appendix_data = apply_inclusion(appendix_data, inc_dlg.inclusion())
         notes_pdf_path = None
         synthesis_pdf_path = None
         try:

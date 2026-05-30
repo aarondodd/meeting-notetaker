@@ -117,6 +117,10 @@ class SessionView(QWidget):
     # Attachments tab forwards (issue #29) -- MainApp persists +
     # refreshes derived state on change.
     attachments_changed = pyqtSignal(str)                 # session_id
+    # User clicked Edit... on the Appendix tray; MainApp opens the
+    # AppendixEditDialog. Kept as a signal so the tray + dialog
+    # imports don't leak into session_view's import surface.
+    appendix_edit_requested = pyqtSignal(str)             # session_id
     attachments_split_changed = pyqtSignal(str)           # session_id, base64 splitter state forwarded via signal
     # Screen-capture lifecycle. start_screen_capture_clicked carries the
     # session id; MainApp shows the first-time popup (if needed) and
@@ -391,6 +395,9 @@ class SessionView(QWidget):
         # appendix (attendee details, topics, context, referenced
         # attachments) plus links and session attachments.
         self._live_notes_appendix = AppendixTray(self)
+        self._live_notes_appendix.edit_requested.connect(
+            self._on_appendix_edit_requested,
+        )
         self._live_notes_page = QWidget(self)
         live_notes_layout = QVBoxLayout(self._live_notes_page)
         live_notes_layout.setContentsMargins(0, 0, 0, 0)
@@ -418,6 +425,9 @@ class SessionView(QWidget):
         self._notes_drawer.contact_clicked.connect(self._on_drawer_contact_clicked)
         # Same Appendix tray pattern below the Synthesis editor.
         self._notes_appendix = AppendixTray(self)
+        self._notes_appendix.edit_requested.connect(
+            self._on_appendix_edit_requested,
+        )
         self._notes_page = QWidget(self)
         notes_layout = QVBoxLayout(self._notes_page)
         notes_layout.setContentsMargins(0, 0, 0, 0)
@@ -1760,6 +1770,12 @@ class SessionView(QWidget):
     def attachments_tab(self) -> AttachmentsTab:
         return self._attachments_tab
 
+    def _on_appendix_edit_requested(self) -> None:
+        """Bubble the tray's Edit click up to MainApp for handling."""
+        if self._session is None:
+            return
+        self.appendix_edit_requested.emit(self._session.id)
+
     def _on_attachments_changed(self, session_id: str) -> None:
         # Forward upward; MainApp may want to update an indicator
         # on the session list (e.g. paperclip glyph).
@@ -2044,7 +2060,7 @@ class SessionView(QWidget):
             self._print_btn.setEnabled(False)
             self._export_pdf_btn.setEnabled(False)
 
-    def _build_print_document(self):
+    def _build_print_document(self, *, ask_appendix_inclusion: bool = True):
         """Render the active tab into a QTextDocument bound to the session dir.
 
         Returns (doc, tab_label) or (None, "") if the active tab can't be
@@ -2053,6 +2069,12 @@ class SessionView(QWidget):
         loadResource() call -- QTextDocument's own setBaseUrl is only
         honored on the first call, which produced broken-image icons in
         printed PDFs.
+
+        When ``ask_appendix_inclusion`` is True (default for the user-
+        facing Export PDF + Print buttons), pops the inclusion dialog
+        so the user picks which Appendix sub-sections land in the
+        output. Cancelling the dialog returns (None, "") so the
+        caller treats it like a normal abort.
         """
         if self._session is None:
             return None, ""
@@ -2105,6 +2127,11 @@ class SessionView(QWidget):
         # in the PDF + the auto-extracted heading is missing.
         from ..utils.appendix_store import collect_for_session  # noqa: PLC0415
         from ..utils.appendix_transform import inject_appendix  # noqa: PLC0415
+        from .appendix_inclusion_dialog import (  # noqa: PLC0415
+            AppendixInclusion,
+            AppendixInclusionDialog,
+            apply_inclusion,
+        )
         # Pull the same sidecar-backed payload the tray uses so the
         # injection picks up sections that have been stripped from
         # notes.md.
@@ -2118,7 +2145,20 @@ class SessionView(QWidget):
                 self, "_session_attachment_names", [],
             ),
         )
-        body_for_print = inject_appendix(body_for_print, appendix_data)
+        if ask_appendix_inclusion:
+            dlg = AppendixInclusionDialog(
+                appendix_data,
+                export_label=f"{tab_label} export",
+                parent=self,
+            )
+            if dlg.exec() != AppendixInclusionDialog.DialogCode.Accepted:
+                return None, ""
+            inclusion = dlg.inclusion()
+        else:
+            inclusion = AppendixInclusion.all_on()
+        body_for_print = inject_appendix(
+            body_for_print, apply_inclusion(appendix_data, inclusion),
+        )
 
         printable = build_print_markdown(
             session_title=self._session.title,

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QFrame,
@@ -41,6 +41,12 @@ from ..utils.appendix_transform import AppendixData
 
 class AppendixTray(QWidget):
     """Collapsible multi-section read-only summary panel."""
+
+    # Emitted when the user clicks the header's Edit button. MainApp
+    # opens the AppendixEditDialog seeded from the sidecar; the
+    # dialog handles persisting back to the sidecar + regenerating
+    # notes.md JSON blocks.
+    edit_requested = pyqtSignal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -67,6 +73,14 @@ class AppendixTray(QWidget):
         self._title.setFont(font)
         header_layout.addWidget(self._title)
         header_layout.addStretch(1)
+        # "Edit..." opens the AppendixEditDialog for the four LLM
+        # sections. The button is enabled whenever the tray carries
+        # any LLM-derived rows -- empty tray has nothing to edit.
+        self._edit_btn = QPushButton("Edit...", header)
+        self._edit_btn.setFlat(True)
+        self._edit_btn.setEnabled(False)
+        self._edit_btn.clicked.connect(self.edit_requested.emit)
+        header_layout.addWidget(self._edit_btn)
         layout.addWidget(header)
 
         # Body: a scroll area whose viewport holds one block per
@@ -146,6 +160,16 @@ class AppendixTray(QWidget):
         self._body_layout.addStretch(1)
         self._total_entries = total
         self._title.setText(f"Appendix ({total})")
+        # Edit button only makes sense when there's LLM-derived
+        # content; Session Attachments + Links are read-only
+        # mirrors of data that lives elsewhere.
+        llm_total = (
+            len(data.attendee_context)
+            + len(data.attendee_details)
+            + len(data.topics)
+            + len(data.referenced_attachments)
+        )
+        self._edit_btn.setEnabled(llm_total > 0)
         # Auto-collapse when there's nothing to show so the empty
         # tray doesn't take vertical space the user can't dismiss.
         if total == 0 and self._is_expanded:
