@@ -76,6 +76,24 @@ leaves the machine; no API key required.
   synthesis result, threaded cancel plumbing through audio export,
   indent-preserving list / quote / task prefixes in My Notes
   formatting toolbar.
+- **Default export folder.** Settings -> Export -> Default folder
+  is honored across every export Save As / Choose Folder dialog
+  (audio, video, full-session zip, full-session folder, PDF). Empty
+  = legacy per-call default. Stale paths (yanked USB drive) silently
+  fall back; `~/...` paths expand against HOME.
+- **PowerShell install + upgrade scripts.** `install.ps1` /
+  `upgrade.ps1` at the repo root cover the headless paths. One-line
+  bootstraps with `iwr -useb .../install.ps1 | iex` (or
+  `upgrade.ps1`); both print version + asset details, prompt Y/N
+  (or `-Yes` for unattended), and launch the Inno Setup wizard.
+  `upgrade.ps1` detects the installed version from the Inno Setup
+  uninstall key and short-circuits when already on latest (use
+  `-Force` to reinstall).
+- **Appendix heading levels (#71).** Injected Appendix now emits
+  `# Appendix (auto-extracted)` (H1) instead of `##`, so it renders
+  as a peer of # Notes / # Open Questions / # Attendees rather than
+  a subsection of whichever H1 preceded it. Sub-sections promoted
+  from `###` to `##`. Same code path drives preview + PDF + ZIP.
 
 ## What's new in v0.7.3
 
