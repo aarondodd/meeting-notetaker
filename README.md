@@ -516,6 +516,26 @@ and run it. The installer:
   weekly background check) by downloading the new installer and
   re-running it in place
 
+### One-line bootstrap (PowerShell)
+
+Two PowerShell scripts in the repo root cover the headless paths:
+
+```powershell
+# Fresh install -- fetches the latest release asset and launches it.
+iwr -useb https://raw.githubusercontent.com/aarondodd/meeting-notetaker/main/install.ps1 | iex
+
+# Upgrade an existing install -- detects the installed version via
+# the Inno Setup registry entry, compares against the latest
+# release, prompts to confirm, then runs the installer in upgrade
+# mode (Restart Manager closes the running app + relaunches it).
+iwr -useb https://raw.githubusercontent.com/aarondodd/meeting-notetaker/main/upgrade.ps1 | iex
+```
+
+Both scripts print the relevant version + asset details and ask
+**Y/N** before downloading. Pass `-Yes` to skip the prompt for
+unattended installs; `upgrade.ps1` also accepts `-Force` to reinstall
+even when the installed version matches the latest release.
+
 ### Build locally (Windows)
 
 ```powershell
