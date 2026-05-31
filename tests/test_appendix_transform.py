@@ -67,20 +67,6 @@ def test_appendix_heading_is_h1_not_h2():
     assert not line.startswith("## "), f"Heading regressed to H2: {line!r}"
 
 
-def test_subsections_separated_by_hr():
-    """Each appendix sub-section is preceded by a `---` horizontal
-    rule (after the first). The HR forces Qt's GFM table parser to
-    see an unambiguous block boundary -- without it, the H2
-    sub-heading after a table was being absorbed as table
-    continuation on Windows. Also gives the user a visible
-    section divider in the rendered preview."""
-    out = build_appendix_markdown(_DATA_FULL)
-    # The full data has six populated sub-sections, so there should
-    # be five HR separators between them. The first sub-section
-    # follows the # Appendix heading directly with no HR.
-    assert out.count("\n---\n") == 5
-
-
 def test_subsection_headings_are_h2_not_h3():
     """Sub-sections must be H2 so they're clearly subordinated to
     the H1 appendix heading + visually distinct from the H3

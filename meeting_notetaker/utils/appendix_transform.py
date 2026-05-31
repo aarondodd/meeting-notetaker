@@ -112,15 +112,7 @@ def build_appendix_markdown(data: AppendixData) -> str:
         sections.append(_render_links(data.links))
     if not sections:
         return ""
-    # Separator strategy: blank-line + horizontal rule + blank-line
-    # between every sub-section. The HR forces Qt's GFM table parser
-    # to see an unambiguous block boundary, which was needed on
-    # Windows where the H2 sub-headings after each table were being
-    # absorbed as table continuation (reported in #v0.7.5 testing).
-    # As a bonus, the HR visually distinguishes the sub-sections so
-    # they read as discrete items rather than one long appendix
-    # blob.
-    body = "\n\n---\n\n".join(sections)
+    body = "\n\n".join(sections)
     return f"{_APPENDIX_HEADING}\n\n{body}\n"
 
 
