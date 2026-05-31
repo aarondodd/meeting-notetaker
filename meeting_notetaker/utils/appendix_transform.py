@@ -2,10 +2,11 @@
 
 Reads the raw JSON appendix blocks from a session's markdown buffer
 (notes.md and / or live_notes.md), strips the raw blocks, and
-appends a single ``## Appendix (auto-extracted)`` Markdown section
-with sub-headings for each data type rendered as friendly Markdown
-tables. Source buffer remains untouched -- this is a render-time
-transform only.
+appends a single ``# Appendix (auto-extracted)`` Markdown section
+(H1 -- top-level peer of the bundled prompt's H1 sections) with
+``## X`` sub-headings for each data type rendered as friendly
+Markdown tables. Source buffer remains untouched -- this is a
+render-time transform only.
 
 Sub-sections (in order):
 1. Attendee Context (#63)

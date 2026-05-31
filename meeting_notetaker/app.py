@@ -620,6 +620,34 @@ class MainApp(QObject):
         }
         return labels.get(event, "")
 
+    def _strip_all_appendices(self, markdown: str) -> str:
+        """Run every LLM-appendix strip helper in sequence.
+
+        Shared by the paste-back path (`_apply_synthesis_result`)
+        and the edit-dialog path (`_on_appendix_edit_requested`)
+        so the strip toggle behaves consistently regardless of
+        which surface produced the new notes.md. All four
+        appendices ride one Settings toggle -- if the user wants
+        notes.md clean, they want them all gone. The sidecar
+        persistence is the caller's responsibility (runs BEFORE
+        the strip so data survives).
+        """
+        from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
+        from .utils.attendee_context import (  # noqa: PLC0415
+            strip_appendix as strip_attendee_context,
+        )
+        from .utils.invite_mentions import (  # noqa: PLC0415
+            strip_appendix as strip_invite_mentions,
+        )
+        from .utils.topic_appendix import (  # noqa: PLC0415
+            strip_appendix as strip_topic_appendix,
+        )
+        markdown = strip_appendix(markdown)
+        markdown = strip_topic_appendix(markdown)
+        markdown = strip_attendee_context(markdown)
+        markdown = strip_invite_mentions(markdown)
+        return markdown
+
     def _apply_synthesis_result(
         self,
         session_id: str,
@@ -665,36 +693,27 @@ class MainApp(QObject):
                 "appendix sidecar write failed: %s", session_id,
             )
         if self.config.synthesis.strip_attendee_appendix:
-            from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
-            from .utils.topic_appendix import (  # noqa: PLC0415
-                strip_appendix as strip_topic_appendix,
-            )
-            from .utils.attendee_context import (  # noqa: PLC0415
-                strip_appendix as strip_attendee_context,
-            )
-            from .utils.invite_mentions import (  # noqa: PLC0415
-                strip_appendix as strip_invite_mentions,
-            )
-            # All four LLM-generated appendices ride the same Settings
-            # toggle. They're each opt-out "show me what was
-            # extracted" surfaces; if the user wants notes.md clean,
-            # they want them all gone. The Appendix tray stays
-            # populated because the sidecar was written above before
-            # this strip pass ran (#64 sidecar followup).
-            markdown = strip_appendix(markdown)
-            markdown = strip_topic_appendix(markdown)
-            markdown = strip_attendee_context(markdown)
-            markdown = strip_invite_mentions(markdown)
-        archive_path = TranscriptStore(session_id).save_notes(
+            markdown = self._strip_all_appendices(markdown)
+        tstore = TranscriptStore(session_id)
+        archive_path = tstore.save_notes(
             markdown, archive_existing=archive_existing,
         )
         self.store.update_session(session_id, has_notes=True)
         self._reindex_search_for(session_id)
-        # Reload the SessionView so the Synthesis tab shows the new
-        # body + the tray re-reads from the freshly-written sidecar.
+        # Targeted SessionView refresh in place of a full
+        # _on_session_selected reload (#73 finding #3). The full
+        # reload re-read transcript / live_notes / templates /
+        # highlights / contacts from disk via a worker thread on
+        # every paste, producing a 50-100ms empty-pane flash on the
+        # highest-touch user actions. The targeted setters update
+        # the Synthesis tab + tray + appendix transform in place
+        # without the round-trip. Only previous-notes-paths need a
+        # re-read when archive_existing actually rotated a file.
         sv = self.window.session_view
         if sv._session is not None and sv._session.id == session_id:
-            self._on_session_selected(session_id)
+            sv.set_notes_text(markdown)
+            if archive_path is not None:
+                sv.set_previous_notes(tstore.list_previous_notes())
         return archive_path
 
     def _handle_synthesis_result(self, session_id: str, markdown: str, target: str) -> None:
@@ -2036,7 +2055,10 @@ class MainApp(QObject):
         # Update notes.md so the LLM's original JSON blocks don't
         # round-trip back into the sidecar via the next
         # _flush_notes. Skipped when the synthesis on disk is
-        # already empty -- no JSON blocks to overwrite.
+        # already empty -- no JSON blocks to overwrite. When the
+        # strip_attendee_appendix Settings toggle is ON, apply the
+        # strip pass so the dialog edits don't restore the JSON
+        # the user told the app to hide (#73 finding #2).
         try:
             tstore = TranscriptStore(session_id)
             current_notes = tstore.read_notes()
@@ -2047,8 +2069,14 @@ class MainApp(QObject):
                 topics=edited_topics,
                 referenced_attachments=edited_referenced,
             )
+            if self.config.synthesis.strip_attendee_appendix:
+                updated_notes = self._strip_all_appendices(updated_notes)
             if updated_notes != current_notes:
                 tstore.save_notes(updated_notes, archive_existing=False)
+                # Keep the search index in sync so the edit is
+                # findable immediately rather than waiting for the
+                # 30s stale-fingerprint scan (#73 finding #2).
+                self._reindex_search_for(session_id)
                 # Push the updated text into the open SessionView so
                 # the editor + tray reflect the change immediately
                 # without waiting for the next session-switch.

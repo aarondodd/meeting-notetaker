@@ -237,6 +237,7 @@ def build_session_package(
                 options.mic_path, options.sys_path,
                 audio_dir / "recording.mp3",
                 lambda p: step("audio_full", p),
+                should_cancel=should_cancel,
             )
         else:
             step("audio_full")
@@ -460,10 +461,12 @@ def render_session_pdf(
     return dst
 
 
-def _export_full_audio(mic, sys_, dst: Path, progress) -> None:
+def _export_full_audio(
+    mic, sys_, dst: Path, progress, *, should_cancel=None,
+) -> None:
     """Run audio.export.export_mixed; force .mp3 extension."""
     from ..audio.export import export_mixed
-    export_mixed(mic, sys_, dst)
+    export_mixed(mic, sys_, dst, should_cancel=should_cancel)
     progress(100)
 
 
@@ -488,12 +491,6 @@ def _export_full_video(
         mic, sys_, screenshots, transcript_text, dst,
         progress=progress, status=status, quality=quality,
     )
-    # SRT sidecar is auto-emitted by export_video; ensure it lands
-    # in the same directory as the .mp4 with a deterministic name.
-    srt = dst.with_suffix(".srt")
-    if not srt.exists():
-        # export_video writes the SRT next to dst -- belt-and-braces.
-        pass
 
 
 def _export_highlights_video(

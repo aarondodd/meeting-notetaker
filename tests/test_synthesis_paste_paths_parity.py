@@ -212,3 +212,110 @@ def test_chrome_and_manual_flow_produce_identical_state(app_with_session):
     # Bob's enrichment is at the Contact level (not session-scoped)
     # so both runs converge on the same value.
     assert manual_bob_title == "CEO"
+
+
+# ---- Edit-dialog + strip-toggle parity (#73 finding #2 + #8) ----
+
+
+def test_edit_dialog_strip_off_writes_json_blocks_back(app_with_session):
+    """When strip toggle is OFF (default), the dialog flow's
+    regenerate_notes_json restores fresh JSON blocks to notes.md
+    so the next debounced _flush_notes doesn't stomp the dialog's
+    edits."""
+    from meeting_notetaker.models.transcript import TranscriptStore
+    from meeting_notetaker.utils.appendix_store import (
+        AppendixStore,
+        regenerate_notes_json,
+    )
+    from meeting_notetaker.utils.attendee_appendix import AttendeeAppendixEntry
+    from meeting_notetaker.utils.attendee_context import (
+        AttendeeContextEntry,
+    )
+    from meeting_notetaker.utils.invite_mentions import InviteMentionEntry
+
+    ma, sid = app_with_session
+    ma.config.synthesis.strip_attendee_appendix = False
+    # Seed sidecar + notes.md via the paste-back path.
+    ma._apply_synthesis_result(sid, _SYNTHESIS_BODY, archive_existing=False)  # noqa: SLF001
+    # Simulate the dialog editing Bob's observation.
+    edited_ctx = [AttendeeContextEntry(name="Bob", observation="REVISED")]
+    edited_det = [AttendeeAppendixEntry(name="Bob", title="CEO", company="Bobco")]
+    edited_topics = ["Q3 hiring"]
+    edited_ref = [InviteMentionEntry(name="deck", context="slide 4")]
+    # Manually run the regenerate step (the dialog's side effect).
+    current = TranscriptStore(sid).read_notes()
+    updated = regenerate_notes_json(
+        current,
+        attendee_context=edited_ctx,
+        attendee_details=edited_det,
+        topics=edited_topics,
+        referenced_attachments=edited_ref,
+    )
+    # Strip toggle OFF -> notes.md keeps JSON blocks with new data.
+    assert "Attendee Context (auto-extracted)" in updated
+    assert "REVISED" in updated
+    # Also confirm sidecar would round-trip via save.
+    AppendixStore(sid).save(
+        attendee_context=edited_ctx,
+        attendee_details=edited_det,
+        topics=edited_topics,
+        referenced_attachments=edited_ref,
+    )
+    ctx, det, topics, ref = AppendixStore(sid).load_as_dataclasses()
+    assert ctx[0].observation == "REVISED"
+
+
+def test_edit_dialog_strip_on_keeps_notes_clean(app_with_session):
+    """When strip toggle is ON, the dialog flow must NOT restore
+    the JSON blocks to notes.md -- the user explicitly chose to
+    hide them. Sidecar still gets the edit (#73 finding #2)."""
+    from meeting_notetaker.models.transcript import TranscriptStore
+    from meeting_notetaker.utils.appendix_store import (
+        AppendixStore,
+        regenerate_notes_json,
+    )
+    from meeting_notetaker.utils.attendee_appendix import AttendeeAppendixEntry
+    from meeting_notetaker.utils.attendee_context import (
+        AttendeeContextEntry,
+    )
+    from meeting_notetaker.utils.invite_mentions import InviteMentionEntry
+
+    ma, sid = app_with_session
+    ma.config.synthesis.strip_attendee_appendix = True
+    # Seed via paste-back (strip toggle ON so notes.md is clean).
+    ma._apply_synthesis_result(sid, _SYNTHESIS_BODY, archive_existing=False)  # noqa: SLF001
+    saved_after_paste = TranscriptStore(sid).read_notes()
+    assert "Attendee Context (auto-extracted)" not in saved_after_paste
+    # Simulate dialog edit + the new post-#73 strip pass.
+    edited_ctx = [AttendeeContextEntry(name="Bob", observation="REVISED")]
+    edited_det = [AttendeeAppendixEntry(name="Bob", title="CEO", company="Bobco")]
+    edited_topics = ["Q3 hiring"]
+    edited_ref = [InviteMentionEntry(name="deck", context="slide 4")]
+    updated = regenerate_notes_json(
+        saved_after_paste,
+        attendee_context=edited_ctx,
+        attendee_details=edited_det,
+        topics=edited_topics,
+        referenced_attachments=edited_ref,
+    )
+    # The new behavior: strip pass runs after regenerate so the
+    # JSON blocks regenerate_notes_json just added get removed.
+    if ma.config.synthesis.strip_attendee_appendix:
+        updated = ma._strip_all_appendices(updated)  # noqa: SLF001
+    # notes.md stays clean; the user's strip preference is honored.
+    for tag in (
+        "Attendee Context",
+        "Attendee Details",
+        "Suggested Topics",
+        "Referenced Attachments",
+    ):
+        assert f"{tag} (auto-extracted)" not in updated
+    # Sidecar still carries the edited data.
+    AppendixStore(sid).save(
+        attendee_context=edited_ctx,
+        attendee_details=edited_det,
+        topics=edited_topics,
+        referenced_attachments=edited_ref,
+    )
+    ctx, _det, _topics, _ref = AppendixStore(sid).load_as_dataclasses()
+    assert ctx[0].observation == "REVISED"

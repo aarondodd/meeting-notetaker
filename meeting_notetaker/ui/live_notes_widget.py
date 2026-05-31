@@ -443,19 +443,24 @@ class LiveNotesWidget(QWidget):
         lines = block.split(chr(0x2029))
         new_lines: list[str] = []
         for line in lines:
-            stripped = line
             if heading:
-                # Drop any existing heading prefix so toggling levels is clean.
-                lstripped = stripped.lstrip()
+                # Drop any existing heading prefix so toggling levels
+                # is clean (H1 -> H2 replaces, not stacks).
+                lstripped = line.lstrip()
                 if lstripped.startswith("#"):
                     rest = lstripped.lstrip("#").lstrip()
-                    stripped = rest
+                    new_lines.append(f"{prefix}{rest}")
                 else:
-                    stripped = lstripped
+                    new_lines.append(f"{prefix}{lstripped}")
             else:
-                # Preserve indentation when prefixing for non-heading actions.
-                pass
-            new_lines.append(f"{prefix}{stripped}")
+                # Preserve leading indentation so toggling List /
+                # Quote / Task on a nested line keeps its indent
+                # (was previously a no-op `pass` that pushed the
+                # prefix in front of the leading whitespace, e.g.
+                # "    foo" -> "-     foo"; #73 finding #7).
+                indent_len = len(line) - len(line.lstrip())
+                indent, content = line[:indent_len], line[indent_len:]
+                new_lines.append(f"{indent}{prefix}{content}")
         cursor.insertText("\n".join(new_lines))
 
     def _numbered_list(self) -> None:
