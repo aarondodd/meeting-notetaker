@@ -1449,7 +1449,13 @@ class MainApp(QObject):
         # through set_session() again (which would flush saves +
         # reset state we already configured in the prelude).
         sv.set_transcript_text(content.transcript)
-        sv._set_live_notes_text(content.live_notes)  # noqa: SLF001
+        # Public setter: applies the My Notes preview-mode default
+        # based on whether the loaded body has content beyond the
+        # seeded template (#67 followup). The session-select prelude
+        # called set_session with an empty live_notes so the editor
+        # landed in Edit; this call swings it to Preview when the
+        # real body has actual notes.
+        sv.set_live_notes_text(content.live_notes)
         sv.set_notes_text(content.notes)
         sv.set_previous_notes(content.previous_notes_paths)
         sv.set_prompt_templates(

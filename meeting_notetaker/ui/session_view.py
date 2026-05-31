@@ -751,16 +751,14 @@ class SessionView(QWidget):
         # paste-back lands directly in the editable buffer.
         self._notes_view.set_preview_mode(bool(notes.strip()))
         self._live_notes_editor.set_session_dir(sdir)
-        self._set_live_notes_text(live_notes)
-        # My Notes defaults to preview when the body has anything
-        # beyond the seeded "# Attendees / # Agenda / # Notes /
-        # # Action Items" template (#67 followup). The user usually
-        # comes back to a past session to read, not to edit; landing
-        # in edit mode forced them to click Preview every time. Fresh
-        # sessions (body == seed) still land in edit so the user
-        # starts typing without an extra click.
-        from ..utils.live_notes import has_user_content  # noqa: PLC0415
-        self._live_notes_editor.set_preview_mode(has_user_content(live_notes))
+        # Use the public setter so the preview-mode default is applied
+        # consistently with the async post-load path (#67 followup).
+        # The session-select prelude passes live_notes="" so this
+        # initial call lands the editor in Edit; MainApp's content
+        # worker calls set_live_notes_text again with the real body
+        # off disk and the public setter flips to Preview when the
+        # body has anything beyond the seeded template.
+        self.set_live_notes_text(live_notes)
         self._retain_checkbox.setEnabled(True)
         self._retain_checkbox.blockSignals(True)
         self._retain_checkbox.setChecked(session.retain_audio)
@@ -1456,6 +1454,26 @@ class SessionView(QWidget):
         # New synthesis content can introduce JSON appendices + new
         # links; refresh the tray + preview transform (#64).
         self._refresh_appendix_trays()
+
+    def set_live_notes_text(self, text: str) -> None:
+        """Replace the My Notes body + reapply the preview-mode default.
+
+        The session-select path is two-phase: set_session() binds an
+        empty buffer synchronously for snappy UI swap, then a worker
+        in MainApp reads live_notes.md off disk and pushes the real
+        content back via this setter. The preview-mode default lands
+        here (not in _set_live_notes_text) so the *real* body is what
+        decides Edit vs Preview -- previously this lived in
+        set_session only, which always ran against an empty body and
+        therefore always landed in Edit even for sessions with notes.
+
+        Matches the Synthesis tab's set_notes_text pattern: public
+        setter applies preview-mode based on content; private
+        _set_live_notes_text just touches text.
+        """
+        self._set_live_notes_text(text)
+        from ..utils.live_notes import has_user_content  # noqa: PLC0415
+        self._live_notes_editor.set_preview_mode(has_user_content(text))
 
     def set_previous_notes(self, paths: list) -> None:
         self._previous_view.set_archives(paths)
