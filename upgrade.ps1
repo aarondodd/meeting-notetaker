@@ -39,40 +39,120 @@ try {
     # See install.ps1 for context.
 }
 
-# Inno Setup's AppId from installer.iss (line 18). Append "_is1" --
-# Inno Setup writes its uninstall key under <AppId>_is1, NOT the bare
-# AppId. The installer.iss comment explicitly notes the AppId is
-# stable across releases, so this lookup is safe long-term.
+# Inno Setup's AppId from installer.iss (line 18). Inno Setup
+# appends "_is1" to the AppId for the uninstall registry key. The
+# installer.iss comment notes the AppId is stable across releases,
+# so this fast-path lookup is safe long-term. If the canonical
+# key isn't found (custom build, registry quirks, etc.) the
+# function falls back to enumerating uninstall keys and matching
+# by DisplayName.
 $InnoAppId = "{B1F03D8E-7C29-4A6E-9B0F-9A6B7C0E1D2F}_is1"
+$DisplayNameMatch = "Meeting Notetaker"
+
+# Three roots cover every scope an Inno Setup install can land in:
+#   HKLM\...\Uninstall              -- system-wide 64-bit
+#   HKLM\...\WOW6432Node\...\Uninstall -- system-wide 32-bit (rare for us)
+#   HKCU\...\Uninstall              -- per-user (default, since
+#                                       installer.iss sets
+#                                       PrivilegesRequired=lowest)
+$UninstallRoots = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+)
+
+function Read-UninstallKey {
+    # Read one uninstall key and return a pscustomobject if it looks
+    # like ours. -LiteralPath so the curly braces in the GUID-shaped
+    # subkey name don't get interpreted as wildcards by the registry
+    # provider (which is the bug that broke the v0.7.5 first cut).
+    param([string]$Root, [string]$Subkey)
+    $path = Join-Path -Path $Root -ChildPath $Subkey
+    try {
+        $key = Get-ItemProperty -LiteralPath $path -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if (-not $key) { return $null }
+    if (-not $key.DisplayVersion) { return $null }
+    return [pscustomobject]@{
+        DisplayVersion = $key.DisplayVersion
+        DisplayName = $key.DisplayName
+        InstallLocation = $key.InstallLocation
+        Publisher = $key.Publisher
+        Scope = if ($Root -like "HKCU:*") { "per-user" } else { "system-wide" }
+        RegistryPath = $path
+    }
+}
 
 function Get-InstalledVersion {
-    # Inno Setup writes to HKCU when the install is per-user and to
-    # HKLM when it elevated for a system-wide install. Check both;
-    # whichever wins gives us the active install. If both exist
-    # (rare, but possible after a per-user install followed by an
-    # elevated reinstall), HKLM takes precedence because that's what
-    # the Start Menu shortcut points to under that scenario.
-    $candidates = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$InnoAppId",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$InnoAppId",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$InnoAppId"
-    )
-    foreach ($path in $candidates) {
+    # Fast path: the canonical Inno Setup AppId_is1 key under each
+    # of the three uninstall roots. Matches every install we've ever
+    # shipped from this repo. HKLM wins over HKCU when both exist
+    # (rare; happens after a per-user install followed by elevated
+    # reinstall).
+    foreach ($root in $UninstallRoots) {
+        $info = Read-UninstallKey -Root $root -Subkey $InnoAppId
+        if ($info) { return $info }
+    }
+    # Fallback: enumerate every uninstall subkey and match by
+    # DisplayName. Covers historical installs registered under a
+    # different AppId + any case where the registry provider can't
+    # reach the canonical key for some other reason.
+    foreach ($root in $UninstallRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
         try {
-            $key = Get-ItemProperty -Path $path -ErrorAction Stop
-            if ($key -and $key.DisplayVersion) {
-                return [pscustomobject]@{
-                    DisplayVersion = $key.DisplayVersion
-                    InstallLocation = $key.InstallLocation
-                    Scope = if ($path -like "HKCU:*") { "per-user" } else { "system-wide" }
-                    RegistryPath = $path
-                }
-            }
+            $children = Get-ChildItem -LiteralPath $root -ErrorAction Stop
         } catch {
             continue
         }
+        foreach ($child in $children) {
+            try {
+                $key = Get-ItemProperty -LiteralPath $child.PSPath -ErrorAction Stop
+            } catch {
+                continue
+            }
+            if (-not $key) { continue }
+            if ($key.DisplayName -and $key.DisplayName -like "*$DisplayNameMatch*") {
+                if ($key.DisplayVersion) {
+                    return [pscustomobject]@{
+                        DisplayVersion = $key.DisplayVersion
+                        DisplayName = $key.DisplayName
+                        InstallLocation = $key.InstallLocation
+                        Publisher = $key.Publisher
+                        Scope = if ($root -like "HKCU:*") { "per-user" } else { "system-wide" }
+                        RegistryPath = $child.PSPath
+                    }
+                }
+            }
+        }
     }
     return $null
+}
+
+function Write-RegistryDiagnostic {
+    # Surface where we looked so the user can attach the output to
+    # an issue if the lookup keeps failing. Cheap, deterministic, no
+    # side effects.
+    Write-Host ""
+    Write-Host "Registry lookup diagnostic:" -ForegroundColor Yellow
+    foreach ($root in $UninstallRoots) {
+        $canonical = Join-Path -Path $root -ChildPath $InnoAppId
+        $existsCanonical = Test-Path -LiteralPath $canonical
+        $rootExists = Test-Path -LiteralPath $root
+        $childCount = 0
+        if ($rootExists) {
+            try {
+                $childCount = (Get-ChildItem -LiteralPath $root -ErrorAction Stop).Count
+            } catch {
+                $childCount = -1
+            }
+        }
+        Write-Host ("  {0}" -f $root)
+        Write-Host ("    exists: {0} (child keys: {1})" -f $rootExists, $childCount)
+        Write-Host ("    canonical key {0}: {1}" -f $InnoAppId, $existsCanonical)
+    }
+    Write-Host ("  DisplayName fallback pattern: *{0}*" -f $DisplayNameMatch)
 }
 
 function Parse-SemVer {
@@ -173,11 +253,21 @@ Write-Host "===================================="
 $installed = Get-InstalledVersion
 if (-not $installed) {
     Write-Host ""
-    $msg = "No installed Meeting Notetaker detected (no Inno Setup " +
-           "registry entry under $InnoAppId)."
-    Write-Host $msg -ForegroundColor Yellow
+    Write-Host ("No installed Meeting Notetaker detected. Tried the " +
+                "canonical Inno Setup key + a DisplayName fallback " +
+                "across HKLM, HKLM\WOW6432Node, and HKCU.") `
+        -ForegroundColor Yellow
+    Write-RegistryDiagnostic
+    Write-Host ""
     Write-Host "Use install.ps1 for a fresh install:"
     Write-Host "  iwr -useb https://raw.githubusercontent.com/$Owner/$Repo/main/install.ps1 | iex"
+    Write-Host ""
+    Write-Host ("If you do have an existing install, paste the above " +
+                "diagnostic + the output of:") -ForegroundColor Yellow
+    Write-Host ("  Get-ChildItem 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' " +
+                "| Where-Object { (Get-ItemProperty `$_.PSPath -ErrorAction SilentlyContinue).DisplayName " +
+                "-like '*Meeting Notetaker*' } | Select-Object -ExpandProperty PSChildName")
+    Write-Host ("into a new issue on $Owner/$Repo.") -ForegroundColor Yellow
     exit 1
 }
 
@@ -241,25 +331,35 @@ try {
     Download-Installer -Url $asset.browser_download_url -Destination $temp
 
     Write-Host ""
-    Write-Host "Launching installer..." -ForegroundColor Cyan
-    Write-Host ("If Meeting Notetaker is currently running, Windows " +
-                "Restart Manager will close it via the installer's " +
-                "CloseApplications hook and relaunch it after the " +
-                "upgrade.")
-    # Interactive wizard; the user sees Inno Setup's upgrade prompts.
-    # The installer's stable AppId means the existing install gets
-    # replaced in place rather than stacking a second Add/Remove
-    # Programs entry.
-    $proc = Start-Process -FilePath $temp -Wait -PassThru
+    Write-Host "Running silent in-place upgrade..." -ForegroundColor Cyan
+    Write-Host ("Same flags as the in-app updater: /SILENT " +
+                "/SUPPRESSMSGBOXES /NORESTART. Inno Setup's stable " +
+                "AppId means the existing install gets replaced in " +
+                "place; Windows Restart Manager closes the running " +
+                "app via the installer's CloseApplications hook and " +
+                "relaunches it after.")
+    Write-Host ("(Use install.ps1 instead if you want the full " +
+                "wizard with EULA + install-dir prompts.)") `
+        -ForegroundColor DarkGray
+
+    # Match meeting_notetaker/utils/updater.launch_installer
+    # (utils/updater.py:294): /SILENT suppresses the wizard UI,
+    # /SUPPRESSMSGBOXES auto-confirms any prompts, /NORESTART tells
+    # Inno Setup never to request a Windows reboot. -Wait so the
+    # script doesn't exit before the installer + Restart Manager
+    # relaunch dance finishes.
+    $proc = Start-Process -FilePath $temp `
+        -ArgumentList "/SILENT","/SUPPRESSMSGBOXES","/NORESTART" `
+        -Wait -PassThru
     if ($proc.ExitCode -eq 0) {
         Write-Host ""
         Write-Host "Upgrade complete." -ForegroundColor Green
     } else {
         Write-Host ""
         Write-Host ("Installer exited with code $($proc.ExitCode). " +
-                    "If the wizard was cancelled, this is expected; " +
-                    "otherwise check the installer's log under " +
-                    "%TEMP%\Setup Log*.txt.") -ForegroundColor Yellow
+                    "Check the installer's log under " +
+                    "%TEMP%\Setup Log*.txt for details.") `
+            -ForegroundColor Yellow
     }
 } finally {
     if (Test-Path -LiteralPath $temp) {

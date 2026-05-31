@@ -554,6 +554,17 @@ Both scripts print the relevant version + asset details and ask
 unattended installs; `upgrade.ps1` also accepts `-Force` to reinstall
 even when the installed version matches the latest release.
 
+`install.ps1` launches the **full Inno Setup wizard** (EULA, install
+dir, desktop shortcut). `upgrade.ps1` launches the installer with the
+same `/SILENT /SUPPRESSMSGBOXES /NORESTART` flags the in-app updater
+uses, so the existing install is replaced in place without
+re-prompting; Windows Restart Manager closes the running app via the
+installer's `CloseApplications` hook and relaunches it after. If you
+want the full wizard during an upgrade for some reason (e.g. moving
+to a different install dir), use `install.ps1` -- the stable AppId
+still produces an in-place upgrade rather than stacking two
+Add/Remove Programs entries.
+
 ### Build locally (Windows)
 
 ```powershell
