@@ -30,7 +30,7 @@ from . import paths
 _FNAME_TS_FMT = "%Y%m%dT%H%M%SZ"
 
 # Email pattern intentionally lax -- OWA mixes the formal display
-# "Aaron Dodd <aaron@example.com>" with raw addresses. We scrub
+# "Sample User <user@example.com>" with raw addresses. We scrub
 # wherever the @ is.
 _EMAIL_RE = re.compile(
     r"(?P<local>[A-Za-z0-9._%+\-]+)@(?P<domain>[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"

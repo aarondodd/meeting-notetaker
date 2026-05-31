@@ -1,5 +1,5 @@
 {
-  "_capture_note": "Sampled from the 2026-05-31 bg-fetch-calendar run against Aaron's personal M365 tenant. Source endpoint: https://outlook.office365.com/api/v2.0/me/calendarview. Email local-parts redacted to ***@<domain>; Teams URLs + opaque IDs left intact because they're already per-meeting unguessable.",
+  "_capture_note": "Real-shape sample from a 2026-05-31 bg-fetch-calendar run against a real M365 tenant. Source endpoint: https://outlook.office365.com/api/v2.0/me/calendarview. Email local-parts redacted to ***@<domain>; org-identifying domains replaced with example-org.com / example-user.com; Teams URLs + opaque IDs preserved structurally because their format is what we're testing.",
   "@odata.context": "https://outlook.office365.com/api/v2.0/$metadata#Me/CalendarView",
   "value": [
     {
@@ -55,10 +55,10 @@
       "Attendees": [{
         "Type": "Required",
         "Status": {"Response": "None", "Time": "0001-01-01T00:00:00Z"},
-        "EmailAddress": {"Name": "Aaron Dodd", "Address": "***@fhb.com"}
+        "EmailAddress": {"Name": "Sample User", "Address": "***@example-org.com"}
       }],
       "Organizer": {
-        "EmailAddress": {"Name": "Aaron Dodd", "Address": "***@aarondodd.com"}
+        "EmailAddress": {"Name": "Sample User", "Address": "***@example-user.com"}
       },
       "OnlineMeeting": {
         "JoinUrl": "https://teams.microsoft.com/l/meetup-join/redacted-context"
@@ -73,7 +73,7 @@
       "End":   {"DateTime": "2026-06-01T00:00:00.0000000", "TimeZone": "UTC"},
       "Location": {"DisplayName": "", "LocationType": "Default"},
       "Body": {"ContentType": "HTML", "Content": "<html><body><p>Solo block</p></body></html>"},
-      "Organizer": {"EmailAddress": {"Name": "Aaron Dodd", "Address": "***@aarondodd.com"}},
+      "Organizer": {"EmailAddress": {"Name": "Sample User", "Address": "***@example-user.com"}},
       "Attendees": [],
       "ResponseStatus": {"Response": "Organizer", "Time": "0001-01-01T00:00:00Z"},
       "ShowAs": "Busy",

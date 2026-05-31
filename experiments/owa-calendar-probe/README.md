@@ -14,9 +14,10 @@ proving the OWA payload shape is sufficient for the existing
 
 ## Validated flow (2026-05-31)
 
-Confirmed working end-to-end on Linux Edge against a personal M365
+Confirmed working end-to-end on Linux Edge against a real M365
 tenant with five "Test N" calendar entries, including a cross-
-tenant attendee (an FHB email on a different M365 tenant).
+tenant attendee (an address on a different M365 tenant from the
+signed-in user).
 
 ```
 Edge service worker (probe extension)
@@ -123,7 +124,7 @@ Outlook REST v2.0 returns **PascalCase** JSON:
     "End":   {"DateTime": "2026-05-31T23:00:00.0000000", "TimeZone": "UTC"},
     "Attendees": [{
       "Type": "Required",
-      "EmailAddress": {"Name": "Aaron Dodd", "Address": "***@fhb.com"}
+      "EmailAddress": {"Name": "Sample User", "Address": "***@example-org.com"}
     }],
     "Organizer": {"EmailAddress": {"Name": "...", "Address": "..."}},
     "Location": {"DisplayName": "Microsoft Teams Meeting"},
@@ -148,11 +149,11 @@ caller-side changes needed.
 | External invitee (`Subclass: ImplicitContact`) | DisplayName + ScoredEmailAddresses only |
 
 JobTitle, CompanyName, Department, OfficeLocation may be null even
-for OrganizationUser if the tenant doesn't populate them (personal
-tenants often don't; enterprise tenants like FHB will). The probe
-preserves null -> empty string in the dataclass so downstream code
-doesn't need to special-case None. This is identical to the COM
-path's behavior on externals.
+for OrganizationUser if the tenant doesn't populate them. Personal-
+grade tenants often don't; enterprise tenants typically do, via
+Active Directory sync. The probe preserves null -> empty string
+in the dataclass so downstream code doesn't need to special-case
+None. This is identical to the COM path's behavior on externals.
 
 ## What it does
 
@@ -380,6 +381,27 @@ Hard questions are now answered. Soft ones remain:
 
 ## Eventual merge target
 
+**Design decision:** the prod app will keep COM and OWA-via-
+extension as two *coexisting* Outlook integration paths, with the
+user explicitly choosing which to use in Settings. Outlook is
+already an optional feature; the choice of mechanism (Classic
+Outlook COM for users who still have it, Chromium extension for
+users on New Outlook / web-only) is just one more user preference.
+Neither path is fallback-only; both are first-class.
+
+The Settings UI will offer three Outlook modes:
+
+| Mode | When to pick it |
+| --- | --- |
+| Disabled | User doesn't want Outlook integration. |
+| Classic COM | User has Classic Outlook on Windows. Lowest latency, no browser dependency. |
+| Chromium extension | User is on New Outlook / web-only OR explicitly prefers the extension path. |
+
+The probe code becomes the "Chromium extension" mode. With this
+design we never need to auto-detect; the user makes the call. That
+also avoids the layered-fallback complexity in `is_available` and
+keeps each path simple.
+
 If the probe holds up across a few weeks of use, the merge into
 prod looks like:
 
@@ -396,14 +418,12 @@ prod looks like:
    into the prod extension's `background.js` alongside the
    existing `synthesize` verb. The two verbs are independent so
    they coexist without interference.
-4. In the prod app, add a layered fallback in `outlook_calendar.py`:
-   - `is_available` returns True if EITHER COM is reachable OR the
-     synthesis bridge is connected to an extension whose
-     `host_permissions` covers `outlook.office365.com`.
-   - `fetch_calendar_range` tries COM first (lower-latency,
-     no browser dependency); falls back to the extension path on
-     COM failure (the New Outlook case).
-   - `fetch_imminent_meetings` likewise.
+4. In the prod app, add a `calendar_source` setting (Disabled /
+   Classic COM / Chromium extension). `outlook_calendar.py`
+   dispatches `is_available`, `fetch_calendar_range`, and
+   `fetch_imminent_meetings` to the implementation backing the
+   chosen mode. No automatic fallback between them -- the user
+   explicitly picks which to use.
 5. Drop the probe (relay + sandbox extension). The native-host
    manifest for `com.meeting_notetaker.probe` gets unregistered.
 

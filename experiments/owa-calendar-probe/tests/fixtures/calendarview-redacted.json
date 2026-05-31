@@ -25,7 +25,7 @@
           "emailAddress": {"name": "Sample Organizer", "address": "***@example.com"}
         },
         "attendees": [
-          {"emailAddress": {"name": "Aaron Dodd", "address": "***@example.com"}, "type": "required"},
+          {"emailAddress": {"name": "Sample User", "address": "***@example.com"}, "type": "required"},
           {"emailAddress": {"name": "Sample Attendee Two", "address": "***@example.com"}, "type": "required"}
         ],
         "body": {"contentType": "html", "content": "<p>Standup agenda</p>"},

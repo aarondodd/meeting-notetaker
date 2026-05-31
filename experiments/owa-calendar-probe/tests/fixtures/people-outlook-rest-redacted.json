@@ -1,13 +1,13 @@
 {
-  "_capture_note": "Sampled from 2026-05-31 bg-fetch-people runs against Aaron's personal M365 tenant. Source endpoint: https://outlook.office365.com/api/v2.0/me/people?$search=...&$top=5. Two distinct responses combined into one fixture: (1) OrganizationUser case from looking up the OWA user's own primary address, (2) ImplicitContact case from looking up adodd@fhb.com (a different tenant's user the OWA user has corresponded with). UUIDs replaced with fixture-stable placeholders; email local parts redacted to ***@<domain>; phone digits replaced with 5555555555.",
+  "_capture_note": "Real-shape sample from 2026-05-31 bg-fetch-people runs against a real M365 tenant. Source endpoint: https://outlook.office365.com/api/v2.0/me/people?$search=...&$top=5. Two distinct responses combined into one fixture: (1) OrganizationUser case from looking up an address that lives in the signed-in user's tenant, (2) ImplicitContact case from looking up an address on a different tenant the user has corresponded with. UUIDs replaced with fixture-stable placeholders; email local parts redacted to ***@<domain>; org-identifying domains replaced with example-org.com / example-user.com; phone digits replaced with 5555555555.",
   "@odata.context": "https://outlook.office365.com/api/v2.0/$metadata#Me/People",
   "value": [
     {
       "@odata.id": "https://outlook.office365.com/api/v2.0/Users('fixture-user-id@fixture-tenant-id')/People('fixture-user-id@fixture-tenant-id')",
       "Id": "fixture-user-id@fixture-tenant-id",
-      "DisplayName": "Aaron Dodd",
-      "GivenName": "Aaron",
-      "Surname": "Dodd",
+      "DisplayName": "Sample User",
+      "GivenName": "Sample",
+      "Surname": "User",
       "Birthday": null,
       "PersonNotes": null,
       "IsFavorite": false,
@@ -17,11 +17,11 @@
       "Department": null,
       "OfficeLocation": null,
       "Profession": null,
-      "UserPrincipalName": "***@aarondodd.com",
-      "IMAddress": "sip:***@aarondodd.com",
+      "UserPrincipalName": "***@example-user.com",
+      "IMAddress": "sip:***@example-user.com",
       "ScoredEmailAddresses": [
         {
-          "Address": "***@aarondodd.com",
+          "Address": "***@example-user.com",
           "RelevanceScore": 1,
           "SelectionLikelihood": "NotSpecified"
         }
@@ -34,7 +34,7 @@
     {
       "@odata.id": "https://outlook.office365.com/api/v2.0/Users('fixture-user-id@fixture-tenant-id')/People('fixture-implicit-contact-id')",
       "Id": "Q7D7BaJbzk6hg2yqdL09lg==",
-      "DisplayName": "Aaron Dodd",
+      "DisplayName": "Sample User",
       "GivenName": null,
       "Surname": null,
       "Birthday": null,
@@ -50,7 +50,7 @@
       "IMAddress": null,
       "ScoredEmailAddresses": [
         {
-          "Address": "***@fhb.com",
+          "Address": "***@example-org.com",
           "RelevanceScore": 898,
           "SelectionLikelihood": "NotSpecified"
         }
