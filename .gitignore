@@ -35,3 +35,9 @@ Thumbs.db
 # Local-only ad-hoc fixtures
 tests/data/private/
 Output/
+
+# OWA calendar probe (experiment/owa-calendar-probe; never built into prod).
+# data/ holds raw capture JSON containing user calendar payloads; tests/fixtures
+# carries the redacted snapshots that ARE tracked.
+experiments/owa-calendar-probe/data/
+!experiments/owa-calendar-probe/data/.gitkeep

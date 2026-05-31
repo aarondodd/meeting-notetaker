@@ -1,0 +1,33 @@
+{
+  "captured_at": "2026-05-31T21:32:00.000Z",
+  "request_id": "attachments-list-0003",
+  "verb": "attachments.list",
+  "ok": true,
+  "status": 200,
+  "url": "https://outlook.office.com/owa/0/api/v2.0/me/events/AAMkAGI2example-event-2/attachments",
+  "owa_build": "16.3000.123",
+  "redacted": true,
+  "headers": {"content-type": "application/json; charset=utf-8"},
+  "error": "",
+  "body": {
+    "@odata.context": "https://outlook.office.com/owa/0/api/v2.0/$metadata#Me/events('...')/attachments",
+    "value": [
+      {
+        "@odata.type": "#Microsoft.OutlookServices.FileAttachment",
+        "id": "attid-fixture-1",
+        "name": "pre-read.pdf",
+        "contentType": "application/pdf",
+        "size": 142331,
+        "isInline": false
+      },
+      {
+        "@odata.type": "#Microsoft.OutlookServices.FileAttachment",
+        "id": "attid-fixture-2",
+        "name": "agenda.docx",
+        "contentType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "size": 28104,
+        "isInline": false
+      }
+    ]
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "MN OWA Calendar Probe",
+  "version": "0.0.1",
+  "description": "EXPERIMENTAL: reads OWA's internal calendar API (/owa/0/api/v2.0/me/*) and forwards results to a local relay app. Not part of the production Meeting Notetaker install. Issue #69 Option C.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA17DT69Y6IvcSZjFnhx4M4P00utO6AIk2Ouu0ienBo38hO9mQ9QEWw+WP/0CW3uSjlFVYh2SI+hlnmZDLIEGa+j0wjdjNKPKT6r8pjJlwENWRs0MPX5Gf07T3pm7844Wk0JHLpSZ5K6iRrVYDXAwuyg6mO5pqHojy0GtfLIHBusTQSb/dupacXVzNqq3xKOUN/fLfdBdSzrZsBavf860KzLA1pQF8SNI/RcfdlXltTYbrg1Kpl6qKlF9/Gs0Y2LqGnt6aUPhKohhjpMhZ3MbE93QRS6wZGFuWzwlU1Be+H/dNFXhefELqsQqTnBtcU4LswW2EQ3tGtXGxH7CNG7VyOQIDAQAB",
+  "minimum_chrome_version": "120",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "MN OWA Probe",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "scripting",
+    "tabs",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "*://outlook.office.com/*",
+    "*://outlook.office365.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://outlook.office.com/*",
+        "*://outlook.office365.com/*"
+      ],
+      "js": ["content/common.js", "content/owa-probe.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "captured_at": "2026-05-31T21:30:00.000Z",
+  "request_id": "calendar-fetch-0001",
+  "verb": "calendar.fetch",
+  "ok": true,
+  "status": 200,
+  "url": "https://outlook.office.com/owa/0/api/v2.0/me/calendarview?startDateTime=2026-05-31T10:00:00Z&endDateTime=2026-05-31T23:59:59Z&%24top=100",
+  "owa_build": "16.3000.123",
+  "redacted": true,
+  "headers": {
+    "content-type": "application/json; charset=utf-8",
+    "request-id": "abcd1234-fixture"
+  },
+  "error": "",
+  "body": {
+    "@odata.context": "https://outlook.office.com/owa/0/api/v2.0/$metadata#Me/calendarview(...)",
+    "value": [
+      {
+        "id": "AAMkAGI2example-event-1",
+        "subject": "Team standup",
+        "start": {"dateTime": "2026-05-31T09:00:00.0000000", "timeZone": "Pacific/Honolulu"},
+        "end":   {"dateTime": "2026-05-31T09:30:00.0000000", "timeZone": "Pacific/Honolulu"},
+        "location": {"displayName": "Teams"},
+        "organizer": {
+          "emailAddress": {"name": "Sample Organizer", "address": "***@example.com"}
+        },
+        "attendees": [
+          {"emailAddress": {"name": "Aaron Dodd", "address": "***@example.com"}, "type": "required"},
+          {"emailAddress": {"name": "Sample Attendee Two", "address": "***@example.com"}, "type": "required"}
+        ],
+        "body": {"contentType": "html", "content": "<p>Standup agenda</p>"},
+        "hasAttachments": false,
+        "isOnlineMeeting": true,
+        "onlineMeetingUrl": "https://teams.microsoft.com/l/meetup-join/redacted",
+        "iCalUId": "040000008200E00074C5B7101A82E008",
+        "showAs": "busy",
+        "type": "singleInstance",
+        "webLink": "https://outlook.office.com/owa/?itemid=redacted"
+      },
+      {
+        "id": "AAMkAGI2example-event-2",
+        "subject": "Architecture sync",
+        "start": {"dateTime": "2026-05-31T14:00:00.0000000", "timeZone": "Pacific/Honolulu"},
+        "end":   {"dateTime": "2026-05-31T15:00:00.0000000", "timeZone": "Pacific/Honolulu"},
+        "location": {"displayName": "Conf Room A"},
+        "organizer": {
+          "emailAddress": {"name": "Another Organizer", "address": "***@example.com"}
+        },
+        "attendees": [
+          {"emailAddress": {"name": "Person One", "address": "***@example.com"}, "type": "required"},
+          {"emailAddress": {"name": "Person Two", "address": "***@example.com"}, "type": "optional"},
+          {"emailAddress": {"name": "External Vendor", "address": "***@vendor.com"}, "type": "required"}
+        ],
+        "body": {"contentType": "text", "content": "Pre-read attached."},
+        "hasAttachments": true,
+        "isOnlineMeeting": false,
+        "iCalUId": "040000008200E00074C5B7101A82E009",
+        "showAs": "busy",
+        "type": "singleInstance"
+      }
+    ]
+  }
+}

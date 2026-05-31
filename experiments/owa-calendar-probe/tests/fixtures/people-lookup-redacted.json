@@ -1,0 +1,31 @@
+{
+  "captured_at": "2026-05-31T21:31:00.000Z",
+  "request_id": "people-lookup-0002",
+  "verb": "people.lookup",
+  "ok": true,
+  "status": 200,
+  "url": "https://outlook.office.com/owa/0/api/v2.0/me/people?%24search=%22***%40example.com%22&%24top=5",
+  "owa_build": "16.3000.123",
+  "redacted": true,
+  "headers": {"content-type": "application/json; charset=utf-8"},
+  "error": "",
+  "body": {
+    "@odata.context": "https://outlook.office.com/owa/0/api/v2.0/$metadata#Me/people",
+    "value": [
+      {
+        "id": "personid-fixture",
+        "displayName": "Sample Person",
+        "givenName": "Sample",
+        "surname": "Person",
+        "jobTitle": "Principal Engineer",
+        "companyName": "Acme Corp",
+        "department": "Platform",
+        "officeLocation": "HQ",
+        "personType": {"class": "Person", "subclass": "OrganizationUser"},
+        "scoredEmailAddresses": [
+          {"address": "***@example.com", "relevanceScore": 18.5}
+        ]
+      }
+    ]
+  }
+}
