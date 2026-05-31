@@ -406,6 +406,12 @@ class MainApp(QObject):
         self.window.session_view.set_appendix_export_defaults(
             self._appendix_export_defaults_from_config(),
         )
+        # Push the Export default folder (v0.7.5) so the PDF dialog
+        # opens there instead of the session dir. Empty config ->
+        # legacy session-dir fallback.
+        self.window.session_view.set_export_default_folder(
+            self.config.synthesis.export_default_folder or "",
+        )
         # Restore the persisted Transcript-playback split percentage so
         # the user's preferred ratio applies the first time playback
         # engages this session.
@@ -2970,7 +2976,12 @@ class MainApp(QObject):
         # the .mp3 extension is pre-typed; the user can switch the
         # filter dropdown to change format.
         suggested = default_export_filename(title, "Audio", ".mp3")
-        suggested_path = str(files[0].parent / suggested)
+        from .utils.export import export_initial_save_path  # noqa: PLC0415
+        suggested_path = export_initial_save_path(
+            self.config.synthesis.export_default_folder,
+            files[0].parent,
+            suggested,
+        )
         path_str, chosen_filter = QFileDialog.getSaveFileName(
             self.window,
             "Export recording",
@@ -3097,7 +3108,12 @@ class MainApp(QObject):
         title = session.title
 
         suggested = default_export_filename(title, "Video", ".mp4")
-        suggested_path = str(files[0].parent / suggested)
+        from .utils.export import export_initial_save_path  # noqa: PLC0415
+        suggested_path = export_initial_save_path(
+            self.config.synthesis.export_default_folder,
+            files[0].parent,
+            suggested,
+        )
         path_str, _ = QFileDialog.getSaveFileName(
             self.window,
             "Export session as video",
@@ -3274,8 +3290,17 @@ class MainApp(QObject):
             session.title or "session",
             session.started_at or session.created_at or "",
         )
+        from .utils.export import (  # noqa: PLC0415
+            export_initial_save_path,
+            resolve_export_initial_dir,
+        )
+        docs_dir = Path.home() / "Documents"
         if compress:
-            suggested_path = str(Path.home() / "Documents" / suggested)
+            suggested_path = export_initial_save_path(
+                self.config.synthesis.export_default_folder,
+                docs_dir,
+                suggested,
+            )
             path_str, _ = QFileDialog.getSaveFileName(
                 self.window, "Export full session",
                 suggested_path,
@@ -3287,9 +3312,13 @@ class MainApp(QObject):
             if target.suffix.lower() != ".zip":
                 target = target.with_suffix(".zip")
         else:
+            initial_dir = resolve_export_initial_dir(
+                self.config.synthesis.export_default_folder,
+                docs_dir,
+            )
             parent_dir = QFileDialog.getExistingDirectory(
                 self.window, "Choose a folder for the export",
-                str(Path.home() / "Documents"),
+                str(initial_dir),
             )
             if not parent_dir:
                 return
@@ -4725,6 +4754,10 @@ class MainApp(QObject):
         # Export PDF + Print dialogs reflect the new settings.
         self.window.session_view.set_appendix_export_defaults(
             self._appendix_export_defaults_from_config(),
+        )
+        # Update the Export default folder (v0.7.5) live too.
+        self.window.session_view.set_export_default_folder(
+            self.config.synthesis.export_default_folder or "",
         )
         self.window.status("Settings saved.", timeout_ms=4000)
 

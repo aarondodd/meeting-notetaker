@@ -218,6 +218,13 @@ class SynthesisConfig:
     # Synthesis Prompts exposes a dropdown listing the templates
     # actually present in the user's prompts folder.
     default_template_name: str = ""
+    # Default destination folder for the Export Recording / Video /
+    # Full Session / PDF dialogs (v0.7.5). When set + the folder
+    # still exists, every Save As / Choose Folder dialog opens here
+    # instead of falling back to the per-call default (session dir
+    # for audio + video, Documents for full-session, session dir for
+    # PDF). Empty == use the per-call default (legacy behavior).
+    export_default_folder: str = ""
     # MP4 quality preset for the export paths -- low / medium / high
     # (issue #54). "medium" defaults to ~1.5 Mbps video + 96 kbps
     # audio, which is appropriate for slideshow-style screenshot

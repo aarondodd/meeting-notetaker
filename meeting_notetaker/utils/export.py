@@ -50,6 +50,46 @@ def default_export_filename(
     return f"{stem}{ext}"
 
 
+def resolve_export_initial_dir(
+    configured: str,
+    fallback: Path,
+) -> Path:
+    """Return the directory a save / folder-pick dialog should open in.
+
+    Used by every Export path so the user's "default export folder"
+    setting (Settings > Export, v0.7.5) is honored consistently.
+
+    - ``configured``: the user's saved default folder (may be empty
+      or a stale path that no longer exists).
+    - ``fallback``: the per-call default the call-site would have
+      used pre-feature -- usually the session dir, the Documents
+      folder, or the source recording's directory.
+
+    Decision: prefer ``configured`` when set + the directory still
+    exists; otherwise fall back to ``fallback``. A configured-but-
+    missing path is treated as if it were unset so a removed external
+    drive doesn't strand the user at a broken initial dir.
+    """
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_dir():
+            return candidate
+    return fallback
+
+
+def export_initial_save_path(
+    configured: str,
+    fallback_dir: Path,
+    filename: str,
+) -> str:
+    """Convenience wrapper for QFileDialog.getSaveFileName.
+
+    Returns the suggested full-path string for the Save As dialog:
+    the resolved initial dir joined with the suggested filename.
+    """
+    return str(resolve_export_initial_dir(configured, fallback_dir) / filename)
+
+
 def build_print_markdown(
     *,
     session_title: str,

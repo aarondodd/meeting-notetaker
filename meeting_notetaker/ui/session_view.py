@@ -38,7 +38,11 @@ from ..models.transcript import (
     label_for,
     rewrite_user_label,
 )
-from ..utils.export import build_print_markdown, default_export_filename
+from ..utils.export import (
+    build_print_markdown,
+    default_export_filename,
+    export_initial_save_path,
+)
 from ..utils.paths import session_dir
 from ..models.highlights import HighlightSet
 from .attachments_tab import AttachmentsTab
@@ -187,6 +191,12 @@ class SessionView(QWidget):
         self._session_contacts: list = []
         # User's Settings-saved AppendixInclusion defaults for the
         # per-tab Export PDF + Print flow. None -> dialog uses
+        # Settings > Export default folder (v0.7.5). MainApp pushes
+        # the config string here via set_export_default_folder; the
+        # per-tab Export PDF flow uses it as the dialog's initial
+        # location. Empty == no default configured (legacy fallback
+        # to the session dir).
+        self._export_default_folder: str = ""
         # "every populated section on". MainApp.set_appendix_export_defaults
         # plumbs the saved config into this field.
         self._appendix_export_defaults = None
@@ -811,6 +821,15 @@ class SessionView(QWidget):
         construction + after every Settings save. ``defaults`` may
         be None to fall back to the dialog's "all on" defaults."""
         self._appendix_export_defaults = defaults
+
+    def set_export_default_folder(self, path: str) -> None:
+        """Push Settings > Export default folder (v0.7.5) so the
+        per-tab Export PDF dialog opens there instead of the session
+        dir. Empty string means "no default configured" -- the PDF
+        dialog falls back to the session dir, matching legacy
+        behavior. MainApp calls this on construction + after every
+        Settings save."""
+        self._export_default_folder = path or ""
 
     def set_session_attachment_names(self, names) -> None:
         """Push the current session's attachment display names into
@@ -2255,7 +2274,11 @@ class SessionView(QWidget):
         suggested_name = default_export_filename(
             self._session.title, tab_label, ".pdf"
         )
-        suggested_path = str(session_dir(self._session.id) / suggested_name)
+        suggested_path = export_initial_save_path(
+            self._export_default_folder,
+            session_dir(self._session.id),
+            suggested_name,
+        )
         path_str, _filter = QFileDialog.getSaveFileName(
             self,
             f"Export {tab_label} as PDF",

@@ -151,3 +151,39 @@ def test_default_window_is_wide_enough_for_no_horizontal_scroll(qt_app):
         assert dlg.size().width() >= 800
     finally:
         dlg.deleteLater()
+
+
+def test_export_default_folder_round_trips_through_dialog(qt_app, tmp_path):
+    """Settings > Export > Default folder writes back to
+    SynthesisConfig.export_default_folder on accept, and the field
+    seeds the line edit with the saved value on next open."""
+    target = tmp_path / "exports"
+    target.mkdir()
+    cfg = Config()
+    cfg.synthesis.export_default_folder = str(target)
+    dlg = SettingsDialog(cfg)
+    try:
+        # The text field is seeded from config.
+        assert dlg._export_default_folder_edit.text() == str(target)  # noqa: SLF001
+        # User edits + accepts -> config picks it up.
+        new_target = tmp_path / "elsewhere"
+        new_target.mkdir()
+        dlg._export_default_folder_edit.setText(str(new_target))  # noqa: SLF001
+        dlg._on_accept()  # noqa: SLF001
+    finally:
+        dlg.deleteLater()
+    assert cfg.synthesis.export_default_folder == str(new_target)
+
+
+def test_export_default_folder_blank_persists_as_empty(qt_app):
+    """Clearing the field saves an empty string so save dialogs fall
+    back to their per-call defaults."""
+    cfg = Config()
+    cfg.synthesis.export_default_folder = "/tmp/old"
+    dlg = SettingsDialog(cfg)
+    try:
+        dlg._export_default_folder_edit.setText("")  # noqa: SLF001
+        dlg._on_accept()  # noqa: SLF001
+    finally:
+        dlg.deleteLater()
+    assert cfg.synthesis.export_default_folder == ""

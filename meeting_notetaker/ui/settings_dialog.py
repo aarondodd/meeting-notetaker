@@ -774,6 +774,33 @@ class SettingsDialog(QDialog):
         # users who want the v0.7.2-era file sizes pick High.
         export_group = QGroupBox("Export", self)
         export_form = QFormLayout(export_group)
+
+        # Default export folder (v0.7.5). Empty == legacy fallback
+        # (session dir for PDFs + recording / video, Documents for
+        # full-session). When set, every Export dialog opens here.
+        export_folder_row = QHBoxLayout()
+        self._export_default_folder_edit = QLineEdit(self)
+        self._export_default_folder_edit.setText(
+            getattr(config.synthesis, "export_default_folder", "") or ""
+        )
+        self._export_default_folder_edit.setPlaceholderText(
+            "(leave blank to use the session folder / Documents)"
+        )
+        self._export_default_folder_edit.setToolTip(
+            "Default location for the Save As / Choose Folder dialog "
+            "that appears when you export a recording, video, full "
+            "session, or PDF. The dialog still lets you navigate "
+            "elsewhere; this just sets the starting point. Leave "
+            "blank to fall back to the session's own folder."
+        )
+        export_folder_row.addWidget(self._export_default_folder_edit, 1)
+        export_folder_browse = QPushButton("Browse...", self)
+        export_folder_browse.clicked.connect(
+            self._on_export_default_folder_browse,
+        )
+        export_folder_row.addWidget(export_folder_browse)
+        export_form.addRow("Default folder:", export_folder_row)
+
         export_blurb = QLabel(
             "Quality preset for MP4 outputs (highlights, recording, "
             "full-session export). Slideshow-style screenshot content "
@@ -1058,6 +1085,9 @@ class SettingsDialog(QDialog):
         self._config.synthesis.video_quality = (
             self._video_quality_picker.currentData() or "medium"
         )
+        self._config.synthesis.export_default_folder = (
+            self._export_default_folder_edit.text().strip()
+        )
         self._config.synthesis.compress_full_session_export = (
             self._compress_full_export.isChecked()
         )
@@ -1103,6 +1133,14 @@ class SettingsDialog(QDialog):
         )
         if picked:
             self._backup_folder_edit.setText(picked)
+
+    def _on_export_default_folder_browse(self) -> None:
+        start = self._export_default_folder_edit.text().strip() or ""
+        picked = QFileDialog.getExistingDirectory(
+            self, "Pick default export folder", start,
+        )
+        if picked:
+            self._export_default_folder_edit.setText(picked)
 
     def _on_backup_now_clicked(self) -> None:
         handler = self._backup_now_handler
