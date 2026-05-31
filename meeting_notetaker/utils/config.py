@@ -148,6 +148,10 @@ class UiConfig:
     # (first launch or after a stale-state recovery).
     main_window_geometry: str = ""
     main_splitter_state: str = ""
+    # Last-active section in the Settings dialog (v0.7.5 nav redesign).
+    # Empty string = first launch, alphabetical default ("Audio").
+    # Persisted on accept so reopening Settings lands on the same page.
+    settings_active_section: str = ""
 
 
 @dataclass

@@ -47,6 +47,13 @@ leaves the machine; no API key required.
 
 ## What's new in v0.7.5
 
+- **Settings redesign.** Sections now live behind a nav list on the
+  left + stacked pages on the right (no more single long scroll).
+  Sections are sorted alphabetically; Synthesis Automation +
+  Synthesis Prompts collapse to a single "Synthesis" page with both
+  as sub-groups. The dialog is sized to fit every page without
+  horizontal scroll, and remembers the last-selected section across
+  opens.
 - **Backups + Restore (#67).** Settings -> Backups configures a
   destination folder, a schedule (Manual / On app close / When idle
   after N minutes past H:00), and a retention policy (newest N
@@ -932,6 +939,8 @@ timestamped zip snapshots of the data dir + all sqlite stores. The
 **Tools -> Backup Now...** menu fires an immediate snapshot; **Tools
 -> Restore from Backup...** picks a zip and atomically swaps the
 data dir aside before relaunching.
+
+![Backups settings page](docs/screenshots/26-dialog-settings-backups.png)
 
 | Setting | Default | What it does |
 |---|---|---|
