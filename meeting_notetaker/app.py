@@ -2272,6 +2272,35 @@ class MainApp(QObject):
         if tab_id in ("live_notes", "notes"):
             from .utils.clipboard import copy_markdown_with_images
             from .models.transcript import TranscriptStore
+            # Synthesis tab: substitute the raw LLM appendix JSON
+            # blocks with the rendered "# Appendix (auto-extracted)"
+            # Markdown tables before the clipboard handoff. Matches
+            # what the user sees in preview / PDF / ZIP export so the
+            # clipboard paste reads cleanly in Notion / Word / etc.
+            # My Notes tab is intentionally NOT transformed -- the
+            # user pastes their raw notes verbatim.
+            if tab_id == "notes":
+                from .utils.appendix_store import collect_for_session
+                from .utils.appendix_transform import inject_appendix
+                try:
+                    from .models.attachments import AttachmentsStore
+                    attach = AttachmentsStore(session_id)
+                    attachment_names = [
+                        rec.display_name for rec in attach.list()
+                    ]
+                except Exception:
+                    log.exception(
+                        "attachment names for copy-synthesis appendix failed: %s",
+                        session_id,
+                    )
+                    attachment_names = []
+                appendix_data = collect_for_session(
+                    session_id=session_id,
+                    notes_text=text,
+                    live_notes_text=sv._live_notes_editor.toPlainText(),  # noqa: SLF001
+                    session_attachments=attachment_names,
+                )
+                text = inject_appendix(text, appendix_data)
             try:
                 store = TranscriptStore(session_id)
                 copy_markdown_with_images(text, store.session_dir)
