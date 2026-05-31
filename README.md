@@ -45,6 +45,38 @@ leaves the machine; no API key required.
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
 
+## What's new in v0.7.5
+
+- **Settings redesign.** Sections now live behind a nav list on the
+  left + stacked pages on the right (no more single long scroll).
+  Sections are sorted alphabetically; Synthesis Automation +
+  Synthesis Prompts collapse to a single "Synthesis" page with both
+  as sub-groups. The dialog is sized to fit every page without
+  horizontal scroll, and remembers the last-selected section across
+  opens.
+- **Backups + Restore (#67).** Settings -> Backups configures a
+  destination folder, a schedule (Manual / On app close / When idle
+  after N minutes past H:00), and a retention policy (newest N
+  snapshots + drop older than D days). Tools -> Backup Now... fires
+  on demand; Tools -> Restore from Backup... atomically swaps the
+  data dir aside and unpacks a chosen snapshot. OneDrive is supported
+  as a backup target (snapshot zips are atomic-once-closed); the data
+  dir itself still has to stay on local disk because OneDrive sync
+  corrupts SQLite WAL files. Detail in the *Backups* section under
+  Settings reference.
+- **My Notes defaults to Preview** when the body has any content
+  beyond the seeded `# Attendees / # Agenda / # Notes / # Action
+  Items` template (#67 follow-up). Fresh sessions still land in Edit
+  mode so you can start typing immediately; coming back to a past
+  session lands in Preview so you read first.
+- Eight code-review findings (#73) fixed: bounded attendee-appendix
+  regex (prior unbounded pattern silently destroyed user content
+  past the appendix on strip-on-save), strip-toggle parity between
+  the edit dialog + initial paste, lighter session reload on
+  synthesis result, threaded cancel plumbing through audio export,
+  indent-preserving list / quote / task prefixes in My Notes
+  formatting toolbar.
+
 ## What's new in v0.7.3
 
 Unified Appendix system, better long-running export UX, and a stack
@@ -484,6 +516,26 @@ and run it. The installer:
   weekly background check) by downloading the new installer and
   re-running it in place
 
+### One-line bootstrap (PowerShell)
+
+Two PowerShell scripts in the repo root cover the headless paths:
+
+```powershell
+# Fresh install -- fetches the latest release asset and launches it.
+iwr -useb https://raw.githubusercontent.com/aarondodd/meeting-notetaker/main/install.ps1 | iex
+
+# Upgrade an existing install -- detects the installed version via
+# the Inno Setup registry entry, compares against the latest
+# release, prompts to confirm, then runs the installer in upgrade
+# mode (Restart Manager closes the running app + relaunches it).
+iwr -useb https://raw.githubusercontent.com/aarondodd/meeting-notetaker/main/upgrade.ps1 | iex
+```
+
+Both scripts print the relevant version + asset details and ask
+**Y/N** before downloading. Pass `-Yes` to skip the prompt for
+unattended installs; `upgrade.ps1` also accepts `-Force` to reinstall
+even when the installed version matches the latest release.
+
 ### Build locally (Windows)
 
 ```powershell
@@ -898,6 +950,53 @@ of these are also editable directly in `config.toml`.
 | Match threshold | 75% | Cosine-similarity floor for matching a meeting voice against a stored speaker. |
 | Merge threshold | 75% | Cosine-similarity floor for merging two clusters into one during the agglomerative pass. |
 | Manage Speakers... | -- | Opens the speaker-library editor. |
+
+## Backups (v0.7.5+)
+
+Local-machine SPOF mitigation. Pick a destination folder under
+**Settings -> Backups**, choose a schedule, and the app writes
+timestamped zip snapshots of the data dir + all sqlite stores. The
+**Tools -> Backup Now...** menu fires an immediate snapshot; **Tools
+-> Restore from Backup...** picks a zip and atomically swaps the
+data dir aside before relaunching.
+
+![Backups settings page](docs/screenshots/26-dialog-settings-backups.png)
+
+| Setting | Default | What it does |
+|---|---|---|
+| Backup folder | (empty -> disabled) | Destination for the snapshot zips. Local disk, external drive, NAS, or OneDrive folder all work. |
+| Schedule | Manual only | One of: Manual only, On app close, When idle (after configured time). |
+| Idle after | 30 min | (When-idle schedule) Minutes of inactivity before a snapshot fires. Resets on any mouse / keyboard activity. |
+| Only after | 19:00 local | (When-idle schedule) Earliest local hour the idle trigger may fire. |
+| Keep newest | 7 snapshots | Retention cap by count (0 disables). |
+| Drop older than | 30 days | Retention cap by age (0 disables). Both gates apply; the intersection survives. |
+
+**OneDrive note.** OneDrive is **safe as a backup target** because the
+snapshot zips are atomic-once-closed -- OneDrive's conflict-resolution
+problem only applies to *open files being modified*. The data dir
+itself **must stay on local disk**: OneDrive sync corrupts the sqlite
+WAL files (the live `*.db-wal` / `*-shm` companions get rewritten
+under the running connection's feet).
+
+**What's in a snapshot.** The three primary sqlite stores
+(`sessions.db`, `classification.db`, `speakers.db`) plus the FTS5
+search index (`search.db`); `config.toml`, the user's customized
+prompt templates, the per-session content (audio + transcripts +
+notes + screenshots + attachments). What's *not* in a snapshot: the
+downloaded faster-whisper models (~480MB-1.5GB, re-downloaded on
+demand), the Chrome native-host install bundle (re-extracted on
+launch), and the running log files.
+
+**Snapshot vs. close.** If a backup is running when you close the
+app, a modal "Backup in progress" dialog blocks the close until the
+snapshot completes (no data loss from a torn zip). When the schedule
+is "On app close", the close-path snapshot shows a progress dialog
+in the same way.
+
+**Restore.** Restoring overwrites the current data directory; the
+existing dir is preserved as `.pre-restore.MeetingNotetaker.<timestamp>/`
+so you can roll back manually if needed. The app quits at the start
+of the restore; relaunch after the swap completes.
 
 ---
 

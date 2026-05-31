@@ -54,6 +54,96 @@ def test_synthesis_tab_starts_in_edit_when_notes_empty(qt_app, fake_session):
     assert view._notes_view.is_in_preview() is False
 
 
+def test_my_notes_tab_starts_in_edit_when_body_is_seed_template(qt_app, fake_session):
+    """A fresh session whose live_notes is exactly the boilerplate
+    seed should land in Edit so the user can immediately start typing.
+    (#67 followup -- My Notes default-to-preview is opt-in: it only
+    triggers when the user has actually written something beyond
+    the # Attendees / # Agenda / # Notes / # Action Items seed.)"""
+    from meeting_notetaker.utils.live_notes import LIVE_NOTES_TEMPLATE
+    view = SessionView()
+    view.set_session(
+        fake_session,
+        transcript="",
+        notes="",
+        previous_notes_paths=[],
+        live_notes=LIVE_NOTES_TEMPLATE,
+    )
+    assert view._live_notes_editor.is_in_preview() is False
+
+
+def test_my_notes_tab_starts_in_preview_when_body_has_user_content(qt_app, fake_session):
+    """Once the live_notes body has anything beyond the seed, a
+    session-select lands in Preview so the user reads first and
+    clicks Edit only when they want to mutate."""
+    from meeting_notetaker.utils.live_notes import LIVE_NOTES_TEMPLATE
+    body = LIVE_NOTES_TEMPLATE + "\nDiscussed the Q3 roadmap.\n"
+    view = SessionView()
+    view.set_session(
+        fake_session,
+        transcript="",
+        notes="",
+        previous_notes_paths=[],
+        live_notes=body,
+    )
+    assert view._live_notes_editor.is_in_preview() is True
+
+
+def test_my_notes_tab_starts_in_edit_when_live_notes_empty(qt_app, fake_session):
+    """An empty live_notes body counts as no-user-content; Edit
+    keeps the keystroke path open."""
+    view = SessionView()
+    view.set_session(
+        fake_session,
+        transcript="",
+        notes="",
+        previous_notes_paths=[],
+        live_notes="",
+    )
+    assert view._live_notes_editor.is_in_preview() is False
+
+
+def test_my_notes_async_load_flips_to_preview_when_body_has_content(qt_app, fake_session):
+    """The MainApp post-load path is two-phase: set_session() runs
+    with live_notes="" (snappy UI swap), then the content worker
+    calls set_live_notes_text(<real body>). The preview-mode default
+    must be reapplied at the second step or the user lands in Edit
+    even when the loaded body has notes -- which is the bug reported
+    on the v0.7.5 PR."""
+    from meeting_notetaker.utils.live_notes import LIVE_NOTES_TEMPLATE
+    view = SessionView()
+    # Phase 1: empty prelude, just like _on_session_selected does.
+    view.set_session(
+        fake_session,
+        transcript="",
+        notes="",
+        previous_notes_paths=[],
+        live_notes="",
+    )
+    assert view._live_notes_editor.is_in_preview() is False
+    # Phase 2: worker delivers the real body via the public setter.
+    body = LIVE_NOTES_TEMPLATE + "\nDiscussed Q3 roadmap commitments.\n"
+    view.set_live_notes_text(body)
+    assert view._live_notes_editor.is_in_preview() is True
+
+
+def test_my_notes_async_load_stays_in_edit_when_body_is_seed(qt_app, fake_session):
+    """Fresh session: worker delivers the seed body (no user
+    content yet) -- editor stays in Edit so the next keystroke
+    lands without a Preview-to-Edit click."""
+    from meeting_notetaker.utils.live_notes import LIVE_NOTES_TEMPLATE
+    view = SessionView()
+    view.set_session(
+        fake_session,
+        transcript="",
+        notes="",
+        previous_notes_paths=[],
+        live_notes="",
+    )
+    view.set_live_notes_text(LIVE_NOTES_TEMPLATE)
+    assert view._live_notes_editor.is_in_preview() is False
+
+
 def test_set_notes_text_does_not_emit_change_signal(qt_app, fake_session):
     """Programmatic load must not look like a user edit (would loop)."""
     view = SessionView()

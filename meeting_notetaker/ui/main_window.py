@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Callable, Iterable, Optional
 
 from PyQt6.QtCore import QDateTime, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDateTimeEdit,
@@ -141,6 +141,11 @@ class MainWindow(QMainWindow):
     # the navigator when the user picks a different filter.
     open_search_requested = pyqtSignal()           # Ctrl+Shift+F
     rebuild_search_index_requested = pyqtSignal()  # Help > Debug
+    # Tools menu (#67): manual + restore entry points for the backup
+    # feature. Settings > Backups still owns folder + schedule +
+    # retention; the menu is the one-click action surface.
+    backup_now_requested = pyqtSignal()
+    restore_backup_requested = pyqtSignal()
     show_session_tab_requested = pyqtSignal(str, str, object)
     # session_id, tab_id ('transcript' | 'live_notes' | 'notes' | 'previous'),
     # optional archive_path (str | None); emitted by the cross-session
@@ -151,6 +156,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Meeting Notetaker")
         self.setWindowIcon(app_icon())
         self.resize(1024, 720)
+        # Optional close handler. MainApp installs one for the
+        # backup-in-progress wait flow (#67); when set, closeEvent
+        # gives it first refusal over the event before super().
+        self._close_handler: Optional[Callable[[QCloseEvent], None]] = None
 
         # Global shortcut: Ctrl+Shift+F opens the cross-session search
         # dialog. Window-scoped so it fires no matter which pane has
@@ -193,6 +202,17 @@ class MainWindow(QMainWindow):
         action_quit.setShortcut("Ctrl+Q")
         action_quit.triggered.connect(self.quit_requested.emit)
         file_menu.addAction(action_quit)
+
+        # Tools menu (#67): manual backup + restore. Sits between
+        # File and Help because backup is data-dir-scoped (closer to
+        # File semantically) but isn't a session action.
+        tools_menu = menubar.addMenu("&Tools")
+        action_backup_now = QAction("&Backup Now...", self)
+        action_backup_now.triggered.connect(self.backup_now_requested.emit)
+        tools_menu.addAction(action_backup_now)
+        action_restore = QAction("&Restore from Backup...", self)
+        action_restore.triggered.connect(self.restore_backup_requested.emit)
+        tools_menu.addAction(action_restore)
 
         help_menu = menubar.addMenu("&Help")
         debug_menu = help_menu.addMenu("&Debug")
@@ -767,6 +787,20 @@ class MainWindow(QMainWindow):
         )
         if confirm == QMessageBox.StandardButton.Yes:
             self.delete_sessions_requested.emit(ids)
+
+    def set_close_handler(self, handler: Callable[[QCloseEvent], None]) -> None:
+        """Install a callback that gets first refusal over a window
+        close. The handler can call ``event.ignore()`` to defer the
+        close (e.g. while a backup is finishing) -- the window stays
+        open and the close path is suppressed."""
+        self._close_handler = handler
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self._close_handler is not None:
+            self._close_handler(event)
+            if not event.isAccepted():
+                return
+        super().closeEvent(event)
 
 
 def _session_date_and_title(s: Session) -> tuple[str, str]:

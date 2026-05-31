@@ -64,6 +64,7 @@ VALID_MODEL_SIZES = ("tiny.en", "base.en", "small.en", "medium.en")
 VALID_LLM_TARGETS = ("claude", "copilot")
 VALID_RETAIN_FORMATS = ("opus", "flac", "wav")
 VALID_SESSION_LIST_SORTS = ("date_desc", "date_asc", "title_asc", "title_desc")
+VALID_BACKUP_SCHEDULES = ("manual", "on_close", "when_idle")
 
 
 @dataclass
@@ -147,6 +148,10 @@ class UiConfig:
     # (first launch or after a stale-state recovery).
     main_window_geometry: str = ""
     main_splitter_state: str = ""
+    # Last-active section in the Settings dialog (v0.7.5 nav redesign).
+    # Empty string = first launch, alphabetical default ("Audio").
+    # Persisted on accept so reopening Settings lands on the same page.
+    settings_active_section: str = ""
 
 
 @dataclass
@@ -213,6 +218,13 @@ class SynthesisConfig:
     # Synthesis Prompts exposes a dropdown listing the templates
     # actually present in the user's prompts folder.
     default_template_name: str = ""
+    # Default destination folder for the Export Recording / Video /
+    # Full Session / PDF dialogs (v0.7.5). When set + the folder
+    # still exists, every Save As / Choose Folder dialog opens here
+    # instead of falling back to the per-call default (session dir
+    # for audio + video, Documents for full-session, session dir for
+    # PDF). Empty == use the per-call default (legacy behavior).
+    export_default_folder: str = ""
     # MP4 quality preset for the export paths -- low / medium / high
     # (issue #54). "medium" defaults to ~1.5 Mbps video + 96 kbps
     # audio, which is appropriate for slideshow-style screenshot
@@ -254,6 +266,45 @@ class SynthesisConfig:
 
 
 @dataclass
+class BackupConfig:
+    """Local-machine SPOF mitigation (#67).
+
+    The user picks a destination folder (often a OneDrive / external
+    drive mirror) and a schedule, the app writes timestamped zips of
+    the data dir + the three sqlite stores, and a retention policy
+    prunes old zips silently.
+
+    ``schedule`` controls when an automatic snapshot fires:
+      - ``manual`` -- the Tools menu's Backup Now button is the only
+        trigger. No daily-on-start: Aaron flagged that as a UX hit
+        when he opens the app to start a meeting quickly.
+      - ``on_close`` -- snapshot on app close. Good when the user
+        regularly closes the app at end of day. If a backup is mid-
+        flight when the user clicks close, the app shows a modal
+        "backup in progress" dialog and waits for the snapshot.
+      - ``when_idle`` -- the most common pattern for an always-open
+        app: snapshot when the app has been idle for
+        ``idle_after_minutes`` AND the local clock is past
+        ``idle_after_hour:00``. A 24h dedup cap means the same idle
+        window can't trigger twice in one day.
+
+    ``retention_count`` and ``retention_days`` both apply -- the
+    intersection wins. Set either to 0 to disable that gate. Default
+    is 7 snapshots OR 30 days, whichever is stricter.
+    """
+    folder: str = ""
+    schedule: str = "manual"
+    idle_after_minutes: int = 30
+    idle_after_hour: int = 19
+    retention_count: int = 7
+    retention_days: int = 30
+    # Last-successful-snapshot timestamp (ISO 8601 local). Empty until
+    # the first backup completes. The 24h dedup gate compares against
+    # this; restoring or upgrading does not bump it.
+    last_snapshot_at: str = ""
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
@@ -262,6 +313,7 @@ class Config:
     speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
+    backup: BackupConfig = field(default_factory=BackupConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -289,6 +341,9 @@ class Config:
             ),
             synthesis=SynthesisConfig(
                 **_filter_fields(SynthesisConfig, data.get("synthesis", {}))
+            ),
+            backup=BackupConfig(
+                **_filter_fields(BackupConfig, data.get("backup", {}))
             ),
         )
 
@@ -373,6 +428,31 @@ class Config:
                 f"synthesis.llm_target {self.synthesis.llm_target!r} "
                 f"must be one of {VALID_LLM_TARGETS}"
             )
+        if self.backup.schedule not in VALID_BACKUP_SCHEDULES:
+            errors.append(
+                f"backup.schedule {self.backup.schedule!r} must be one "
+                f"of {VALID_BACKUP_SCHEDULES}"
+            )
+        if not (1 <= self.backup.idle_after_minutes <= 720):
+            errors.append(
+                "backup.idle_after_minutes must be between 1 and 720, "
+                f"got {self.backup.idle_after_minutes}"
+            )
+        if not (0 <= self.backup.idle_after_hour <= 23):
+            errors.append(
+                "backup.idle_after_hour must be between 0 and 23, "
+                f"got {self.backup.idle_after_hour}"
+            )
+        if not (0 <= self.backup.retention_count <= 365):
+            errors.append(
+                "backup.retention_count must be between 0 and 365 "
+                f"(0 disables), got {self.backup.retention_count}"
+            )
+        if not (0 <= self.backup.retention_days <= 3650):
+            errors.append(
+                "backup.retention_days must be between 0 and 3650 "
+                f"(0 disables), got {self.backup.retention_days}"
+            )
         if self.synthesis.claude_project_id:
             # Optional field; if set, must look like a UUID
             # (8-4-4-4-12 hex). Loose match -- Claude uses UUID-v7
@@ -403,6 +483,7 @@ class Config:
             ("speakers", self.speakers),
             ("detection", self.detection),
             ("synthesis", self.synthesis),
+            ("backup", self.backup),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from .automation import messages as automation_messages
@@ -321,6 +321,40 @@ class MainApp(QObject):
         # install; without this wait, quitting during that window
         # destroys a running QThread = process abort.
         self.qt_app.aboutToQuit.connect(self._retire_encoder_prewarm)
+        # Backup-on-close + restore-after-close hooks (#67). Both run
+        # last in the shutdown sequence so live connections are already
+        # drained when the swap / snapshot fires.
+        self._pending_restore_path: Optional[Path] = None
+        # Background backup worker + last-error capture for the idle
+        # scheduler (#67). Manual backup uses a separate modal-progress
+        # path so we don't share state here.
+        self._backup_worker: Optional[QThread] = None
+        self._backup_worker_error: Optional[str] = None
+        # Idle-trigger backup state (#67). The application event
+        # filter (see eventFilter) bumps _last_input_at on any user
+        # input; _backup_idle_timer polls every minute and fires the
+        # snapshot when ``should_run_idle_backup`` returns True.
+        import time as _time  # noqa: PLC0415
+        self._last_input_at: float = _time.monotonic()
+        self._backup_idle_timer = QTimer(self)
+        self._backup_idle_timer.setInterval(60_000)  # 1 min poll
+        self._backup_idle_timer.timeout.connect(self._maybe_fire_idle_backup)
+        self._on_close_backup_ran = False
+        self.qt_app.aboutToQuit.connect(self._run_backup_on_close)
+        self.qt_app.aboutToQuit.connect(self._run_pending_restore)
+        # Backup-in-progress close interception (#67). When the idle
+        # scheduler kicked off a snapshot in a worker thread, clicking
+        # the X / Quit drops into _handle_window_close which shows a
+        # modal "Backup in progress..." dialog instead of tearing the
+        # process down mid-write.
+        self.window.set_close_handler(self._handle_window_close)
+        # Application-wide event filter for idle-time tracking. We
+        # only care about user input (key + mouse press/move) so the
+        # filter is cheap; everything else falls through.
+        self.qt_app.installEventFilter(self)
+        if self.config.backup.schedule == "when_idle" \
+                and (self.config.backup.folder or "").strip():
+            self._backup_idle_timer.start()
 
         self._wire_signals()
         self._apply_user_name()
@@ -371,6 +405,12 @@ class MainApp(QObject):
         # Export PDF + Print dialogs pre-check the right boxes.
         self.window.session_view.set_appendix_export_defaults(
             self._appendix_export_defaults_from_config(),
+        )
+        # Push the Export default folder (v0.7.5) so the PDF dialog
+        # opens there instead of the session dir. Empty config ->
+        # legacy session-dir fallback.
+        self.window.session_view.set_export_default_folder(
+            self.config.synthesis.export_default_folder or "",
         )
         # Restore the persisted Transcript-playback split percentage so
         # the user's preferred ratio applies the first time playback
@@ -620,6 +660,34 @@ class MainApp(QObject):
         }
         return labels.get(event, "")
 
+    def _strip_all_appendices(self, markdown: str) -> str:
+        """Run every LLM-appendix strip helper in sequence.
+
+        Shared by the paste-back path (`_apply_synthesis_result`)
+        and the edit-dialog path (`_on_appendix_edit_requested`)
+        so the strip toggle behaves consistently regardless of
+        which surface produced the new notes.md. All four
+        appendices ride one Settings toggle -- if the user wants
+        notes.md clean, they want them all gone. The sidecar
+        persistence is the caller's responsibility (runs BEFORE
+        the strip so data survives).
+        """
+        from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
+        from .utils.attendee_context import (  # noqa: PLC0415
+            strip_appendix as strip_attendee_context,
+        )
+        from .utils.invite_mentions import (  # noqa: PLC0415
+            strip_appendix as strip_invite_mentions,
+        )
+        from .utils.topic_appendix import (  # noqa: PLC0415
+            strip_appendix as strip_topic_appendix,
+        )
+        markdown = strip_appendix(markdown)
+        markdown = strip_topic_appendix(markdown)
+        markdown = strip_attendee_context(markdown)
+        markdown = strip_invite_mentions(markdown)
+        return markdown
+
     def _apply_synthesis_result(
         self,
         session_id: str,
@@ -665,36 +733,27 @@ class MainApp(QObject):
                 "appendix sidecar write failed: %s", session_id,
             )
         if self.config.synthesis.strip_attendee_appendix:
-            from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
-            from .utils.topic_appendix import (  # noqa: PLC0415
-                strip_appendix as strip_topic_appendix,
-            )
-            from .utils.attendee_context import (  # noqa: PLC0415
-                strip_appendix as strip_attendee_context,
-            )
-            from .utils.invite_mentions import (  # noqa: PLC0415
-                strip_appendix as strip_invite_mentions,
-            )
-            # All four LLM-generated appendices ride the same Settings
-            # toggle. They're each opt-out "show me what was
-            # extracted" surfaces; if the user wants notes.md clean,
-            # they want them all gone. The Appendix tray stays
-            # populated because the sidecar was written above before
-            # this strip pass ran (#64 sidecar followup).
-            markdown = strip_appendix(markdown)
-            markdown = strip_topic_appendix(markdown)
-            markdown = strip_attendee_context(markdown)
-            markdown = strip_invite_mentions(markdown)
-        archive_path = TranscriptStore(session_id).save_notes(
+            markdown = self._strip_all_appendices(markdown)
+        tstore = TranscriptStore(session_id)
+        archive_path = tstore.save_notes(
             markdown, archive_existing=archive_existing,
         )
         self.store.update_session(session_id, has_notes=True)
         self._reindex_search_for(session_id)
-        # Reload the SessionView so the Synthesis tab shows the new
-        # body + the tray re-reads from the freshly-written sidecar.
+        # Targeted SessionView refresh in place of a full
+        # _on_session_selected reload (#73 finding #3). The full
+        # reload re-read transcript / live_notes / templates /
+        # highlights / contacts from disk via a worker thread on
+        # every paste, producing a 50-100ms empty-pane flash on the
+        # highest-touch user actions. The targeted setters update
+        # the Synthesis tab + tray + appendix transform in place
+        # without the round-trip. Only previous-notes-paths need a
+        # re-read when archive_existing actually rotated a file.
         sv = self.window.session_view
         if sv._session is not None and sv._session.id == session_id:
-            self._on_session_selected(session_id)
+            sv.set_notes_text(markdown)
+            if archive_path is not None:
+                sv.set_previous_notes(tstore.list_previous_notes())
         return archive_path
 
     def _handle_synthesis_result(self, session_id: str, markdown: str, target: str) -> None:
@@ -1107,6 +1166,8 @@ class MainApp(QObject):
         self.window.session_list_sort_changed.connect(self._on_session_list_sort_changed)
         self.window.open_search_requested.connect(self._on_open_search)
         self.window.rebuild_search_index_requested.connect(self._on_rebuild_search_index)
+        self.window.backup_now_requested.connect(self._on_backup_now_requested)
+        self.window.restore_backup_requested.connect(self._on_restore_backup_requested)
         self.window.classification_filter_changed.connect(
             self._on_classification_filter_changed
         )
@@ -1394,7 +1455,13 @@ class MainApp(QObject):
         # through set_session() again (which would flush saves +
         # reset state we already configured in the prelude).
         sv.set_transcript_text(content.transcript)
-        sv._set_live_notes_text(content.live_notes)  # noqa: SLF001
+        # Public setter: applies the My Notes preview-mode default
+        # based on whether the loaded body has content beyond the
+        # seeded template (#67 followup). The session-select prelude
+        # called set_session with an empty live_notes so the editor
+        # landed in Edit; this call swings it to Preview when the
+        # real body has actual notes.
+        sv.set_live_notes_text(content.live_notes)
         sv.set_notes_text(content.notes)
         sv.set_previous_notes(content.previous_notes_paths)
         sv.set_prompt_templates(
@@ -2036,7 +2103,10 @@ class MainApp(QObject):
         # Update notes.md so the LLM's original JSON blocks don't
         # round-trip back into the sidecar via the next
         # _flush_notes. Skipped when the synthesis on disk is
-        # already empty -- no JSON blocks to overwrite.
+        # already empty -- no JSON blocks to overwrite. When the
+        # strip_attendee_appendix Settings toggle is ON, apply the
+        # strip pass so the dialog edits don't restore the JSON
+        # the user told the app to hide (#73 finding #2).
         try:
             tstore = TranscriptStore(session_id)
             current_notes = tstore.read_notes()
@@ -2047,8 +2117,14 @@ class MainApp(QObject):
                 topics=edited_topics,
                 referenced_attachments=edited_referenced,
             )
+            if self.config.synthesis.strip_attendee_appendix:
+                updated_notes = self._strip_all_appendices(updated_notes)
             if updated_notes != current_notes:
                 tstore.save_notes(updated_notes, archive_existing=False)
+                # Keep the search index in sync so the edit is
+                # findable immediately rather than waiting for the
+                # 30s stale-fingerprint scan (#73 finding #2).
+                self._reindex_search_for(session_id)
                 # Push the updated text into the open SessionView so
                 # the editor + tray reflect the change immediately
                 # without waiting for the next session-switch.
@@ -2272,6 +2348,35 @@ class MainApp(QObject):
         if tab_id in ("live_notes", "notes"):
             from .utils.clipboard import copy_markdown_with_images
             from .models.transcript import TranscriptStore
+            # Synthesis tab: substitute the raw LLM appendix JSON
+            # blocks with the rendered "# Appendix (auto-extracted)"
+            # Markdown tables before the clipboard handoff. Matches
+            # what the user sees in preview / PDF / ZIP export so the
+            # clipboard paste reads cleanly in Notion / Word / etc.
+            # My Notes tab is intentionally NOT transformed -- the
+            # user pastes their raw notes verbatim.
+            if tab_id == "notes":
+                from .utils.appendix_store import collect_for_session
+                from .utils.appendix_transform import inject_appendix
+                try:
+                    from .models.attachments import AttachmentsStore
+                    attach = AttachmentsStore(session_id)
+                    attachment_names = [
+                        rec.display_name for rec in attach.list()
+                    ]
+                except Exception:
+                    log.exception(
+                        "attachment names for copy-synthesis appendix failed: %s",
+                        session_id,
+                    )
+                    attachment_names = []
+                appendix_data = collect_for_session(
+                    session_id=session_id,
+                    notes_text=text,
+                    live_notes_text=sv._live_notes_editor.toPlainText(),  # noqa: SLF001
+                    session_attachments=attachment_names,
+                )
+                text = inject_appendix(text, appendix_data)
             try:
                 store = TranscriptStore(session_id)
                 copy_markdown_with_images(text, store.session_dir)
@@ -2871,7 +2976,12 @@ class MainApp(QObject):
         # the .mp3 extension is pre-typed; the user can switch the
         # filter dropdown to change format.
         suggested = default_export_filename(title, "Audio", ".mp3")
-        suggested_path = str(files[0].parent / suggested)
+        from .utils.export import export_initial_save_path  # noqa: PLC0415
+        suggested_path = export_initial_save_path(
+            self.config.synthesis.export_default_folder,
+            files[0].parent,
+            suggested,
+        )
         path_str, chosen_filter = QFileDialog.getSaveFileName(
             self.window,
             "Export recording",
@@ -2998,7 +3108,12 @@ class MainApp(QObject):
         title = session.title
 
         suggested = default_export_filename(title, "Video", ".mp4")
-        suggested_path = str(files[0].parent / suggested)
+        from .utils.export import export_initial_save_path  # noqa: PLC0415
+        suggested_path = export_initial_save_path(
+            self.config.synthesis.export_default_folder,
+            files[0].parent,
+            suggested,
+        )
         path_str, _ = QFileDialog.getSaveFileName(
             self.window,
             "Export session as video",
@@ -3175,8 +3290,17 @@ class MainApp(QObject):
             session.title or "session",
             session.started_at or session.created_at or "",
         )
+        from .utils.export import (  # noqa: PLC0415
+            export_initial_save_path,
+            resolve_export_initial_dir,
+        )
+        docs_dir = Path.home() / "Documents"
         if compress:
-            suggested_path = str(Path.home() / "Documents" / suggested)
+            suggested_path = export_initial_save_path(
+                self.config.synthesis.export_default_folder,
+                docs_dir,
+                suggested,
+            )
             path_str, _ = QFileDialog.getSaveFileName(
                 self.window, "Export full session",
                 suggested_path,
@@ -3188,9 +3312,13 @@ class MainApp(QObject):
             if target.suffix.lower() != ".zip":
                 target = target.with_suffix(".zip")
         else:
+            initial_dir = resolve_export_initial_dir(
+                self.config.synthesis.export_default_folder,
+                docs_dir,
+            )
             parent_dir = QFileDialog.getExistingDirectory(
                 self.window, "Choose a folder for the export",
-                str(Path.home() / "Documents"),
+                str(initial_dir),
             )
             if not parent_dir:
                 return
@@ -3640,6 +3768,433 @@ class MainApp(QObject):
                 "An error occurred while rebuilding the search index. "
                 "See the log for details.",
             )
+
+    # ---- backup + restore (#67) --------------------------------------------
+
+    def _make_backup_manager(self):  # type: ignore[no-untyped-def]
+        """Build a BackupManager pointed at the configured destination.
+
+        Returns None when the destination is not configured -- callers
+        surface the "Configure first" message to the user. Lives as a
+        helper so the Tools menu, Settings dialog, and the idle / close
+        triggers can all share the same construction path.
+        """
+        from .utils.backup import BackupManager  # noqa: PLC0415
+        from .utils.paths import app_data_dir  # noqa: PLC0415
+        dest = (self.config.backup.folder or "").strip()
+        if not dest:
+            return None
+        manager = BackupManager(
+            data_dir=app_data_dir(),
+            destination=Path(dest),
+        )
+        manager.set_retention(
+            count=self.config.backup.retention_count,
+            days=self.config.backup.retention_days,
+        )
+        return manager
+
+    def _on_backup_now_requested(self) -> None:
+        """Tools > Backup Now. Synchronous with a progress dialog so the
+        user can see the write happen. Errors surface as critical-level
+        message boxes."""
+        from .utils.backup import BackupError  # noqa: PLC0415
+        manager = self._make_backup_manager()
+        if manager is None:
+            QMessageBox.information(
+                self.window, "Backup not configured",
+                "Open Settings > Backups and pick a destination folder "
+                "before running a manual backup.",
+            )
+            return
+        # Block the UI behind a non-cancelable busy dialog. The sqlite
+        # backup + filesystem copy together complete in well under the
+        # 1-minute mark even for multi-GB session dirs, so a simple
+        # "Backing up..." dialog (rather than a progress bar) is fine.
+        from PyQt6.QtWidgets import QProgressDialog  # noqa: PLC0415
+        from PyQt6.QtCore import Qt  # noqa: PLC0415
+        dlg = QProgressDialog(
+            "Backing up data directory...", "", 0, 0, self.window,
+        )
+        dlg.setWindowTitle("Backup Now")
+        dlg.setCancelButton(None)  # no cancel for manual backup
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.show()
+        try:
+            from PyQt6.QtCore import QCoreApplication  # noqa: PLC0415
+            QCoreApplication.processEvents()
+            result = manager.snapshot_now()
+        except BackupError as exc:
+            dlg.close()
+            log.exception("Manual backup failed")
+            QMessageBox.critical(
+                self.window, "Backup failed", str(exc),
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            dlg.close()
+            log.exception("Manual backup raised unexpected error")
+            QMessageBox.critical(
+                self.window, "Backup failed",
+                f"Unexpected error during backup: {exc}",
+            )
+            return
+        finally:
+            try:
+                dlg.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._record_successful_backup(result)
+        size_mb = result.size_bytes / (1024 * 1024)
+        QMessageBox.information(
+            self.window, "Backup complete",
+            f"Snapshot written: {result.path.name}\n"
+            f"Size: {size_mb:,.1f} MB\n"
+            f"Pruned {len(result.pruned)} older snapshot(s).",
+        )
+
+    def _on_restore_backup_requested(self) -> None:
+        """Tools > Restore from Backup. Picks a snapshot, confirms,
+        quits the app after kicking off the restore, and relies on
+        the user to relaunch."""
+        from .utils.backup import BackupError, BackupManager  # noqa: PLC0415
+        from .utils.paths import app_data_dir  # noqa: PLC0415
+        from PyQt6.QtWidgets import QFileDialog  # noqa: PLC0415
+        start_dir = (self.config.backup.folder or "").strip() or str(Path.home())
+        picked, _ = QFileDialog.getOpenFileName(
+            self.window, "Pick a snapshot to restore",
+            start_dir, "Backup snapshots (*.zip)",
+        )
+        if not picked:
+            return
+        # Verify before asking the user to confirm a destructive op.
+        manager = BackupManager(
+            data_dir=app_data_dir(),
+            destination=Path(picked).parent,
+        )
+        try:
+            manager.verify(Path(picked))
+        except BackupError as exc:
+            QMessageBox.critical(
+                self.window, "Snapshot is not usable", str(exc),
+            )
+            return
+        confirm = QMessageBox.warning(
+            self.window, "Restore from backup?",
+            f"Selected snapshot:\n  {Path(picked).name}\n\n"
+            "Restoring REPLACES the current data directory with the "
+            "contents of this snapshot. Your existing data dir will be "
+            "preserved as .pre-restore.<timestamp> in case you need to "
+            "roll back manually.\n\n"
+            "The app will close before the swap; relaunch after the "
+            "restore completes.\n\n"
+            "Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        # Restore must happen with all sqlite connections closed; the
+        # cleanest way is to schedule the restore for after-quit. The
+        # actual swap runs in MainApp.aboutToQuit -> _run_pending_restore.
+        self._pending_restore_path = Path(picked)
+        self.qt_app.quit()
+
+    def _record_successful_backup(self, result) -> None:  # type: ignore[no-untyped-def]
+        """Stamp last_snapshot_at into config so the idle scheduler's
+        24h dedup gate has fresh state. Save synchronously -- the
+        backup just landed and is the most important piece of state."""
+        import datetime as _dt  # noqa: PLC0415
+        self.config.backup.last_snapshot_at = _dt.datetime.now().isoformat(
+            timespec="seconds",
+        )
+        try:
+            self.config.save()
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "Could not persist last_snapshot_at after backup",
+                exc_info=True,
+            )
+
+    # Qt event filter for idle tracking. The filter is installed on
+    # ``self.qt_app`` so it sees every user-input event across all
+    # windows; only mouse + key events bump _last_input_at, everything
+    # else falls through cheaply. Note: this fires on every key + mouse
+    # event, so the body must stay fast (no logging, no allocation).
+    _IDLE_INPUT_EVENTS = (
+        QEvent.Type.KeyPress,
+        QEvent.Type.MouseButtonPress,
+        QEvent.Type.MouseMove,
+        QEvent.Type.Wheel,
+        QEvent.Type.TouchBegin,
+        QEvent.Type.TabletMove,
+    )
+
+    def eventFilter(self, obj, event):  # noqa: N802, ARG002
+        try:
+            if event.type() in self._IDLE_INPUT_EVENTS:
+                import time as _time  # noqa: PLC0415
+                self._last_input_at = _time.monotonic()
+        except Exception:  # noqa: BLE001
+            pass
+        # Always return False so the event continues to its real
+        # target -- we're a passive observer here.
+        return False
+
+    def apply_backup_idle_scheduler_config(self) -> None:
+        """Re-evaluate whether the idle timer should run after a
+        Settings save. Called from ``_on_settings`` after the config
+        round-trips so flipping the schedule on / off picks up
+        without an app restart."""
+        if (
+            self.config.backup.schedule == "when_idle"
+            and (self.config.backup.folder or "").strip()
+        ):
+            if not self._backup_idle_timer.isActive():
+                import time as _time  # noqa: PLC0415
+                # Reset the idle clock so a recently-changed schedule
+                # doesn't trigger immediately from old activity.
+                self._last_input_at = _time.monotonic()
+                self._backup_idle_timer.start()
+        else:
+            if self._backup_idle_timer.isActive():
+                self._backup_idle_timer.stop()
+
+    def _maybe_fire_idle_backup(self) -> None:
+        """1-minute timer tick: decide whether to launch a snapshot
+        in the background worker. Cheap when not eligible; the
+        ``should_run_idle_backup`` predicate is the gate."""
+        import datetime as _dt  # noqa: PLC0415
+        import time as _time  # noqa: PLC0415
+        from .utils.backup import should_run_idle_backup  # noqa: PLC0415
+        if self._backup_worker is not None and self._backup_worker.isRunning():
+            return
+        cfg = self.config.backup
+        if not (cfg.folder or "").strip():
+            return
+        idle_seconds = _time.monotonic() - self._last_input_at
+        eligible = should_run_idle_backup(
+            schedule=cfg.schedule,
+            last_snapshot_at=cfg.last_snapshot_at,
+            idle_seconds=idle_seconds,
+            idle_after_minutes=cfg.idle_after_minutes,
+            idle_after_hour=cfg.idle_after_hour,
+            now_local=_dt.datetime.now(),
+        )
+        if not eligible:
+            return
+        manager = self._make_backup_manager()
+        if manager is None:
+            return
+        log.info(
+            "Idle-trigger backup firing (idle %.0fs, schedule=%s)",
+            idle_seconds, cfg.schedule,
+        )
+        self._start_backup_worker(manager)
+
+    def _start_backup_worker(self, manager) -> None:  # type: ignore[no-untyped-def]
+        """Spawn a QThread that runs ``manager.snapshot_now()`` and
+        emits the result back to the GUI thread. Used by the idle
+        trigger; manual + on-close paths run synchronously instead."""
+        worker = _BackupWorker(manager, parent=self)
+        worker.finished_ok.connect(self._on_idle_backup_success)
+        worker.failed.connect(self._on_idle_backup_failure)
+        worker.finished.connect(worker.deleteLater)
+
+        def _clear() -> None:
+            if self._backup_worker is worker:
+                self._backup_worker = None
+
+        worker.finished.connect(_clear)
+        self._backup_worker = worker
+        worker.start()
+
+    def _on_idle_backup_success(self, result) -> None:  # type: ignore[no-untyped-def]
+        self._record_successful_backup(result)
+        log.info(
+            "Idle backup landed: %s (%.1f MB, %d pruned)",
+            result.path,
+            result.size_bytes / (1024 * 1024),
+            len(result.pruned),
+        )
+
+    def _on_idle_backup_failure(self, message: str) -> None:
+        log.warning("Idle backup failed: %s", message)
+
+    def _handle_window_close(self, event) -> None:  # type: ignore[no-untyped-def]
+        """MainWindow close-handler hook (#67).
+
+        Two interesting cases here:
+          (1) An idle-triggered backup is running in the background.
+              Show a modal busy dialog and defer the close until the
+              worker finishes; then re-emit close.
+          (2) Schedule == on_close. Run the synchronous snapshot now
+              with a modal progress dialog so the user sees activity
+              instead of a frozen window during aboutToQuit. Accept
+              the close after the snapshot finishes.
+        Anything else: accept the close immediately (default Qt path).
+
+        The aboutToQuit hook ``_run_backup_on_close`` skips its work
+        when this method handled the synchronous on-close snapshot
+        already; we don't double-run via the LAST_BACKUP_FROM_CLOSE
+        guard flag.
+        """
+        # Backup-in-flight wait dialog.
+        if self._backup_worker is not None and self._backup_worker.isRunning():
+            self._show_wait_for_backup_dialog(event)
+            return
+        if self.config.backup.schedule == "on_close" \
+                and (self.config.backup.folder or "").strip():
+            self._run_on_close_backup_with_dialog()
+            # Mark that the close-path snapshot ran so aboutToQuit
+            # doesn't try a second time.
+            self._on_close_backup_ran = True
+        event.accept()
+
+    def _show_wait_for_backup_dialog(self, close_event) -> None:  # type: ignore[no-untyped-def]
+        """Block the close behind a modal informational dialog while a
+        background backup finishes. Once the worker emits finished, the
+        dialog dismisses and we re-trigger ``self.qt_app.quit()``."""
+        from PyQt6.QtWidgets import QProgressDialog  # noqa: PLC0415
+        from PyQt6.QtCore import Qt  # noqa: PLC0415
+        close_event.ignore()
+        dlg = QProgressDialog(
+            "Backup in progress. The app will close when it finishes.",
+            "",  # no cancel button text
+            0, 0, self.window,
+        )
+        dlg.setWindowTitle("Backup in progress")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.show()
+        worker = self._backup_worker
+
+        def _on_done() -> None:
+            try:
+                dlg.close()
+            except Exception:  # noqa: BLE001
+                pass
+            # Trigger Qt's quit path. Since the worker has finished,
+            # _handle_window_close will fall through to event.accept()
+            # when Qt re-issues the close on quit.
+            self.qt_app.quit()
+
+        if worker is not None:
+            worker.finished.connect(_on_done)
+        else:
+            _on_done()
+
+    def _run_on_close_backup_with_dialog(self) -> None:
+        """Synchronous snapshot during the close path, with a modal
+        progress dialog so the user sees activity rather than a frozen
+        window. Failures log + show a critical message box but still
+        allow the close to proceed (we don't want to trap the user)."""
+        from PyQt6.QtWidgets import QProgressDialog  # noqa: PLC0415
+        from PyQt6.QtCore import Qt, QCoreApplication  # noqa: PLC0415
+        from .utils.backup import BackupError  # noqa: PLC0415
+        manager = self._make_backup_manager()
+        if manager is None:
+            return
+        dlg = QProgressDialog(
+            "Backing up data directory before close...",
+            "", 0, 0, self.window,
+        )
+        dlg.setWindowTitle("Backup")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.show()
+        QCoreApplication.processEvents()
+        try:
+            result = manager.snapshot_now()
+            self._record_successful_backup(result)
+            log.info(
+                "Close-path backup landed: %s (%d pruned)",
+                result.path, len(result.pruned),
+            )
+        except BackupError as exc:
+            log.exception("Close-path backup failed")
+            QMessageBox.critical(
+                self.window, "Backup failed",
+                f"The on-close backup did not complete: {exc}\n\n"
+                "The app will still exit. Your data dir is unchanged.",
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Close-path backup raised unexpected error")
+        finally:
+            try:
+                dlg.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _run_backup_on_close(self) -> None:
+        """aboutToQuit fallback for the ``on_close`` schedule.
+
+        ``_handle_window_close`` already does the synchronous snapshot
+        with a progress dialog when the user clicks the X / Quit menu.
+        This hook is for the (rare) shutdown path where Qt quits
+        without first dispatching a closeEvent to MainWindow -- e.g.
+        a tray quit or programmatic ``self.qt_app.quit()`` mid-task.
+        It runs in silent mode (no dialog, just logs)."""
+        from .utils.backup import BackupError  # noqa: PLC0415
+        if getattr(self, "_on_close_backup_ran", False):
+            return
+        if self._pending_restore_path is not None:
+            return
+        if self.config.backup.schedule != "on_close":
+            return
+        manager = self._make_backup_manager()
+        if manager is None:
+            return
+        try:
+            result = manager.snapshot_now()
+            self._record_successful_backup(result)
+            log.info(
+                "On-close backup (silent path) landed: %s (%d pruned)",
+                result.path, len(result.pruned),
+            )
+        except BackupError:
+            log.exception("On-close backup failed")
+        except Exception:  # noqa: BLE001
+            log.exception("On-close backup raised unexpected error")
+
+    def _run_pending_restore(self) -> None:
+        """aboutToQuit hook -- if the user asked to restore from a
+        snapshot, perform the data-dir swap now (all sqlite handles
+        from this process are closed by Qt's shutdown sequence).
+
+        The user must relaunch manually after the restore; auto-relaunch
+        would require respawning the process from the dying one, which
+        is fragile on Windows."""
+        if self._pending_restore_path is None:
+            return
+        zip_path = self._pending_restore_path
+        self._pending_restore_path = None
+        from .utils.backup import BackupError, BackupManager  # noqa: PLC0415
+        from .utils.paths import app_data_dir  # noqa: PLC0415
+        # Close any sqlite connections we still own so the rename in
+        # restore_from doesn't fail with EBUSY on Windows.
+        for store_attr in ("store", "classification", "search_index"):
+            store = getattr(self, store_attr, None)
+            close = getattr(store, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    log.exception("Closing %s before restore failed", store_attr)
+        manager = BackupManager(
+            data_dir=app_data_dir(),
+            destination=zip_path.parent,
+        )
+        try:
+            manager.restore_from(zip_path)
+            log.info("Restore from %s complete", zip_path)
+        except BackupError:
+            log.exception("Restore from %s failed", zip_path)
+        except Exception:  # noqa: BLE001
+            log.exception("Restore raised unexpected error")
 
     # ---- classification -----------------------------------------------------
 
@@ -4168,6 +4723,10 @@ class MainApp(QObject):
             ping_extension=self._ping_extension,
             classification_store=self.classification,
         )
+        # Backups group exposes a Backup Now button; route it through
+        # MainApp's manual-backup handler so the same modal dialog +
+        # validation as the Tools menu path is used.
+        dialog.inject_backup_now_handler(self._on_backup_now_requested)
         accepted = dialog.exec() == dialog.DialogCode.Accepted
         # The Manage Speakers sub-dialog can mutate the store regardless
         # of whether the parent Settings dialog is accepted or canceled,
@@ -4184,6 +4743,7 @@ class MainApp(QObject):
         self._apply_calendar_config()
         self._apply_audio_monitor_config()
         self._apply_synthesis_automation()
+        self.apply_backup_idle_scheduler_config()
         self._refresh_status_indicators()
         # Push the new auto-capture interval to the sidebar so the
         # "every Ns" hint reflects what Settings just saved.
@@ -4194,6 +4754,10 @@ class MainApp(QObject):
         # Export PDF + Print dialogs reflect the new settings.
         self.window.session_view.set_appendix_export_defaults(
             self._appendix_export_defaults_from_config(),
+        )
+        # Update the Export default folder (v0.7.5) live too.
+        self.window.session_view.set_export_default_folder(
+            self.config.synthesis.export_default_folder or "",
         )
         self.window.status("Settings saved.", timeout_ms=4000)
 
@@ -4833,6 +5397,43 @@ class MainApp(QObject):
         self.window.showNormal()
         self.window.raise_()
         self.window.activateWindow()
+
+
+class _BackupWorker(QThread):
+    """Off-thread snapshot worker for the idle-trigger backup (#67).
+
+    The manager's snapshot_now path is blocking (sqlite backup +
+    filesystem copy + zip), so running it on the GUI thread would
+    freeze the app for the duration. ``parent`` is the MainApp QObject
+    so the worker shares its lifetime + cleans up on app quit.
+
+    Emits exactly one of:
+      - ``finished_ok(BackupResult)`` on success
+      - ``failed(message)`` on BackupError or any unexpected error
+
+    The base QThread ``finished`` signal still fires after either
+    branch so callers can connect lifecycle cleanup once.
+    """
+
+    finished_ok = pyqtSignal(object)  # BackupResult
+    failed = pyqtSignal(str)
+
+    def __init__(self, manager, parent: Optional[QObject] = None) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(parent)
+        self._manager = manager
+
+    def run(self) -> None:
+        from .utils.backup import BackupError  # noqa: PLC0415
+        try:
+            result = self._manager.snapshot_now()
+        except BackupError as exc:
+            self.failed.emit(str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Idle backup worker raised unexpected error")
+            self.failed.emit(f"Unexpected error: {exc}")
+            return
+        self.finished_ok.emit(result)
 
 
 class _UpdateCheckWorker(QThread):

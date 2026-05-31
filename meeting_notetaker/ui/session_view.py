@@ -38,7 +38,11 @@ from ..models.transcript import (
     label_for,
     rewrite_user_label,
 )
-from ..utils.export import build_print_markdown, default_export_filename
+from ..utils.export import (
+    build_print_markdown,
+    default_export_filename,
+    export_initial_save_path,
+)
 from ..utils.paths import session_dir
 from ..models.highlights import HighlightSet
 from .attachments_tab import AttachmentsTab
@@ -187,6 +191,12 @@ class SessionView(QWidget):
         self._session_contacts: list = []
         # User's Settings-saved AppendixInclusion defaults for the
         # per-tab Export PDF + Print flow. None -> dialog uses
+        # Settings > Export default folder (v0.7.5). MainApp pushes
+        # the config string here via set_export_default_folder; the
+        # per-tab Export PDF flow uses it as the dialog's initial
+        # location. Empty == no default configured (legacy fallback
+        # to the session dir).
+        self._export_default_folder: str = ""
         # "every populated section on". MainApp.set_appendix_export_defaults
         # plumbs the saved config into this field.
         self._appendix_export_defaults = None
@@ -751,7 +761,14 @@ class SessionView(QWidget):
         # paste-back lands directly in the editable buffer.
         self._notes_view.set_preview_mode(bool(notes.strip()))
         self._live_notes_editor.set_session_dir(sdir)
-        self._set_live_notes_text(live_notes)
+        # Use the public setter so the preview-mode default is applied
+        # consistently with the async post-load path (#67 followup).
+        # The session-select prelude passes live_notes="" so this
+        # initial call lands the editor in Edit; MainApp's content
+        # worker calls set_live_notes_text again with the real body
+        # off disk and the public setter flips to Preview when the
+        # body has anything beyond the seeded template.
+        self.set_live_notes_text(live_notes)
         self._retain_checkbox.setEnabled(True)
         self._retain_checkbox.blockSignals(True)
         self._retain_checkbox.setChecked(session.retain_audio)
@@ -804,6 +821,15 @@ class SessionView(QWidget):
         construction + after every Settings save. ``defaults`` may
         be None to fall back to the dialog's "all on" defaults."""
         self._appendix_export_defaults = defaults
+
+    def set_export_default_folder(self, path: str) -> None:
+        """Push Settings > Export default folder (v0.7.5) so the
+        per-tab Export PDF dialog opens there instead of the session
+        dir. Empty string means "no default configured" -- the PDF
+        dialog falls back to the session dir, matching legacy
+        behavior. MainApp calls this on construction + after every
+        Settings save."""
+        self._export_default_folder = path or ""
 
     def set_session_attachment_names(self, names) -> None:
         """Push the current session's attachment display names into
@@ -1447,6 +1473,26 @@ class SessionView(QWidget):
         # New synthesis content can introduce JSON appendices + new
         # links; refresh the tray + preview transform (#64).
         self._refresh_appendix_trays()
+
+    def set_live_notes_text(self, text: str) -> None:
+        """Replace the My Notes body + reapply the preview-mode default.
+
+        The session-select path is two-phase: set_session() binds an
+        empty buffer synchronously for snappy UI swap, then a worker
+        in MainApp reads live_notes.md off disk and pushes the real
+        content back via this setter. The preview-mode default lands
+        here (not in _set_live_notes_text) so the *real* body is what
+        decides Edit vs Preview -- previously this lived in
+        set_session only, which always ran against an empty body and
+        therefore always landed in Edit even for sessions with notes.
+
+        Matches the Synthesis tab's set_notes_text pattern: public
+        setter applies preview-mode based on content; private
+        _set_live_notes_text just touches text.
+        """
+        self._set_live_notes_text(text)
+        from ..utils.live_notes import has_user_content  # noqa: PLC0415
+        self._live_notes_editor.set_preview_mode(has_user_content(text))
 
     def set_previous_notes(self, paths: list) -> None:
         self._previous_view.set_archives(paths)
@@ -2228,7 +2274,11 @@ class SessionView(QWidget):
         suggested_name = default_export_filename(
             self._session.title, tab_label, ".pdf"
         )
-        suggested_path = str(session_dir(self._session.id) / suggested_name)
+        suggested_path = export_initial_save_path(
+            self._export_default_folder,
+            session_dir(self._session.id),
+            suggested_name,
+        )
         path_str, _filter = QFileDialog.getSaveFileName(
             self,
             f"Export {tab_label} as PDF",

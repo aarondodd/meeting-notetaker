@@ -408,10 +408,14 @@ def export_highlights_audio(
             dst_path=dst_path,
             codec_name=codec_name,
             container_format=container_format,
+            should_cancel=should_cancel,
         )
     except Exception:
         # Clean up partial output for both real failures and the
-        # cancellation paths in _encode_mono_float32.
+        # ExportCancelled raised by _encode_mono_float32's chunk-
+        # boundary cancellation check (#73 finding #4 added that
+        # path; previously the comment promised behavior the
+        # callee didn't implement).
         if dst_path.exists():
             try:
                 dst_path.unlink()

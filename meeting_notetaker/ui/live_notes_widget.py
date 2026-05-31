@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QImage, QKeySequence, QTextCursor
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -89,6 +89,22 @@ class LiveNotesWidget(QWidget):
         # hands it here. None disables the appendix injection (e.g.
         # before a session is loaded).
         self._appendix_data = None
+        # Coalesce preview re-renders during session load. Multiple
+        # setters (setPlainText / set_appendix_data /
+        # set_session_contacts) fire back-to-back in the same event-
+        # loop tick as SessionView fills itself in; each one used to
+        # call setMarkdown directly, which on Windows left the
+        # rendered preview in an inconsistent state (sub-section H2
+        # headings missing until the user toggled edit / preview).
+        # Coalescing into one deferred setMarkdown on the next tick
+        # eliminates the race. Toggle-to-preview still renders
+        # synchronously for instant UX.
+        self._preview_refresh_timer = QTimer(self)
+        self._preview_refresh_timer.setSingleShot(True)
+        self._preview_refresh_timer.setInterval(0)
+        self._preview_refresh_timer.timeout.connect(
+            self._on_preview_refresh_timeout,
+        )
         self._toolbar = QToolBar(self)
         self._toolbar.setMovable(False)
         self._toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
@@ -124,8 +140,7 @@ class LiveNotesWidget(QWidget):
 
     def setPlainText(self, text: str) -> None:
         self._editor.setPlainText(text)
-        if self.is_in_preview():
-            self._preview.setMarkdown(self._preview_text(text))
+        self._schedule_preview_refresh()
 
     def setPlaceholderText(self, text: str) -> None:
         self._editor.setPlaceholderText(text)
@@ -139,12 +154,7 @@ class LiveNotesWidget(QWidget):
         pane. Edit mode always shows the user's actual buffer.
         """
         self._session_contacts = list(contacts or [])
-        # If we're currently in preview, re-render with the new
-        # contacts so the table appears immediately.
-        if self.is_in_preview():
-            self._preview.setMarkdown(
-                self._preview_text(self._editor.toPlainText())
-            )
+        self._schedule_preview_refresh()
 
     def set_appendix_data(self, data) -> None:
         """Drive the preview-time Appendix injection (#64).
@@ -156,10 +166,7 @@ class LiveNotesWidget(QWidget):
         place of the raw JSON appendix blocks.
         """
         self._appendix_data = data
-        if self.is_in_preview():
-            self._preview.setMarkdown(
-                self._preview_text(self._editor.toPlainText())
-            )
+        self._schedule_preview_refresh()
 
     def _preview_text(self, source: str) -> str:
         """Apply preview-time transformations.
@@ -344,9 +351,12 @@ class LiveNotesWidget(QWidget):
 
     def _on_toggle_preview(self, checked: bool) -> None:
         if checked:
-            self._preview.setMarkdown(
-                self._preview_text(self._editor.toPlainText())
-            )
+            # Cancel any pending deferred refresh + render
+            # synchronously so the toggle is instant. The
+            # explicit user action takes priority over the
+            # coalesced background-refresh path.
+            self._preview_refresh_timer.stop()
+            self._render_preview_now()
             self._stack.setCurrentWidget(self._preview)
             self._a_preview.setText("Edit")
         else:
@@ -355,6 +365,45 @@ class LiveNotesWidget(QWidget):
             self._editor.setFocus()
         for action in self._formatting_actions:
             action.setEnabled(not checked)
+
+    # ---- preview refresh coalescing -----------------------------------
+
+    def _schedule_preview_refresh(self) -> None:
+        """Mark the preview dirty + schedule a deferred re-render.
+
+        Called by every setter that affects the rendered preview
+        (setPlainText, set_appendix_data, set_session_contacts).
+        Multiple back-to-back calls within one event-loop tick
+        coalesce into a single setMarkdown on the next tick, after
+        Qt has settled the layout from the prior setters.
+
+        Skipped when not in preview mode -- the next toggle into
+        preview will pick up the latest data via _render_preview_now
+        in _on_toggle_preview.
+        """
+        if self.is_in_preview():
+            self._preview_refresh_timer.start()
+
+    def _on_preview_refresh_timeout(self) -> None:
+        """Timer slot: render the preview if still in preview mode.
+
+        The user may have toggled to edit between schedule and
+        fire; in that case the next toggle to preview handles the
+        render.
+        """
+        if self.is_in_preview():
+            self._render_preview_now()
+
+    def _render_preview_now(self) -> None:
+        """Apply preview-time transformations + setMarkdown immediately.
+
+        Caller is responsible for the is_in_preview check
+        (deferred path checks; toggle-to-preview path bypasses
+        because the stack widget hasn't been switched yet).
+        """
+        self._preview.setMarkdown(
+            self._preview_text(self._editor.toPlainText())
+        )
 
     # ---- formatting helpers ------------------------------------------------
 
@@ -394,19 +443,24 @@ class LiveNotesWidget(QWidget):
         lines = block.split(chr(0x2029))
         new_lines: list[str] = []
         for line in lines:
-            stripped = line
             if heading:
-                # Drop any existing heading prefix so toggling levels is clean.
-                lstripped = stripped.lstrip()
+                # Drop any existing heading prefix so toggling levels
+                # is clean (H1 -> H2 replaces, not stacks).
+                lstripped = line.lstrip()
                 if lstripped.startswith("#"):
                     rest = lstripped.lstrip("#").lstrip()
-                    stripped = rest
+                    new_lines.append(f"{prefix}{rest}")
                 else:
-                    stripped = lstripped
+                    new_lines.append(f"{prefix}{lstripped}")
             else:
-                # Preserve indentation when prefixing for non-heading actions.
-                pass
-            new_lines.append(f"{prefix}{stripped}")
+                # Preserve leading indentation so toggling List /
+                # Quote / Task on a nested line keeps its indent
+                # (was previously a no-op `pass` that pushed the
+                # prefix in front of the leading whitespace, e.g.
+                # "    foo" -> "-     foo"; #73 finding #7).
+                indent_len = len(line) - len(line.lstrip())
+                indent, content = line[:indent_len], line[indent_len:]
+                new_lines.append(f"{indent}{prefix}{content}")
         cursor.insertText("\n".join(new_lines))
 
     def _numbered_list(self) -> None:

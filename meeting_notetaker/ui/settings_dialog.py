@@ -15,16 +15,21 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSlider,
     QSpinBox,
+    QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -56,7 +61,15 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self.resize(560, 600)
+        # Wide enough by default to fit the longest row (Backups folder
+        # picker + Browse button, Synthesis Claude project ID) without
+        # horizontal scrolling. The nav list on the left takes ~180 px
+        # and the right pane needs ~620 px for the widest content.
+        # v0.7.5: switched from single long-scrolling pane to nav +
+        # stacked pages (#67 follow-up). The right pane carries its
+        # own scroll for sections that still overflow vertically
+        # (Speakers, Backups, Synthesis).
+        self.resize(900, 650)
         self._config = config
         # The install wizard's Verify step probes the live bridge to
         # confirm the extension is reachable. The Settings dialog
@@ -72,19 +85,19 @@ class SettingsDialog(QDialog):
         # live store.
         self._classification_store = classification_store
 
-        # Outer layout: scroll area on top, button bar at the bottom outside
-        # the scroll region so OK/Cancel are always reachable. The content
-        # widget's layout is what every group below adds to.
+        # Outer layout: nav (left) + stacked content (right) + button bar
+        # below. Each section is built below as a QGroupBox or composite
+        # widget and registered via _add_section(label, widget); the call
+        # to _assemble_sections at the bottom of __init__ sorts the
+        # accumulated list alphabetically and builds the splitter +
+        # stack + nav at once.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        outer.addWidget(scroll, 1)
 
-        content = QWidget()
-        scroll.setWidget(content)
-        layout = QVBoxLayout(content)
+        # Accumulator: each entry is (display label, content widget).
+        # Synthesis Automation + Synthesis Prompts are registered once
+        # under "Synthesis" via a composite wrapper widget.
+        self._sections: list[tuple[str, QWidget]] = []
 
         # Transcription group ---------------------------------------------
         tx_group = QGroupBox("Transcription", self)
@@ -190,7 +203,7 @@ class SettingsDialog(QDialog):
         self._open_vocab_btn = QPushButton("Open Vocabulary File", self)
         self._open_vocab_btn.clicked.connect(self._open_vocabulary_file)
         tx_form.addRow(self._open_vocab_btn)
-        layout.addWidget(tx_group)
+        self._add_section("Transcription", tx_group)
 
         # Audio group ------------------------------------------------------
         audio_group = QGroupBox("Audio", self)
@@ -287,7 +300,7 @@ class SettingsDialog(QDialog):
         )
         audio_form.addRow("VAD min silence:", self._vad_slider)
         audio_form.addRow("", self._vad_value_label)
-        layout.addWidget(audio_group)
+        self._add_section("Audio", audio_group)
 
         # Screen Capture group ---------------------------------------------
         screencap_group = QGroupBox("Screen Capture", self)
@@ -355,7 +368,7 @@ class SettingsDialog(QDialog):
         )
         screencap_form.addRow("Dedup threshold:", self._screencap_dedup_threshold)
         screencap_form.addRow("", self._screencap_dedup_threshold_label)
-        layout.addWidget(screencap_group)
+        self._add_section("Screen Capture", screencap_group)
 
         # Speakers group ---------------------------------------------------
         speakers_group = QGroupBox("Speakers", self)
@@ -472,7 +485,7 @@ class SettingsDialog(QDialog):
         speakers_form.addRow("Your voice:", self._voice_status_label)
         speakers_form.addRow("", voice_row)
         self._refresh_voiceprint_row()
-        layout.addWidget(speakers_group)
+        self._add_section("Speakers", speakers_group)
 
         # Calendar group ---------------------------------------------------
         calendar_group = QGroupBox("Calendar (Outlook)", self)
@@ -510,7 +523,7 @@ class SettingsDialog(QDialog):
         )
         calendar_form.addRow("Notify within:", self._window_slider)
         calendar_form.addRow("", self._window_value_label)
-        layout.addWidget(calendar_group)
+        self._add_section("Calendar", calendar_group)
 
         # Ad-hoc meeting detection group -----------------------------------
         detection_group = QGroupBox("Detect ad-hoc meetings", self)
@@ -573,7 +586,7 @@ class SettingsDialog(QDialog):
             "excluded -- chrome.exe / msedge.exe also play music + video."
         )
         detection_form.addRow("Watch apps:", self._detect_allowlist_edit)
-        layout.addWidget(detection_group)
+        self._add_section("Meeting Detection", detection_group)
 
         # UI group ---------------------------------------------------------
         ui_group = QGroupBox("Interface", self)
@@ -589,10 +602,13 @@ class SettingsDialog(QDialog):
             "prompt-generation time."
         )
         ui_form.addRow("Your name:", self._user_name_edit)
-        layout.addWidget(ui_group)
+        self._add_section("Interface", ui_group)
 
-        # Synthesis Automation group --------------------------------------
-        auto_group = QGroupBox("Synthesis Automation (optional)", self)
+        # Synthesis (combined Automation + Prompt Templates) ---------
+        # Both sub-groups live on a single page so the user finds
+        # everything LLM-related in one place. The sub-groups keep
+        # their own QGroupBox so the visual subdivision survives.
+        auto_group = QGroupBox("Automation", self)
         auto_layout = QVBoxLayout(auto_group)
         auto_blurb = QLabel(
             "When enabled, the Generate Synthesis Prompt + Paste Response "
@@ -669,11 +685,10 @@ class SettingsDialog(QDialog):
         auto_actions.addStretch(1)
         auto_layout.addLayout(auto_actions)
 
-        layout.addWidget(auto_group)
         self._refresh_automation_status()
 
-        # Prompts group ----------------------------------------------------
-        prompts_group = QGroupBox("Synthesis Prompts", self)
+        # Prompt Templates sub-group of Synthesis -----------------------
+        prompts_group = QGroupBox("Prompt Templates", self)
         prompts_layout = QVBoxLayout(prompts_group)
         prompts_blurb = QLabel(
             "Prompt templates are Markdown files in the folder below. Edit any file "
@@ -742,7 +757,16 @@ class SettingsDialog(QDialog):
         prompts_row.addWidget(self._open_prompts_btn)
         prompts_row.addStretch(1)
         prompts_layout.addLayout(prompts_row)
-        layout.addWidget(prompts_group)
+        # Compose both sub-groups into a single "Synthesis" page so
+        # they share the same nav entry. Automation sits above
+        # Prompt Templates because users typically configure
+        # automation once and then iterate on templates.
+        synth_page = QWidget(self)
+        synth_page_layout = QVBoxLayout(synth_page)
+        synth_page_layout.setContentsMargins(0, 0, 0, 0)
+        synth_page_layout.addWidget(auto_group)
+        synth_page_layout.addWidget(prompts_group)
+        self._add_section("Synthesis", synth_page)
 
         # Export group ----------------------------------------------------
         # MP4 quality preset for the per-session video exports + the
@@ -750,6 +774,33 @@ class SettingsDialog(QDialog):
         # users who want the v0.7.2-era file sizes pick High.
         export_group = QGroupBox("Export", self)
         export_form = QFormLayout(export_group)
+
+        # Default export folder (v0.7.5). Empty == legacy fallback
+        # (session dir for PDFs + recording / video, Documents for
+        # full-session). When set, every Export dialog opens here.
+        export_folder_row = QHBoxLayout()
+        self._export_default_folder_edit = QLineEdit(self)
+        self._export_default_folder_edit.setText(
+            getattr(config.synthesis, "export_default_folder", "") or ""
+        )
+        self._export_default_folder_edit.setPlaceholderText(
+            "(leave blank to use the session folder / Documents)"
+        )
+        self._export_default_folder_edit.setToolTip(
+            "Default location for the Save As / Choose Folder dialog "
+            "that appears when you export a recording, video, full "
+            "session, or PDF. The dialog still lets you navigate "
+            "elsewhere; this just sets the starting point. Leave "
+            "blank to fall back to the session's own folder."
+        )
+        export_folder_row.addWidget(self._export_default_folder_edit, 1)
+        export_folder_browse = QPushButton("Browse...", self)
+        export_folder_browse.clicked.connect(
+            self._on_export_default_folder_browse,
+        )
+        export_folder_row.addWidget(export_folder_browse)
+        export_form.addRow("Default folder:", export_folder_row)
+
         export_blurb = QLabel(
             "Quality preset for MP4 outputs (highlights, recording, "
             "full-session export). Slideshow-style screenshot content "
@@ -847,17 +898,142 @@ class SettingsDialog(QDialog):
             export_form.addRow(cb)
             self._appendix_section_checkboxes[field_name] = cb
 
-        layout.addWidget(export_group)
+        self._add_section("Export", export_group)
 
-        layout.addStretch(1)
+        # Backups group (#67) ---------------------------------------------
+        backup_group = QGroupBox("Backups", self)
+        backup_layout = QVBoxLayout(backup_group)
+        backup_blurb = QLabel(
+            "Creates a zip archive of the internal application folder "
+            "(under %APPDATA%\MeetingNotetaker on Windows) with all "
+            "meeting notes, synthesis, and application settings "
+            "(speakers, addressbook, app config, etc.). ",
+            self,
+        )
+        backup_blurb.setWordWrap(True)
+        backup_layout.addWidget(backup_blurb)
+
+        folder_row = QHBoxLayout()
+        folder_label = QLabel("Backup folder:", self)
+        folder_row.addWidget(folder_label)
+        self._backup_folder_edit = QLineEdit(self)
+        self._backup_folder_edit.setText(config.backup.folder or "")
+        self._backup_folder_edit.setPlaceholderText(
+            "(leave blank to disable scheduled backups)"
+        )
+        folder_row.addWidget(self._backup_folder_edit, 1)
+        browse_btn = QPushButton("Browse...", self)
+        browse_btn.clicked.connect(self._on_backup_folder_browse)
+        folder_row.addWidget(browse_btn)
+        backup_layout.addLayout(folder_row)
+
+        sched_label = QLabel("Schedule:", self)
+        backup_layout.addWidget(sched_label)
+        self._backup_sched_manual = QRadioButton(
+            "Manual only (Tools > Backup Now)", self,
+        )
+        self._backup_sched_on_close = QRadioButton(
+            "On app close", self,
+        )
+        self._backup_sched_when_idle = QRadioButton(
+            "When idle after configured time", self,
+        )
+        backup_layout.addWidget(self._backup_sched_manual)
+        backup_layout.addWidget(self._backup_sched_on_close)
+        backup_layout.addWidget(self._backup_sched_when_idle)
+        sched = config.backup.schedule or "manual"
+        if sched == "on_close":
+            self._backup_sched_on_close.setChecked(True)
+        elif sched == "when_idle":
+            self._backup_sched_when_idle.setChecked(True)
+        else:
+            self._backup_sched_manual.setChecked(True)
+
+        idle_form = QFormLayout()
+        self._backup_idle_minutes = QSpinBox(self)
+        self._backup_idle_minutes.setRange(1, 720)
+        self._backup_idle_minutes.setSuffix(" min")
+        self._backup_idle_minutes.setValue(
+            int(config.backup.idle_after_minutes or 30)
+        )
+        self._backup_idle_minutes.setToolTip(
+            "How long the app must sit without user input before the "
+            "idle scheduler fires a snapshot. Resets on any mouse or "
+            "keyboard activity."
+        )
+        idle_form.addRow("Idle after:", self._backup_idle_minutes)
+        self._backup_idle_hour = QSpinBox(self)
+        self._backup_idle_hour.setRange(0, 23)
+        self._backup_idle_hour.setValue(
+            int(config.backup.idle_after_hour or 19)
+        )
+        self._backup_idle_hour.setSuffix(":00 local")
+        self._backup_idle_hour.setToolTip(
+            "Earliest local hour the idle trigger may fire. Default "
+            "19:00 (7pm) so the backup doesn't kick in during the "
+            "workday."
+        )
+        idle_form.addRow("Only after:", self._backup_idle_hour)
+        backup_layout.addLayout(idle_form)
+
+        retention_form = QFormLayout()
+        self._backup_retention_count = QSpinBox(self)
+        self._backup_retention_count.setRange(0, 365)
+        self._backup_retention_count.setValue(
+            int(config.backup.retention_count or 7)
+        )
+        self._backup_retention_count.setSuffix(" snapshots")
+        self._backup_retention_count.setToolTip(
+            "Keep at most N most-recent snapshots. 0 disables this "
+            "gate (rely on the days cutoff instead). Pruning happens "
+            "silently after every snapshot."
+        )
+        retention_form.addRow(
+            "Keep newest:", self._backup_retention_count,
+        )
+        self._backup_retention_days = QSpinBox(self)
+        self._backup_retention_days.setRange(0, 3650)
+        self._backup_retention_days.setValue(
+            int(config.backup.retention_days or 30)
+        )
+        self._backup_retention_days.setSuffix(" days")
+        self._backup_retention_days.setToolTip(
+            "Drop snapshots older than D days. 0 disables this gate. "
+            "Applied alongside the snapshot count -- a snapshot is "
+            "kept only when it passes both gates."
+        )
+        retention_form.addRow(
+            "Drop older than:", self._backup_retention_days,
+        )
+        backup_layout.addLayout(retention_form)
+
+        backup_btn_row = QHBoxLayout()
+        self._backup_now_btn = QPushButton("Backup Now...", self)
+        self._backup_now_btn.setToolTip(
+            "Snapshot the data dir into the configured destination "
+            "right now. Settings changes since the last save are NOT "
+            "included until you click OK first."
+        )
+        # Wired by MainApp via inject_backup_now_handler so the dialog
+        # stays independent of MainApp imports.
+        self._backup_now_handler: Optional[callable] = None
+        self._backup_now_btn.clicked.connect(self._on_backup_now_clicked)
+        backup_btn_row.addStretch(1)
+        backup_btn_row.addWidget(self._backup_now_btn)
+        backup_layout.addLayout(backup_btn_row)
+
+        self._add_section("Backups", backup_group)
+
+        # Assemble nav + stack from the accumulated sections, sorted
+        # alphabetically by label. Restores last-active section so the
+        # user lands back where they were when they reopen Settings.
+        self._assemble_sections(outer)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self
         )
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
-        # Button bar lives outside the scroll area so OK/Cancel are always
-        # reachable, even if the content overflows.
         outer.addWidget(buttons)
 
     def _on_accept(self) -> None:
@@ -909,6 +1085,9 @@ class SettingsDialog(QDialog):
         self._config.synthesis.video_quality = (
             self._video_quality_picker.currentData() or "medium"
         )
+        self._config.synthesis.export_default_folder = (
+            self._export_default_folder_edit.text().strip()
+        )
         self._config.synthesis.compress_full_session_export = (
             self._compress_full_export.isChecked()
         )
@@ -917,7 +1096,150 @@ class SettingsDialog(QDialog):
         )
         for field, cb in self._appendix_section_checkboxes.items():
             setattr(self._config.synthesis, field, cb.isChecked())
+        self._config.backup.folder = self._backup_folder_edit.text().strip()
+        if self._backup_sched_on_close.isChecked():
+            self._config.backup.schedule = "on_close"
+        elif self._backup_sched_when_idle.isChecked():
+            self._config.backup.schedule = "when_idle"
+        else:
+            self._config.backup.schedule = "manual"
+        self._config.backup.idle_after_minutes = int(
+            self._backup_idle_minutes.value()
+        )
+        self._config.backup.idle_after_hour = int(
+            self._backup_idle_hour.value()
+        )
+        self._config.backup.retention_count = int(
+            self._backup_retention_count.value()
+        )
+        self._config.backup.retention_days = int(
+            self._backup_retention_days.value()
+        )
+        # Remember which section the user was on so reopening Settings
+        # lands them right back. Stored in ui.settings_active_section.
+        self._config.ui.settings_active_section = self._active_section_label()
         self.accept()
+
+    def inject_backup_now_handler(self, handler) -> None:
+        """Caller (MainApp) wires the manual-backup action here so the
+        Backup Now button in the Backups group can fire without the
+        dialog needing a back-pointer to MainApp."""
+        self._backup_now_handler = handler
+
+    def _on_backup_folder_browse(self) -> None:
+        start = self._backup_folder_edit.text().strip() or ""
+        picked = QFileDialog.getExistingDirectory(
+            self, "Pick backup destination folder", start,
+        )
+        if picked:
+            self._backup_folder_edit.setText(picked)
+
+    def _on_export_default_folder_browse(self) -> None:
+        start = self._export_default_folder_edit.text().strip() or ""
+        picked = QFileDialog.getExistingDirectory(
+            self, "Pick default export folder", start,
+        )
+        if picked:
+            self._export_default_folder_edit.setText(picked)
+
+    def _on_backup_now_clicked(self) -> None:
+        handler = self._backup_now_handler
+        if handler is None:
+            return
+        handler()
+
+    # ---- section nav (v0.7.5 redesign) -------------------------------
+
+    def _add_section(self, label: str, content: QWidget) -> None:
+        """Register a section page. Called from __init__ as each
+        group's widgets finish building. ``content`` is whatever the
+        section's body is -- a QGroupBox in most cases, or a composite
+        QWidget (e.g. Synthesis combining Automation + Prompt Templates)."""
+        self._sections.append((label, content))
+
+    def _assemble_sections(self, outer: QVBoxLayout) -> None:
+        """Build the nav + stack from ``self._sections`` and attach
+        them to ``outer``. Called at the bottom of __init__.
+
+        Layout:
+          - QSplitter (horizontal, user-resizable)
+            - QListWidget  (nav, alphabetized)
+            - QStackedWidget (content, one page per section)
+          - QDialogButtonBox (added by caller after this method)
+
+        Per-page scroll: each section gets wrapped in a QScrollArea so
+        tall sections (Speakers, Backups, Synthesis) stay usable on
+        small screens without forcing the whole dialog to scroll.
+        """
+        sections = sorted(self._sections, key=lambda s: s[0].lower())
+
+        self._nav = QListWidget(self)
+        self._nav.setFrameShape(QFrame.Shape.NoFrame)
+        self._nav.setMaximumWidth(200)
+        self._nav.setMinimumWidth(150)
+        # Slight padding around each row so the labels breathe.
+        self._nav.setStyleSheet(
+            "QListWidget::item { padding: 6px 8px; }"
+        )
+
+        self._stack = QStackedWidget(self)
+
+        for label, content in sections:
+            page = QWidget(self)
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(8, 8, 8, 8)
+            scroll = QScrollArea(page)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            # Horizontal scroll off entirely -- the dialog's default
+            # width is sized to fit the widest section's contents, so
+            # the only reason to scroll is vertical overflow.
+            scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+            )
+            inner = QWidget()
+            inner_layout = QVBoxLayout(inner)
+            inner_layout.setContentsMargins(0, 0, 0, 0)
+            inner_layout.addWidget(content)
+            inner_layout.addStretch(1)
+            scroll.setWidget(inner)
+            page_layout.addWidget(scroll)
+            self._stack.addWidget(page)
+            self._nav.addItem(label)
+
+        # Click-to-switch wiring.
+        self._nav.currentRowChanged.connect(self._stack.setCurrentIndex)
+
+        # Restore the section the user was on last time Settings was
+        # open. Falls back to the first entry (alphabetical = "Audio")
+        # on first launch.
+        target_label = self._config.ui.settings_active_section or ""
+        target_row = 0
+        for idx, (label, _) in enumerate(sections):
+            if label == target_label:
+                target_row = idx
+                break
+        self._nav.setCurrentRow(target_row)
+
+        # Splitter so power users can widen the nav for long labels.
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        splitter.addWidget(self._nav)
+        splitter.addWidget(self._stack)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([180, 720])
+        outer.addWidget(splitter, 1)
+
+    def _active_section_label(self) -> str:
+        """Return the label of the currently-selected nav entry, or
+        empty string if nothing is selected (shouldn't happen in
+        practice -- the assembly step always selects row 0)."""
+        row = self._nav.currentRow()
+        if row < 0:
+            return ""
+        item = self._nav.item(row)
+        return item.text() if item is not None else ""
 
     def _on_appendix_export_master_toggled(self, on: bool) -> None:
         """Enable / disable the per-section checkboxes alongside the

@@ -33,17 +33,63 @@ _DATA_FULL = AppendixData(
 
 def test_build_appendix_markdown_renders_each_section():
     out = build_appendix_markdown(_DATA_FULL)
-    assert "## Appendix (auto-extracted)" in out
-    assert "### Attendee Context" in out
-    assert "### Attendee Details" in out
-    assert "### Suggested Topics" in out
-    assert "### Referenced Attachments" in out
-    assert "### Session Attachments" in out
-    assert "### Links" in out
+    # v0.7.5: appendix heading promoted to H1, sub-sections to H2,
+    # so the appendix sits as a top-level peer of # Attendees /
+    # # Decisions / # Notes / etc. from the bundled prompt rather
+    # than nesting under # Open Questions.
+    assert "# Appendix (auto-extracted)" in out
+    assert "## Attendee Context" in out
+    assert "## Attendee Details" in out
+    assert "## Suggested Topics" in out
+    assert "## Referenced Attachments" in out
+    assert "## Session Attachments" in out
+    assert "## Links" in out
     assert "Bob" in out
     assert "Q3 hiring" in out
     assert "meeting-notes.pptx" in out
     assert "[auth](https://wiki/auth)" in out
+
+
+def test_appendix_heading_is_h1_not_h2():
+    """Pin the heading level explicitly so a future regression to
+    '## Appendix' (which renders as a sub-section of # Open
+    Questions under the bundled prompt) breaks loudly."""
+    out = build_appendix_markdown(_DATA_FULL)
+    # Each heading line that contains "Appendix (auto-extracted)"
+    # must start with exactly one '#' followed by a space.
+    appendix_heading_lines = [
+        line for line in out.splitlines()
+        if "Appendix (auto-extracted)" in line
+    ]
+    assert len(appendix_heading_lines) == 1, appendix_heading_lines
+    line = appendix_heading_lines[0]
+    assert line.startswith("# "), f"Expected H1 heading, got {line!r}"
+    assert not line.startswith("## "), f"Heading regressed to H2: {line!r}"
+
+
+def test_subsection_headings_are_h2_not_h3():
+    """Sub-sections must be H2 so they're clearly subordinated to
+    the H1 appendix heading + visually distinct from the H3
+    ### Topic sub-headings the prompt uses inside # Notes."""
+    out = build_appendix_markdown(_DATA_FULL)
+    expected = {
+        "Attendee Context",
+        "Attendee Details",
+        "Suggested Topics",
+        "Referenced Attachments",
+        "Session Attachments",
+        "Links",
+    }
+    for line in out.splitlines():
+        for name in expected:
+            if line.endswith(name) and line.lstrip("#").strip() == name:
+                # This is a heading line for one of the sub-sections.
+                assert line.startswith("## "), (
+                    f"Sub-section heading should be H2, got {line!r}"
+                )
+                assert not line.startswith("### "), (
+                    f"Sub-section heading regressed to H3: {line!r}"
+                )
 
 
 def test_build_appendix_markdown_omits_empty_sections():
@@ -53,10 +99,10 @@ def test_build_appendix_markdown_omits_empty_sections():
         session_attachments=[], links=[],
     )
     out = build_appendix_markdown(data)
-    assert "### Suggested Topics" in out
-    assert "### Attendee Context" not in out
-    assert "### Attendee Details" not in out
-    assert "### Links" not in out
+    assert "## Suggested Topics" in out
+    assert "## Attendee Context" not in out
+    assert "## Attendee Details" not in out
+    assert "## Links" not in out
 
 
 def test_build_appendix_markdown_empty_when_no_data():
@@ -113,10 +159,10 @@ synthesis prose
     assert "Attendee Details (auto-extracted)" not in out
     # Synthesis body survives.
     assert "synthesis prose" in out
-    # Rendered appendix appears.
-    assert "## Appendix (auto-extracted)" in out
-    assert "### Attendee Details" in out
-    assert "### Suggested Topics" in out
+    # Rendered appendix appears (v0.7.5 heading levels: H1 + H2).
+    assert "# Appendix (auto-extracted)" in out
+    assert "## Attendee Details" in out
+    assert "## Suggested Topics" in out
 
 
 def test_inject_appendix_no_data_just_strips():
@@ -140,8 +186,9 @@ body
 
 def test_inject_appendix_preserves_user_appendix_heading():
     """A user's own '## Appendix' heading isn't touched; the
-    rendered section uses '## Appendix (auto-extracted)' so the
-    two coexist."""
+    rendered section uses '# Appendix (auto-extracted)' (a
+    different heading level + the explicit suffix) so the two
+    coexist."""
     source = """# TL;DR
 body
 
@@ -159,7 +206,7 @@ User-written appendix content here.
     out = inject_appendix(source, data)
     assert "## Appendix\n" in out  # user heading preserved
     assert "User-written appendix content here." in out
-    assert "## Appendix (auto-extracted)" in out
+    assert "# Appendix (auto-extracted)" in out
 
 
 def test_collect_from_markdown_picks_up_links_from_live_notes():

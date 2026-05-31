@@ -483,25 +483,40 @@ def shot_new_session() -> None:
 
 
 def shot_settings() -> None:
+    """Capture the redesigned Settings dialog (v0.7.5).
+
+    The dialog is now nav-on-left + stacked-pages-on-right (no more
+    single long scroll). The default 900x650 resize fits the widest
+    section without horizontal scroll; we land on the Synthesis page
+    because Automation is pre-enabled here, which surfaces the most
+    interesting controls (target picker, Claude project, install
+    buttons) plus the Prompt Templates sub-group below."""
     cfg = Config()
     cfg.ui.user_name = USER_NAME
-    # Pre-enable synthesis automation so the new section's controls
-    # (target picker, Claude project field, install/uninstall) are
-    # all visible in the screenshot. Default (False) would still
-    # show the group but the placeholder text/help reads better
-    # when the picker has its real selected target shown.
     cfg.synthesis.automation_enabled = True
     cfg.synthesis.llm_target = "claude"
+    # Land on Synthesis so the merged page is what readers see.
+    cfg.ui.settings_active_section = "Synthesis"
     dlg = SettingsDialog(cfg)
-    # The dialog has a scroll area; force-resize to a tall window
-    # so the full content is visible (rather than just the
-    # Transcription group at the top). v0.6.3 added the synthesis
-    # automation + prompts groups at the bottom -- bumped from 1200
-    # to 1600 to accommodate.
-    dlg.resize(680, 1600)
+    dlg.resize(900, 650)
     dlg.show()
     QApplication.processEvents()
     _grab(dlg, "07-dialog-settings.png", autosize=False)
+    dlg.close()
+
+
+def shot_settings_backups() -> None:
+    """v0.7.5 Backups page -- shown separately so the OneDrive notes
+    + schedule radio + retention spinboxes are readable in the README's
+    Backups section without forcing the reader to zoom in."""
+    cfg = Config()
+    cfg.ui.user_name = USER_NAME
+    cfg.ui.settings_active_section = "Backups"
+    dlg = SettingsDialog(cfg)
+    dlg.resize(900, 650)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "26-dialog-settings-backups.png", autosize=False)
     dlg.close()
 
 
@@ -831,6 +846,7 @@ def main() -> int:
     shot_main_attachments()
     shot_new_session()
     shot_settings()
+    shot_settings_backups()
     shot_generate_prompt()
     shot_paste_response()
     shot_new_session_calendar_prefill()

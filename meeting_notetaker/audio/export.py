@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -60,6 +60,8 @@ def export_mixed(
     mic_path: Optional[Path],
     sys_path: Optional[Path],
     dst_path: Path,
+    *,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
     """Mix the two source files into dst_path; format inferred from suffix.
 
@@ -95,6 +97,7 @@ def export_mixed(
         dst_path=dst_path,
         codec_name=codec_name,
         container_format=container_format,
+        should_cancel=should_cancel,
     )
 
 
@@ -151,10 +154,23 @@ def _encode_mono_float32(
     dst_path: Path,
     codec_name: str,
     container_format: Optional[str],
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> None:
-    """Stream samples through the chosen codec, write to dst_path."""
+    """Stream samples through the chosen codec, write to dst_path.
+
+    Optional ``should_cancel`` lets the orchestrator abort the
+    encode mid-loop without waiting for the whole pass to finish
+    (#73 finding #4 -- previously the cancel signal had no effect
+    here even though the highlights-audio path's comment claimed
+    otherwise). Checked at chunk boundaries; raises
+    ``ExportCancelled`` which the export_mixed /
+    export_highlights_audio callers' except blocks already handle
+    by removing the partial output.
+    """
     import av  # noqa: PLC0415
     from av.audio.frame import AudioFrame  # noqa: PLC0415
+
+    from ..utils.cancellation import raise_if_cancelled  # noqa: PLC0415
 
     try:
         out_container = av.open(
@@ -178,6 +194,7 @@ def _encode_mono_float32(
 
         try:
             for i in range(0, samples.size, _FRAMES_PER_CHUNK):
+                raise_if_cancelled(should_cancel, "audio encode")
                 chunk = samples[i : i + _FRAMES_PER_CHUNK]
                 frame = AudioFrame.from_ndarray(
                     chunk.reshape(1, -1), format="flt", layout=_TARGET_LAYOUT,

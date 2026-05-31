@@ -29,8 +29,10 @@ A couple of ground rules I care about:
 - The `name` field is required on every object. Use the attendee's
   full name as it appears in the meeting.
 - Phone numbers go in a `phone` field, any format is fine.
-- Put this section LAST in your response so I can scan the synthesis
-  without scrolling past it.
+- Put this section near the end of your response (after the main
+  synthesis sections) so I can scan the synthesis without scrolling
+  past it. Other auto-extracted appendix sections may follow this
+  one; order among the appendix sections doesn't matter.
 
 This is for my own contact records -- I review what you extracted and
 my app fills in any details I don't already have. Thanks.

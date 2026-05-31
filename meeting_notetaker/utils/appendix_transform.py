@@ -2,10 +2,11 @@
 
 Reads the raw JSON appendix blocks from a session's markdown buffer
 (notes.md and / or live_notes.md), strips the raw blocks, and
-appends a single ``## Appendix (auto-extracted)`` Markdown section
-with sub-headings for each data type rendered as friendly Markdown
-tables. Source buffer remains untouched -- this is a render-time
-transform only.
+appends a single ``# Appendix (auto-extracted)`` Markdown section
+(H1 -- top-level peer of the bundled prompt's H1 sections) with
+``## X`` sub-headings for each data type rendered as friendly
+Markdown tables. Source buffer remains untouched -- this is a
+render-time transform only.
 
 Sub-sections (in order):
 1. Attendee Context (#63)
@@ -36,7 +37,15 @@ from . import (
 )
 
 
-_APPENDIX_HEADING = "## Appendix (auto-extracted)"
+# H1 so the appendix sits as a top-level peer of the synthesis
+# sections (# Attendees, # Decisions, # Notes, # Open Questions,
+# etc.) that the bundled default.md prompt produces. Sub-sections
+# below use H2 so they're clearly subordinated to the appendix and
+# distinct from the H3 ### Topic headings used inside # Notes.
+# Pre-v0.7.5 used ## here which rendered as a subsection of the
+# preceding H1 (typically # Open Questions).
+_APPENDIX_HEADING = "# Appendix (auto-extracted)"
+_SUBSECTION_LEVEL = "## "
 
 
 @dataclass
@@ -163,7 +172,12 @@ def _md_escape(s: str) -> str:
 
 
 def _render_attendee_context(entries) -> str:
-    rows = ["### Attendee Context", "", "| Name | Observation |", "|------|-------------|"]
+    rows = [
+        f"{_SUBSECTION_LEVEL}Attendee Context",
+        "",
+        "| Name | Observation |",
+        "|------|-------------|",
+    ]
     for e in entries:
         rows.append(f"| {_md_escape(e.name)} | {_md_escape(e.observation)} |")
     return "\n".join(rows)
@@ -171,7 +185,7 @@ def _render_attendee_context(entries) -> str:
 
 def _render_attendee_details(entries) -> str:
     rows = [
-        "### Attendee Details",
+        f"{_SUBSECTION_LEVEL}Attendee Details",
         "",
         "| Name | Title | Company | Email | Phone |",
         "|------|-------|---------|-------|-------|",
@@ -192,7 +206,7 @@ def _render_attendee_details(entries) -> str:
 
 
 def _render_topics(topics) -> str:
-    lines = ["### Suggested Topics", ""]
+    lines = [f"{_SUBSECTION_LEVEL}Suggested Topics", ""]
     for t in topics:
         lines.append(f"- {_md_escape(t)}")
     return "\n".join(lines)
@@ -200,7 +214,7 @@ def _render_topics(topics) -> str:
 
 def _render_referenced_attachments(entries) -> str:
     rows = [
-        "### Referenced Attachments",
+        f"{_SUBSECTION_LEVEL}Referenced Attachments",
         "",
         "| Name | Context |",
         "|------|---------|",
@@ -211,14 +225,14 @@ def _render_referenced_attachments(entries) -> str:
 
 
 def _render_session_attachments(names) -> str:
-    lines = ["### Session Attachments", ""]
+    lines = [f"{_SUBSECTION_LEVEL}Session Attachments", ""]
     for n in names:
         lines.append(f"- {_md_escape(n)}")
     return "\n".join(lines)
 
 
 def _render_links(links) -> str:
-    lines = ["### Links", ""]
+    lines = [f"{_SUBSECTION_LEVEL}Links", ""]
     for link in links:
         if link.label and link.label != link.url:
             lines.append(f"- [{_md_escape(link.label)}]({link.url})")

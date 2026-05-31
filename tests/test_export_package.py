@@ -123,7 +123,7 @@ def patched_heavies():
     ) as full_video, patch(
         "meeting_notetaker.utils.export_package._export_highlights_video"
     ) as hl_video:
-        def _write_audio_stub(mic, sys_, dst, progress):
+        def _write_audio_stub(mic, sys_, dst, progress, *, should_cancel=None):
             Path(dst).write_bytes(b"fake mp3")
             progress(100)
         full_audio.side_effect = _write_audio_stub

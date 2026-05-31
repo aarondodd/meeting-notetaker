@@ -175,6 +175,62 @@ def test_strip_appendix_noop_when_missing():
     assert strip_appendix(md) == md
 
 
+def test_strip_appendix_preserves_following_section():
+    """The bounded regex (post-#73 finding #1) must stop at the
+    next H2 instead of greedily consuming the rest of the
+    document. Without the bound, user-authored content + later
+    appendix sections were silently lost on strip-on-save."""
+    md = """# TL;DR
+body
+
+## Attendee Details (auto-extracted)
+
+```json
+[{"name": "Bob"}]
+```
+
+## My Personal Notes
+
+User-authored content that must survive the strip.
+
+## Suggested Topics (auto-extracted)
+
+```json
+["Topic A"]
+```
+"""
+    out = strip_appendix(md)
+    assert "Attendee Details (auto-extracted)" not in out
+    assert "## My Personal Notes" in out
+    assert "User-authored content that must survive the strip." in out
+    assert "## Suggested Topics (auto-extracted)" in out
+
+
+def test_parse_appendix_stops_at_next_h2_heading():
+    """The bounded regex must scope the appendix to the next H2
+    so JSON entries from a later appendix don't leak into this
+    one's payload."""
+    md = """## Attendee Details (auto-extracted)
+
+```json
+[{"name": "Bob", "title": "CEO"}]
+```
+
+## Attendee Context (auto-extracted)
+
+```json
+[{"name": "Mary", "observation": "led the call"}]
+```
+"""
+    entries = parse_appendix(md)
+    # Only Bob from the Attendee Details section; Mary's
+    # context-observation shape doesn't have a title field, so
+    # if it leaked we'd see two entries.
+    assert len(entries) == 1
+    assert entries[0].name == "Bob"
+    assert entries[0].title == "CEO"
+
+
 # ---- find_appendix_span ----------------------------------------------------
 
 
