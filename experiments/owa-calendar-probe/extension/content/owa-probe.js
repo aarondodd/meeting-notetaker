@@ -43,6 +43,8 @@ async function handleVerb(msg) {
       return attachmentsList(params || {});
     case "attachments.fetch":
       return attachmentsFetch(params || {});
+    case "diagnose":
+      return diagnose(params || {});
     default:
       return {
         ok: false,
@@ -54,6 +56,155 @@ async function handleVerb(msg) {
         owa_build: MN_PROBE.owaBuild(),
       };
   }
+}
+
+// Diagnostic verb: introspect the OWA tab's runtime + probe a set of
+// candidate API roots. Returns a structured report so we can pick the
+// right endpoint without iterating the manifest's host_permissions.
+async function diagnose(params) {
+  const report = {
+    location_href: location.href,
+    location_origin: location.origin,
+    document_title: document.title,
+    has_window_owa: typeof window.Owa !== "undefined",
+    owa_local_settings: null,
+    meta_tags: {},
+    cookies_sample: document.cookie ? "(present, len=" + document.cookie.length + ")" : "(none)",
+    candidate_probes: [],
+  };
+
+  // Meta tag dump -- the OWA SPA emits a ton of these and they often
+  // include the API path + build hash.
+  document.querySelectorAll("meta[name]").forEach((m) => {
+    const name = m.getAttribute("name");
+    const value = m.getAttribute("content");
+    if (name && value !== null) {
+      report.meta_tags[name] = value;
+    }
+  });
+
+  // window.Owa exposes some build + endpoint config when the SPA has
+  // booted. Snapshot the parts that are likely to point at the real
+  // API.
+  try {
+    if (window.Owa) {
+      const o = window.Owa;
+      report.owa_local_settings = {
+        keys: Object.keys(o).slice(0, 50),
+        localSettings: o.LocalSettings ? Object.keys(o.LocalSettings).slice(0, 30) : null,
+      };
+    }
+  } catch (e) {
+    report.owa_local_settings = { error: String(e) };
+  }
+
+  // Probe each candidate API root. We're looking for one that returns
+  // JSON content-type with a real status code. The candidates are
+  // ordered from most-modern to most-legacy.
+  const start = new Date(Date.now() - 12 * 3600 * 1000).toISOString();
+  const end = new Date(Date.now() + 36 * 3600 * 1000).toISOString();
+  const candidates = [
+    {
+      name: "owa_action_GetCalendarView_POST",
+      method: "POST",
+      url: location.origin +
+        "/owa/service.svc?action=GetCalendarView&app=Calendar",
+      body: JSON.stringify({
+        __type: "GetCalendarViewJsonRequest:#Exchange",
+        Header: {
+          __type: "JsonRequestHeaders:#Exchange",
+          RequestServerVersion: "V2018_01_08",
+        },
+        Body: {
+          __type: "GetCalendarViewRequest:#Exchange",
+          StartDate: start,
+          EndDate: end,
+          FolderId: { __type: "FolderId:#Exchange", BaseFolderId: { __type: "DistinguishedFolderId:#Exchange", Id: "calendar" }, },
+        },
+      }),
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Accept": "application/json",
+        "X-OWA-CANARY": _readCookie("X-OWA-CANARY"),
+      },
+    },
+    {
+      name: "graph_v10_calendarview",
+      method: "GET",
+      url: location.origin + "/api/Calendar/EventsViewV2" +
+        "?startDateTime=" + encodeURIComponent(start) +
+        "&endDateTime=" + encodeURIComponent(end),
+      headers: { "Accept": "application/json" },
+    },
+    {
+      name: "owa_internal_api_calendarview",
+      method: "GET",
+      url: location.origin + "/owa/0/api/v2.0/me/calendarview" +
+        "?startDateTime=" + encodeURIComponent(start) +
+        "&endDateTime=" + encodeURIComponent(end),
+      headers: { "Accept": "application/json" },
+    },
+    {
+      name: "outlook_office365_internal",
+      method: "GET",
+      url: "https://outlook.office365.com/owa/0/api/v2.0/me/calendarview" +
+        "?startDateTime=" + encodeURIComponent(start) +
+        "&endDateTime=" + encodeURIComponent(end),
+      headers: { "Accept": "application/json" },
+    },
+  ];
+
+  for (const c of candidates) {
+    try {
+      const r = await fetch(c.url, {
+        method: c.method,
+        credentials: "include",
+        headers: c.headers,
+        body: c.body || undefined,
+      });
+      const ct = r.headers.get("content-type") || "";
+      const bodyPreview = ct.indexOf("json") >= 0
+        ? await r.json().then((j) => ({ keys: Object.keys(j).slice(0, 8) }))
+            .catch((e) => "json_parse_error: " + e.message)
+        : (await r.text().then((t) => t.slice(0, 240)).catch(() => "(unreadable)"));
+      report.candidate_probes.push({
+        name: c.name,
+        url: c.url,
+        status: r.status,
+        content_type: ct,
+        body_preview: bodyPreview,
+        ok: r.ok,
+      });
+    } catch (e) {
+      report.candidate_probes.push({
+        name: c.name,
+        url: c.url,
+        error: String(e && e.message ? e.message : e),
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    url: location.href,
+    body: report,
+    headers: {},
+    error: "",
+    owa_build: MN_PROBE.owaBuild(),
+  };
+}
+
+function _readCookie(name) {
+  const all = document.cookie || "";
+  const parts = all.split(";");
+  for (const p of parts) {
+    const eq = p.indexOf("=");
+    if (eq < 0) continue;
+    const k = p.slice(0, eq).trim();
+    if (k === name) return decodeURIComponent(p.slice(eq + 1));
+  }
+  return "";
 }
 
 function calendarFetch(params) {

@@ -50,10 +50,47 @@ def host_wrapper_path() -> Path:
     return data_dir() / "native_host.sh"
 
 
+def native_host_manifest_paths() -> list[Path]:
+    """JSON manifest locations Chrome/Edge read to learn where the
+    native host lives.
+
+    Windows: a single bundled manifest under the probe data dir; the
+    HKCU registry value points at it.
+
+    POSIX (dev box): every browser has its own NMH directory. We
+    install into all of them whose parent dir exists -- Chrome,
+    Chromium, Chrome Beta/Dev, Edge, Edge Beta/Dev. The browser
+    only reads its own dir, so installing in all of them is a
+    convenience for switching browsers without re-running the
+    installer."""
+    if os.name == "nt":
+        return [data_dir() / "com.meeting_notetaker.probe.json"]
+
+    candidates = [
+        Path.home() / ".config" / "google-chrome",
+        Path.home() / ".config" / "google-chrome-beta",
+        Path.home() / ".config" / "google-chrome-dev",
+        Path.home() / ".config" / "chromium",
+        Path.home() / ".config" / "microsoft-edge",
+        Path.home() / ".config" / "microsoft-edge-beta",
+        Path.home() / ".config" / "microsoft-edge-dev",
+    ]
+    return [
+        c / "NativeMessagingHosts" / "com.meeting_notetaker.probe.json"
+        for c in candidates
+        if c.exists()
+    ]
+
+
 def native_host_manifest_path() -> Path:
-    """JSON manifest Chrome reads to learn where the host lives. On
-    Windows the registry value points HERE; on POSIX (dev only),
-    Chrome looks under ~/.config/google-chrome/NativeMessagingHosts/."""
+    """Legacy single-path accessor. Returns the first install target
+    (Chrome's NMH dir on POSIX; the bundled path on Windows). Tests
+    + uninstall use native_host_manifest_paths() for the full set."""
+    paths = native_host_manifest_paths()
+    if paths:
+        return paths[0]
+    # No browser config dir exists yet -- fall back to Chrome's path
+    # so install_host can create the dir tree.
     if os.name == "nt":
         return data_dir() / "com.meeting_notetaker.probe.json"
     return (

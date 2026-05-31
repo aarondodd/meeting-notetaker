@@ -1,0 +1,85 @@
+{
+  "_capture_note": "Sampled from the 2026-05-31 bg-fetch-calendar run against Aaron's personal M365 tenant. Source endpoint: https://outlook.office365.com/api/v2.0/me/calendarview. Email local-parts redacted to ***@<domain>; Teams URLs + opaque IDs left intact because they're already per-meeting unguessable.",
+  "@odata.context": "https://outlook.office365.com/api/v2.0/$metadata#Me/CalendarView",
+  "value": [
+    {
+      "@odata.id": "https://outlook.office365.com/api/v2.0/Users('600d5719-65d8-4459-85fe-971f9de4c989')/Events('redacted-event-1')",
+      "@odata.etag": "W/\"Q9LhCIi1SUi76awJXgWrAgADsJdEIA==\"",
+      "Id": "AAMkADlkYTVkMmMyLTIyNzQtNGQ1Zi1iMWFhLThkOGI4ZDc0OWU4NgBGAAAAAADSGni2F6NLRJraBX86_event1",
+      "CreatedDateTime": "2026-05-31T21:27:30.590969Z",
+      "LastModifiedDateTime": "2026-05-31T21:33:24.2188319Z",
+      "ChangeKey": "Q9LhCIi1SUi76awJXgWrAgADsJdEIA==",
+      "Categories": [],
+      "OriginalStartTimeZone": "Hawaiian Standard Time",
+      "OriginalEndTimeZone": "Hawaiian Standard Time",
+      "iCalUId": "040000008200E00074C5B7101A82E008000000006492684944F1DC0100000000000000001000000000000000",
+      "Uid": "040000008200E00074C5B7101A82E008000000006492684944F1DC0100000000000000001000000000000000",
+      "ReminderMinutesBeforeStart": 15,
+      "IsReminderOn": true,
+      "HasAttachments": false,
+      "Subject": "Test 1",
+      "BodyPreview": "Microsoft Teams meeting -- join URL elided in fixture",
+      "Importance": "Normal",
+      "Sensitivity": "Normal",
+      "IsAllDay": false,
+      "IsCancelled": false,
+      "IsOrganizer": true,
+      "ResponseRequested": true,
+      "SeriesMasterId": null,
+      "ShowAs": "Busy",
+      "Type": "SingleInstance",
+      "WebLink": "https://outlook.office365.com/owa/?itemid=redacted&path=/calendar/item",
+      "OnlineMeetingUrl": null,
+      "IsOnlineMeeting": true,
+      "OnlineMeetingProvider": "TeamsForBusiness",
+      "ResponseStatus": {"Response": "Organizer", "Time": "0001-01-01T00:00:00Z"},
+      "Body": {
+        "ContentType": "HTML",
+        "Content": "<html><body><span>Microsoft Teams meeting</span><br><a href=\"https://teams.microsoft.com/meet/redacted\">https://teams.microsoft.com/meet/redacted</a></body></html>"
+      },
+      "Start": {"DateTime": "2026-05-31T22:30:00.0000000", "TimeZone": "UTC"},
+      "End": {"DateTime": "2026-05-31T23:00:00.0000000", "TimeZone": "UTC"},
+      "Location": {
+        "DisplayName": "Microsoft Teams Meeting",
+        "LocationType": "Default",
+        "UniqueId": "Microsoft Teams Meeting",
+        "UniqueIdType": "Private"
+      },
+      "Locations": [{
+        "DisplayName": "Microsoft Teams Meeting",
+        "LocationType": "Default",
+        "UniqueId": "Microsoft Teams Meeting",
+        "UniqueIdType": "Private"
+      }],
+      "Recurrence": null,
+      "Attendees": [{
+        "Type": "Required",
+        "Status": {"Response": "None", "Time": "0001-01-01T00:00:00Z"},
+        "EmailAddress": {"Name": "Aaron Dodd", "Address": "***@fhb.com"}
+      }],
+      "Organizer": {
+        "EmailAddress": {"Name": "Aaron Dodd", "Address": "***@aarondodd.com"}
+      },
+      "OnlineMeeting": {
+        "JoinUrl": "https://teams.microsoft.com/l/meetup-join/redacted-context"
+      }
+    },
+    {
+      "Id": "AAMkADlkYTVkMmMyLTIyNzQtNGQ1Zi1iMWFhLThkOGI4ZDc0OWU4NgBGAAAAAADSGni2F6NLRJraBX86_event2",
+      "Subject": "Test 2",
+      "HasAttachments": false,
+      "IsOnlineMeeting": false,
+      "Start": {"DateTime": "2026-05-31T23:30:00.0000000", "TimeZone": "UTC"},
+      "End":   {"DateTime": "2026-06-01T00:00:00.0000000", "TimeZone": "UTC"},
+      "Location": {"DisplayName": "", "LocationType": "Default"},
+      "Body": {"ContentType": "HTML", "Content": "<html><body><p>Solo block</p></body></html>"},
+      "Organizer": {"EmailAddress": {"Name": "Aaron Dodd", "Address": "***@aarondodd.com"}},
+      "Attendees": [],
+      "ResponseStatus": {"Response": "Organizer", "Time": "0001-01-01T00:00:00Z"},
+      "ShowAs": "Busy",
+      "Type": "SingleInstance",
+      "iCalUId": "040000008200E00074C5B7101A82E008_evt2",
+      "WebLink": "https://outlook.office365.com/owa/?itemid=redacted-evt2"
+    }
+  ]
+}

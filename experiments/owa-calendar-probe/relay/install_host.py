@@ -67,9 +67,17 @@ def _write_wrapper(python_exe: Path, native_host_py: Path) -> Path:
     return wrapper
 
 
-def _write_manifest(wrapper: Path) -> Path:
-    manifest_path = paths.native_host_manifest_path()
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+def _write_manifest(wrapper: Path) -> list[Path]:
+    """Write the NMH manifest to every browser config dir that exists
+    (Chrome, Chromium, Edge, plus their beta/dev channels). On Windows
+    we write a single bundled file and rely on HKCU pointing at it.
+
+    Returns the list of paths actually written."""
+    targets = paths.native_host_manifest_paths()
+    if not targets:
+        # Edge cases (no browser config dirs yet) -- create Chrome's
+        # so the file system has a landing pad.
+        targets = [paths.native_host_manifest_path()]
     manifest = {
         "name": NATIVE_HOST_NAME,
         "description": (
@@ -81,8 +89,13 @@ def _write_manifest(wrapper: Path) -> Path:
         "type": "stdio",
         "allowed_origins": [f"chrome-extension://{EXTENSION_ID}/"],
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return manifest_path
+    body = json.dumps(manifest, indent=2)
+    written: list[Path] = []
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        written.append(target)
+    return written
 
 
 def _register_windows(manifest_path: Path, *, include_edge: bool) -> list[str]:
@@ -133,14 +146,18 @@ def install(*, include_edge: bool = True) -> dict:
         )
 
     wrapper = _write_wrapper(python_exe, native_host_py)
-    manifest = _write_manifest(wrapper)
-    registry = _register_windows(manifest, include_edge=include_edge)
+    manifests = _write_manifest(wrapper)
+    # On Windows the registry pointer always references the first
+    # (bundled) manifest; on POSIX there is no registry, just the
+    # browser-managed dirs the manifests already live in.
+    registry_target = manifests[0] if manifests else paths.native_host_manifest_path()
+    registry = _register_windows(registry_target, include_edge=include_edge)
 
     return {
         "extension_id": EXTENSION_ID,
         "native_host_name": NATIVE_HOST_NAME,
         "wrapper": str(wrapper),
-        "manifest": str(manifest),
+        "manifests": [str(m) for m in manifests],
         "registry_paths": registry,
         "python_exe": str(python_exe),
     }
@@ -148,7 +165,14 @@ def install(*, include_edge: bool = True) -> dict:
 
 def uninstall(*, include_edge: bool = True) -> dict:
     removed_paths: list[str] = []
-    for p in (paths.host_wrapper_path(), paths.native_host_manifest_path()):
+    targets: list[Path] = [paths.host_wrapper_path()]
+    targets.extend(paths.native_host_manifest_paths())
+    # Also try the legacy single-path location in case the file was
+    # written by an older install with the Chrome-only path layout.
+    legacy = paths.native_host_manifest_path()
+    if legacy not in targets:
+        targets.append(legacy)
+    for p in targets:
         if p.exists():
             try:
                 p.unlink()

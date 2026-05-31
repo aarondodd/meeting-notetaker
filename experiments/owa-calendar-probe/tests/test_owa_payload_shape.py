@@ -138,6 +138,156 @@ def test_attachments_list_handles_missing_value_key():
     assert parser.parse_attachments_list({}) == []
 
 
+# ---- Outlook REST v2.0 PascalCase shape (real-shape from probe) -----------
+#
+# These test against the JSON shape outlook.office365.com/api/v2.0
+# actually returns. The 2026-05-31 probe validated that this is the
+# path that works on the cloud.microsoft Outlook host without an
+# Entra app registration. The Graph-style camelCase fixture above is
+# kept because the prod merge will eventually try Graph too (or as a
+# fallback) and the parser must accept both shapes.
+
+
+def test_outlook_rest_returns_two_events():
+    payload = _load("calendarview-outlook-rest-redacted.json")
+    meetings = parser.parse_calendarview(payload)
+    assert len(meetings) == 2
+
+
+def test_outlook_rest_pascal_case_event_basics():
+    payload = _load("calendarview-outlook-rest-redacted.json")
+    m = parser.parse_calendarview(payload)[0]
+    assert m.subject == "Test 1"
+    assert m.event_id.startswith("AAMkADlk")
+    assert m.location == "Microsoft Teams Meeting"
+    assert m.is_online_meeting is True
+    assert m.online_meeting_url.startswith("https://teams.microsoft.com/l/meetup-join/")
+    assert m.has_attachments is False
+    assert m.start_utc is not None
+    assert m.end_utc is not None
+    assert m.start_utc < m.end_utc
+    # Web link round-trip.
+    assert m.web_link.startswith("https://outlook.office365.com/")
+
+
+def test_outlook_rest_organizer_split():
+    payload = _load("calendarview-outlook-rest-redacted.json")
+    m = parser.parse_calendarview(payload)[0]
+    assert m.organizer_name == "Aaron Dodd"
+    assert "@" in m.organizer_email
+    # Redaction stripped the local part but the domain survives so
+    # downstream tenant routing can still infer it.
+    assert m.organizer_email.endswith("@aarondodd.com")
+
+
+def test_outlook_rest_attendees_with_external_invitee():
+    """First fixture event has Aaron's FHB address as the attendee.
+    This is the cross-tenant invite case that mattered for the live
+    probe: the meeting was on his personal tenant; the attendee is
+    on a different (FHB) tenant. The parser must preserve both
+    name and email even when redacted."""
+    payload = _load("calendarview-outlook-rest-redacted.json")
+    m = parser.parse_calendarview(payload)[0]
+    assert len(m.attendees) == 1
+    att = m.attendees[0]
+    assert att.name == "Aaron Dodd"
+    assert att.email.endswith("@fhb.com")
+    assert att.attendee_type == "Required"
+
+
+def test_outlook_rest_body_html_extracted_and_stripped():
+    payload = _load("calendarview-outlook-rest-redacted.json")
+    m = parser.parse_calendarview(payload)[0]
+    assert "<html>" in m.body_html
+    # body_text must be HTML-free.
+    assert "<" not in m.body_text
+    assert "Microsoft Teams meeting" in m.body_text
+
+
+def test_outlook_rest_handles_empty_attendees_and_location():
+    payload = _load("calendarview-outlook-rest-redacted.json")
+    m = parser.parse_calendarview(payload)[1]
+    assert m.subject == "Test 2"
+    assert m.attendees == []
+    assert m.location == ""
+    assert m.is_online_meeting is False
+
+
+def test_people_outlook_rest_returns_two_entries():
+    payload = _load("people-outlook-rest-redacted.json")
+    people = parser.parse_people_lookup(payload)
+    assert len(people) == 2
+
+
+def test_people_outlook_rest_organization_user_enrichment():
+    """Tenant-resolved person -- PersonType.Subclass = OrganizationUser.
+    On the personal tenant tested, JobTitle/Company/Department come
+    back null; the OWA user is the tenant owner and the tenant has no
+    HR-style admin filling those fields. Enterprise tenants like FHB
+    populate them. The parser should preserve nulls as empty strings
+    so downstream code doesn't have to special-case None."""
+    payload = _load("people-outlook-rest-redacted.json")
+    person = parser.parse_people_lookup(payload)[0]
+    assert person["display_name"] == "Aaron Dodd"
+    assert person["given_name"] == "Aaron"
+    assert person["surname"] == "Dodd"
+    assert person["person_type"] == "OrganizationUser"
+    assert person["email"].endswith("@aarondodd.com")
+    # Null enrichment fields collapse to empty strings.
+    assert person["job_title"] == ""
+    assert person["company_name"] == ""
+    assert person["department"] == ""
+
+
+def test_people_outlook_rest_implicit_contact():
+    """External invitee -- on a different tenant from the OWA user.
+    PersonType.Subclass = ImplicitContact. No GivenName/Surname, no
+    UPN, no IM address; just the email + Display Name + a high
+    RelevanceScore proving the user has corresponded with this
+    address before."""
+    payload = _load("people-outlook-rest-redacted.json")
+    person = parser.parse_people_lookup(payload)[1]
+    assert person["display_name"] == "Aaron Dodd"
+    assert person["person_type"] == "ImplicitContact"
+    assert person["email"].endswith("@fhb.com")
+    assert person["given_name"] == ""
+    assert person["surname"] == ""
+    # Same null-as-empty contract for enrichment fields.
+    assert person["job_title"] == ""
+    assert person["company_name"] == ""
+
+
+def test_parser_accepts_both_casings_in_one_payload():
+    """Mixed-shape payloads shouldn't happen in practice but the
+    parser should not crash if some events are PascalCase and
+    others camelCase (e.g. a hypothetical layered fallback that
+    merged responses from both endpoints)."""
+    mixed = {
+        "value": [
+            {  # PascalCase
+                "Id": "evt-pascal",
+                "Subject": "Pascal one",
+                "Start": {"DateTime": "2026-06-01T10:00:00.0000000", "TimeZone": "UTC"},
+                "End":   {"DateTime": "2026-06-01T10:30:00.0000000", "TimeZone": "UTC"},
+                "Attendees": [],
+                "Organizer": {"EmailAddress": {"Name": "P", "Address": "p@x.com"}},
+            },
+            {  # camelCase
+                "id": "evt-camel",
+                "subject": "Camel one",
+                "start": {"dateTime": "2026-06-01T11:00:00.0000000", "timeZone": "UTC"},
+                "end":   {"dateTime": "2026-06-01T11:30:00.0000000", "timeZone": "UTC"},
+                "attendees": [],
+                "organizer": {"emailAddress": {"name": "C", "address": "c@x.com"}},
+            },
+        ],
+    }
+    out = parser.parse_calendarview(mixed)
+    assert len(out) == 2
+    assert {m.subject for m in out} == {"Pascal one", "Camel one"}
+    assert {m.event_id for m in out} == {"evt-pascal", "evt-camel"}
+
+
 # ---- capture redaction ----------------------------------------------------
 
 

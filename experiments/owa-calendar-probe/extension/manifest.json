@@ -32,13 +32,16 @@
   ],
   "host_permissions": [
     "*://outlook.office.com/*",
-    "*://outlook.office365.com/*"
+    "*://outlook.office365.com/*",
+    "*://outlook.cloud.microsoft/*",
+    "*://graph.microsoft.com/*"
   ],
   "content_scripts": [
     {
       "matches": [
         "*://outlook.office.com/*",
-        "*://outlook.office365.com/*"
+        "*://outlook.office365.com/*",
+        "*://outlook.cloud.microsoft/*"
       ],
       "js": ["content/common.js", "content/owa-probe.js"],
       "run_at": "document_idle"

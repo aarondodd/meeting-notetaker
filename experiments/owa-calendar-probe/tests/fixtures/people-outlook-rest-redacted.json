@@ -1,0 +1,62 @@
+{
+  "_capture_note": "Sampled from 2026-05-31 bg-fetch-people runs against Aaron's personal M365 tenant. Source endpoint: https://outlook.office365.com/api/v2.0/me/people?$search=...&$top=5. Two distinct responses combined into one fixture: (1) OrganizationUser case from looking up the OWA user's own primary address, (2) ImplicitContact case from looking up adodd@fhb.com (a different tenant's user the OWA user has corresponded with). UUIDs replaced with fixture-stable placeholders; email local parts redacted to ***@<domain>; phone digits replaced with 5555555555.",
+  "@odata.context": "https://outlook.office365.com/api/v2.0/$metadata#Me/People",
+  "value": [
+    {
+      "@odata.id": "https://outlook.office365.com/api/v2.0/Users('fixture-user-id@fixture-tenant-id')/People('fixture-user-id@fixture-tenant-id')",
+      "Id": "fixture-user-id@fixture-tenant-id",
+      "DisplayName": "Aaron Dodd",
+      "GivenName": "Aaron",
+      "Surname": "Dodd",
+      "Birthday": null,
+      "PersonNotes": null,
+      "IsFavorite": false,
+      "JobTitle": null,
+      "CompanyName": null,
+      "YomiCompany": null,
+      "Department": null,
+      "OfficeLocation": null,
+      "Profession": null,
+      "UserPrincipalName": "***@aarondodd.com",
+      "IMAddress": "sip:***@aarondodd.com",
+      "ScoredEmailAddresses": [
+        {
+          "Address": "***@aarondodd.com",
+          "RelevanceScore": 1,
+          "SelectionLikelihood": "NotSpecified"
+        }
+      ],
+      "Phones": [
+        {"Type": "Business", "Number": "5555555555"}
+      ],
+      "PersonType": {"Class": "Person", "Subclass": "OrganizationUser"}
+    },
+    {
+      "@odata.id": "https://outlook.office365.com/api/v2.0/Users('fixture-user-id@fixture-tenant-id')/People('fixture-implicit-contact-id')",
+      "Id": "Q7D7BaJbzk6hg2yqdL09lg==",
+      "DisplayName": "Aaron Dodd",
+      "GivenName": null,
+      "Surname": null,
+      "Birthday": null,
+      "PersonNotes": null,
+      "IsFavorite": false,
+      "JobTitle": null,
+      "CompanyName": null,
+      "YomiCompany": null,
+      "Department": null,
+      "OfficeLocation": null,
+      "Profession": null,
+      "UserPrincipalName": null,
+      "IMAddress": null,
+      "ScoredEmailAddresses": [
+        {
+          "Address": "***@fhb.com",
+          "RelevanceScore": 898,
+          "SelectionLikelihood": "NotSpecified"
+        }
+      ],
+      "Phones": [],
+      "PersonType": {"Class": "Person", "Subclass": "ImplicitContact"}
+    }
+  ]
+}
