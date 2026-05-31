@@ -877,13 +877,10 @@ class SettingsDialog(QDialog):
         backup_group = QGroupBox("Backups", self)
         backup_layout = QVBoxLayout(backup_group)
         backup_blurb = QLabel(
-            "Local-machine SPOF mitigation. Pick a destination folder "
-            "(external drive, NAS, or OneDrive -- the snapshot zips are "
-            "atomic-once-closed so OneDrive's lock-on-modify issue does "
-            "not apply to them) plus a schedule, and the app writes "
-            "timestamped zips you can restore from at any time. The "
-            "data dir itself must stay on local disk -- OneDrive sync "
-            "corrupts SQLite WAL files.",
+            "Creates a zip archive of the internal application folder "
+            "(under %APPDATA%\MeetingNotetaker on Windows) with all "
+            "meeting notes, synthesis, and application settings "
+            "(speakers, addressbook, app config, etc.). ",
             self,
         )
         backup_blurb.setWordWrap(True)
