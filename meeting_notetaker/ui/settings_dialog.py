@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSlider,
     QSpinBox,
@@ -849,6 +851,133 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(export_group)
 
+        # Backups group (#67) ---------------------------------------------
+        backup_group = QGroupBox("Backups", self)
+        backup_layout = QVBoxLayout(backup_group)
+        backup_blurb = QLabel(
+            "Local-machine SPOF mitigation. Pick a destination folder "
+            "(external drive, NAS, or OneDrive -- the snapshot zips are "
+            "atomic-once-closed so OneDrive's lock-on-modify issue does "
+            "not apply to them) plus a schedule, and the app writes "
+            "timestamped zips you can restore from at any time. The "
+            "data dir itself must stay on local disk -- OneDrive sync "
+            "corrupts SQLite WAL files.",
+            self,
+        )
+        backup_blurb.setWordWrap(True)
+        backup_layout.addWidget(backup_blurb)
+
+        folder_row = QHBoxLayout()
+        folder_label = QLabel("Backup folder:", self)
+        folder_row.addWidget(folder_label)
+        self._backup_folder_edit = QLineEdit(self)
+        self._backup_folder_edit.setText(config.backup.folder or "")
+        self._backup_folder_edit.setPlaceholderText(
+            "(leave blank to disable scheduled backups)"
+        )
+        folder_row.addWidget(self._backup_folder_edit, 1)
+        browse_btn = QPushButton("Browse...", self)
+        browse_btn.clicked.connect(self._on_backup_folder_browse)
+        folder_row.addWidget(browse_btn)
+        backup_layout.addLayout(folder_row)
+
+        sched_label = QLabel("Schedule:", self)
+        backup_layout.addWidget(sched_label)
+        self._backup_sched_manual = QRadioButton(
+            "Manual only (Tools > Backup Now)", self,
+        )
+        self._backup_sched_on_close = QRadioButton(
+            "On app close", self,
+        )
+        self._backup_sched_when_idle = QRadioButton(
+            "When idle after configured time", self,
+        )
+        backup_layout.addWidget(self._backup_sched_manual)
+        backup_layout.addWidget(self._backup_sched_on_close)
+        backup_layout.addWidget(self._backup_sched_when_idle)
+        sched = config.backup.schedule or "manual"
+        if sched == "on_close":
+            self._backup_sched_on_close.setChecked(True)
+        elif sched == "when_idle":
+            self._backup_sched_when_idle.setChecked(True)
+        else:
+            self._backup_sched_manual.setChecked(True)
+
+        idle_form = QFormLayout()
+        self._backup_idle_minutes = QSpinBox(self)
+        self._backup_idle_minutes.setRange(1, 720)
+        self._backup_idle_minutes.setSuffix(" min")
+        self._backup_idle_minutes.setValue(
+            int(config.backup.idle_after_minutes or 30)
+        )
+        self._backup_idle_minutes.setToolTip(
+            "How long the app must sit without user input before the "
+            "idle scheduler fires a snapshot. Resets on any mouse or "
+            "keyboard activity."
+        )
+        idle_form.addRow("Idle after:", self._backup_idle_minutes)
+        self._backup_idle_hour = QSpinBox(self)
+        self._backup_idle_hour.setRange(0, 23)
+        self._backup_idle_hour.setValue(
+            int(config.backup.idle_after_hour or 19)
+        )
+        self._backup_idle_hour.setSuffix(":00 local")
+        self._backup_idle_hour.setToolTip(
+            "Earliest local hour the idle trigger may fire. Default "
+            "19:00 (7pm) so the backup doesn't kick in during the "
+            "workday."
+        )
+        idle_form.addRow("Only after:", self._backup_idle_hour)
+        backup_layout.addLayout(idle_form)
+
+        retention_form = QFormLayout()
+        self._backup_retention_count = QSpinBox(self)
+        self._backup_retention_count.setRange(0, 365)
+        self._backup_retention_count.setValue(
+            int(config.backup.retention_count or 7)
+        )
+        self._backup_retention_count.setSuffix(" snapshots")
+        self._backup_retention_count.setToolTip(
+            "Keep at most N most-recent snapshots. 0 disables this "
+            "gate (rely on the days cutoff instead). Pruning happens "
+            "silently after every snapshot."
+        )
+        retention_form.addRow(
+            "Keep newest:", self._backup_retention_count,
+        )
+        self._backup_retention_days = QSpinBox(self)
+        self._backup_retention_days.setRange(0, 3650)
+        self._backup_retention_days.setValue(
+            int(config.backup.retention_days or 30)
+        )
+        self._backup_retention_days.setSuffix(" days")
+        self._backup_retention_days.setToolTip(
+            "Drop snapshots older than D days. 0 disables this gate. "
+            "Applied alongside the snapshot count -- a snapshot is "
+            "kept only when it passes both gates."
+        )
+        retention_form.addRow(
+            "Drop older than:", self._backup_retention_days,
+        )
+        backup_layout.addLayout(retention_form)
+
+        backup_btn_row = QHBoxLayout()
+        self._backup_now_btn = QPushButton("Backup Now...", self)
+        self._backup_now_btn.setToolTip(
+            "Snapshot the data dir into the configured destination "
+            "right now. Settings changes since the last save are NOT "
+            "included until you click OK first."
+        )
+        # Wired by MainApp via inject_backup_now_handler so the dialog
+        # stays independent of MainApp imports.
+        self._backup_now_handler: Optional[callable] = None
+        self._backup_now_btn.clicked.connect(self._on_backup_now_clicked)
+        backup_btn_row.addStretch(1)
+        backup_btn_row.addWidget(self._backup_now_btn)
+        backup_layout.addLayout(backup_btn_row)
+
+        layout.addWidget(backup_group)
+
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(
@@ -917,7 +1046,46 @@ class SettingsDialog(QDialog):
         )
         for field, cb in self._appendix_section_checkboxes.items():
             setattr(self._config.synthesis, field, cb.isChecked())
+        self._config.backup.folder = self._backup_folder_edit.text().strip()
+        if self._backup_sched_on_close.isChecked():
+            self._config.backup.schedule = "on_close"
+        elif self._backup_sched_when_idle.isChecked():
+            self._config.backup.schedule = "when_idle"
+        else:
+            self._config.backup.schedule = "manual"
+        self._config.backup.idle_after_minutes = int(
+            self._backup_idle_minutes.value()
+        )
+        self._config.backup.idle_after_hour = int(
+            self._backup_idle_hour.value()
+        )
+        self._config.backup.retention_count = int(
+            self._backup_retention_count.value()
+        )
+        self._config.backup.retention_days = int(
+            self._backup_retention_days.value()
+        )
         self.accept()
+
+    def inject_backup_now_handler(self, handler) -> None:
+        """Caller (MainApp) wires the manual-backup action here so the
+        Backup Now button in the Backups group can fire without the
+        dialog needing a back-pointer to MainApp."""
+        self._backup_now_handler = handler
+
+    def _on_backup_folder_browse(self) -> None:
+        start = self._backup_folder_edit.text().strip() or ""
+        picked = QFileDialog.getExistingDirectory(
+            self, "Pick backup destination folder", start,
+        )
+        if picked:
+            self._backup_folder_edit.setText(picked)
+
+    def _on_backup_now_clicked(self) -> None:
+        handler = self._backup_now_handler
+        if handler is None:
+            return
+        handler()
 
     def _on_appendix_export_master_toggled(self, on: bool) -> None:
         """Enable / disable the per-section checkboxes alongside the

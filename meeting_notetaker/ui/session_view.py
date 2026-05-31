@@ -752,6 +752,15 @@ class SessionView(QWidget):
         self._notes_view.set_preview_mode(bool(notes.strip()))
         self._live_notes_editor.set_session_dir(sdir)
         self._set_live_notes_text(live_notes)
+        # My Notes defaults to preview when the body has anything
+        # beyond the seeded "# Attendees / # Agenda / # Notes /
+        # # Action Items" template (#67 followup). The user usually
+        # comes back to a past session to read, not to edit; landing
+        # in edit mode forced them to click Preview every time. Fresh
+        # sessions (body == seed) still land in edit so the user
+        # starts typing without an extra click.
+        from ..utils.live_notes import has_user_content  # noqa: PLC0415
+        self._live_notes_editor.set_preview_mode(has_user_content(live_notes))
         self._retain_checkbox.setEnabled(True)
         self._retain_checkbox.blockSignals(True)
         self._retain_checkbox.setChecked(session.retain_audio)

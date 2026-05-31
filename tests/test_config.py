@@ -462,3 +462,67 @@ def test_appendix_export_defaults_round_trip(isolated_data_dir):
     # Defaults for fields the test didn't touch survive.
     assert loaded.synthesis.appendix_export_include is True
     assert loaded.synthesis.appendix_export_attendee_context is True
+
+
+# ---- BackupConfig (#67) ---------------------------------------------------
+
+
+def test_backup_defaults_are_safe(isolated_data_dir):
+    """Fresh install lands with manual schedule + empty folder so the
+    backup feature is opt-in. The first time the user opens Settings >
+    Backups they consciously pick a destination + schedule before any
+    snapshot fires."""
+    cfg = Config()
+    assert cfg.backup.folder == ""
+    assert cfg.backup.schedule == "manual"
+    assert cfg.backup.idle_after_minutes == 30
+    assert cfg.backup.idle_after_hour == 19
+    assert cfg.backup.retention_count == 7
+    assert cfg.backup.retention_days == 30
+    assert cfg.backup.last_snapshot_at == ""
+    assert cfg.validate() == []
+
+
+def test_backup_settings_round_trip(isolated_data_dir):
+    cfg = Config()
+    cfg.backup.folder = "/mnt/backups"
+    cfg.backup.schedule = "when_idle"
+    cfg.backup.idle_after_minutes = 45
+    cfg.backup.idle_after_hour = 21
+    cfg.backup.retention_count = 14
+    cfg.backup.retention_days = 60
+    cfg.backup.last_snapshot_at = "2026-06-01T22:00:00"
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.backup.folder == "/mnt/backups"
+    assert loaded.backup.schedule == "when_idle"
+    assert loaded.backup.idle_after_minutes == 45
+    assert loaded.backup.idle_after_hour == 21
+    assert loaded.backup.retention_count == 14
+    assert loaded.backup.retention_days == 60
+    assert loaded.backup.last_snapshot_at == "2026-06-01T22:00:00"
+
+
+def test_backup_validate_rejects_unknown_schedule(isolated_data_dir):
+    cfg = Config()
+    cfg.backup.schedule = "weekly"  # not in VALID_BACKUP_SCHEDULES
+    errors = cfg.validate()
+    assert any("backup.schedule" in e for e in errors)
+
+
+def test_backup_validate_rejects_out_of_range_idle(isolated_data_dir):
+    cfg = Config()
+    cfg.backup.idle_after_minutes = 0
+    cfg.backup.idle_after_hour = 24
+    errors = cfg.validate()
+    assert any("idle_after_minutes" in e for e in errors)
+    assert any("idle_after_hour" in e for e in errors)
+
+
+def test_backup_validate_rejects_negative_retention(isolated_data_dir):
+    cfg = Config()
+    cfg.backup.retention_count = -1
+    cfg.backup.retention_days = -1
+    errors = cfg.validate()
+    assert any("retention_count" in e for e in errors)
+    assert any("retention_days" in e for e in errors)
