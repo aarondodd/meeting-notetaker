@@ -19,8 +19,14 @@ EXTENSION_DIR = PROBE_ROOT / "extension"
 
 
 def data_dir() -> Path:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return DATA_DIR
+    # MN_PROBE_DATA_DIR lets smoke tests + scripted invocations point
+    # the relay at a sandboxed dir without touching the project tree.
+    # bridge.json, bridge.log, capture files, the host wrapper, and
+    # (on POSIX dev) the Chrome NMH manifest all derive from here.
+    override = os.environ.get("MN_PROBE_DATA_DIR")
+    target = Path(override).expanduser() if override else DATA_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def handshake_path() -> Path:

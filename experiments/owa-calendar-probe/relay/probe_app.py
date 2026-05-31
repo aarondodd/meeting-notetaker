@@ -92,6 +92,10 @@ class ProbeWindow(QMainWindow):
         self.resize(1100, 720)
 
         self._capture = CaptureLog(redact=redact)
+        # _port is read by the "listening" state callback, which Bridge
+        # invokes synchronously from start() before start() returns.
+        # Initialize it first so the early callback doesn't AttributeError.
+        self._port = 0
         self._signals = BridgeSignals()
         self._signals.message_received.connect(self._on_bridge_message)
         self._signals.state_changed.connect(self._on_bridge_state)
