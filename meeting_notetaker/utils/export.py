@@ -99,14 +99,20 @@ def build_print_markdown(
 ) -> str:
     """Prepend a title + metadata header to `body` for the printable doc.
 
-    The header gives the printed page / PDF a clear identity (session
-    title, which tab the content came from, the session's date). The
-    horizontal rule separates the header from the note content; we
-    insert a blank line before `body` so a leading `# Heading` in the
-    note doesn't get glued to the rule by the Markdown converter.
+    The header gives the printed page / PDF a clear identity (the
+    session title + the session's date). The horizontal rule separates
+    the header from the note content; we insert a blank line before
+    `body` so a leading `# Heading` in the note doesn't get glued to
+    the rule by the Markdown converter.
+
+    `tab_label` is kept in the signature for callsite-compatibility +
+    so the filename layer can keep using it, but it no longer appears
+    in the in-document H1 (#78). The tab tag belongs in the filename,
+    not duplicated inside the document where the user already knows
+    what they exported.
     """
     title = (session_title or "Untitled session").strip() or "Untitled session"
-    tab = (tab_label or "Notes").strip() or "Notes"
+    _ = tab_label  # accepted for caller compatibility; see docstring.
     if session_date is not None:
         try:
             date_str = session_date.strftime("%Y-%m-%d %H:%M")
@@ -115,7 +121,7 @@ def build_print_markdown(
     else:
         date_str = ""
 
-    lines = [f"# {title} -- {tab}"]
+    lines = [f"# {title}"]
     if date_str:
         lines.append("")
         lines.append(f"*{date_str}*")

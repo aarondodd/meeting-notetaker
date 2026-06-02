@@ -2313,7 +2313,11 @@ class SessionView(QWidget):
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(str(target))
-        printer.setDocName(f"{self._session.title} -- {tab_label}")
+        # PDF metadata title matches the rendered H1 -- session title
+        # alone, no tab suffix (#78). The Print-job equivalent above
+        # still uses "title -- tab" because that's a printer-queue
+        # label, not a document property.
+        printer.setDocName(self._session.title)
         try:
             doc.clamp_images_to_printer(printer)
             doc.print(printer)
