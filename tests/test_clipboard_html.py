@@ -173,6 +173,86 @@ def test_whitespace_collapse_is_reasonable():
 # ---- Notion-shaped checkboxes / Confluence storage XML ------------------
 
 
+def test_notion_attachment_image_replaced_with_placeholder():
+    """Notion's HTML clipboard uses ``attachment:UUID:filename.png``
+    for image refs -- these are page-local attachments that no
+    non-authenticated downstream renderer can fetch. Surface a small
+    italic placeholder noting the filename so the user knows
+    something was there (Aaron's 2026-06-02 paste-from-Notion
+    feedback)."""
+    html = (
+        '<p>Before image.</p>'
+        '<p><img src="attachment:9196c211-82ce-4c2d-ae5a-edd8d8c249b7:image.png" '
+        'alt="image.png"></p>'
+        '<p>After image.</p>'
+    )
+    md = html_to_markdown(html)
+    assert "(image: image.png omitted from paste)" in md
+    # The broken attachment URL must NOT appear in the output.
+    assert "attachment:" not in md
+    # Surrounding paragraphs survive.
+    assert "Before image." in md
+    assert "After image." in md
+
+
+def test_http_image_passes_through_unchanged():
+    """Hosted HTTP / HTTPS images are fetchable -- downstream
+    renderers (preview, PDF, Notion export) can resolve them, so
+    the placeholder rewrite must skip them."""
+    html = '<img src="https://example.com/foo.png" alt="hosted">'
+    md = html_to_markdown(html)
+    assert "https://example.com/foo.png" in md
+    assert "[hosted]" in md or "![hosted]" in md
+    assert "omitted from paste" not in md
+
+
+def test_data_uri_image_passes_through_unchanged():
+    """Inline base64 data URIs are self-contained; they stay."""
+    html = '<img src="data:image/png;base64,abc123" alt="inline">'
+    md = html_to_markdown(html)
+    assert "data:image/png;base64,abc123" in md
+    assert "omitted from paste" not in md
+
+
+def test_cid_image_replaced_with_placeholder():
+    """Email content-id refs (cid:) only resolve inside the
+    originating email client; surface as placeholder."""
+    md = html_to_markdown('<img src="cid:embedded@mail.local" alt="chart">')
+    assert "(image: chart omitted from paste)" in md
+    assert "cid:" not in md
+
+
+def test_file_uri_image_replaced_with_placeholder():
+    """file:// refs resolve only on the source machine."""
+    md = html_to_markdown('<img src="file:///home/aaron/foo.png" alt="local">')
+    assert "(image: local omitted from paste)" in md
+    assert "file://" not in md
+
+
+def test_relative_image_path_replaced_with_placeholder():
+    """A bare relative path resolves against the source HTML's base
+    URL, which is meaningless after a clipboard round-trip."""
+    md = html_to_markdown('<img src="images/foo.png" alt="rel">')
+    assert "(image: rel omitted from paste)" in md
+    assert "images/foo.png" not in md
+
+
+def test_image_without_alt_falls_back_to_filename_in_placeholder():
+    """When the source ``<img>`` carries no alt text, the placeholder
+    label is mined from the URL tail so the user still sees what
+    they pasted."""
+    md = html_to_markdown(
+        '<img src="attachment:abc-def-ghi:meeting-notes.png">'
+    )
+    assert "meeting-notes.png" in md
+    assert "omitted from paste" in md
+
+
+def test_image_without_src_dropped_with_generic_placeholder():
+    md = html_to_markdown("<img alt=''>")
+    assert "(image omitted from paste)" in md
+
+
 def test_github_style_task_list_collapses_to_bullets():
     # markdownify drops the <input> elements; the user sees clean
     # bullets even if the source had checkboxes. Acceptable trade-off
