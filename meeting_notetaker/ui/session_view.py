@@ -1703,12 +1703,31 @@ class SessionView(QWidget):
                 # both render the same template.
                 continue
             self._prompt_template_picker.addItem(name, name)
-        # Restore selection.
-        target_idx = 0  # (default)
-        for i in range(self._prompt_template_picker.count()):
-            if self._prompt_template_picker.itemData(i) == selected:
-                target_idx = i
-                break
+        # Restore selection. Priority:
+        #   1. Per-session override (`selected`) -> match its row.
+        #   2. No override but a Settings default exists -> point at
+        #      the Settings default's row so the dropdown displays
+        #      the template name the user actually chose. Without
+        #      this, new sessions always landed on the "(default: X)"
+        #      placeholder which truncates inside the 200px-wide
+        #      combo to e.g. "(default..stom)" and reads as if the
+        #      Settings default is being ignored (#76).
+        #   3. Otherwise fall back to the placeholder row.
+        # The Settings default is dynamic: if Settings later changes
+        # to a different template, sessions with `selected=""` will
+        # display the new default on their next load. Per-session
+        # overrides win over Settings default.
+        target_idx = 0  # placeholder
+        effective = selected
+        if not effective:
+            resolved = (settings_default or "").strip()
+            if resolved and resolved != "default":
+                effective = resolved
+        if effective:
+            for i in range(self._prompt_template_picker.count()):
+                if self._prompt_template_picker.itemData(i) == effective:
+                    target_idx = i
+                    break
         self._prompt_template_picker.setCurrentIndex(target_idx)
         self._prompt_template_picker.blockSignals(False)
 
