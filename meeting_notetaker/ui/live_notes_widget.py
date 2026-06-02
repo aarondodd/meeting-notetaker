@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..utils.clipboard_html import html_to_markdown
 from ..utils.images import (
     IMAGES_SUBDIR,
     copy_image_file,
@@ -49,8 +50,16 @@ class _MarkdownEditor(QPlainTextEdit):
     Standard QPlainTextEdit ignores image MIME data on paste (drops it
     silently). This subclass detects an image payload and emits
     `image_pasted`; the parent (`LiveNotesWidget`) handles save-to-disk
-    and markdown-insert. All non-image paste paths fall through to the
-    default implementation.
+    and markdown-insert.
+
+    HTML mime data (Notion, VS Code, GitHub, Office, Confluence rendered
+    view) gets converted to Markdown source via `html_to_markdown` and
+    inserted as plain text so structure (headings, links, lists, code
+    fences, blockquotes) round-trips into the editor's markdown buffer
+    instead of collapsing to the source app's lossy text/plain variant.
+    Empty conversion output falls through to the default plain paste so
+    a paste from sources whose HTML strips to nothing still lands the
+    plain-text fallback.
     """
 
     image_pasted = pyqtSignal(object)  # QImage; `object` keeps Qt's type-check loose
@@ -61,10 +70,15 @@ class _MarkdownEditor(QPlainTextEdit):
             if data is not None:
                 self.image_pasted.emit(data)
                 return
+        if source is not None and source.hasHtml():
+            markdown = html_to_markdown(source.html())
+            if markdown:
+                self.insertPlainText(markdown)
+                return
         super().insertFromMimeData(source)
 
     def canInsertFromMimeData(self, source) -> bool:  # type: ignore[override]
-        if source is not None and source.hasImage():
+        if source is not None and (source.hasImage() or source.hasHtml()):
             return True
         return super().canInsertFromMimeData(source)
 

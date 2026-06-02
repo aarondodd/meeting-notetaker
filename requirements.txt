@@ -20,6 +20,10 @@ numpy>=1.24.0
 # the original project has no maintained wheels for Python 3.10+.
 webrtcvad-wheels>=2.0.14
 pyperclip>=1.8.2
+# Convert clipboard HTML (Notion, VS Code, GitHub, Office, Confluence
+# rendered view) to Markdown on paste into the notes editors. MIT
+# licensed; pure Python; pulls beautifulsoup4 transitively.
+markdownify>=0.11.6
 sounddevice>=0.4.6
 tomli>=2.0.0; python_version < '3.11'
 # Make Python's ssl module use the OS certificate store so corporate MITM

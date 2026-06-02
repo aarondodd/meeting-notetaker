@@ -91,6 +91,17 @@ hiddenimports += [
     "sounddevice",
 ]
 
+# markdownify (clipboard HTML -> Markdown on paste) is statically
+# imported inside utils/clipboard_html.html_to_markdown via a local
+# try/except so the unit tests can run without it installed. PyInstaller
+# can see the import but the local-inside-function placement makes the
+# pickup fragile across hook revisions; listing both top-level packages
+# here is defensive.
+hiddenimports += [
+    "markdownify",
+    "bs4",
+]
+
 # pywin32 submodules that win32com loads lazily via __getattr__ at
 # runtime when a COM property returns a typed value (date, currency,
 # variant). Without an explicit hint, PyInstaller drops them from the
