@@ -229,6 +229,35 @@ class ConfluenceClient:
         }
         return self._request("POST", "/wiki/api/v2/pages", json=body)
 
+    def update_page(
+        self,
+        *,
+        page_id: str,
+        title: str,
+        storage_xml: str,
+    ) -> dict[str, Any]:
+        """Replace ``page_id``'s body with new storage XML.
+
+        Used by the attachments path in export.py: we first create a
+        placeholder, attach images to the resulting page id, then
+        update the body so storage XML references the attachments by
+        filename. Confluence v2 requires the current version number on
+        update; we GET the page to read it, increment, and send.
+        """
+        current = self._request("GET", f"/wiki/api/v2/pages/{page_id}")
+        version_num = (current.get("version") or {}).get("number") or 1
+        body = {
+            "id": str(page_id),
+            "status": "current",
+            "title": title,
+            "body": {
+                "representation": "storage",
+                "value": storage_xml,
+            },
+            "version": {"number": int(version_num) + 1},
+        }
+        return self._request("PUT", f"/wiki/api/v2/pages/{page_id}", json=body)
+
     # ---- attachments ---------------------------------------------------
 
     def upload_attachment(self, page_id: str, path: Path) -> dict[str, Any]:

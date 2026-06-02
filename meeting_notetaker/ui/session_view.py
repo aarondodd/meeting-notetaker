@@ -14,11 +14,13 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSplitter,
     QStackedWidget,
     QTabWidget,
     QPlainTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -104,6 +106,12 @@ class SessionView(QWidget):
     # the manual Generate dialog as the default. Empty string means
     # "use the bundled default template."
     prompt_template_changed = pyqtSignal(str, str)            # session_id, template_name
+    # Issue #79: experimental Notion / Confluence export. Each signal
+    # fires with (session_id, tab_label, markdown_body) so MainApp
+    # owns the picker dialog + worker thread + URL-open without
+    # SessionView importing the integration modules.
+    export_to_notion_requested = pyqtSignal(str, str, str)
+    export_to_confluence_requested = pyqtSignal(str, str, str)
     # Click-to-tag for in-meeting speaker anchoring. The sidebar emits
     # (session_id, name) per click; the controller persists a SpeakerTag
     # and the post-meeting refiner uses tags to constrain the clusterer.
@@ -341,14 +349,39 @@ class SessionView(QWidget):
         )
         self._print_btn.clicked.connect(self._on_print)
         synthesis.addWidget(self._print_btn)
-        self._export_pdf_btn = QPushButton("Export PDF...", self)
-        self._export_pdf_btn.setToolTip(
-            "Save the active tab (My Notes or Synthesis) directly to a "
-            "PDF. Images and links are preserved (the Print path through "
-            "Windows Print to PDF is lossy)."
+        # Issue #79: unified Export... button. PDF always available;
+        # Notion + Confluence menu items appear only when their
+        # respective integrations are configured + verified.
+        self._export_btn = QToolButton(self)
+        self._export_btn.setText("Export...")
+        self._export_btn.setToolTip(
+            "Save or post the active tab (My Notes or Synthesis) to "
+            "PDF, Notion, or Confluence."
         )
-        self._export_pdf_btn.clicked.connect(self._on_export_pdf)
-        synthesis.addWidget(self._export_pdf_btn)
+        self._export_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup,
+        )
+        self._export_menu = QMenu(self._export_btn)
+        self._export_pdf_action = self._export_menu.addAction("Export as PDF...")
+        self._export_pdf_action.triggered.connect(self._on_export_pdf)
+        # Notion + Confluence actions; visibility re-evaluated whenever
+        # the session changes or settings are saved.
+        self._export_notion_action = self._export_menu.addAction(
+            "Export to Notion..."
+        )
+        self._export_notion_action.triggered.connect(self._on_export_notion)
+        self._export_confluence_action = self._export_menu.addAction(
+            "Export to Confluence..."
+        )
+        self._export_confluence_action.triggered.connect(self._on_export_confluence)
+        # Hidden by default; MainApp toggles via set_integration_targets().
+        self._export_notion_action.setVisible(False)
+        self._export_confluence_action.setVisible(False)
+        self._export_btn.setMenu(self._export_menu)
+        synthesis.addWidget(self._export_btn)
+        # Legacy alias so older test references to _export_pdf_btn don't
+        # break -- the menu action carries the same handler.
+        self._export_pdf_btn = self._export_btn
         # Speaker review button. Hidden until the session has a
         # diarization.json on disk (set_session enables it).
         self._review_speakers_btn = QPushButton("Review Speakers...", self)
@@ -2273,6 +2306,53 @@ class SessionView(QWidget):
             return
         doc.clamp_images_to_printer(printer)
         doc.print(printer)
+
+    def set_integration_targets(
+        self, *, notion_enabled: bool, confluence_enabled: bool,
+    ) -> None:
+        """MainApp calls this whenever Settings is saved or on startup
+        so the Export menu surfaces Notion / Confluence only when the
+        relevant integration's verify stamp is present (#79)."""
+        self._export_notion_action.setVisible(notion_enabled)
+        self._export_confluence_action.setVisible(confluence_enabled)
+
+    def _active_tab_body_and_label(self) -> tuple[str, str]:
+        """Return (markdown_body, tab_label) for the currently
+        viewed My Notes / Synthesis tab. Mirrors the resolution the
+        PDF export path uses so the export targets land the same
+        content the user sees in the editor."""
+        # The Synthesis tab is the auto-generated notes; My Notes is
+        # the user's running buffer. The PDF path keys off the
+        # current tab index; we duplicate that mapping here for
+        # consistency.
+        # _tabs holds wrapper pages, not the editors themselves; resolve
+        # by the page widget so localization doesn't break the mapping.
+        current_page = self._tabs.currentWidget()
+        if current_page is self._notes_page:
+            body = self._notes_view.toPlainText() or ""
+            label = "Synthesis"
+        elif current_page is self._live_notes_page:
+            body = self._live_notes_editor.toPlainText() or ""
+            label = "My Notes"
+        else:
+            # Fall back to whichever tab is showing; treat unknown tabs
+            # as My Notes since that's the buffer the user is most
+            # likely to want exported.
+            body = ""
+            label = "Notes"
+        return body, label
+
+    def _on_export_notion(self) -> None:
+        if self._session is None:
+            return
+        body, label = self._active_tab_body_and_label()
+        self.export_to_notion_requested.emit(self._session.id, label, body)
+
+    def _on_export_confluence(self) -> None:
+        if self._session is None:
+            return
+        body, label = self._active_tab_body_and_label()
+        self.export_to_confluence_requested.emit(self._session.id, label, body)
 
     def _on_export_pdf(self) -> None:
         """Save the active tab as a PDF via Qt's native PDF backend.

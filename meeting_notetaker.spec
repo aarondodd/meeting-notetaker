@@ -102,6 +102,23 @@ hiddenimports += [
     "bs4",
 ]
 
+# Issue #79: mistune + requests for Notion + Confluence export. Both are
+# regular static imports, but listing them defensively keeps the frozen
+# build resilient if PyInstaller's hook coverage shifts.
+hiddenimports += [
+    "mistune",
+    "mistune.renderers",
+    "mistune.renderers._list",
+    "mistune.plugins.table",
+    "mistune.plugins.task_lists",
+    "mistune.plugins.url",
+    "requests",
+    "urllib3",
+    "charset_normalizer",
+    "certifi",
+    "idna",
+]
+
 # pywin32 submodules that win32com loads lazily via __getattr__ at
 # runtime when a COM property returns a typed value (date, currency,
 # variant). Without an explicit hint, PyInstaller drops them from the
