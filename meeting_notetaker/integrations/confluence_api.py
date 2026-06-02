@@ -2,21 +2,28 @@
 
 Wraps the endpoints the export feature needs:
 
-- ``GET /wiki/rest/api/user/current`` -- verify the email + API token.
-- ``GET /wiki/api/v2/spaces`` -- list spaces (the picker's top level).
-- ``GET /wiki/api/v2/spaces/<id>/pages?root-level=true`` -- list a
+- ``GET /rest/api/user/current`` -- verify the email + API token.
+- ``GET /api/v2/spaces`` -- list spaces (the picker's top level).
+- ``GET /api/v2/spaces/<id>/pages?root-level=true`` -- list a
   space's root pages (the picker's second level).
-- ``GET /wiki/api/v2/pages/<id>/children`` -- list a page's children
+- ``GET /api/v2/pages/<id>/children`` -- list a page's children
   (third level + deeper).
-- ``POST /wiki/api/v2/pages`` -- create a page with content_format =
+- ``POST /api/v2/pages`` -- create a page with content_format =
   storage; body is Confluence storage XML (NOT markdown, see
   L-2026-05-17-001).
-- ``POST /wiki/rest/api/content/<id>/child/attachment`` -- upload an
+- ``POST /rest/api/content/<id>/child/attachment`` -- upload an
   image as an attachment; the storage XML references it via
   ``<ac:image><ri:attachment ri:filename="..." />``.
 
 Confluence Cloud uses Atlassian basic auth (email + API token).
 Self-hosted servers use the same shape with a different base URL.
+
+Base URL convention: the user enters the full tenant root including
+the context path -- Cloud expects ``https://your-org.atlassian.net/wiki``;
+self-hosted may use ``/confluence`` or ``/``. Paths above are relative
+to that base. Earlier versions of this client hard-coded ``/wiki``
+into every path, which produced ``.../wiki/wiki/...`` against the
+Cloud placeholder and 404'd the verify call (Aaron, 2026-06-02).
 """
 from __future__ import annotations
 
@@ -141,13 +148,13 @@ class ConfluenceClient:
 
     def verify(self) -> dict[str, Any]:
         """Confirm the credentials work. Returns the current user payload."""
-        return self._request("GET", "/wiki/rest/api/user/current")
+        return self._request("GET", "/rest/api/user/current")
 
     # ---- browse --------------------------------------------------------
 
     def list_spaces(self) -> list[ConfluenceNodeRef]:
         """Top-level picker entries: every space the user can see."""
-        data = self._request("GET", "/wiki/api/v2/spaces", params={"limit": 250})
+        data = self._request("GET", "/api/v2/spaces", params={"limit": 250})
         out: list[ConfluenceNodeRef] = []
         for s in data.get("results", []):
             out.append(ConfluenceNodeRef(
@@ -162,7 +169,7 @@ class ConfluenceClient:
     def list_root_pages(self, space_id: str) -> list[ConfluenceNodeRef]:
         """Root-level pages within a space."""
         params = {"space-id": space_id, "depth": "root", "limit": 250}
-        data = self._request("GET", "/wiki/api/v2/pages", params=params)
+        data = self._request("GET", "/api/v2/pages", params=params)
         return self._page_refs(data.get("results", []), space_id=space_id)
 
     def list_child_pages(
@@ -170,7 +177,7 @@ class ConfluenceClient:
     ) -> list[ConfluenceNodeRef]:
         """Children of a specific page."""
         data = self._request(
-            "GET", f"/wiki/api/v2/pages/{page_id}/children",
+            "GET", f"/api/v2/pages/{page_id}/children",
             params={"limit": 250},
         )
         return self._page_refs(data.get("results", []), space_id=space_id)
@@ -227,7 +234,7 @@ class ConfluenceClient:
                 "value": storage_xml,
             },
         }
-        return self._request("POST", "/wiki/api/v2/pages", json=body)
+        return self._request("POST", "/api/v2/pages", json=body)
 
     def update_page(
         self,
@@ -244,7 +251,7 @@ class ConfluenceClient:
         filename. Confluence v2 requires the current version number on
         update; we GET the page to read it, increment, and send.
         """
-        current = self._request("GET", f"/wiki/api/v2/pages/{page_id}")
+        current = self._request("GET", f"/api/v2/pages/{page_id}")
         version_num = (current.get("version") or {}).get("number") or 1
         body = {
             "id": str(page_id),
@@ -256,7 +263,7 @@ class ConfluenceClient:
             },
             "version": {"number": int(version_num) + 1},
         }
-        return self._request("PUT", f"/wiki/api/v2/pages/{page_id}", json=body)
+        return self._request("PUT", f"/api/v2/pages/{page_id}", json=body)
 
     # ---- attachments ---------------------------------------------------
 
@@ -275,7 +282,7 @@ class ConfluenceClient:
             files = {"file": (path.name, fh, _guess_mime(path))}
             return self._request(
                 "POST",
-                f"/wiki/rest/api/content/{page_id}/child/attachment",
+                f"/rest/api/content/{page_id}/child/attachment",
                 files=files,
                 # Allow re-attaching if the user re-runs the export
                 # against the same parent + same image filename.

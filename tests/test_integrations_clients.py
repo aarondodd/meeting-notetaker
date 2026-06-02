@@ -275,7 +275,40 @@ def test_confluence_verify_uses_basic_auth_header():
         b"user@example.com:ATATT-token"
     ).decode()
     assert headers["Authorization"] == expected
-    assert sess.calls[0]["url"].endswith("/wiki/rest/api/user/current")
+    # Pin the full URL (not endsWith) so a regression that doubles
+    # the /wiki context path can't slip through unnoticed (Aaron's
+    # 404 on Cloud verify, 2026-06-02).
+    assert sess.calls[0]["url"] == (
+        "https://example.atlassian.net/wiki/rest/api/user/current"
+    )
+
+
+def test_confluence_does_not_double_prefix_wiki_context_path():
+    """Regression: ConfluenceClient must not hard-code /wiki into its
+    paths. Cloud users enter the base URL with /wiki already in it
+    (matches the placeholder text in Settings); doubling produces a
+    404 on every endpoint."""
+    sess = _FakeSession()
+    sess.queue(
+        _FakeResponse(200, {"accountId": "u-1"}),
+        _FakeResponse(200, {"results": []}),
+        _FakeResponse(200, {"results": []}),
+        _FakeResponse(200, {"results": []}),
+    )
+    client = ConfluenceClient(
+        "https://example.atlassian.net/wiki",
+        "u@example.com",
+        "t",
+        session=sess,
+    )
+    client.verify()
+    client.list_spaces()
+    client.list_root_pages("100")
+    client.list_child_pages("9001")
+    for call in sess.calls:
+        assert "/wiki/wiki/" not in call["url"], (
+            f"context path doubled in {call['url']}"
+        )
 
 
 def test_confluence_list_spaces_returns_node_refs():
@@ -354,7 +387,7 @@ def test_confluence_upload_attachment_uses_multipart_and_no_check_header(tmp_pat
     assert "files" in call
     # Atlassian requires X-Atlassian-Token: no-check for multipart uploads.
     assert call["headers"]["X-Atlassian-Token"] == "no-check"
-    assert call["url"].endswith("/wiki/rest/api/content/999/child/attachment")
+    assert call["url"] == "https://x/wiki/rest/api/content/999/child/attachment"
 
 
 def test_confluence_page_url_combines_base_and_webui():

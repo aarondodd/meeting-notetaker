@@ -1340,8 +1340,16 @@ class SettingsDialog(QDialog):
         try:
             user = ConfluenceClient(base_url, email, token).verify()
         except ConfluenceAPIError as exc:
+            hint = ""
+            if exc.status == 404:
+                hint = (
+                    " (404 typically means the base URL is wrong -- "
+                    "Cloud expects https://your-org.atlassian.net/wiki)"
+                )
+            elif exc.status == 401:
+                hint = " (401 typically means the email or API token is wrong)"
             self._confluence_status_label.setText(
-                f"Failed ({exc.status}): check the base URL, email, and token."
+                f"Failed ({exc.status}){hint}: check the base URL, email, and token."
             )
             return
         except Exception as exc:
