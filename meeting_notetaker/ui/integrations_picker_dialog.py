@@ -216,8 +216,11 @@ class IntegrationsPickerDialog(QDialog):
         are still rendered (collapsed) so the user can see the
         affordance exists.
         """
+        # Favorites alphabetized so a glance always finds the right
+        # pinned entry; Recents intentionally stays in recency order
+        # (that's the entire point of the section).
         self._fav_root = self._make_group_item("Favorites")
-        for entry in self._favorites:
+        for entry in _sorted_entries(self._favorites):
             self._append_pinned_row(self._fav_root, entry, source="favorite")
 
         self._rec_root = self._make_group_item("Recents")
@@ -278,7 +281,7 @@ class IntegrationsPickerDialog(QDialog):
             empty.setText(0, "(none)")
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
             return
-        for node in nodes:
+        for node in _sorted_nodes(nodes):
             self._append_lazy_node(self._browse_root, node)
         self._browse_root.setExpanded(True)
 
@@ -323,7 +326,7 @@ class IntegrationsPickerDialog(QDialog):
             empty.setText(0, "(no children)")
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
             return
-        for child in children:
+        for child in _sorted_nodes(children):
             self._append_lazy_node(item, child)
 
     # ---- selection + star ------------------------------------------------
@@ -366,10 +369,10 @@ class IntegrationsPickerDialog(QDialog):
                 "kind": node.kind,
                 "extra": node.extra,
             })
-        # Rebuild the Favorites group rows in place.
+        # Rebuild the Favorites group rows in place, alphabetized.
         while self._fav_root.childCount():
             self._fav_root.takeChild(0)
-        for entry in self._favorites:
+        for entry in _sorted_entries(self._favorites):
             self._append_pinned_row(self._fav_root, entry, source="favorite")
         self._fav_root.setExpanded(True)
         # Refresh button label.
@@ -399,3 +402,16 @@ class IntegrationsPickerDialog(QDialog):
             return fn()
         finally:
             QApplication.restoreOverrideCursor()
+
+
+# ---- module-level sort helpers -------------------------------------------
+
+
+def _sorted_nodes(nodes: list[PickerNode]) -> list[PickerNode]:
+    """Alphabetize a PickerNode list by title (case-insensitive)."""
+    return sorted(nodes, key=lambda n: (n.title or "").casefold())
+
+
+def _sorted_entries(entries: list[dict]) -> list[dict]:
+    """Alphabetize a favorites / recents dict list by title."""
+    return sorted(entries, key=lambda e: (e.get("title") or "").casefold())

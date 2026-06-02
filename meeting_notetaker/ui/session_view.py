@@ -2317,29 +2317,70 @@ class SessionView(QWidget):
         self._export_confluence_action.setVisible(confluence_enabled)
 
     def _active_tab_body_and_label(self) -> tuple[str, str]:
-        """Return (markdown_body, tab_label) for the currently
-        viewed My Notes / Synthesis tab. Mirrors the resolution the
-        PDF export path uses so the export targets land the same
-        content the user sees in the editor."""
-        # The Synthesis tab is the auto-generated notes; My Notes is
-        # the user's running buffer. The PDF path keys off the
-        # current tab index; we duplicate that mapping here for
-        # consistency.
+        """Return (markdown_body, tab_label) for the currently viewed
+        My Notes / Synthesis tab, with the same attendees-table +
+        rendered-appendix transforms the PDF path applies (#79
+        followup): the export target should receive the formatted
+        appendix (tables etc.), not the raw LLM JSON blocks the
+        editor source carries.
+
+        The appendix-inclusion dialog the PDF flow shows is skipped
+        here -- the integration export flow already opens a picker
+        dialog, and stacking a second modal would be annoying. Saved
+        Settings defaults drive the inclusion instead; the user can
+        change them under Settings -> Export.
+        """
         # _tabs holds wrapper pages, not the editors themselves; resolve
         # by the page widget so localization doesn't break the mapping.
         current_page = self._tabs.currentWidget()
         if current_page is self._notes_page:
-            body = self._notes_view.toPlainText() or ""
+            source = self._notes_view.toPlainText() or ""
             label = "Synthesis"
         elif current_page is self._live_notes_page:
-            body = self._live_notes_editor.toPlainText() or ""
+            source = self._live_notes_editor.toPlainText() or ""
             label = "My Notes"
         else:
-            # Fall back to whichever tab is showing; treat unknown tabs
-            # as My Notes since that's the buffer the user is most
-            # likely to want exported.
-            body = ""
-            label = "Notes"
+            return "", "Notes"
+
+        if self._session is None:
+            return source, label
+
+        # Attendees-table substitution (#51 Phase 5): bullet list
+        # becomes a Markdown table when at least one contact has
+        # rich-field data.
+        from ..utils.live_notes import (  # noqa: PLC0415
+            replace_attendees_section_with_table,
+            should_render_attendees_as_table,
+        )
+        body = source
+        if should_render_attendees_as_table(self._session_contacts):
+            body = replace_attendees_section_with_table(
+                body, self._session_contacts,
+            )
+
+        # Appendix transform (#64) -- swap raw JSON blocks for the
+        # rendered "## Appendix (auto-extracted)" tables, mirroring
+        # the PDF flow.
+        from ..utils.appendix_store import collect_for_session  # noqa: PLC0415
+        from ..utils.appendix_transform import inject_appendix  # noqa: PLC0415
+        from .appendix_inclusion_dialog import (  # noqa: PLC0415
+            AppendixInclusion,
+            apply_inclusion,
+        )
+        notes_md = self._notes_view.toPlainText()
+        live_md = self._live_notes_editor.toPlainText()
+        appendix_data = collect_for_session(
+            session_id=self._session.id,
+            notes_text=notes_md,
+            live_notes_text=live_md,
+            session_attachments=getattr(
+                self, "_session_attachment_names", [],
+            ),
+        )
+        inclusion = self._appendix_export_defaults or AppendixInclusion.all_on()
+        body = inject_appendix(
+            body, apply_inclusion(appendix_data, inclusion),
+        )
         return body, label
 
     def _on_export_notion(self) -> None:

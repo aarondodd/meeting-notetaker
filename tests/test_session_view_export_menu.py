@@ -128,3 +128,43 @@ def test_export_action_does_not_emit_when_no_session_loaded(qt_app):
         assert captured == []
     finally:
         sv.deleteLater()
+
+
+def test_export_body_strips_raw_attendee_context_appendix(qt_app):
+    """Regression for the post-merge feedback: Notion/Confluence
+    exports were shipping the raw JSON appendix blocks instead of
+    the formatted '## Appendix (auto-extracted)' tables. The
+    SessionView export hook applies the same inject_appendix
+    transform the PDF path uses, so the raw block is removed from
+    the body the export worker receives."""
+    sv = SessionView()
+    notes_with_raw_appendix = (
+        "# Notes\n\n"
+        "Standard content.\n\n"
+        "## Attendee Context (auto-extracted)\n\n"
+        "```json\n"
+        '{"entries": [{"name": "Alice", "observation": "VP of widgets"}]}\n'
+        "```\n"
+    )
+    sv.set_session(
+        _make_session(),
+        transcript="", notes=notes_with_raw_appendix,
+        previous_notes_paths=[],
+        live_notes="",
+    )
+    captured: list[tuple[str, str, str]] = []
+    sv.export_to_notion_requested.connect(
+        lambda sid, label, body: captured.append((sid, label, body))
+    )
+    try:
+        sv._tabs.setCurrentWidget(sv._notes_page)  # noqa: SLF001
+        sv._export_notion_action.trigger()  # noqa: SLF001
+        assert len(captured) == 1
+        _, _, body = captured[0]
+        # Raw JSON block is stripped from the body that goes to the
+        # export converter; the formatted appendix takes its place if
+        # data is present (Aaron's post-merge feedback, 2026-06-02).
+        assert "VP of widgets" not in body
+        assert "```json" not in body
+    finally:
+        sv.deleteLater()

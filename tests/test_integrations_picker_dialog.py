@@ -248,6 +248,128 @@ def test_notion_browser_adapts_client_pages_to_picker_nodes():
     assert children[0].id == "x.c1"
 
 
+def test_browse_root_entries_are_alphabetized(qt_app):
+    """API responses may return spaces or pages in arbitrary order
+    (creation date, page id, etc.). The picker shows them sorted by
+    title so users find their destination by scanning, not searching."""
+    browser = _FakeBrowser(root=[
+        PickerNode(id="z", title="Zebra"),
+        PickerNode(id="a", title="apple"),
+        PickerNode(id="m", title="Mango"),
+    ])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+    )
+    try:
+        rows = [
+            dlg._browse_root.child(i).text(0)  # noqa: SLF001
+            for i in range(dlg._browse_root.childCount())  # noqa: SLF001
+        ]
+        assert rows == ["apple", "Mango", "Zebra"]
+    finally:
+        dlg.deleteLater()
+
+
+def test_browse_children_are_alphabetized(qt_app):
+    browser = _FakeBrowser(
+        root=[PickerNode(id="p", title="Parent")],
+        children={"p": [
+            PickerNode(id="c3", title="Zucchini"),
+            PickerNode(id="c1", title="Asparagus"),
+            PickerNode(id="c2", title="kale"),
+        ]},
+    )
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+    )
+    try:
+        parent_item = dlg._browse_root.child(0)  # noqa: SLF001
+        parent_item.setExpanded(True)
+        rows = [
+            parent_item.child(i).text(0)
+            for i in range(parent_item.childCount())
+        ]
+        assert rows == ["Asparagus", "kale", "Zucchini"]
+    finally:
+        dlg.deleteLater()
+
+
+def test_favorites_render_alphabetized(qt_app):
+    """Favorites get the same alphabetical treatment as Browse rows.
+    Recents stay in recency order (they're date-sorted by definition)."""
+    browser = _FakeBrowser(root=[])
+    dlg = IntegrationsPickerDialog(
+        title="t",
+        browser=browser,
+        favorites=[
+            {"id": "f1", "title": "Zeta"},
+            {"id": "f2", "title": "alpha"},
+            {"id": "f3", "title": "Mu"},
+        ],
+        recents=[],
+    )
+    try:
+        rows = [
+            dlg._fav_root.child(i).text(0)  # noqa: SLF001
+            for i in range(dlg._fav_root.childCount())  # noqa: SLF001
+        ]
+        assert rows == ["alpha", "Mu", "Zeta"]
+    finally:
+        dlg.deleteLater()
+
+
+def test_recents_preserve_input_order(qt_app):
+    """Recents must NOT be alphabetized; they're ordered by recency
+    so the most-recently-used destination sits at the top."""
+    browser = _FakeBrowser(root=[])
+    dlg = IntegrationsPickerDialog(
+        title="t",
+        browser=browser,
+        favorites=[],
+        recents=[
+            {"id": "r1", "title": "Zebra", "used_at": "2026-06-02T15:00:00"},
+            {"id": "r2", "title": "Apple", "used_at": "2026-06-02T14:00:00"},
+        ],
+    )
+    try:
+        rows = [
+            dlg._rec_root.child(i).text(0)  # noqa: SLF001
+            for i in range(dlg._rec_root.childCount())  # noqa: SLF001
+        ]
+        assert rows == ["Zebra", "Apple"]  # input order preserved
+    finally:
+        dlg.deleteLater()
+
+
+def test_starring_keeps_favorites_alphabetized(qt_app):
+    """Toggling star on a new entry should slot it into the
+    alphabetized favorites list, not append to the end."""
+    browser = _FakeBrowser(root=[
+        PickerNode(id="bbb", title="Banana"),
+    ])
+    dlg = IntegrationsPickerDialog(
+        title="t",
+        browser=browser,
+        favorites=[
+            {"id": "aaa", "title": "Apple"},
+            {"id": "ccc", "title": "Cherry"},
+        ],
+        recents=[],
+    )
+    try:
+        # Star the Banana row.
+        banana = dlg._browse_root.child(0)  # noqa: SLF001
+        dlg._tree.setCurrentItem(banana)  # noqa: SLF001
+        dlg._on_star_clicked()  # noqa: SLF001
+        rows = [
+            dlg._fav_root.child(i).text(0)  # noqa: SLF001
+            for i in range(dlg._fav_root.childCount())  # noqa: SLF001
+        ]
+        assert rows == ["Apple", "Banana", "Cherry"]
+    finally:
+        dlg.deleteLater()
+
+
 def test_confluence_browser_adapts_spaces_then_pages():
     from meeting_notetaker.integrations.confluence_api import ConfluenceNodeRef
 
