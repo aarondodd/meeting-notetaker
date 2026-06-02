@@ -116,9 +116,9 @@ class AttendeeDetailsDrawer(QWidget):
         body_layout = QVBoxLayout(self._body)
         body_layout.setContentsMargins(6, 4, 6, 6)
         body_layout.setSpacing(0)
-        self._table = QTableWidget(0, 6, self._body)
+        self._table = QTableWidget(0, 7, self._body)
         self._table.setHorizontalHeaderLabels([
-            "Name", "Title", "Company", "Email", "Notes", "",
+            "Name", "Title", "Company", "Department", "Email", "Notes", "",
         ])
         self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -138,13 +138,16 @@ class AttendeeDetailsDrawer(QWidget):
         )
         self._table.setAlternatingRowColors(True)
         h = self._table.horizontalHeader()
+        # Columns 0-4 sized to content (Name / Title / Company / Department
+        # / Email), Notes stretches, edit-button column fixed.
         h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        h.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self._table.setColumnWidth(5, 32)
+        h.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(6, 32)
         self._table.cellDoubleClicked.connect(self._on_cell_clicked)
         body_layout.addWidget(self._table)
         self._body.setVisible(False)
@@ -190,6 +193,12 @@ class AttendeeDetailsDrawer(QWidget):
             ))
             self._table.setItem(row, 3, QTableWidgetItem(
                 _cell_with_badge(
+                    getattr(c, "department", None),
+                    getattr(c, "department_source", None),
+                ),
+            ))
+            self._table.setItem(row, 4, QTableWidgetItem(
+                _cell_with_badge(
                     c.primary_email,
                     getattr(c, "primary_email_source", None),
                 ),
@@ -202,8 +211,8 @@ class AttendeeDetailsDrawer(QWidget):
             # truncated single-line cell display isn't a dead-end.
             if notes_value:
                 notes_item.setToolTip(notes_value)
-            self._table.setItem(row, 4, notes_item)
-            self._table.setItem(row, 5, QTableWidgetItem(""))
+            self._table.setItem(row, 5, notes_item)
+            self._table.setItem(row, 6, QTableWidgetItem(""))
             self._install_edit_button(row, c.id)
         # If there's nothing to show, collapse so the drawer isn't
         # taking visual space with an empty table.
@@ -248,4 +257,4 @@ class AttendeeDetailsDrawer(QWidget):
         btn.clicked.connect(
             lambda _checked=False, cid=contact_id: self.contact_clicked.emit(cid),
         )
-        self._table.setCellWidget(row, 5, btn)
+        self._table.setCellWidget(row, 6, btn)

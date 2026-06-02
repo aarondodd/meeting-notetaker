@@ -74,10 +74,11 @@ def test_drawer_expand_toggle_changes_state(qt_app):
 def test_drawer_table_renders_contact_fields(qt_app):
     """set_contacts populates the table; cells map to rich fields.
 
-    Column shape: Name | Title | Company | Email | Notes | (edit button).
-    Phone field on Contact is intentionally not shown -- the drawer
-    favors Notes (free-form context) over Phone (rarely used in
-    meeting prep) per Aaron's 2026-05-28 feedback. Each value cell
+    Column shape: Name | Title | Company | Department | Email | Notes |
+    (edit button). Department slotted between Company and Email
+    (#77). Phone field on Contact is intentionally not shown -- the
+    drawer favors Notes (free-form context) over Phone (rarely used
+    in meeting prep) per Aaron's 2026-05-28 feedback. Each value cell
     that has a non-None source gets a trailing source emoji.
     """
     d = AttendeeDetailsDrawer()
@@ -85,23 +86,59 @@ def test_drawer_table_renders_contact_fields(qt_app):
         d.set_contacts([
             _FakeContact(
                 id=1, display_name="Bob Smith",
-                title="VP", company="Acme",
+                title="VP", company="Acme", department="Platform",
                 primary_email="bob@acme.com",
                 notes="met at strategy offsite",
             ),
         ])
         assert d._title.text() == "Attendees (1)"  # noqa: SLF001
         assert d._table.rowCount() == 1  # noqa: SLF001
-        assert d._table.columnCount() == 6  # noqa: SLF001
+        assert d._table.columnCount() == 7  # noqa: SLF001
         # Name cell holds the display name + (possibly) a source badge.
         assert "Bob Smith" in d._table.item(0, 0).text()  # noqa: SLF001
         # No per-field sources set -> cells carry just the values.
         assert d._table.item(0, 1).text() == "VP"  # noqa: SLF001
         assert d._table.item(0, 2).text() == "Acme"  # noqa: SLF001
-        assert d._table.item(0, 3).text() == "bob@acme.com"  # noqa: SLF001
-        assert d._table.item(0, 4).text() == "met at strategy offsite"  # noqa: SLF001
+        assert d._table.item(0, 3).text() == "Platform"  # noqa: SLF001
+        assert d._table.item(0, 4).text() == "bob@acme.com"  # noqa: SLF001
+        assert d._table.item(0, 5).text() == "met at strategy offsite"  # noqa: SLF001
         # Edit button column carries a widget, not text.
-        assert d._table.cellWidget(0, 5) is not None  # noqa: SLF001
+        assert d._table.cellWidget(0, 6) is not None  # noqa: SLF001
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_department_column_header_between_company_and_email(qt_app):
+    """Pin the header order so Department doesn't drift to a different
+    column on a future edit (#77)."""
+    d = AttendeeDetailsDrawer()
+    try:
+        labels = [
+            d._table.horizontalHeaderItem(i).text()  # noqa: SLF001
+            for i in range(d._table.columnCount())  # noqa: SLF001
+        ]
+        # Skip the trailing edit-button column whose header is "".
+        named = [label for label in labels if label]
+        assert named == [
+            "Name", "Title", "Company", "Department", "Email", "Notes",
+        ]
+    finally:
+        d.deleteLater()
+
+
+def test_drawer_department_renders_with_source_badge(qt_app):
+    """Department gets the same source-badge treatment as Title /
+    Company / Email when the contact carries a department_source."""
+    d = AttendeeDetailsDrawer()
+    try:
+        d.set_contacts([
+            _FakeContact(
+                id=1, display_name="Bob",
+                department="Platform", department_source="outlook",
+            ),
+        ])
+        assert "Platform" in d._table.item(0, 3).text()  # noqa: SLF001
+        assert "ᴼ" in d._table.item(0, 3).text()  # noqa: SLF001
     finally:
         d.deleteLater()
 
@@ -123,8 +160,8 @@ def test_drawer_renders_per_field_source_badges(qt_app):
         ])
         assert "ᴼ" in d._table.item(0, 1).text()  # noqa: SLF001 # Title -> Outlook
         assert "ᴸ" in d._table.item(0, 2).text()  # noqa: SLF001 # Company -> LLM
-        assert "ᴹ" in d._table.item(0, 3).text()  # noqa: SLF001 # Email -> Manual
-        assert "ᴹ" in d._table.item(0, 4).text()  # noqa: SLF001 # Notes -> Manual
+        assert "ᴹ" in d._table.item(0, 4).text()  # noqa: SLF001 # Email -> Manual
+        assert "ᴹ" in d._table.item(0, 5).text()  # noqa: SLF001 # Notes -> Manual
     finally:
         d.deleteLater()
 
@@ -163,7 +200,8 @@ def test_drawer_empty_fields_render_as_blank(qt_app):
     d = AttendeeDetailsDrawer()
     try:
         d.set_contacts([_FakeContact(id=1, display_name="Plain Jane")])
-        for col in (1, 2, 3, 4):
+        # Title (1) / Company (2) / Department (3) / Email (4) / Notes (5).
+        for col in (1, 2, 3, 4, 5):
             assert d._table.item(0, col).text() == ""  # noqa: SLF001
     finally:
         d.deleteLater()
@@ -180,9 +218,10 @@ def test_drawer_edit_button_emits_contact_id(qt_app):
             _FakeContact(id=42, display_name="Alpha"),
             _FakeContact(id=99, display_name="Beta"),
         ])
-        # Trigger the embedded button programmatically.
-        d._table.cellWidget(0, 5).click()  # noqa: SLF001
-        d._table.cellWidget(1, 5).click()  # noqa: SLF001
+        # Trigger the embedded button programmatically. Lives in the
+        # last column (index 6 after Department was inserted at #77).
+        d._table.cellWidget(0, 6).click()  # noqa: SLF001
+        d._table.cellWidget(1, 6).click()  # noqa: SLF001
         assert captured == [42, 99]
     finally:
         d.deleteLater()
@@ -197,7 +236,7 @@ def test_drawer_notes_cell_has_tooltip_with_full_text(qt_app):
         d.set_contacts([_FakeContact(
             id=1, display_name="Bob", notes=long_notes,
         )])
-        assert d._table.item(0, 4).toolTip() == long_notes  # noqa: SLF001
+        assert d._table.item(0, 5).toolTip() == long_notes  # noqa: SLF001
     finally:
         d.deleteLater()
 
