@@ -83,8 +83,87 @@ def test_file_menu_has_session_actions_and_quit(qt_app):
         assert "Rename Session..." in labels
         assert "Edit Timestamp..." in labels
         assert "Export" in labels
+        assert "Save to" in labels
         assert "Delete" in labels
         assert "Quit" in labels
+    finally:
+        win.deleteLater()
+
+
+def test_file_save_to_submenu_carries_three_destinations(qt_app):
+    """File > Save to mirrors the SessionView's right-pane Save to...
+    button. PDF, Notion, Confluence all surface here regardless of
+    integration verify state (verified-gate runs in the handler)."""
+    win = MainWindow()
+    try:
+        save_action = None
+        for top in win.menuBar().actions():
+            if top.text().replace("&", "") == "File":
+                for a in top.menu().actions():
+                    if a.text().replace("&", "") == "Save to":
+                        save_action = a
+                        break
+        assert save_action is not None
+        sub_labels = [
+            a.text().replace("&", "")
+            for a in save_action.menu().actions()
+        ]
+        assert "Save as PDF..." in sub_labels
+        assert "Save to Notion..." in sub_labels
+        assert "Save to Confluence..." in sub_labels
+    finally:
+        win.deleteLater()
+
+
+def test_save_to_actions_disabled_without_selection(qt_app):
+    win = MainWindow()
+    try:
+        assert not win._action_save_pdf.isEnabled()  # noqa: SLF001
+        assert not win._action_save_notion.isEnabled()  # noqa: SLF001
+        assert not win._action_save_confluence.isEnabled()  # noqa: SLF001
+    finally:
+        win.deleteLater()
+
+
+def test_save_to_actions_enable_on_single_select_regardless_of_audio(qt_app):
+    """Save-to operates on the notes body, not the audio file -- so
+    it should enable for any single selection, even sessions with
+    no retained recording."""
+    win = MainWindow()
+    try:
+        win.set_sessions([_make_session("s-save-1", has_audio=False)])
+        _select(win, "s-save-1")
+        assert win._action_save_pdf.isEnabled()  # noqa: SLF001
+        assert win._action_save_notion.isEnabled()  # noqa: SLF001
+        assert win._action_save_confluence.isEnabled()  # noqa: SLF001
+    finally:
+        win.deleteLater()
+
+
+def test_save_to_pdf_action_emits_signal(qt_app):
+    win = MainWindow()
+    captured = []
+    win.save_to_pdf_requested.connect(lambda: captured.append("pdf"))
+    try:
+        win.set_sessions([_make_session("s-save-2", has_audio=False)])
+        _select(win, "s-save-2")
+        win._action_save_pdf.trigger()  # noqa: SLF001
+        assert captured == ["pdf"]
+    finally:
+        win.deleteLater()
+
+
+def test_save_to_notion_and_confluence_actions_emit_signals(qt_app):
+    win = MainWindow()
+    captured = []
+    win.save_to_notion_requested.connect(lambda: captured.append("notion"))
+    win.save_to_confluence_requested.connect(lambda: captured.append("confluence"))
+    try:
+        win.set_sessions([_make_session("s-save-3", has_audio=False)])
+        _select(win, "s-save-3")
+        win._action_save_notion.trigger()  # noqa: SLF001
+        win._action_save_confluence.trigger()  # noqa: SLF001
+        assert captured == ["notion", "confluence"]
     finally:
         win.deleteLater()
 

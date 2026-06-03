@@ -1179,6 +1179,18 @@ class MainApp(QObject):
             self._on_manage_classification,
         )
         self.window.address_book_requested.connect(self._on_address_book)
+        # File > Save to ... mirrors the SessionView's right-pane
+        # Save to... button. Route both through the same handlers so
+        # body resolution + worker spawn stay in one place (#79).
+        self.window.save_to_pdf_requested.connect(
+            self._on_file_menu_save_to_pdf,
+        )
+        self.window.save_to_notion_requested.connect(
+            self._on_file_menu_save_to_notion,
+        )
+        self.window.save_to_confluence_requested.connect(
+            self._on_file_menu_save_to_confluence,
+        )
         # SessionView -> classification chip mutations
         sv = self.window.session_view
         sv.add_topic_requested.connect(self._on_add_topic_requested)
@@ -2463,6 +2475,33 @@ class MainApp(QObject):
             tab_label=tab_label,
             body=body,
         )
+
+    # ---- File menu > Save to ... bridges (#79) -------------------------
+    #
+    # MainWindow's File > Save to submenu emits these no-arg signals;
+    # we look up the active session + tab from the SessionView and
+    # forward to the same per-target handlers the right-pane button
+    # uses, so body resolution + worker spawn stay in one place.
+
+    def _on_file_menu_save_to_pdf(self) -> None:
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            return
+        sv._on_export_pdf()  # noqa: SLF001
+
+    def _on_file_menu_save_to_notion(self) -> None:
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            return
+        body, label = sv._active_tab_body_and_label()  # noqa: SLF001
+        self._on_export_to_notion(sv._session.id, label, body)  # noqa: SLF001
+
+    def _on_file_menu_save_to_confluence(self) -> None:
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            return
+        body, label = sv._active_tab_body_and_label()  # noqa: SLF001
+        self._on_export_to_confluence(sv._session.id, label, body)  # noqa: SLF001
 
     def _on_restore_previous_notes(self, session_id: str, archive_path) -> None:
         """Replace notes.md with a selected archive's contents. The

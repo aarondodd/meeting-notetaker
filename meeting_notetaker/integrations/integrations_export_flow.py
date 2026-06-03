@@ -52,17 +52,19 @@ def run_notion_export(
     cfg = main_app.config.notion
     if not (cfg.api_token and cfg.last_verified_at):
         QMessageBox.information(
-            main_app.window, "Export to Notion",
+            main_app.window, "Save to Notion",
             "Verify the Notion connection in Settings -> Integrations first.",
         )
         return
     client = NotionClient(cfg.api_token)
     browser = NotionPickerBrowser(client)
     dlg = IntegrationsPickerDialog(
-        title="Export to Notion",
+        title="Save to Notion",
         browser=browser,
         favorites=cfg.favorites,
         recents=cfg.recents,
+        default_page_title=_default_page_title(main_app, session_id),
+        series_name=_session_series_name(main_app, session_id),
         parent=main_app.window,
     )
     if dlg.exec() != dlg.DialogCode.Accepted:
@@ -74,14 +76,14 @@ def run_notion_export(
     # durable even if the export itself fails.
     main_app.config.notion.favorites = dlg.updated_favorites()
 
-    title = _build_export_title(main_app, session_id, tab_label)
     worker = NotionExportWorker(
         client=client,
         parent_id=selection.id,
-        title=title,
+        title=selection.page_title,
         markdown_body=body,
         session_dir=session_dir(session_id),
     )
+    del tab_label  # picker title carries the user's wording now
     _run_worker_with_progress(
         main_app, worker,
         progress_title="Exporting to Notion",
@@ -99,17 +101,19 @@ def run_confluence_export(
     cfg = main_app.config.confluence
     if not (cfg.base_url and cfg.email and cfg.api_token and cfg.last_verified_at):
         QMessageBox.information(
-            main_app.window, "Export to Confluence",
+            main_app.window, "Save to Confluence",
             "Verify the Confluence connection in Settings -> Integrations first.",
         )
         return
     client = ConfluenceClient(cfg.base_url, cfg.email, cfg.api_token)
     browser = ConfluencePickerBrowser(client)
     dlg = IntegrationsPickerDialog(
-        title="Export to Confluence",
+        title="Save to Confluence",
         browser=browser,
         favorites=cfg.favorites,
         recents=cfg.recents,
+        default_page_title=_default_page_title(main_app, session_id),
+        series_name=_session_series_name(main_app, session_id),
         parent=main_app.window,
     )
     if dlg.exec() != dlg.DialogCode.Accepted:
@@ -122,20 +126,20 @@ def run_confluence_export(
     space_id = selection.extra.get("space_id") or ""
     if not space_id:
         QMessageBox.warning(
-            main_app.window, "Export to Confluence",
+            main_app.window, "Save to Confluence",
             "The picked parent has no associated space; pick a page inside a space.",
         )
         return
 
-    title = _build_export_title(main_app, session_id, tab_label)
     worker = ConfluenceExportWorker(
         client=client,
         parent_id=selection.id,
         space_id=space_id,
-        title=title,
+        title=selection.page_title,
         markdown_body=body,
         session_dir=session_dir(session_id),
     )
+    del tab_label  # picker title carries the user's wording now
     _run_worker_with_progress(
         main_app, worker,
         progress_title="Exporting to Confluence",
@@ -150,12 +154,49 @@ def run_confluence_export(
 # ---- helpers --------------------------------------------------------------
 
 
+def _default_page_title(main_app: "MainApp", session_id: str) -> str:
+    """Default the picker's title field to
+    'YYYY-MM-DD HH:MM - <session title>' (#79 polish, Aaron's
+    2026-06-03 ask). The date+time is the session's stored UTC
+    converted to the user's local timezone so it lines up with
+    what the rest of the app shows."""
+    session = main_app.store.get_session(session_id)
+    title = (session.title if session else session_id) or session_id
+    when_str = ""
+    if session and session.created_at:
+        try:
+            local = datetime.fromisoformat(
+                session.created_at.replace("Z", "+00:00")
+            ).astimezone()
+            when_str = local.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            when_str = ""
+    if when_str:
+        return f"{when_str} - {title}"
+    return title
+
+
+def _session_series_name(main_app: "MainApp", session_id: str) -> str:
+    """Look up the session's series name for the Create-folder
+    sub-dialog's 'Use series name' button. Empty when no series is
+    set or the classification store isn't wired up."""
+    store = getattr(main_app, "classification", None)
+    if store is None:
+        return ""
+    try:
+        series = store.series_for_session(session_id)
+    except Exception:
+        return ""
+    return (series.name or "") if series else ""
+
+
 def _build_export_title(
     main_app: "MainApp", session_id: str, tab_label: str,
 ) -> str:
-    """Title shape: '<session title> -- <tab>'. Matches the filename
-    layer's convention so users see consistent naming across PDF +
-    Notion + Confluence exports."""
+    """Legacy helper retained for tests that pinned the old
+    '<session title> -- <tab>' shape. New call sites should use
+    `_default_page_title` (the picker title field is now the source
+    of truth for the page name)."""
     session = main_app.store.get_session(session_id)
     base = (session.title if session else session_id) or session_id
     if tab_label:

@@ -228,12 +228,18 @@ class ConfluenceClient:
             "spaceId": space_id,
             "status": "current",
             "title": title,
-            "parentId": parent_id,
             "body": {
                 "representation": "storage",
                 "value": storage_xml,
             },
         }
+        # Omit parentId entirely when blank -- the v2 API treats that
+        # as "root of the space" instead of erroring on a malformed
+        # empty parent reference. Used by the Create-folder path when
+        # the user picks a space (no specific parent page) as the
+        # location for a new container page.
+        if parent_id:
+            body["parentId"] = parent_id
         return self._request("POST", "/api/v2/pages", json=body)
 
     def update_page(

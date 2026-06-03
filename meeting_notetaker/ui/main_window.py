@@ -146,6 +146,12 @@ class MainWindow(QMainWindow):
     # retention; the menu is the one-click action surface.
     backup_now_requested = pyqtSignal()
     restore_backup_requested = pyqtSignal()
+    # Issue #79: File > Save to ... mirrors the SessionView's Save to...
+    # menu button. MainApp routes these to SessionView so the same
+    # body resolution + worker spawn is used.
+    save_to_pdf_requested = pyqtSignal()
+    save_to_notion_requested = pyqtSignal()
+    save_to_confluence_requested = pyqtSignal()
     show_session_tab_requested = pyqtSignal(str, str, object)
     # session_id, tab_id ('transcript' | 'live_notes' | 'notes' | 'previous'),
     # optional archive_path (str | None); emitted by the cross-session
@@ -205,6 +211,29 @@ class MainWindow(QMainWindow):
         self._action_export_package.triggered.connect(self._emit_export_package)
         export_menu.addAction(self._action_export_package)
         self._file_export_menu = export_menu
+        # Save to submenu mirrors the SessionView's "Save to..." button
+        # so a menu-bar user can fire the same flow without a mouse to
+        # the right pane. The Notion + Confluence items are always
+        # visible here -- if the integration isn't configured + verified,
+        # MainApp's handler shows the same "Verify in Settings..." note
+        # as the right-pane button does today.
+        save_menu = file_menu.addMenu("&Save to")
+        self._action_save_pdf = QAction("Save as PDF...", self)
+        self._action_save_pdf.triggered.connect(
+            self.save_to_pdf_requested.emit,
+        )
+        save_menu.addAction(self._action_save_pdf)
+        self._action_save_notion = QAction("Save to Notion...", self)
+        self._action_save_notion.triggered.connect(
+            self.save_to_notion_requested.emit,
+        )
+        save_menu.addAction(self._action_save_notion)
+        self._action_save_confluence = QAction("Save to Confluence...", self)
+        self._action_save_confluence.triggered.connect(
+            self.save_to_confluence_requested.emit,
+        )
+        save_menu.addAction(self._action_save_confluence)
+        self._file_save_menu = save_menu
         # Delete submenu: recording-only vs the whole session, matching
         # the right-click split so users don't fat-finger the wrong one.
         delete_menu = file_menu.addMenu("&Delete")
@@ -270,10 +299,14 @@ class MainWindow(QMainWindow):
             self._action_export_package,
             self._action_delete_recording,
             self._action_delete_session,
+            self._action_save_pdf,
+            self._action_save_notion,
+            self._action_save_confluence,
         ):
             action.setEnabled(False)
         self._file_export_menu.setEnabled(False)
         self._file_delete_menu.setEnabled(False)
+        self._file_save_menu.setEnabled(False)
 
         help_menu = menubar.addMenu("&Help")
         debug_menu = help_menu.addMenu("&Debug")
@@ -739,6 +772,13 @@ class MainWindow(QMainWindow):
         self._action_delete_recording.setEnabled(has_audio)
         self._action_delete_session.setEnabled(any_selected)
         self._file_delete_menu.setEnabled(any_selected)
+        # Save to actions: need a single session loaded so the right
+        # pane has a tab body to export. Notion + Confluence are
+        # always selectable; MainApp's handler checks verified state.
+        self._action_save_pdf.setEnabled(single is not None)
+        self._action_save_notion.setEnabled(single is not None)
+        self._action_save_confluence.setEnabled(single is not None)
+        self._file_save_menu.setEnabled(single is not None)
 
     # ---- File-menu emit helpers ----------------------------------------
 

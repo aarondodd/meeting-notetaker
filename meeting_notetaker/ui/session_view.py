@@ -349,29 +349,33 @@ class SessionView(QWidget):
         )
         self._print_btn.clicked.connect(self._on_print)
         synthesis.addWidget(self._print_btn)
-        # Issue #79: unified Export... button. PDF always available;
+        # Issue #79: unified Save to... button. PDF always available;
         # Notion + Confluence menu items appear only when their
-        # respective integrations are configured + verified.
+        # respective integrations are configured + verified. Button
+        # label switched from "Export..." to "Save to..." on 2026-06-03
+        # to match how users think about the destinations -- PDF is
+        # "save as" a file format, Notion / Confluence are "save to"
+        # a remote destination.
         self._export_btn = QToolButton(self)
-        self._export_btn.setText("Export...")
+        self._export_btn.setText("Save to...")
         self._export_btn.setToolTip(
-            "Save or post the active tab (My Notes or Synthesis) to "
-            "PDF, Notion, or Confluence."
+            "Save the active tab (My Notes or Synthesis) as a PDF or "
+            "to Notion / Confluence."
         )
         self._export_btn.setPopupMode(
             QToolButton.ToolButtonPopupMode.InstantPopup,
         )
         self._export_menu = QMenu(self._export_btn)
-        self._export_pdf_action = self._export_menu.addAction("Export as PDF...")
+        self._export_pdf_action = self._export_menu.addAction("Save as PDF...")
         self._export_pdf_action.triggered.connect(self._on_export_pdf)
         # Notion + Confluence actions; visibility re-evaluated whenever
         # the session changes or settings are saved.
         self._export_notion_action = self._export_menu.addAction(
-            "Export to Notion..."
+            "Save to Notion..."
         )
         self._export_notion_action.triggered.connect(self._on_export_notion)
         self._export_confluence_action = self._export_menu.addAction(
-            "Export to Confluence..."
+            "Save to Confluence..."
         )
         self._export_confluence_action.triggered.connect(self._on_export_confluence)
         # Hidden by default; MainApp toggles via set_integration_targets().

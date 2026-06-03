@@ -38,12 +38,15 @@ def test_export_button_default_hides_notion_and_confluence(qt_app):
     try:
         actions = sv._export_menu.actions()  # noqa: SLF001
         labels = [a.text() for a in actions]
-        assert "Export as PDF..." in labels
-        # Notion + Confluence in the menu but not visible until configured.
-        assert any("Notion" in l for l in labels)
-        assert any("Confluence" in l for l in labels)
+        # Wording reorg 2026-06-03: button is Save to..., PDF is Save
+        # as PDF... (file format), Notion / Confluence are Save to ...
+        assert sv._export_btn.text() == "Save to..."  # noqa: SLF001
+        assert "Save as PDF..." in labels
+        assert any("Save to Notion" in l for l in labels)
+        assert any("Save to Confluence" in l for l in labels)
         notion = next(a for a in actions if "Notion" in a.text())
         confluence = next(a for a in actions if "Confluence" in a.text())
+        # Hidden by default until verified.
         assert notion.isVisible() is False
         assert confluence.isVisible() is False
     finally:

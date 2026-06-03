@@ -41,12 +41,21 @@ class _FakeBrowser:
     def __init__(self, *, root: list[PickerNode], children: Optional[dict] = None) -> None:
         self._root = root
         self._children = children or {}
+        self.create_folder_calls: list[tuple[Optional[PickerNode], str]] = []
+        self._next_folder_id = 9000
 
     def browse_root(self) -> list[PickerNode]:
         return list(self._root)
 
     def browse_children(self, node: PickerNode) -> list[PickerNode]:
         return list(self._children.get(node.id, []))
+
+    def create_folder(self, parent, name):
+        self.create_folder_calls.append((parent, name))
+        self._next_folder_id += 1
+        return PickerNode(
+            id=f"new-{self._next_folder_id}", title=name, has_children=False,
+        )
 
 
 # ---- dialog smoke ----------------------------------------------------------
@@ -193,6 +202,7 @@ def test_accept_records_selection_payload(qt_app):
     ])
     dlg = IntegrationsPickerDialog(
         title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="default title",
     )
     try:
         item = dlg._browse_root.child(0)  # noqa: SLF001
@@ -202,6 +212,7 @@ def test_accept_records_selection_payload(qt_app):
         assert sel is not None
         assert sel.id == "p1"
         assert sel.title == "Page 1"
+        assert sel.page_title == "default title"
         assert sel.extra == {"space_id": "100"}
     finally:
         dlg.deleteLater()
@@ -368,6 +379,298 @@ def test_starring_keeps_favorites_alphabetized(qt_app):
         assert rows == ["Apple", "Banana", "Cherry"]
     finally:
         dlg.deleteLater()
+
+
+# ---- title field + page-title round trip --------------------------------
+
+
+def test_title_field_defaults_from_constructor(qt_app):
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t",
+        browser=browser,
+        favorites=[], recents=[],
+        default_page_title="2026-06-03 14:30 - Weekly Sync",
+    )
+    try:
+        assert dlg._title_edit.text() == "2026-06-03 14:30 - Weekly Sync"  # noqa: SLF001
+    finally:
+        dlg.deleteLater()
+
+
+def test_accept_carries_user_edited_page_title(qt_app):
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="default title",
+    )
+    try:
+        dlg._title_edit.setText("user edited title")  # noqa: SLF001
+        dlg._tree.setCurrentItem(dlg._browse_root.child(0))  # noqa: SLF001
+        dlg._on_accept()  # noqa: SLF001
+        sel = dlg.selection()
+        assert sel is not None
+        assert sel.page_title == "user edited title"
+    finally:
+        dlg.deleteLater()
+
+
+def test_accept_blocked_when_title_is_empty(qt_app):
+    """A blank title would create a page with no name; block accept."""
+    from unittest.mock import patch
+
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="",
+    )
+    try:
+        dlg._tree.setCurrentItem(dlg._browse_root.child(0))  # noqa: SLF001
+        # Title is empty -- accept should refuse + dialog stays open.
+        with patch(
+            "meeting_notetaker.ui.integrations_picker_dialog.QMessageBox.information"
+        ):
+            dlg._on_accept()  # noqa: SLF001
+        assert dlg.selection() is None
+    finally:
+        dlg.deleteLater()
+
+
+# ---- create-folder flow -------------------------------------------------
+
+
+def test_create_folder_button_disabled_when_nothing_selected(qt_app):
+    browser = _FakeBrowser(root=[])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+    )
+    try:
+        assert not dlg._create_folder_btn.isEnabled()  # noqa: SLF001
+    finally:
+        dlg.deleteLater()
+
+
+def test_create_folder_button_enabled_for_space_selection(qt_app):
+    """Confluence spaces aren't valid destinations but ARE valid
+    parents for new folders. Create-folder must enable when a space
+    is selected even though OK is disabled."""
+    browser = _FakeBrowser(root=[
+        PickerNode(id="s", title="Eng Space", kind="space"),
+    ])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+    )
+    try:
+        dlg._tree.setCurrentItem(dlg._browse_root.child(0))  # noqa: SLF001
+        assert dlg._create_folder_btn.isEnabled()  # noqa: SLF001
+        assert not dlg._ok_btn.isEnabled()  # noqa: SLF001
+    finally:
+        dlg.deleteLater()
+
+
+def test_create_folder_calls_browser_with_parent_node_and_name(qt_app, monkeypatch):
+    """Clicking Create Folder + entering a name routes through the
+    browser's create_folder + slots the new node under the selected
+    parent + selects it."""
+    from PyQt6.QtWidgets import QDialog as _QDialog
+
+    browser = _FakeBrowser(
+        root=[PickerNode(id="parent", title="Parent Page")],
+        children={"parent": []},
+    )
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+    )
+    try:
+        parent_item = dlg._browse_root.child(0)  # noqa: SLF001
+        dlg._tree.setCurrentItem(parent_item)  # noqa: SLF001
+        # Stub the sub-dialog so the test doesn't need user input.
+        from meeting_notetaker.ui import integrations_picker_dialog as ipd
+
+        class _StubSub:
+            def __init__(self, *args, **kwargs):
+                self._name = "My New Folder"
+            def exec(self):
+                return _QDialog.DialogCode.Accepted
+            def entered_name(self):
+                return self._name
+        monkeypatch.setattr(ipd, "_CreateFolderDialog", _StubSub)
+        dlg._on_create_folder_clicked()  # noqa: SLF001
+        # Browser saw the create call with the right args.
+        assert len(browser.create_folder_calls) == 1
+        parent_arg, name_arg = browser.create_folder_calls[0]
+        assert parent_arg.id == "parent"
+        assert name_arg == "My New Folder"
+        # New folder appears under the parent + is the current selection.
+        current = dlg._tree.currentItem()  # noqa: SLF001
+        assert current is not None
+        new_node = current.data(0, Qt.ItemDataRole.UserRole)
+        assert new_node.title == "My New Folder"
+    finally:
+        dlg.deleteLater()
+
+
+def test_create_folder_cancelled_does_not_call_browser(qt_app, monkeypatch):
+    from PyQt6.QtWidgets import QDialog as _QDialog
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+    )
+    try:
+        dlg._tree.setCurrentItem(dlg._browse_root.child(0))  # noqa: SLF001
+        from meeting_notetaker.ui import integrations_picker_dialog as ipd
+
+        class _Cancel:
+            def __init__(self, *args, **kwargs):
+                pass
+            def exec(self):
+                return _QDialog.DialogCode.Rejected
+            def entered_name(self):
+                return ""
+        monkeypatch.setattr(ipd, "_CreateFolderDialog", _Cancel)
+        dlg._on_create_folder_clicked()  # noqa: SLF001
+        assert browser.create_folder_calls == []
+    finally:
+        dlg.deleteLater()
+
+
+# ---- sub-dialog: use-series-name affordance -----------------------------
+
+
+def test_create_folder_dialog_use_series_btn_fills_name(qt_app):
+    from meeting_notetaker.ui.integrations_picker_dialog import _CreateFolderDialog
+
+    sub = _CreateFolderDialog(
+        series_name="Weekly Engineering Sync",
+        parent_title="Meetings",
+    )
+    try:
+        assert sub._series_btn.isEnabled()  # noqa: SLF001
+        sub._on_use_series()  # noqa: SLF001
+        assert sub.entered_name() == "Weekly Engineering Sync"
+    finally:
+        sub.deleteLater()
+
+
+def test_create_folder_dialog_use_series_btn_disabled_when_no_series(qt_app):
+    from meeting_notetaker.ui.integrations_picker_dialog import _CreateFolderDialog
+
+    sub = _CreateFolderDialog(series_name="", parent_title="Meetings")
+    try:
+        assert not sub._series_btn.isEnabled()  # noqa: SLF001
+    finally:
+        sub.deleteLater()
+
+
+# ---- adapter create_folder ----------------------------------------------
+
+
+def test_notion_browser_create_folder_routes_through_client():
+    """NotionPickerBrowser.create_folder creates a child page via
+    the underlying NotionClient. The returned PickerNode carries
+    the new page id."""
+
+    class _Client:
+        def __init__(self):
+            self.create_calls = []
+        def create_page(self, **kwargs):
+            self.create_calls.append(kwargs)
+            return {"id": "new-page-id", "url": "https://notion.so/new-page-id"}
+
+    from meeting_notetaker.ui.integrations_picker_dialog import NotionPickerBrowser
+
+    client = _Client()
+    browser = NotionPickerBrowser(client)
+    parent = PickerNode(id="parent-page", title="Meetings")
+    result = browser.create_folder(parent, "Weekly Sync")
+    assert result.id == "new-page-id"
+    assert result.title == "Weekly Sync"
+    assert client.create_calls[0]["parent_id"] == "parent-page"
+    assert client.create_calls[0]["title"] == "Weekly Sync"
+    assert client.create_calls[0]["children"] == []
+
+
+def test_confluence_browser_create_folder_in_space_omits_parent():
+    """When the parent is a space, the folder is a root-level page;
+    the client is called with parent_id='' so confluence_api.create_page
+    drops parentId from the body."""
+
+    class _Client:
+        def __init__(self):
+            self.calls = []
+        def create_page(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"id": "9999"}
+
+    from meeting_notetaker.ui.integrations_picker_dialog import ConfluencePickerBrowser
+
+    client = _Client()
+    browser = ConfluencePickerBrowser(client)
+    space = PickerNode(
+        id="100", title="Engineering", kind="space",
+        extra={"space_id": "100"},
+    )
+    result = browser.create_folder(space, "Project Notes")
+    assert result.id == "9999"
+    assert result.title == "Project Notes"
+    assert client.calls[0]["space_id"] == "100"
+    assert client.calls[0]["parent_id"] == ""
+    assert client.calls[0]["storage_xml"] == "<p></p>"
+
+
+def test_confluence_browser_create_folder_under_page_passes_parent_id():
+    class _Client:
+        def __init__(self):
+            self.calls = []
+        def create_page(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"id": "9999"}
+
+    from meeting_notetaker.ui.integrations_picker_dialog import ConfluencePickerBrowser
+
+    client = _Client()
+    browser = ConfluencePickerBrowser(client)
+    page = PickerNode(
+        id="123", title="Parent Page", kind="page",
+        extra={"space_id": "100"},
+    )
+    browser.create_folder(page, "Child Folder")
+    assert client.calls[0]["space_id"] == "100"
+    assert client.calls[0]["parent_id"] == "123"
+
+
+def test_confluence_api_create_page_drops_empty_parent_id():
+    """Smoke test for the confluence_api.create_page change: when
+    parent_id is empty, parentId must be omitted from the request
+    body so the v2 API treats it as a root-level page in the space."""
+    from unittest.mock import MagicMock
+    from meeting_notetaker.integrations.confluence_api import ConfluenceClient
+
+    sess = MagicMock()
+    sess.request.return_value.status_code = 200
+    sess.request.return_value.content = b"{}"
+    sess.request.return_value.json.return_value = {"id": "1"}
+    client = ConfluenceClient(
+        "https://x/wiki", "u@x.com", "t", session=sess,
+    )
+    client.create_page(
+        parent_id="", space_id="100", title="t", storage_xml="<p></p>",
+    )
+    body = sess.request.call_args.kwargs["json"]
+    assert "parentId" not in body
+    # Now confirm that when parent_id is non-empty the field IS present.
+    sess.reset_mock()
+    sess.request.return_value.status_code = 200
+    sess.request.return_value.content = b"{}"
+    sess.request.return_value.json.return_value = {"id": "1"}
+    client.create_page(
+        parent_id="9001", space_id="100", title="t", storage_xml="<p></p>",
+    )
+    body = sess.request.call_args.kwargs["json"]
+    assert body["parentId"] == "9001"
 
 
 def test_confluence_browser_adapts_spaces_then_pages():
