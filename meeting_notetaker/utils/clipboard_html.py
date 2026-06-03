@@ -110,8 +110,8 @@ def _rewrite_unfetchable_images(soup) -> None:
         # is one of the few cases where this project ships a Unicode
         # glyph in user-visible output -- explicit user request.
         msg = (
-            f"❌ (image: {label} omitted from paste) ❌" if label
-            else "❌ (image omitted from paste) ❌"
+            f"❌ (image: {label} could not be pasted) ❌" if label
+            else "❌ (image could not be pasted) ❌"
         )
         placeholder = soup.new_tag("em")
         placeholder.string = msg
