@@ -104,9 +104,14 @@ def _rewrite_unfetchable_images(soup) -> None:
             tail = src.rsplit(":", 1)[-1].rsplit("/", 1)[-1]
             if tail and tail != src:
                 label = tail
+        # Aaron asked for emoji bookends so the placeholder is
+        # obvious at a glance and doesn't blend into surrounding
+        # italicized prose (#74 polish, 2026-06-02). U+274C CROSS MARK
+        # is one of the few cases where this project ships a Unicode
+        # glyph in user-visible output -- explicit user request.
         msg = (
-            f"(image: {label} omitted from paste)" if label
-            else "(image omitted from paste)"
+            f"❌ (image: {label} omitted from paste) ❌" if label
+            else "❌ (image omitted from paste) ❌"
         )
         placeholder = soup.new_tag("em")
         placeholder.string = msg
