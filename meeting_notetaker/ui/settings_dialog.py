@@ -1024,13 +1024,15 @@ class SettingsDialog(QDialog):
 
         self._add_section("Backups", backup_group)
 
-        # Integrations (experimental, #79) -----------------------------------
+        # Integrations (#79) -------------------------------------------------
         # Notion + Confluence export targets. Both surface only when the
         # user provides credentials AND the Verify button has reported
         # success since the credentials last changed (verify writes
-        # last_verified_at; the export menu reads this).
+        # last_verified_at; the export menu reads this). Shipped as
+        # "(Experimental)" in v0.7.6-dev; tag dropped on 2026-06-03 after
+        # end-to-end verification on Cloud Notion + Cloud Confluence.
         integrations_page = self._build_integrations_section(config)
-        self._add_section("Integrations (Experimental)", integrations_page)
+        self._add_section("Integrations", integrations_page)
 
         # Assemble nav + stack from the accumulated sections, sorted
         # alphabetically by label. Restores last-active section so the
@@ -1123,11 +1125,11 @@ class SettingsDialog(QDialog):
         self._config.backup.retention_days = int(
             self._backup_retention_days.value()
         )
-        # Issue #79 -- experimental integrations. Token edits persist
-        # whether or not Verify ran (the user can save partial state and
-        # verify later). Any change to the credential fields clears the
-        # last_verified_at stamp so a stale "Connected" label doesn't
-        # outlive the credentials it described.
+        # Issue #79 -- Notion + Confluence integrations. Token edits
+        # persist whether or not Verify ran (the user can save partial
+        # state and verify later). Any change to the credential fields
+        # clears the last_verified_at stamp so a stale "Connected"
+        # label doesn't outlive the credentials it described.
         new_notion_token = self._notion_token_edit.text().strip()
         if new_notion_token != self._config.notion.api_token:
             self._config.notion.api_token = new_notion_token
@@ -1150,16 +1152,14 @@ class SettingsDialog(QDialog):
         self._config.ui.settings_active_section = self._active_section_label()
         self.accept()
 
-    # ---- integrations (experimental, #79) ------------------------------
+    # ---- integrations (#79) -------------------------------------------
 
     def _build_integrations_section(self, config: Config) -> QWidget:
         """Build the Notion + Confluence credential rows.
 
-        Experimental section: shipped as opt-in so users not in the
-        Notion / Confluence path don't see export options that don't
-        apply to them. The Settings nav label includes "(Experimental)"
-        so the status is clear; once stable + battle-tested we drop
-        the tag in a later release.
+        Opt-in: users not in the Notion / Confluence path see no
+        export options that don't apply to them. Both targets verify
+        their credentials before the Save to menu surfaces them.
         """
         page = QWidget(self)
         layout = QVBoxLayout(page)
@@ -1167,10 +1167,10 @@ class SettingsDialog(QDialog):
 
         # Header explainer.
         header = QLabel(
-            "Experimental: post the active My Notes or Synthesis tab to "
-            "Notion or Confluence as a new page under a parent you pick. "
-            "Tokens stay local in your settings.toml. The Export menu "
-            "surfaces these destinations only after Verify succeeds.",
+            "Save the active My Notes or Synthesis tab to Notion or "
+            "Confluence as a new page under a parent you pick. Tokens "
+            "stay local in your settings.toml. The Save to menu surfaces "
+            "these destinations only after Verify succeeds.",
             self,
         )
         header.setWordWrap(True)

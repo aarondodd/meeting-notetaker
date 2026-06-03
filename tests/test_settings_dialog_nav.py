@@ -74,7 +74,7 @@ def test_expected_sections_present(qt_app):
     finally:
         dlg.deleteLater()
     expected = {
-        "Audio", "Backups", "Calendar", "Export", "Integrations (Experimental)",
+        "Audio", "Backups", "Calendar", "Export", "Integrations",
         "Interface", "Meeting Detection", "Screen Capture", "Speakers",
         "Synthesis", "Transcription",
     }

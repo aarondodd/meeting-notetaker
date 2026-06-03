@@ -1,4 +1,4 @@
-"""Settings -> Integrations (Experimental) tab tests (#79).
+"""Settings -> Integrations tab tests (#79).
 
 Covers the new Notion + Confluence credential rows. Verify-click
 flows mock the network so the test runs offline + deterministic.
@@ -25,7 +25,7 @@ def qt_app():
     return QApplication.instance() or QApplication(sys.argv)
 
 
-def test_integrations_section_registered_with_experimental_tag(qt_app):
+def test_integrations_section_registered(qt_app):
     cfg = Config()
     dlg = SettingsDialog(cfg)
     try:
@@ -33,7 +33,10 @@ def test_integrations_section_registered_with_experimental_tag(qt_app):
             dlg._nav.item(i).text()  # noqa: SLF001
             for i in range(dlg._nav.count())  # noqa: SLF001
         ]
-        assert "Integrations (Experimental)" in labels
+        # Renamed from "Integrations (Experimental)" -> "Integrations"
+        # on 2026-06-03 after end-to-end verification on Cloud.
+        assert "Integrations" in labels
+        assert "Integrations (Experimental)" not in labels
     finally:
         dlg.deleteLater()
 
