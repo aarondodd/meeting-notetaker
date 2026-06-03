@@ -216,10 +216,15 @@ class NotionClient:
             json={"children": children},
         )
 
-    # ---- images ---------------------------------------------------------
+    # ---- files / images -------------------------------------------------
 
     def upload_image(self, path: Path) -> str:
-        """Upload a local image and return its ``file_upload`` id.
+        """Upload a local image. Thin wrapper over :meth:`upload_file`
+        kept for back-compat + readability at image-only call sites."""
+        return self.upload_file(path)
+
+    def upload_file(self, path: Path, *, mime: str = "") -> str:
+        """Upload any local file and return its ``file_upload`` id.
 
         Three steps per Notion's documented protocol:
 
@@ -228,11 +233,17 @@ class NotionClient:
         2. ``POST <upload_url>`` (multipart/form-data with the file in
            the ``file`` field) -- sends the bytes.
         3. The upload object's ``id`` can now be referenced via
-           ``image`` block ``type: "file_upload"``.
+           ``image`` or ``file`` block ``type: "file_upload"``.
+
+        ``mime`` lets the caller pass an explicit content type (the
+        sender of an attachment usually knows the recorded mime from
+        AttachmentRecord); when empty the helper falls back to the
+        image-MIME guesser, which is correct for image paths and
+        defaults to ``application/octet-stream`` for everything else.
         """
         path = Path(path)
         if not path.is_file():
-            raise NotionAPIError(0, f"image not found: {path}", "")
+            raise NotionAPIError(0, f"file not found: {path}", "")
 
         # Step 1: create the upload record.
         create = self._request(
@@ -243,12 +254,14 @@ class NotionClient:
         upload_id = create["id"]
         upload_url = create["upload_url"]
 
+        content_type = (mime or "").strip() or _guess_mime(path)
+
         # Step 2: send the file bytes via multipart. Notion's
         # /file_uploads send endpoint expects the body in a field
         # literally named "file"; the upload_url already encodes the
         # endpoint, so we just POST to it.
         with path.open("rb") as fh:
-            files = {"file": (path.name, fh, _guess_mime(path))}
+            files = {"file": (path.name, fh, content_type)}
             # Authorization is still required on the send call; only
             # Content-Type changes (multipart, set by requests).
             send_headers = {

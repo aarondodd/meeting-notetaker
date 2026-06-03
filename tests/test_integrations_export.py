@@ -76,6 +76,9 @@ class _FakeNotionClient:
         self._upload_counter = 0
 
     def upload_image(self, path: Path) -> str:
+        return self.upload_file(path)
+
+    def upload_file(self, path: Path, *, mime: str = "") -> str:
         self._upload_counter += 1
         upload_id = f"upl-{self._upload_counter}"
         self.uploads.append((str(path), upload_id))
@@ -217,6 +220,74 @@ def test_notion_export_message_notes_sibling_creation(tmp_path):
     assert "sibling" in result.message.lower()
 
 
+def test_notion_export_uploads_attachments_and_appends_file_blocks(tmp_path):
+    """When the picker checkbox is set, attachments upload via the
+    file_upload endpoint + appear as file blocks under an Attachments
+    heading at the end of the page."""
+    from meeting_notetaker.integrations.export import ExportAttachment
+
+    pdf = tmp_path / "agenda.pdf"
+    pdf.write_bytes(b"%PDF-1.4 stub")
+    docx = tmp_path / "notes.docx"
+    docx.write_bytes(b"PK stub")
+
+    client = _FakeNotionClient()
+    export_to_notion(
+        client=client, parent_id="p", title="t",
+        markdown_body="# Body\n\nNo inline images.",
+        session_dir=tmp_path,
+        attachments=[
+            ExportAttachment(path=pdf, display_name="Meeting agenda", mime="application/pdf"),
+            ExportAttachment(path=docx, display_name="Notes", mime=""),
+        ],
+    )
+    # Two uploads via the file upload path.
+    uploaded_paths = sorted(p for p, _id in client.uploads)
+    assert str(pdf) in uploaded_paths
+    assert str(docx) in uploaded_paths
+    # The last create_page call's children include an "Attachments"
+    # heading followed by file blocks for each attachment.
+    children = client.last_create["children"]
+    heading_indices = [
+        i for i, b in enumerate(children)
+        if b.get("type") == "heading_2"
+        and b["heading_2"]["rich_text"][0]["text"]["content"] == "Attachments"
+    ]
+    assert len(heading_indices) == 1
+    after = children[heading_indices[0] + 1:]
+    file_blocks = [b for b in after if b.get("type") == "file"]
+    assert len(file_blocks) == 2
+    # Each file block references its uploaded id.
+    assert file_blocks[0]["file"]["type"] == "file_upload"
+    assert file_blocks[0]["file"]["file_upload"]["id"]
+    # Display name reaches the caption + name.
+    captions = {b["file"]["caption"][0]["text"]["content"] for b in file_blocks}
+    assert "Meeting agenda" in captions
+    assert "Notes" in captions
+
+
+def test_notion_export_skips_missing_attachments_silently(tmp_path):
+    from meeting_notetaker.integrations.export import ExportAttachment
+
+    client = _FakeNotionClient()
+    export_to_notion(
+        client=client, parent_id="p", title="t",
+        markdown_body="x", session_dir=tmp_path,
+        attachments=[
+            ExportAttachment(path=tmp_path / "missing.pdf", display_name="ghost"),
+        ],
+    )
+    assert client.uploads == []  # nothing uploaded
+    # No Attachments heading when no successful uploads.
+    children = client.last_create["children"]
+    headings = [
+        b for b in children
+        if b.get("type") == "heading_2"
+        and b["heading_2"]["rich_text"][0]["text"]["content"] == "Attachments"
+    ]
+    assert headings == []
+
+
 # ---- Confluence export ---------------------------------------------------
 
 
@@ -285,3 +356,58 @@ def test_confluence_export_message_notes_sibling_creation(tmp_path):
         title="t", markdown_body="hi", session_dir=tmp_path,
     )
     assert "sibling" in result.message.lower()
+
+
+def test_confluence_export_attaches_session_files_and_appends_listing(tmp_path):
+    """When attachments are present, the export forces a 2-pass run:
+    placeholder create -> attachments upload -> body update with a
+    storage-XML Attachments section linking each ri:attachment."""
+    from meeting_notetaker.integrations.export import ExportAttachment
+
+    pdf = tmp_path / "agenda.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    docx = tmp_path / "spec.docx"
+    docx.write_bytes(b"PK")
+
+    client = _FakeConfluenceClient()
+    export_to_confluence(
+        client=client, parent_id="9001", space_id="100",
+        title="With attachments",
+        markdown_body="# Body\n\nNo inline images.",
+        session_dir=tmp_path,
+        attachments=[
+            ExportAttachment(path=pdf, display_name="Agenda"),
+            ExportAttachment(path=docx, display_name="Spec"),
+        ],
+    )
+    # Placeholder create.
+    assert len(client.created) == 1
+    page_id = client.created[0]["id"]
+    # Each attachment uploaded to the new page.
+    assert len(client.attachments) == 2
+    uploaded_filenames = sorted(name for _pid, name in client.attachments)
+    assert uploaded_filenames == ["agenda.pdf", "spec.docx"]
+    # Body update lands and carries the attachments section.
+    assert len(client.updates) == 1
+    final_xml = client.updates[0]["storage_xml"]
+    assert "<h2>Attachments</h2>" in final_xml
+    assert '<ri:attachment ri:filename="agenda.pdf" />' in final_xml
+    assert '<ri:attachment ri:filename="spec.docx" />' in final_xml
+    # Display names ride along inside the link bodies.
+    assert "Agenda" in final_xml
+    assert "Spec" in final_xml
+
+
+def test_confluence_export_no_attachments_keeps_single_pass(tmp_path):
+    """Without attachments + without inline images, the single-pass
+    create path stays in place (no placeholder + update churn)."""
+    client = _FakeConfluenceClient()
+    export_to_confluence(
+        client=client, parent_id="9001", space_id="100",
+        title="t", markdown_body="# Body",
+        session_dir=tmp_path,
+        attachments=[],
+    )
+    assert len(client.created) == 1
+    assert client.attachments == []
+    assert client.updates == []

@@ -17,6 +17,7 @@ from typing import Optional
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from .export import (
+    ExportAttachment,
     ExportResult,
     export_to_confluence,
     export_to_notion,
@@ -41,6 +42,7 @@ class NotionExportWorker(_ExportWorkerBase):
         title: str,
         markdown_body: str,
         session_dir: Path,
+        attachments: Optional[list[ExportAttachment]] = None,
     ) -> None:
         super().__init__()
         self._client = client
@@ -48,6 +50,7 @@ class NotionExportWorker(_ExportWorkerBase):
         self._title = title
         self._markdown_body = markdown_body
         self._session_dir = session_dir
+        self._attachments = attachments or []
 
     def run(self) -> None:
         try:
@@ -57,6 +60,7 @@ class NotionExportWorker(_ExportWorkerBase):
                 title=self._title,
                 markdown_body=self._markdown_body,
                 session_dir=self._session_dir,
+                attachments=self._attachments,
                 progress=self._emit_progress,
             )
         except Exception as exc:
@@ -75,6 +79,7 @@ class ConfluenceExportWorker(_ExportWorkerBase):
         title: str,
         markdown_body: str,
         session_dir: Path,
+        attachments: Optional[list[ExportAttachment]] = None,
     ) -> None:
         super().__init__()
         self._client = client
@@ -83,6 +88,7 @@ class ConfluenceExportWorker(_ExportWorkerBase):
         self._title = title
         self._markdown_body = markdown_body
         self._session_dir = session_dir
+        self._attachments = attachments or []
 
     def run(self) -> None:
         try:
@@ -93,6 +99,7 @@ class ConfluenceExportWorker(_ExportWorkerBase):
                 title=self._title,
                 markdown_body=self._markdown_body,
                 session_dir=self._session_dir,
+                attachments=self._attachments,
                 progress=self._emit_progress,
             )
         except Exception as exc:

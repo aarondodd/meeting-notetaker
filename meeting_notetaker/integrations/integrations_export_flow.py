@@ -25,8 +25,10 @@ from PyQt6.QtCore import QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import QMessageBox, QProgressDialog
 
+from ..models.attachments import AttachmentsStore
 from ..utils.paths import session_dir
 from .confluence_api import ConfluenceClient
+from .export import ExportAttachment
 from .export_worker import ConfluenceExportWorker, NotionExportWorker
 from .notion_api import NotionClient
 from ..ui.integrations_picker_dialog import (
@@ -58,6 +60,7 @@ def run_notion_export(
         return
     client = NotionClient(cfg.api_token)
     browser = NotionPickerBrowser(client)
+    session_attachments = _load_session_attachments(session_id)
     dlg = IntegrationsPickerDialog(
         title="Save to Notion",
         browser=browser,
@@ -65,6 +68,7 @@ def run_notion_export(
         recents=cfg.recents,
         default_page_title=_default_page_title(main_app, session_id),
         series_name=_session_series_name(main_app, session_id),
+        attachment_count=len(session_attachments),
         parent=main_app.window,
     )
     if dlg.exec() != dlg.DialogCode.Accepted:
@@ -82,6 +86,9 @@ def run_notion_export(
         title=selection.page_title,
         markdown_body=body,
         session_dir=session_dir(session_id),
+        attachments=(
+            session_attachments if selection.include_attachments else []
+        ),
     )
     del tab_label  # picker title carries the user's wording now
     _run_worker_with_progress(
@@ -107,6 +114,7 @@ def run_confluence_export(
         return
     client = ConfluenceClient(cfg.base_url, cfg.email, cfg.api_token)
     browser = ConfluencePickerBrowser(client)
+    session_attachments = _load_session_attachments(session_id)
     dlg = IntegrationsPickerDialog(
         title="Save to Confluence",
         browser=browser,
@@ -114,6 +122,7 @@ def run_confluence_export(
         recents=cfg.recents,
         default_page_title=_default_page_title(main_app, session_id),
         series_name=_session_series_name(main_app, session_id),
+        attachment_count=len(session_attachments),
         parent=main_app.window,
     )
     if dlg.exec() != dlg.DialogCode.Accepted:
@@ -138,6 +147,9 @@ def run_confluence_export(
         title=selection.page_title,
         markdown_body=body,
         session_dir=session_dir(session_id),
+        attachments=(
+            session_attachments if selection.include_attachments else []
+        ),
     )
     del tab_label  # picker title carries the user's wording now
     _run_worker_with_progress(
@@ -174,6 +186,28 @@ def _default_page_title(main_app: "MainApp", session_id: str) -> str:
     if when_str:
         return f"{when_str} - {title}"
     return title
+
+
+def _load_session_attachments(session_id: str) -> list[ExportAttachment]:
+    """Return the session's tracked files as ExportAttachment records,
+    skipping any whose on-disk file is missing. The picker uses the
+    count to decide whether to surface the Include-attachments
+    checkbox; the worker uses the list when the user opts in."""
+    try:
+        records = AttachmentsStore(session_id).list()
+    except Exception:
+        return []
+    out: list[ExportAttachment] = []
+    for rec in records:
+        path = session_dir(session_id) / "attachments" / rec.stored_name
+        if not path.is_file():
+            continue
+        out.append(ExportAttachment(
+            path=path,
+            display_name=rec.display_name or rec.stored_name,
+            mime=rec.mime or "",
+        ))
+    return out
 
 
 def _session_series_name(main_app: "MainApp", session_id: str) -> str:

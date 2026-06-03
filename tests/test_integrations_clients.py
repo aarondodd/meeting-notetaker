@@ -252,7 +252,28 @@ def test_notion_upload_image_missing_file_raises(tmp_path):
     client = NotionClient("t", session=_FakeSession())
     with pytest.raises(NotionAPIError) as exc:
         client.upload_image(tmp_path / "not-there.png")
-    assert "image not found" in str(exc.value)
+    assert "file not found" in str(exc.value)
+
+
+def test_notion_upload_file_uses_provided_mime_type(tmp_path):
+    """upload_file's explicit mime parameter overrides the extension-
+    based guess so attachments land with the right Content-Type."""
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4 stub")
+    sess = _FakeSession()
+    sess.queue(
+        _FakeResponse(200, {"id": "upl-1", "upload_url": "https://api.notion/upload/xyz"}),
+        _FakeResponse(200, {"id": "upl-1", "status": "uploaded"}),
+    )
+    client = NotionClient("t", session=sess)
+    upload_id = client.upload_file(pdf, mime="application/pdf")
+    assert upload_id == "upl-1"
+    # The multipart call carries the file tuple with the explicit
+    # content-type as the third element.
+    files = sess.calls[1]["files"]
+    fname, _fh, content_type = files["file"]
+    assert fname == "doc.pdf"
+    assert content_type == "application/pdf"
 
 
 # ---- Confluence -----------------------------------------------------------

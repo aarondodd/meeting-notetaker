@@ -37,6 +37,20 @@ from .notion_api import NotionClient
 from .notion_blocks import markdown_to_blocks
 
 
+# ---- attachment payload ----------------------------------------------------
+
+
+@dataclass
+class ExportAttachment:
+    """One session attachment to push to the created page."""
+    path: Path
+    display_name: str = ""
+    mime: str = ""
+
+    def label(self) -> str:
+        return (self.display_name or self.path.name).strip() or self.path.name
+
+
 # ---- public types ---------------------------------------------------------
 
 
@@ -131,10 +145,17 @@ def export_to_notion(
     title: str,
     markdown_body: str,
     session_dir: Path,
+    attachments: Optional[list[ExportAttachment]] = None,
     progress: Optional[Callable[[str], None]] = None,
 ) -> ExportResult:
     """Convert + upload + create. Returns ExportResult with the new
-    page's URL for the caller to surface (toast + open-in-browser)."""
+    page's URL for the caller to surface (toast + open-in-browser).
+
+    ``attachments`` are session files to push as ``file`` blocks at
+    the end of the page, under a "## Attachments" heading. Uploaded
+    via the same file_uploads endpoint as inline images.
+    """
+    attachments = attachments or []
 
     def report(msg: str) -> None:
         if progress:
@@ -177,6 +198,49 @@ def export_to_notion(
     # 2. Convert + create.
     report("Converting Markdown to Notion blocks...")
     children = markdown_to_blocks(markdown_body, image_resolver=image_resolver)
+
+    # 3. Optional session attachments -- upload each, append file blocks
+    #    under an Attachments heading at the bottom of the page so the
+    #    saved record is self-contained.
+    if attachments:
+        report(f"Uploading {len(attachments)} attachment(s)...")
+        attachment_blocks: list[dict[str, Any]] = []
+        for att in attachments:
+            if not att.path.is_file():
+                continue
+            try:
+                upload_id = client.upload_file(att.path, mime=att.mime)
+            except Exception:
+                # Best effort -- one bad upload doesn't sink the export.
+                continue
+            attachment_blocks.append({
+                "object": "block",
+                "type": "file",
+                "file": {
+                    "type": "file_upload",
+                    "file_upload": {"id": upload_id},
+                    "caption": [{
+                        "type": "text",
+                        "text": {"content": att.label()},
+                        "plain_text": att.label(),
+                    }],
+                    "name": att.label(),
+                },
+            })
+        if attachment_blocks:
+            children.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": {"content": "Attachments"},
+                        "plain_text": "Attachments",
+                    }],
+                },
+            })
+            children.extend(attachment_blocks)
+
     report("Creating page in Notion...")
     page = client.create_page(parent_id=parent_id, title=title, children=children)
 
@@ -212,17 +276,20 @@ def export_to_confluence(
     title: str,
     markdown_body: str,
     session_dir: Path,
+    attachments: Optional[list[ExportAttachment]] = None,
     progress: Optional[Callable[[str], None]] = None,
 ) -> ExportResult:
-    """Two-pass when images are present:
+    """Two-pass when images OR attachments are present:
       1. Create a placeholder page so we have a page_id.
-      2. Upload images as attachments to that page_id.
-      3. UPDATE the page body with the final storage XML referencing
-         attachments by filename.
+      2. Upload images + session attachments to that page_id via the
+         multipart attachment endpoint.
+      3. UPDATE the page body with final storage XML, including a
+         "## Attachments" section listing the session files.
 
-    When the body has no local images, we collapse into a single
-    create call.
+    When the body has no local images and the caller didn't request
+    attachments, we collapse into a single create call for speed.
     """
+    attachments = attachments or []
 
     def report(msg: str) -> None:
         if progress:
@@ -230,9 +297,10 @@ def export_to_confluence(
 
     refs = collect_image_refs(markdown_body)
     local_refs = [(u, a) for u, a in refs if is_local_image_ref(u)]
+    has_attachments = bool(attachments)
 
-    # No local images -- single-pass create.
-    if not local_refs:
+    # No local images + no attachments -- single-pass create.
+    if not local_refs and not has_attachments:
         report("Converting Markdown to Confluence storage XML...")
         storage_xml = markdown_to_storage(markdown_body)
         report("Creating page in Confluence...")
@@ -255,13 +323,14 @@ def export_to_confluence(
     report("Creating placeholder page in Confluence...")
     placeholder = client.create_page(
         parent_id=parent_id, space_id=space_id, title=title,
-        storage_xml="<p>Uploading images...</p>",
+        storage_xml="<p>Uploading images and attachments...</p>",
     )
     page_id = str(placeholder.get("id", ""))
 
-    # 2. Upload attachments and build the url -> filename map.
+    # 2a. Upload inline image refs and build the url -> filename map.
     url_to_filename: dict[str, str] = {}
-    report(f"Uploading {len(local_refs)} image attachment(s)...")
+    if local_refs:
+        report(f"Uploading {len(local_refs)} image(s)...")
     for url, _alt in local_refs:
         path = resolve_local_image_path(url, base_dir=session_dir)
         if path is None:
@@ -269,7 +338,24 @@ def export_to_confluence(
         client.upload_attachment(page_id, path)
         url_to_filename[url] = path.name
 
-    # 3. Build the final body via a resolver that emits ri:attachment.
+    # 2b. Upload session attachments and remember their filenames so
+    #     we can list them in the storage XML below.
+    uploaded_attachments: list[tuple[str, str]] = []  # (filename, display_label)
+    if has_attachments:
+        report(f"Uploading {len(attachments)} attachment(s)...")
+    for att in attachments:
+        if not att.path.is_file():
+            continue
+        try:
+            client.upload_attachment(page_id, att.path)
+        except Exception:
+            # Best effort -- one bad upload doesn't sink the export.
+            continue
+        uploaded_attachments.append((att.path.name, att.label()))
+
+    # 3. Build the final body via a resolver that emits ri:attachment
+    #    for image refs, plus a tail "## Attachments" section listing
+    #    each uploaded session file as an ac:link.
     def image_resolver(url: str, alt: str) -> str:
         if url in url_to_filename:
             alt_attr = f' ac:alt="{_xml_attr(alt)}"' if alt else ""
@@ -290,6 +376,8 @@ def export_to_confluence(
 
     report("Converting Markdown + attachments to storage XML...")
     storage_xml = markdown_to_storage(markdown_body, image_resolver=image_resolver)
+    if uploaded_attachments:
+        storage_xml += _build_confluence_attachments_section(uploaded_attachments)
 
     report("Updating page body in Confluence...")
     client.update_page(page_id=page_id, title=title, storage_xml=storage_xml)
@@ -306,6 +394,22 @@ def export_to_confluence(
             "parent. Previous exports of this session were not replaced."
         ),
     )
+
+
+def _build_confluence_attachments_section(
+    uploaded: list[tuple[str, str]],
+) -> str:
+    """Storage-XML "## Attachments" section linking each uploaded file."""
+    items: list[str] = []
+    for filename, label in uploaded:
+        items.append(
+            "<li><p>"
+            f'<ac:link><ri:attachment ri:filename="{_xml_attr(filename)}" />'
+            f"<ac:plain-text-link-body><![CDATA[{label}]]></ac:plain-text-link-body>"
+            "</ac:link>"
+            "</p></li>"
+        )
+    return "<h2>Attachments</h2><ul>" + "".join(items) + "</ul>"
 
 
 # ---- xml escaping helpers (mirrors confluence_storage but tiny) -----------

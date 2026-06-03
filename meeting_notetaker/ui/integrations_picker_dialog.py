@@ -28,6 +28,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -65,8 +66,11 @@ class PickerSelection:
 
     ``id`` + ``title`` identify the destination parent. ``page_title``
     is the user-edited (or defaulted) title the export will use for
-    the new page. ``extra`` carries adapter-specific metadata
-    (Confluence: ``space_id``).
+    the new page. ``include_attachments`` flags whether the export
+    should upload the session's files to the created page (only
+    meaningful when the picker was opened with attachments present).
+    ``extra`` carries adapter-specific metadata (Confluence:
+    ``space_id``).
     """
     def __init__(
         self,
@@ -74,11 +78,13 @@ class PickerSelection:
         title: str,
         *,
         page_title: str = "",
+        include_attachments: bool = False,
         extra: Optional[dict] = None,
     ) -> None:
         self.id = id
         self.title = title
         self.page_title = page_title or title
+        self.include_attachments = include_attachments
         self.extra = extra or {}
 
 
@@ -211,6 +217,7 @@ class IntegrationsPickerDialog(QDialog):
         recents: list[dict],
         default_page_title: str = "",
         series_name: str = "",
+        attachment_count: int = 0,
         parent: Optional[QWidget] = None,
         load_root_immediately: bool = True,
     ) -> None:
@@ -222,6 +229,7 @@ class IntegrationsPickerDialog(QDialog):
         self._favorites = list(favorites or [])
         self._recents = list(recents or [])
         self._series_name = (series_name or "").strip()
+        self._attachment_count = max(0, int(attachment_count))
         self._selection: Optional[PickerSelection] = None
 
         layout = QVBoxLayout(self)
@@ -244,6 +252,25 @@ class IntegrationsPickerDialog(QDialog):
         )
         title_form.addRow("Page title:", self._title_edit)
         layout.addLayout(title_form)
+
+        # Optional Include-Attachments checkbox. Only rendered when
+        # the session has at least one attachment; clean dialog
+        # surface for sessions without files. When checked, the
+        # export uploads each attachment to the created page (Notion:
+        # file blocks; Confluence: page attachments with a linked
+        # Attachments section).
+        self._include_attachments_cb: Optional[QCheckBox] = None
+        if self._attachment_count > 0:
+            noun = "attachment" if self._attachment_count == 1 else "attachments"
+            self._include_attachments_cb = QCheckBox(
+                f"Include {self._attachment_count} {noun} from this session",
+                self,
+            )
+            self._include_attachments_cb.setToolTip(
+                "Upload the session's attachment files to the created "
+                "page so the saved record is self-contained."
+            )
+            layout.addWidget(self._include_attachments_cb)
 
         self._tree = QTreeWidget(self)
         self._tree.setHeaderHidden(True)
@@ -556,9 +583,14 @@ class IntegrationsPickerDialog(QDialog):
             )
             self._title_edit.setFocus()
             return
+        include_attachments = bool(
+            self._include_attachments_cb
+            and self._include_attachments_cb.isChecked()
+        )
         self._selection = PickerSelection(
             id=node.id, title=node.title,
             page_title=page_title,
+            include_attachments=include_attachments,
             extra=dict(node.extra),
         )
         self.accept()

@@ -381,6 +381,107 @@ def test_starring_keeps_favorites_alphabetized(qt_app):
         dlg.deleteLater()
 
 
+# ---- include-attachments checkbox ----------------------------------------
+
+
+def test_include_attachments_checkbox_hidden_when_no_attachments(qt_app):
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+        attachment_count=0,
+    )
+    try:
+        assert dlg._include_attachments_cb is None  # noqa: SLF001
+    finally:
+        dlg.deleteLater()
+
+
+def test_include_attachments_checkbox_visible_with_count(qt_app):
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+        attachment_count=3,
+    )
+    try:
+        cb = dlg._include_attachments_cb  # noqa: SLF001
+        assert cb is not None
+        assert "3 attachments" in cb.text()
+        assert cb.isChecked() is False  # off by default
+    finally:
+        dlg.deleteLater()
+
+
+def test_include_attachments_label_singular_for_one(qt_app):
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+        attachment_count=1,
+    )
+    try:
+        assert "1 attachment from" in dlg._include_attachments_cb.text()  # noqa: SLF001
+        # No plural 's' in the singular case.
+        assert "attachments" not in dlg._include_attachments_cb.text()  # noqa: SLF001
+    finally:
+        dlg.deleteLater()
+
+
+def test_accept_carries_include_attachments_when_checked(qt_app):
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+        attachment_count=2,
+    )
+    try:
+        dlg._include_attachments_cb.setChecked(True)  # noqa: SLF001
+        dlg._tree.setCurrentItem(dlg._browse_root.child(0))  # noqa: SLF001
+        dlg._on_accept()  # noqa: SLF001
+        sel = dlg.selection()
+        assert sel is not None
+        assert sel.include_attachments is True
+    finally:
+        dlg.deleteLater()
+
+
+def test_accept_default_include_attachments_false_when_unchecked(qt_app):
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+        attachment_count=2,
+    )
+    try:
+        dlg._tree.setCurrentItem(dlg._browse_root.child(0))  # noqa: SLF001
+        dlg._on_accept()  # noqa: SLF001
+        sel = dlg.selection()
+        assert sel is not None
+        assert sel.include_attachments is False
+    finally:
+        dlg.deleteLater()
+
+
+def test_accept_include_attachments_false_when_no_checkbox(qt_app):
+    """No attachments -> no checkbox -> include_attachments must be
+    False in the resulting selection."""
+    browser = _FakeBrowser(root=[PickerNode(id="p", title="P")])
+    dlg = IntegrationsPickerDialog(
+        title="t", browser=browser, favorites=[], recents=[],
+        default_page_title="t",
+        attachment_count=0,
+    )
+    try:
+        dlg._tree.setCurrentItem(dlg._browse_root.child(0))  # noqa: SLF001
+        dlg._on_accept()  # noqa: SLF001
+        sel = dlg.selection()
+        assert sel is not None
+        assert sel.include_attachments is False
+    finally:
+        dlg.deleteLater()
+
+
 # ---- title field + page-title round trip --------------------------------
 
 
