@@ -835,6 +835,99 @@ def shot_export_progress_dialog() -> None:
     dlg.close()
 
 
+def shot_settings_integrations() -> None:
+    """v0.7.6 Integrations page (Notion + Confluence). The screenshot
+    lands on the Integrations nav entry so the credential fields +
+    Verify buttons + status labels are all on screen."""
+    cfg = Config()
+    cfg.ui.user_name = USER_NAME
+    # Pre-populate with a fake "Verified" state so the screenshot
+    # shows the connected look without needing real tokens.
+    cfg.notion.api_token = "secret_redacted"
+    cfg.notion.last_verified_at = "2026-06-03T14:30:00"
+    cfg.confluence.base_url = "https://example.atlassian.net/wiki"
+    cfg.confluence.email = "you@example.com"
+    cfg.confluence.api_token = "ATATT-redacted"
+    cfg.confluence.last_verified_at = "2026-06-03T14:32:00"
+    cfg.ui.settings_active_section = "Integrations"
+    dlg = SettingsDialog(cfg)
+    dlg.resize(900, 650)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "28-dialog-settings-integrations.png", autosize=False)
+    dlg.close()
+
+
+def shot_save_to_menu() -> None:
+    """v0.7.6 Save to dropdown -- the renamed Export button with its
+    three options. Built by simulating a click on the QToolButton's
+    popup menu so the dropdown is rendered open."""
+    win = _build_main_window()
+    win.session_view._tabs.setCurrentIndex(1)
+    # Surface the Notion + Confluence menu items.
+    win.session_view.set_integration_targets(
+        notion_enabled=True, confluence_enabled=True,
+    )
+    QApplication.processEvents()
+    # The menu lives on the QToolButton; rendering the menu open is
+    # awkward in offscreen mode, so we instead grab the menu widget
+    # directly after showing it next to the button.
+    menu = win.session_view._export_menu
+    btn = win.session_view._export_btn
+    # Show the menu just below the Save to... button so the framing
+    # looks natural.
+    point = btn.mapToGlobal(btn.rect().bottomLeft())
+    menu.popup(point)
+    QApplication.processEvents()
+    _grab(win, "29-main-save-to-menu.png", autosize=False)
+    menu.hide()
+    win.close()
+
+
+def shot_integrations_picker() -> None:
+    """v0.7.6 Notion / Confluence destination picker -- title field,
+    Favorites + Recents + Browse tree, Star + Create folder buttons,
+    Include-attachments checkbox."""
+    from meeting_notetaker.ui.integrations_picker_dialog import (
+        IntegrationsPickerDialog,
+        PickerNode,
+    )
+
+    class _StubBrowser:
+        def browse_root(self):
+            return [
+                PickerNode(id="space-eng", title="Engineering", kind="space",
+                           extra={"space_id": "100"}),
+                PickerNode(id="space-product", title="Product", kind="space",
+                           extra={"space_id": "200"}),
+                PickerNode(id="space-platform", title="Platform", kind="space",
+                           extra={"space_id": "300"}),
+            ]
+
+        def browse_children(self, node):
+            return []
+
+    dlg = IntegrationsPickerDialog(
+        title="Save to Confluence",
+        browser=_StubBrowser(),
+        favorites=[
+            {"id": "page-a", "title": "Engineering / Weekly Sync"},
+            {"id": "page-b", "title": "Engineering / Architecture"},
+        ],
+        recents=[
+            {"id": "page-c", "title": "Product / Roadmap",
+             "used_at": "2026-06-02T15:00:00"},
+        ],
+        default_page_title="2026-06-03 14:00 - Q3 Platform Sync",
+        series_name="Q3 Platform Sync",
+        attachment_count=2,
+    )
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "30-dialog-integrations-picker.png", autosize=False)
+    dlg.close()
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -861,6 +954,10 @@ def main() -> int:
     shot_appendix_edit_dialog()
     shot_appendix_inclusion_dialog()
     shot_export_progress_dialog()
+    # v0.7.6 surfaces (#79 + menu reorg).
+    shot_settings_integrations()
+    shot_save_to_menu()
+    shot_integrations_picker()
     print("done.")
     return 0
 

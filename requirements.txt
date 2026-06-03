@@ -20,6 +20,18 @@ numpy>=1.24.0
 # the original project has no maintained wheels for Python 3.10+.
 webrtcvad-wheels>=2.0.14
 pyperclip>=1.8.2
+# Convert clipboard HTML (Notion, VS Code, GitHub, Office, Confluence
+# rendered view) to Markdown on paste into the notes editors. MIT
+# licensed; pure Python; pulls beautifulsoup4 transitively.
+markdownify>=0.11.6
+# Issue #79: experimental Notion + Confluence export.
+#   mistune -- Markdown AST parser for converting note source to the
+#   target's native block/storage format. Pure Python, BSD-3.
+#   requests -- HTTP client for Notion + Confluence REST APIs. Already
+#   transitively present via huggingface_hub but pinned explicitly so
+#   the integrations module doesn't break if the indirect dep is dropped.
+mistune>=3.0
+requests>=2.28
 sounddevice>=0.4.6
 tomli>=2.0.0; python_version < '3.11'
 # Make Python's ssl module use the OS certificate store so corporate MITM

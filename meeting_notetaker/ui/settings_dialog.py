@@ -1024,6 +1024,16 @@ class SettingsDialog(QDialog):
 
         self._add_section("Backups", backup_group)
 
+        # Integrations (#79) -------------------------------------------------
+        # Notion + Confluence export targets. Both surface only when the
+        # user provides credentials AND the Verify button has reported
+        # success since the credentials last changed (verify writes
+        # last_verified_at; the export menu reads this). Shipped as
+        # "(Experimental)" in v0.7.6-dev; tag dropped on 2026-06-03 after
+        # end-to-end verification on Cloud Notion + Cloud Confluence.
+        integrations_page = self._build_integrations_section(config)
+        self._add_section("Integrations", integrations_page)
+
         # Assemble nav + stack from the accumulated sections, sorted
         # alphabetically by label. Restores last-active section so the
         # user lands back where they were when they reopen Settings.
@@ -1115,10 +1125,250 @@ class SettingsDialog(QDialog):
         self._config.backup.retention_days = int(
             self._backup_retention_days.value()
         )
+        # Issue #79 -- Notion + Confluence integrations. Token edits
+        # persist whether or not Verify ran (the user can save partial
+        # state and verify later). Any change to the credential fields
+        # clears the last_verified_at stamp so a stale "Connected"
+        # label doesn't outlive the credentials it described.
+        new_notion_token = self._notion_token_edit.text().strip()
+        if new_notion_token != self._config.notion.api_token:
+            self._config.notion.api_token = new_notion_token
+            self._config.notion.last_verified_at = ""
+        new_cf_base = self._confluence_base_url_edit.text().strip()
+        new_cf_email = self._confluence_email_edit.text().strip()
+        new_cf_token = self._confluence_token_edit.text().strip()
+        cf_changed = (
+            new_cf_base != self._config.confluence.base_url
+            or new_cf_email != self._config.confluence.email
+            or new_cf_token != self._config.confluence.api_token
+        )
+        if cf_changed:
+            self._config.confluence.base_url = new_cf_base
+            self._config.confluence.email = new_cf_email
+            self._config.confluence.api_token = new_cf_token
+            self._config.confluence.last_verified_at = ""
         # Remember which section the user was on so reopening Settings
         # lands them right back. Stored in ui.settings_active_section.
         self._config.ui.settings_active_section = self._active_section_label()
         self.accept()
+
+    # ---- integrations (#79) -------------------------------------------
+
+    def _build_integrations_section(self, config: Config) -> QWidget:
+        """Build the Notion + Confluence credential rows.
+
+        Opt-in: users not in the Notion / Confluence path see no
+        export options that don't apply to them. Both targets verify
+        their credentials before the Save to menu surfaces them.
+        """
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Header explainer.
+        header = QLabel(
+            "Save the active My Notes or Synthesis tab to Notion or "
+            "Confluence as a new page under a parent you pick. Tokens "
+            "stay local in your settings.toml. The Save to menu surfaces "
+            "these destinations only after Verify succeeds.",
+            self,
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        # ---- Notion --------------------------------------------------------
+        notion_group = QGroupBox("Notion", self)
+        notion_form = QFormLayout(notion_group)
+
+        self._notion_token_edit = QLineEdit(self)
+        self._notion_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._notion_token_edit.setText(config.notion.api_token)
+        self._notion_token_edit.setPlaceholderText("secret_XXXXXXXXXXXX")
+        self._notion_token_edit.setToolTip(
+            "Create an internal integration at notion.so/my-integrations, "
+            "copy the Internal Integration Token here, and share each "
+            "destination page with that integration."
+        )
+        # "Show" toggle so the user can confirm what they pasted.
+        notion_token_row = QHBoxLayout()
+        notion_token_row.addWidget(self._notion_token_edit, 1)
+        self._notion_show_token = QPushButton("Show", self)
+        self._notion_show_token.setCheckable(True)
+        self._notion_show_token.setMaximumWidth(60)
+        self._notion_show_token.toggled.connect(
+            lambda checked: self._notion_token_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        notion_token_row.addWidget(self._notion_show_token)
+        notion_form.addRow("Integration token:", notion_token_row)
+
+        notion_verify_row = QHBoxLayout()
+        self._notion_verify_btn = QPushButton("Verify connection", self)
+        self._notion_verify_btn.clicked.connect(self._on_verify_notion)
+        notion_verify_row.addWidget(self._notion_verify_btn)
+        self._notion_status_label = QLabel(self)
+        self._notion_status_label.setWordWrap(True)
+        notion_verify_row.addWidget(self._notion_status_label, 1)
+        notion_form.addRow(notion_verify_row)
+        self._refresh_notion_status_label()
+        layout.addWidget(notion_group)
+
+        # ---- Confluence ---------------------------------------------------
+        confluence_group = QGroupBox("Confluence", self)
+        confluence_form = QFormLayout(confluence_group)
+
+        self._confluence_base_url_edit = QLineEdit(self)
+        self._confluence_base_url_edit.setText(config.confluence.base_url)
+        self._confluence_base_url_edit.setPlaceholderText(
+            "https://your-org.atlassian.net/wiki"
+        )
+        confluence_form.addRow("Base URL:", self._confluence_base_url_edit)
+
+        self._confluence_email_edit = QLineEdit(self)
+        self._confluence_email_edit.setText(config.confluence.email)
+        self._confluence_email_edit.setPlaceholderText("you@example.com")
+        confluence_form.addRow("Email:", self._confluence_email_edit)
+
+        self._confluence_token_edit = QLineEdit(self)
+        self._confluence_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._confluence_token_edit.setText(config.confluence.api_token)
+        self._confluence_token_edit.setPlaceholderText("Atlassian API token")
+        self._confluence_token_edit.setToolTip(
+            "Generate at id.atlassian.com -> Security -> API tokens. "
+            "Confluence Cloud authenticates as email + token via Basic auth."
+        )
+        confluence_token_row = QHBoxLayout()
+        confluence_token_row.addWidget(self._confluence_token_edit, 1)
+        self._confluence_show_token = QPushButton("Show", self)
+        self._confluence_show_token.setCheckable(True)
+        self._confluence_show_token.setMaximumWidth(60)
+        self._confluence_show_token.toggled.connect(
+            lambda checked: self._confluence_token_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        confluence_token_row.addWidget(self._confluence_show_token)
+        confluence_form.addRow("API token:", confluence_token_row)
+
+        confluence_verify_row = QHBoxLayout()
+        self._confluence_verify_btn = QPushButton("Verify connection", self)
+        self._confluence_verify_btn.clicked.connect(self._on_verify_confluence)
+        confluence_verify_row.addWidget(self._confluence_verify_btn)
+        self._confluence_status_label = QLabel(self)
+        self._confluence_status_label.setWordWrap(True)
+        confluence_verify_row.addWidget(self._confluence_status_label, 1)
+        confluence_form.addRow(confluence_verify_row)
+        self._refresh_confluence_status_label()
+        layout.addWidget(confluence_group)
+
+        layout.addStretch(1)
+        return page
+
+    def _refresh_notion_status_label(self) -> None:
+        when = self._config.notion.last_verified_at
+        if not self._notion_token_edit.text().strip():
+            self._notion_status_label.setText("Not configured.")
+        elif when:
+            self._notion_status_label.setText(f"Connected (verified {when}).")
+        else:
+            self._notion_status_label.setText(
+                "Token entered. Click Verify to confirm + enable export."
+            )
+
+    def _refresh_confluence_status_label(self) -> None:
+        when = self._config.confluence.last_verified_at
+        configured = (
+            self._confluence_base_url_edit.text().strip()
+            and self._confluence_email_edit.text().strip()
+            and self._confluence_token_edit.text().strip()
+        )
+        if not configured:
+            self._confluence_status_label.setText("Not configured.")
+        elif when:
+            self._confluence_status_label.setText(f"Connected (verified {when}).")
+        else:
+            self._confluence_status_label.setText(
+                "Credentials entered. Click Verify to confirm + enable export."
+            )
+
+    def _on_verify_notion(self) -> None:
+        from ..integrations.notion_api import NotionAPIError, NotionClient  # noqa: PLC0415
+        from datetime import datetime as _dt  # noqa: PLC0415
+
+        token = self._notion_token_edit.text().strip()
+        if not token:
+            self._notion_status_label.setText("Enter a token first.")
+            return
+        self._notion_status_label.setText("Verifying...")
+        self._notion_verify_btn.setEnabled(False)
+        try:
+            user = NotionClient(token).verify()
+        except NotionAPIError as exc:
+            self._notion_status_label.setText(
+                f"Failed ({exc.status}): check the token + that the integration is shared with at least one page."
+            )
+            return
+        except Exception as exc:
+            self._notion_status_label.setText(f"Failed: {exc}")
+            return
+        finally:
+            self._notion_verify_btn.setEnabled(True)
+        name = user.get("name") or user.get("bot", {}).get("owner", {}).get("user", {}).get("name") or "(unnamed)"
+        when = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
+        self._config.notion.api_token = token  # store immediately so future Verify reuses
+        self._config.notion.last_verified_at = when
+        self._notion_status_label.setText(f"Connected as {name} (verified {when}).")
+
+    def _on_verify_confluence(self) -> None:
+        from ..integrations.confluence_api import (  # noqa: PLC0415
+            ConfluenceAPIError,
+            ConfluenceClient,
+        )
+        from datetime import datetime as _dt  # noqa: PLC0415
+
+        base_url = self._confluence_base_url_edit.text().strip()
+        email = self._confluence_email_edit.text().strip()
+        token = self._confluence_token_edit.text().strip()
+        if not (base_url and email and token):
+            self._confluence_status_label.setText(
+                "Provide base URL, email, and token first."
+            )
+            return
+        self._confluence_status_label.setText("Verifying...")
+        self._confluence_verify_btn.setEnabled(False)
+        try:
+            user = ConfluenceClient(base_url, email, token).verify()
+        except ConfluenceAPIError as exc:
+            hint = ""
+            if exc.status == 404:
+                hint = (
+                    " (404 typically means the base URL is wrong -- "
+                    "Cloud expects https://your-org.atlassian.net/wiki)"
+                )
+            elif exc.status == 401:
+                hint = " (401 typically means the email or API token is wrong)"
+            self._confluence_status_label.setText(
+                f"Failed ({exc.status}){hint}: check the base URL, email, and token."
+            )
+            return
+        except Exception as exc:
+            self._confluence_status_label.setText(f"Failed: {exc}")
+            return
+        finally:
+            self._confluence_verify_btn.setEnabled(True)
+        name = (
+            user.get("displayName")
+            or user.get("publicName")
+            or user.get("accountId")
+            or "(unknown user)"
+        )
+        when = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
+        self._config.confluence.base_url = base_url
+        self._config.confluence.email = email
+        self._config.confluence.api_token = token
+        self._config.confluence.last_verified_at = when
+        self._confluence_status_label.setText(f"Connected as {name} (verified {when}).")
 
     def inject_backup_now_handler(self, handler) -> None:
         """Caller (MainApp) wires the manual-backup action here so the

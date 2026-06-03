@@ -25,6 +25,18 @@ from PyQt6.QtGui import QImage, QPageLayout, QTextDocument
 from .markdown_preview import clamp_image_widths
 
 
+# Default stylesheet applied to every printable document. Sets the
+# anchor color to black with an underline so Markdown links remain
+# identifiable as links in the rendered PDF / printed page without
+# Qt's default cyan, which is hard to read on white. setHtml /
+# setMarkdown still emit clickable anchors in the PDF; only the
+# visual treatment changes (#78).
+_PRINT_STYLESHEET = """
+a { color: black; text-decoration: underline; }
+a:visited { color: black; }
+"""
+
+
 class PrintTextDocument(QTextDocument):
     """QTextDocument that loads images relative to a base directory.
 
@@ -45,6 +57,11 @@ class PrintTextDocument(QTextDocument):
         # Mirror setBaseUrl so QTextBrowser-style behaviors (e.g. an
         # in-app preview that reuses the same doc) keep working.
         self.setBaseUrl(QUrl.fromLocalFile(str(self._base_dir) + "/"))
+        # Default stylesheet must land BEFORE any setMarkdown / setHtml
+        # call -- Qt resolves CSS at render time and caches the parse,
+        # so a later setDefaultStyleSheet doesn't repaint existing
+        # content.
+        self.setDefaultStyleSheet(_PRINT_STYLESHEET)
 
     def loadResource(self, resource_type, name):  # type: ignore[override]
         if int(resource_type) == int(QTextDocument.ResourceType.ImageResource):

@@ -9,19 +9,21 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.3. End-to-end capture, transcription, synthesis,
+> **Status:** v0.7.6. End-to-end capture, transcription, synthesis,
 > screen capture, retained-audio playback + export, and transcript-
-> synchronized playback all working. v0.7.3 layers a unified Appendix
-> system on top of the v0.7.2 Contact model: four new structured
-> LLM-emitted sections (Attendee Context, Attendee Details, Suggested
-> Topics, Referenced Attachments) get parsed into a sidecar JSON
-> store, surfaced in a collapsible tray below the My Notes + Synthesis
-> editors, edited via a tabular dialog, and bundled into preview / PDF
-> / ZIP exports as a clean Markdown table view. Pre-export prompts
-> let the user pick which Appendix sections to include (configurable
-> defaults in Settings); cancel buttons + a status-log dialog cover
-> long-running exports; folder-mode replaces the zip step when the
-> user is dropping output on OneDrive or a shared drive.
+> synchronized playback all working. v0.7.6 adds Notion and Confluence
+> as save-to destinations alongside PDF (with a Verify-gated picker
+> dialog, page title field, Create-folder affordance, and an opt-in
+> Include-attachments flow), preserves formatting on clipboard pastes
+> into the notes editors, polishes the PDF (black underlined links,
+> session-title-only header), reorganizes the menu bar (File now
+> mirrors the right-click session menu; Tools owns Settings + the
+> catalog editors), and refreshes the Attendees tray with a
+> Department column. Earlier v0.7.x layered a unified Appendix system
+> on top of the v0.7.2 Contact model: four LLM-emitted sections
+> parsed into a sidecar JSON store, surfaced in a collapsible tray,
+> edited via a tabular dialog, and bundled into preview / PDF / ZIP
+> exports as Markdown tables.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -44,6 +46,72 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.6
+
+- **Save to Notion / Confluence (#79).** New entry alongside Save as
+  PDF. Pick from a tree-view picker dialog with Favorites + Recents
+  + Browse, a page-title text field defaulted to
+  `YYYY-MM-DD HH:MM - <session title>`, and a Create-folder button
+  (with a one-click "Use series name" affordance). Local images in
+  the notes upload as Notion file blocks or Confluence attachments;
+  link refs the destination can't fetch (Notion's `attachment:UUID`,
+  `cid:`, `file://`) render as visible placeholder lines instead of
+  broken icons. Confluence storage XML is used directly so code
+  blocks + nested lists + multi-paragraph blockquotes survive the
+  round-trip. Tokens stay local in your `config.toml`; Verify gates
+  the menu visibility. On success the new page opens in your
+  default browser.
+
+  ![Settings -- Integrations](docs/screenshots/28-dialog-settings-integrations.png)
+
+  ![Save to picker](docs/screenshots/30-dialog-integrations-picker.png)
+
+- **Optional Include-attachments.** When the active session has
+  attached files, the picker offers an opt-in checkbox to upload
+  them with the page. Notion lands them as file blocks under an
+  Attachments heading; Confluence attaches the files + appends a
+  storage-XML linked list.
+
+- **Save to ... menu (replaces Export).** The right-pane button is
+  now "Save to..." with options "Save as PDF...", "Save to Notion..."
+  (when verified), and "Save to Confluence..." (when verified). PDF
+  reads as "save AS" (file format); Notion + Confluence read as "save
+  TO" (remote destination).
+
+  ![Save to menu](docs/screenshots/29-main-save-to-menu.png)
+
+- **File / Tools menu reorganization.** Settings, Manage
+  Classification, and Address Book moved from File to Tools where
+  catalog + configuration actions belong. File gained a session-
+  action surface mirroring the session-list right-click menu:
+  Rename Session, Edit Timestamp, Export (Recording / Video / Full
+  Session), Delete (Recording / Session), and the Save to mirror
+  (PDF / Notion / Confluence). Per-session actions enable/disable
+  in lockstep with the list selection.
+
+- **Formatting-preserving clipboard paste.** Pastes from Notion, VS
+  Code, GitHub, Confluence's rendered view, Office, and similar HTML
+  sources into the My Notes / Synthesis editors land as Markdown
+  source instead of the lossy `text/plain` variant. Headings, bold
+  / italic, nested lists, fenced code (with language hints), and
+  blockquotes round-trip. Image refs the receiver can't fetch
+  (Notion's page-attachment URLs, `cid:`, `file://`) render as a
+  visible `*❌ (image: foo.png could not be pasted) ❌*` placeholder.
+
+- **PDF polish.** Hyperlinks render as black + underlined instead
+  of Qt's default cyan (unreadable on white). The PDF's in-document
+  H1 is just the session title; the tab tag ("My Notes" /
+  "Synthesis") stays in the filename only.
+
+- **Synthesis prompt dropdown fix (#76).** The dropdown now lands
+  on the Settings default's row directly (not the truncated
+  "(default: ...)" placeholder), so a glance tells you which
+  template is going to run.
+
+- **Department column** in the Attendees tray, between Company and
+  Email. Carries the same per-field source badges (`O` / `L` / `M`)
+  the rest of the rich-fields row uses.
 
 ## What's new in v0.7.5
 
@@ -678,6 +746,16 @@ were actually in the meeting.
 into the session's `images/` folder and inserts a Markdown
 reference. The Preview pane renders these inline.
 
+**Rich-text paste.** Pastes from Notion, VS Code, GitHub,
+Confluence's rendered view, Office, and similar HTML sources land
+as Markdown source instead of the lossy `text/plain` variant.
+Headings, bold / italic, nested lists, fenced code blocks (with
+language hints), blockquotes, and links round-trip cleanly. Image
+references the receiver can't fetch (Notion's page-attachment
+URLs, `cid:` from email, `file://` from the source machine) render
+as a visible `*❌ (image: foo.png could not be pasted) ❌*`
+placeholder rather than a broken icon.
+
 ## Screen capture
 
 The Screen Capture feature snapshots a region of your screen on
@@ -818,9 +896,22 @@ plain editors. Coverage varies by destination; see the
 paste-target table in the [Technical Details](#technical-details)
 section.
 
-The **Print** and **Export PDF** buttons render the active tab
-to a printer or a PDF file (with images preserved and Markdown
-links clickable).
+The **Print** and **Save to...** buttons render the active tab to
+a printer or write it to one of three destinations:
+
+- **Save as PDF...** -- writes a PDF file (images preserved,
+  Markdown links clickable, links rendered as black + underlined).
+- **Save to Notion...** -- creates a new Notion page under a parent
+  you pick. Visible only when Notion is configured + verified under
+  Settings > Integrations.
+- **Save to Confluence...** -- creates a new Confluence page under
+  a parent you pick. Visible only when Confluence is configured +
+  verified.
+
+The File menu mirrors the same Save to submenu so you can drive
+the flow without leaving the menu bar. See
+[Saving notes to Notion or Confluence](#saving-notes-to-notion-or-confluence)
+below for the picker dialog walk-through.
 
 ### Synthesis automation (optional)
 
@@ -892,6 +983,76 @@ one-on-one, standup, or any custom file in
 `%APPDATA%\MeetingNotetaker\prompts\`) to use for that session.
 Selection persists across app restarts.
 
+## Saving notes to Notion or Confluence
+
+The **Save to...** button on the Synthesis row (and the matching
+**File > Save to** submenu) sends the active My Notes or Synthesis
+tab to Notion or Confluence as a new page. Both destinations
+require a one-time setup under **Tools > Settings > Integrations**.
+
+![Settings -- Integrations](docs/screenshots/28-dialog-settings-integrations.png)
+
+**Notion:** create an internal integration at
+[notion.so/my-integrations](https://www.notion.so/my-integrations),
+paste the integration token, click **Verify connection**. Share
+each destination page or workspace with the integration from inside
+Notion -- the picker only lists pages the integration has access to.
+
+**Confluence Cloud:** generate an API token at
+[id.atlassian.com](https://id.atlassian.com/) (Security > API
+tokens), enter your tenant base URL
+(`https://your-org.atlassian.net/wiki`), your email, and the token.
+Click **Verify**. Self-hosted Confluence Server users supply their
+own base URL.
+
+Tokens persist in `config.toml` (chmod-equivalent to user-only).
+Changing a credential clears the verified-state stamp so a stale
+"Connected" label can't outlive the change. The Save to menu items
+only surface after Verify succeeds.
+
+**The picker dialog.** When you pick **Save to Notion** or **Save to
+Confluence**, a dialog opens with:
+
+- A **Page title** field defaulted to `YYYY-MM-DD HH:MM - <session
+  title>`. Edit it freely; whatever's in this field becomes the
+  page name.
+- An **Include N attachment(s)** checkbox (only when the session has
+  attached files). When checked, each attachment uploads to the new
+  page -- Notion as file blocks under an "Attachments" heading,
+  Confluence as page attachments with a linked list at the bottom.
+- A **Favorites** group with destinations you've starred, a
+  **Recents** group with the last 5 places you saved, and a
+  **Browse** tree that lazy-loads children on expand. Entries
+  alphabetize; recents stay in recency order.
+- A **Star this selection** button to pin / unpin the current row,
+  and a **Create folder...** button to make a new container page
+  under the currently-selected destination. The Create folder
+  dialog has a one-click "Use series name" affordance that fills
+  the input with the session's series name (when one is set).
+
+![Save to picker](docs/screenshots/30-dialog-integrations-picker.png)
+
+Click **OK** and the export runs on a background thread; on
+success your default browser opens the new page. Re-running the
+export creates a new sibling under the same parent rather than
+overwriting; the status toast spells this out so previous exports
+stay intact.
+
+**Format fidelity.** Notion exports go through a Markdown-to-block
+converter that maps headings, lists (including nested + task
+lists), bold / italic / code, inline links, code fences with
+language hints, quotes, dividers, tables, and inline images.
+Confluence exports use the storage XML format directly -- not the
+REST converter -- so code blocks, nested lists, and adjacent
+blockquotes survive round-tripping unscathed.
+
+**Image handling.** Local images in the notes body upload to the
+target with the page; HTTP-hosted images stay external. Image refs
+the destination can't fetch (Notion's page-attachment URLs,
+`cid:`, `file://`) render as visible
+`*❌ (image: foo.png could not be pasted) ❌*` placeholders rather
+than broken icons.
+
 ## Speaker identification
 
 After each recording, the app tries to label the *system audio*
@@ -949,7 +1110,7 @@ thresholds](#tuning-diarization-thresholds) subsection below.
 
 ## Settings reference
 
-Open via **File -> Settings...** (`Ctrl+,`) or the tray menu. All
+Open via **Tools -> Settings...** (`Ctrl+,`) or the tray menu. All
 of these are also editable directly in `config.toml`.
 
 ![Settings dialog](docs/screenshots/07-dialog-settings.png)
@@ -979,6 +1140,9 @@ of these are also editable directly in `config.toml`.
 | Match threshold | 75% | Cosine-similarity floor for matching a meeting voice against a stored speaker. |
 | Merge threshold | 75% | Cosine-similarity floor for merging two clusters into one during the agglomerative pass. |
 | Manage Speakers... | -- | Opens the speaker-library editor. |
+| Notion integration token | (empty) | Internal Integration Token from notion.so/my-integrations. Enables Save to Notion when Verify succeeds. |
+| Confluence base URL | (empty) | Tenant root (Cloud: `https://your-org.atlassian.net/wiki`). |
+| Confluence email + API token | (empty) | Email + token from id.atlassian.com. Enables Save to Confluence when Verify succeeds. |
 
 ## Backups (v0.7.5+)
 

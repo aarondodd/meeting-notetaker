@@ -14,11 +14,13 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QSplitter,
     QStackedWidget,
     QTabWidget,
     QPlainTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -104,6 +106,12 @@ class SessionView(QWidget):
     # the manual Generate dialog as the default. Empty string means
     # "use the bundled default template."
     prompt_template_changed = pyqtSignal(str, str)            # session_id, template_name
+    # Issue #79: experimental Notion / Confluence export. Each signal
+    # fires with (session_id, tab_label, markdown_body) so MainApp
+    # owns the picker dialog + worker thread + URL-open without
+    # SessionView importing the integration modules.
+    export_to_notion_requested = pyqtSignal(str, str, str)
+    export_to_confluence_requested = pyqtSignal(str, str, str)
     # Click-to-tag for in-meeting speaker anchoring. The sidebar emits
     # (session_id, name) per click; the controller persists a SpeakerTag
     # and the post-meeting refiner uses tags to constrain the clusterer.
@@ -341,14 +349,43 @@ class SessionView(QWidget):
         )
         self._print_btn.clicked.connect(self._on_print)
         synthesis.addWidget(self._print_btn)
-        self._export_pdf_btn = QPushButton("Export PDF...", self)
-        self._export_pdf_btn.setToolTip(
-            "Save the active tab (My Notes or Synthesis) directly to a "
-            "PDF. Images and links are preserved (the Print path through "
-            "Windows Print to PDF is lossy)."
+        # Issue #79: unified Save to... button. PDF always available;
+        # Notion + Confluence menu items appear only when their
+        # respective integrations are configured + verified. Button
+        # label switched from "Export..." to "Save to..." on 2026-06-03
+        # to match how users think about the destinations -- PDF is
+        # "save as" a file format, Notion / Confluence are "save to"
+        # a remote destination.
+        self._export_btn = QToolButton(self)
+        self._export_btn.setText("Save to...")
+        self._export_btn.setToolTip(
+            "Save the active tab (My Notes or Synthesis) as a PDF or "
+            "to Notion / Confluence."
         )
-        self._export_pdf_btn.clicked.connect(self._on_export_pdf)
-        synthesis.addWidget(self._export_pdf_btn)
+        self._export_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup,
+        )
+        self._export_menu = QMenu(self._export_btn)
+        self._export_pdf_action = self._export_menu.addAction("Save as PDF...")
+        self._export_pdf_action.triggered.connect(self._on_export_pdf)
+        # Notion + Confluence actions; visibility re-evaluated whenever
+        # the session changes or settings are saved.
+        self._export_notion_action = self._export_menu.addAction(
+            "Save to Notion..."
+        )
+        self._export_notion_action.triggered.connect(self._on_export_notion)
+        self._export_confluence_action = self._export_menu.addAction(
+            "Save to Confluence..."
+        )
+        self._export_confluence_action.triggered.connect(self._on_export_confluence)
+        # Hidden by default; MainApp toggles via set_integration_targets().
+        self._export_notion_action.setVisible(False)
+        self._export_confluence_action.setVisible(False)
+        self._export_btn.setMenu(self._export_menu)
+        synthesis.addWidget(self._export_btn)
+        # Legacy alias so older test references to _export_pdf_btn don't
+        # break -- the menu action carries the same handler.
+        self._export_pdf_btn = self._export_btn
         # Speaker review button. Hidden until the session has a
         # diarization.json on disk (set_session enables it).
         self._review_speakers_btn = QPushButton("Review Speakers...", self)
@@ -1703,12 +1740,31 @@ class SessionView(QWidget):
                 # both render the same template.
                 continue
             self._prompt_template_picker.addItem(name, name)
-        # Restore selection.
-        target_idx = 0  # (default)
-        for i in range(self._prompt_template_picker.count()):
-            if self._prompt_template_picker.itemData(i) == selected:
-                target_idx = i
-                break
+        # Restore selection. Priority:
+        #   1. Per-session override (`selected`) -> match its row.
+        #   2. No override but a Settings default exists -> point at
+        #      the Settings default's row so the dropdown displays
+        #      the template name the user actually chose. Without
+        #      this, new sessions always landed on the "(default: X)"
+        #      placeholder which truncates inside the 200px-wide
+        #      combo to e.g. "(default..stom)" and reads as if the
+        #      Settings default is being ignored (#76).
+        #   3. Otherwise fall back to the placeholder row.
+        # The Settings default is dynamic: if Settings later changes
+        # to a different template, sessions with `selected=""` will
+        # display the new default on their next load. Per-session
+        # overrides win over Settings default.
+        target_idx = 0  # placeholder
+        effective = selected
+        if not effective:
+            resolved = (settings_default or "").strip()
+            if resolved and resolved != "default":
+                effective = resolved
+        if effective:
+            for i in range(self._prompt_template_picker.count()):
+                if self._prompt_template_picker.itemData(i) == effective:
+                    target_idx = i
+                    break
         self._prompt_template_picker.setCurrentIndex(target_idx)
         self._prompt_template_picker.blockSignals(False)
 
@@ -2255,6 +2311,94 @@ class SessionView(QWidget):
         doc.clamp_images_to_printer(printer)
         doc.print(printer)
 
+    def set_integration_targets(
+        self, *, notion_enabled: bool, confluence_enabled: bool,
+    ) -> None:
+        """MainApp calls this whenever Settings is saved or on startup
+        so the Export menu surfaces Notion / Confluence only when the
+        relevant integration's verify stamp is present (#79)."""
+        self._export_notion_action.setVisible(notion_enabled)
+        self._export_confluence_action.setVisible(confluence_enabled)
+
+    def _active_tab_body_and_label(self) -> tuple[str, str]:
+        """Return (markdown_body, tab_label) for the currently viewed
+        My Notes / Synthesis tab, with the same attendees-table +
+        rendered-appendix transforms the PDF path applies (#79
+        followup): the export target should receive the formatted
+        appendix (tables etc.), not the raw LLM JSON blocks the
+        editor source carries.
+
+        The appendix-inclusion dialog the PDF flow shows is skipped
+        here -- the integration export flow already opens a picker
+        dialog, and stacking a second modal would be annoying. Saved
+        Settings defaults drive the inclusion instead; the user can
+        change them under Settings -> Export.
+        """
+        # _tabs holds wrapper pages, not the editors themselves; resolve
+        # by the page widget so localization doesn't break the mapping.
+        current_page = self._tabs.currentWidget()
+        if current_page is self._notes_page:
+            source = self._notes_view.toPlainText() or ""
+            label = "Synthesis"
+        elif current_page is self._live_notes_page:
+            source = self._live_notes_editor.toPlainText() or ""
+            label = "My Notes"
+        else:
+            return "", "Notes"
+
+        if self._session is None:
+            return source, label
+
+        # Attendees-table substitution (#51 Phase 5): bullet list
+        # becomes a Markdown table when at least one contact has
+        # rich-field data.
+        from ..utils.live_notes import (  # noqa: PLC0415
+            replace_attendees_section_with_table,
+            should_render_attendees_as_table,
+        )
+        body = source
+        if should_render_attendees_as_table(self._session_contacts):
+            body = replace_attendees_section_with_table(
+                body, self._session_contacts,
+            )
+
+        # Appendix transform (#64) -- swap raw JSON blocks for the
+        # rendered "## Appendix (auto-extracted)" tables, mirroring
+        # the PDF flow.
+        from ..utils.appendix_store import collect_for_session  # noqa: PLC0415
+        from ..utils.appendix_transform import inject_appendix  # noqa: PLC0415
+        from .appendix_inclusion_dialog import (  # noqa: PLC0415
+            AppendixInclusion,
+            apply_inclusion,
+        )
+        notes_md = self._notes_view.toPlainText()
+        live_md = self._live_notes_editor.toPlainText()
+        appendix_data = collect_for_session(
+            session_id=self._session.id,
+            notes_text=notes_md,
+            live_notes_text=live_md,
+            session_attachments=getattr(
+                self, "_session_attachment_names", [],
+            ),
+        )
+        inclusion = self._appendix_export_defaults or AppendixInclusion.all_on()
+        body = inject_appendix(
+            body, apply_inclusion(appendix_data, inclusion),
+        )
+        return body, label
+
+    def _on_export_notion(self) -> None:
+        if self._session is None:
+            return
+        body, label = self._active_tab_body_and_label()
+        self.export_to_notion_requested.emit(self._session.id, label, body)
+
+    def _on_export_confluence(self) -> None:
+        if self._session is None:
+            return
+        body, label = self._active_tab_body_and_label()
+        self.export_to_confluence_requested.emit(self._session.id, label, body)
+
     def _on_export_pdf(self) -> None:
         """Save the active tab as a PDF via Qt's native PDF backend.
 
@@ -2294,7 +2438,11 @@ class SessionView(QWidget):
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(str(target))
-        printer.setDocName(f"{self._session.title} -- {tab_label}")
+        # PDF metadata title matches the rendered H1 -- session title
+        # alone, no tab suffix (#78). The Print-job equivalent above
+        # still uses "title -- tab" because that's a printer-queue
+        # label, not a document property.
+        printer.setDocName(self._session.title)
         try:
             doc.clamp_images_to_printer(printer)
             doc.print(printer)

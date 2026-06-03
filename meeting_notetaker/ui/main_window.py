@@ -146,6 +146,12 @@ class MainWindow(QMainWindow):
     # retention; the menu is the one-click action surface.
     backup_now_requested = pyqtSignal()
     restore_backup_requested = pyqtSignal()
+    # Issue #79: File > Save to ... mirrors the SessionView's Save to...
+    # menu button. MainApp routes these to SessionView so the same
+    # body resolution + worker spawn is used.
+    save_to_pdf_requested = pyqtSignal()
+    save_to_notion_requested = pyqtSignal()
+    save_to_confluence_requested = pyqtSignal()
     show_session_tab_requested = pyqtSignal(str, str, object)
     # session_id, tab_id ('transcript' | 'live_notes' | 'notes' | 'previous'),
     # optional archive_path (str | None); emitted by the cross-session
@@ -176,36 +182,80 @@ class MainWindow(QMainWindow):
         action_new.setShortcut("Ctrl+N")
         action_new.triggered.connect(self.new_session_requested.emit)
         file_menu.addAction(action_new)
-        action_settings = QAction("&Settings...", self)
-        action_settings.setShortcut("Ctrl+,")
-        action_settings.triggered.connect(self.open_settings_requested.emit)
-        file_menu.addAction(action_settings)
-        # Phase 2: catalog editors. Manage Classification covers
-        # Series + Topics (tabbed); Address Book covers Contacts
-        # (formerly People) -- separated because Contacts also link
-        # to the Speaker store and have alias / merge-suggestion
-        # surfaces the simpler Series/Topics tabs don't need.
-        action_manage_classification = QAction(
-            "&Manage Classification...", self,
+        file_menu.addSeparator()
+        # Per-session actions mirroring the right-click context menu so
+        # the menu bar is also a friendly entry point (Aaron's 2026-06-02
+        # menu-reorg ask). Enabled state tracks the session-list
+        # selection via _refresh_session_actions, fired from
+        # _on_selection_changed below.
+        self._action_rename_session = QAction("&Rename Session...", self)
+        self._action_rename_session.triggered.connect(self._rename_selected)
+        file_menu.addAction(self._action_rename_session)
+        self._action_edit_timestamp = QAction("Edit &Timestamp...", self)
+        self._action_edit_timestamp.triggered.connect(
+            self._edit_timestamp_selected,
         )
-        action_manage_classification.triggered.connect(
-            self.manage_classification_requested.emit,
+        file_menu.addAction(self._action_edit_timestamp)
+        # Export submenu mirrors the right-click Export-* entries so a
+        # mouse-averse user has parity from the menu bar.
+        export_menu = file_menu.addMenu("&Export")
+        self._action_export_recording = QAction("Recording As...", self)
+        self._action_export_recording.triggered.connect(
+            self._emit_export_recording,
         )
-        file_menu.addAction(action_manage_classification)
-        action_address_book = QAction("&Address Book...", self)
-        action_address_book.triggered.connect(
-            self.address_book_requested.emit,
+        export_menu.addAction(self._action_export_recording)
+        self._action_export_video = QAction("Session as Video...", self)
+        self._action_export_video.triggered.connect(self._emit_export_video)
+        export_menu.addAction(self._action_export_video)
+        self._action_export_package = QAction("&Full Session...", self)
+        self._action_export_package.triggered.connect(self._emit_export_package)
+        export_menu.addAction(self._action_export_package)
+        self._file_export_menu = export_menu
+        # Save to submenu mirrors the SessionView's "Save to..." button
+        # so a menu-bar user can fire the same flow without a mouse to
+        # the right pane. The Notion + Confluence items are always
+        # visible here -- if the integration isn't configured + verified,
+        # MainApp's handler shows the same "Verify in Settings..." note
+        # as the right-pane button does today.
+        save_menu = file_menu.addMenu("&Save to")
+        self._action_save_pdf = QAction("Save as PDF...", self)
+        self._action_save_pdf.triggered.connect(
+            self.save_to_pdf_requested.emit,
         )
-        file_menu.addAction(action_address_book)
+        save_menu.addAction(self._action_save_pdf)
+        self._action_save_notion = QAction("Save to Notion...", self)
+        self._action_save_notion.triggered.connect(
+            self.save_to_notion_requested.emit,
+        )
+        save_menu.addAction(self._action_save_notion)
+        self._action_save_confluence = QAction("Save to Confluence...", self)
+        self._action_save_confluence.triggered.connect(
+            self.save_to_confluence_requested.emit,
+        )
+        save_menu.addAction(self._action_save_confluence)
+        self._file_save_menu = save_menu
+        # Delete submenu: recording-only vs the whole session, matching
+        # the right-click split so users don't fat-finger the wrong one.
+        delete_menu = file_menu.addMenu("&Delete")
+        self._action_delete_recording = QAction("Recording...", self)
+        self._action_delete_recording.triggered.connect(
+            self._emit_delete_recording,
+        )
+        delete_menu.addAction(self._action_delete_recording)
+        self._action_delete_session = QAction("&Session...", self)
+        self._action_delete_session.triggered.connect(self._delete_selected)
+        delete_menu.addAction(self._action_delete_session)
+        self._file_delete_menu = delete_menu
         file_menu.addSeparator()
         action_quit = QAction("&Quit", self)
         action_quit.setShortcut("Ctrl+Q")
         action_quit.triggered.connect(self.quit_requested.emit)
         file_menu.addAction(action_quit)
 
-        # Tools menu (#67): manual backup + restore. Sits between
-        # File and Help because backup is data-dir-scoped (closer to
-        # File semantically) but isn't a session action.
+        # Tools menu (#67): manual backup + restore + the catalog
+        # editors + Settings. Settings + Manage Classification +
+        # Address Book moved here from File on 2026-06-02 because
+        # they're configuration / catalog actions, not file actions.
         tools_menu = menubar.addMenu("&Tools")
         action_backup_now = QAction("&Backup Now...", self)
         action_backup_now.triggered.connect(self.backup_now_requested.emit)
@@ -213,6 +263,50 @@ class MainWindow(QMainWindow):
         action_restore = QAction("&Restore from Backup...", self)
         action_restore.triggered.connect(self.restore_backup_requested.emit)
         tools_menu.addAction(action_restore)
+        tools_menu.addSeparator()
+        # Manage Classification covers Series + Topics (tabbed);
+        # Address Book covers Contacts (formerly People) -- separated
+        # because Contacts also link to the Speaker store and have
+        # alias / merge-suggestion surfaces the simpler Series/Topics
+        # tabs don't need.
+        action_manage_classification = QAction(
+            "&Manage Classification...", self,
+        )
+        action_manage_classification.triggered.connect(
+            self.manage_classification_requested.emit,
+        )
+        tools_menu.addAction(action_manage_classification)
+        action_address_book = QAction("&Address Book...", self)
+        action_address_book.triggered.connect(
+            self.address_book_requested.emit,
+        )
+        tools_menu.addAction(action_address_book)
+        tools_menu.addSeparator()
+        action_settings = QAction("&Settings...", self)
+        action_settings.setShortcut("Ctrl+,")
+        action_settings.triggered.connect(self.open_settings_requested.emit)
+        tools_menu.addAction(action_settings)
+        # Per-session File actions all start disabled; the
+        # itemSelectionChanged slot calls _refresh_session_actions to
+        # toggle them as the user picks rows. Setting initial state
+        # here so _refresh_session_actions doesn't have to be safe to
+        # call before _list exists.
+        for action in (
+            self._action_rename_session,
+            self._action_edit_timestamp,
+            self._action_export_recording,
+            self._action_export_video,
+            self._action_export_package,
+            self._action_delete_recording,
+            self._action_delete_session,
+            self._action_save_pdf,
+            self._action_save_notion,
+            self._action_save_confluence,
+        ):
+            action.setEnabled(False)
+        self._file_export_menu.setEnabled(False)
+        self._file_delete_menu.setEnabled(False)
+        self._file_save_menu.setEnabled(False)
 
         help_menu = menubar.addMenu("&Help")
         debug_menu = help_menu.addMenu("&Debug")
@@ -654,6 +748,59 @@ class MainWindow(QMainWindow):
             self.session_selected.emit(
                 selected[0].data(_COL_TITLE, Qt.ItemDataRole.UserRole)
             )
+        self._refresh_session_actions()
+
+    def _refresh_session_actions(self) -> None:
+        """Sync the File menu's per-session actions to the live
+        selection. Mirrors the enable/disable matrix the right-click
+        menu uses so the two surfaces stay consistent."""
+        ids = self.selected_session_ids()
+        single = ids[0] if len(ids) == 1 else None
+        has_audio = bool(single) and has_retained_audio(single)
+        any_selected = bool(ids)
+        # Rename + edit-timestamp are single-session-only.
+        self._action_rename_session.setEnabled(single is not None)
+        self._action_edit_timestamp.setEnabled(single is not None)
+        # Export actions need a single session with retained audio
+        # (except Full Session which only needs a single session).
+        self._action_export_recording.setEnabled(has_audio)
+        self._action_export_video.setEnabled(has_audio)
+        self._action_export_package.setEnabled(single is not None)
+        self._file_export_menu.setEnabled(single is not None)
+        # Delete actions: recording requires audio; session works on
+        # any selection (single or multi).
+        self._action_delete_recording.setEnabled(has_audio)
+        self._action_delete_session.setEnabled(any_selected)
+        self._file_delete_menu.setEnabled(any_selected)
+        # Save to actions: need a single session loaded so the right
+        # pane has a tab body to export. Notion + Confluence are
+        # always selectable; MainApp's handler checks verified state.
+        self._action_save_pdf.setEnabled(single is not None)
+        self._action_save_notion.setEnabled(single is not None)
+        self._action_save_confluence.setEnabled(single is not None)
+        self._file_save_menu.setEnabled(single is not None)
+
+    # ---- File-menu emit helpers ----------------------------------------
+
+    def _emit_export_recording(self) -> None:
+        ids = self.selected_session_ids()
+        if len(ids) == 1:
+            self.export_recording_requested.emit(ids[0])
+
+    def _emit_export_video(self) -> None:
+        ids = self.selected_session_ids()
+        if len(ids) == 1:
+            self.export_video_requested.emit(ids[0])
+
+    def _emit_export_package(self) -> None:
+        ids = self.selected_session_ids()
+        if len(ids) == 1:
+            self.export_package_requested.emit(ids[0])
+
+    def _emit_delete_recording(self) -> None:
+        ids = self.selected_session_ids()
+        if len(ids) == 1:
+            self._confirm_delete_recording(ids[0])
 
     def _show_list_menu(self, pos) -> None:
         selected = self._list.selectedItems()

@@ -181,6 +181,22 @@ def test_clamp_images_to_printer_does_not_change_page_size(qt_app, tmp_path):
     assert doc.pageSize() == page_size_before
 
 
+def test_default_stylesheet_pins_anchor_color_black_underlined(qt_app, tmp_path):
+    """Markdown links in the printed PDF render with Qt's default
+    anchor color, which is cyan and unreadable on white. The print
+    document's default stylesheet forces black + underline so the
+    link still reads as a link without disappearing into the page
+    (#78)."""
+    doc = PrintTextDocument(tmp_path)
+    sheet = doc.defaultStyleSheet()
+    # The styling lives in PrintTextDocument's _PRINT_STYLESHEET; the
+    # test pins the user-visible contract rather than the literal
+    # string so cosmetic edits (whitespace, ordering) don't break.
+    assert "a {" in sheet
+    assert "color: black" in sheet
+    assert "text-decoration: underline" in sheet
+
+
 def test_pdf_actually_embeds_image(qt_app, session_with_image, tmp_path):
     """End-to-end: render a Markdown doc to PDF and verify the rendered
     page has the colored pixels somewhere on it.

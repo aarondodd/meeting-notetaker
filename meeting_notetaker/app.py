@@ -412,6 +412,9 @@ class MainApp(QObject):
         self.window.session_view.set_export_default_folder(
             self.config.synthesis.export_default_folder or "",
         )
+        # Issue #79: surface Notion + Confluence in the Export menu
+        # only when the relevant integration is configured + verified.
+        self._refresh_integration_targets()
         # Restore the persisted Transcript-playback split percentage so
         # the user's preferred ratio applies the first time playback
         # engages this session.
@@ -1176,6 +1179,18 @@ class MainApp(QObject):
             self._on_manage_classification,
         )
         self.window.address_book_requested.connect(self._on_address_book)
+        # File > Save to ... mirrors the SessionView's right-pane
+        # Save to... button. Route both through the same handlers so
+        # body resolution + worker spawn stay in one place (#79).
+        self.window.save_to_pdf_requested.connect(
+            self._on_file_menu_save_to_pdf,
+        )
+        self.window.save_to_notion_requested.connect(
+            self._on_file_menu_save_to_notion,
+        )
+        self.window.save_to_confluence_requested.connect(
+            self._on_file_menu_save_to_confluence,
+        )
         # SessionView -> classification chip mutations
         sv = self.window.session_view
         sv.add_topic_requested.connect(self._on_add_topic_requested)
@@ -1206,6 +1221,12 @@ class MainApp(QObject):
         sv.restore_previous_notes_clicked.connect(self._on_restore_previous_notes)
         sv.delete_previous_notes_clicked.connect(self._on_delete_previous_notes)
         sv.prompt_template_changed.connect(self._on_prompt_template_changed)
+        # Issue #79: experimental Notion + Confluence export. SessionView
+        # emits with (session_id, tab_label, markdown_body); MainApp owns
+        # the picker dialog + the QThread worker + the URL-open path so
+        # SessionView stays unaware of the integrations module.
+        sv.export_to_notion_requested.connect(self._on_export_to_notion)
+        sv.export_to_confluence_requested.connect(self._on_export_to_confluence)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
         # Click-to-tag attendee sidebar. The session-view passes its own
         # session_id; we forward to controller.tag_speaker which captures
@@ -2407,6 +2428,80 @@ class MainApp(QObject):
             TranscriptStore(session_id).write_prompt_template_name(name)
         except OSError:
             log.exception("failed to save prompt template name for %s", session_id)
+
+    # ---- experimental Notion / Confluence export (#79) -------------------
+
+    def _refresh_integration_targets(self) -> None:
+        """Tell the SessionView which Experimental export destinations
+        should appear in the Export menu. A destination surfaces only
+        when its credentials are present AND last_verified_at is set;
+        the Settings dialog clears last_verified_at whenever the
+        credentials change so we never offer a stale-verified target."""
+        notion_ready = bool(
+            self.config.notion.api_token
+            and self.config.notion.last_verified_at
+        )
+        confluence_ready = bool(
+            self.config.confluence.base_url
+            and self.config.confluence.email
+            and self.config.confluence.api_token
+            and self.config.confluence.last_verified_at
+        )
+        self.window.session_view.set_integration_targets(
+            notion_enabled=notion_ready,
+            confluence_enabled=confluence_ready,
+        )
+
+    def _on_export_to_notion(
+        self, session_id: str, tab_label: str, body: str,
+    ) -> None:
+        from .integrations.integrations_export_flow import run_notion_export  # noqa: PLC0415
+
+        run_notion_export(
+            self,
+            session_id=session_id,
+            tab_label=tab_label,
+            body=body,
+        )
+
+    def _on_export_to_confluence(
+        self, session_id: str, tab_label: str, body: str,
+    ) -> None:
+        from .integrations.integrations_export_flow import run_confluence_export  # noqa: PLC0415
+
+        run_confluence_export(
+            self,
+            session_id=session_id,
+            tab_label=tab_label,
+            body=body,
+        )
+
+    # ---- File menu > Save to ... bridges (#79) -------------------------
+    #
+    # MainWindow's File > Save to submenu emits these no-arg signals;
+    # we look up the active session + tab from the SessionView and
+    # forward to the same per-target handlers the right-pane button
+    # uses, so body resolution + worker spawn stay in one place.
+
+    def _on_file_menu_save_to_pdf(self) -> None:
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            return
+        sv._on_export_pdf()  # noqa: SLF001
+
+    def _on_file_menu_save_to_notion(self) -> None:
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            return
+        body, label = sv._active_tab_body_and_label()  # noqa: SLF001
+        self._on_export_to_notion(sv._session.id, label, body)  # noqa: SLF001
+
+    def _on_file_menu_save_to_confluence(self) -> None:
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            return
+        body, label = sv._active_tab_body_and_label()  # noqa: SLF001
+        self._on_export_to_confluence(sv._session.id, label, body)  # noqa: SLF001
 
     def _on_restore_previous_notes(self, session_id: str, archive_path) -> None:
         """Replace notes.md with a selected archive's contents. The
@@ -4759,6 +4854,8 @@ class MainApp(QObject):
         self.window.session_view.set_export_default_folder(
             self.config.synthesis.export_default_folder or "",
         )
+        # Issue #79: Notion + Confluence menu visibility refresh.
+        self._refresh_integration_targets()
         self.window.status("Settings saved.", timeout_ms=4000)
 
     def _appendix_export_defaults_from_config(self):

@@ -82,10 +82,18 @@ def test_picker_set_during_population_does_not_emit_change_signal(qt_app):
 
 
 def test_picker_placeholder_reflects_settings_default(qt_app):
-    """The first entry's label surfaces the Settings default name so
-    the user sees which template will actually be used when no
-    session-level override is set (#55). Data role stays empty so the
-    resolution chain still runs at synthesis time."""
+    """The placeholder entry's label surfaces the Settings default
+    name (#55) so an expanded dropdown shows what the placeholder
+    resolves to. The placeholder data stays empty so picking it
+    explicitly clears any per-session override.
+
+    Selection behavior is covered by
+    test_picker_lands_on_settings_default_row_for_new_session (#76):
+    when no per-session override exists, the dropdown points at the
+    Settings default's row directly, not the placeholder, because
+    the truncated "(default..stom)" form was unreadable inside the
+    200px-wide combo and read as "Settings default is ignored."
+    """
     from meeting_notetaker.ui.session_view import SessionView
 
     sv = SessionView()
@@ -97,9 +105,83 @@ def test_picker_placeholder_reflects_settings_default(qt_app):
     picker = sv._prompt_template_picker  # noqa: SLF001
     assert picker.itemText(0) == "(default: one-on-one)"
     assert picker.itemData(0) == ""
-    # Selection should land on the placeholder when nothing's saved.
+
+
+def test_picker_lands_on_settings_default_row_for_new_session(qt_app):
+    """Regression for #76: when there is no per-session override but
+    the user has picked a Settings default, the dropdown should show
+    the chosen template's name directly so the user can see at a
+    glance which template will run. The placeholder still exists in
+    the list; the user can pick it explicitly to clear any
+    per-session override later."""
+    from meeting_notetaker.ui.session_view import SessionView
+
+    sv = SessionView()
+    sv.set_prompt_templates(
+        ["default", "standup", "one-on-one"],
+        selected="",
+        settings_default="one-on-one",
+    )
+    picker = sv._prompt_template_picker  # noqa: SLF001
+    # currentText shows the template name, not the placeholder.
+    assert picker.currentData() == "one-on-one"
+    assert picker.currentText() == "one-on-one"
+    # selected_prompt_template returns the resolved name -- callers
+    # like _on_send_to_llm see what the user sees.
+    assert sv.selected_prompt_template() == "one-on-one"
+
+
+def test_picker_falls_back_to_placeholder_when_settings_default_missing(qt_app):
+    """If the Settings default points at a template that's no longer
+    in the prompts folder (deleted, renamed), the dropdown falls
+    back to the placeholder so something coherent is displayed.
+    The runtime resolution chain handles the actual template lookup
+    at Send time."""
+    from meeting_notetaker.ui.session_view import SessionView
+
+    sv = SessionView()
+    sv.set_prompt_templates(
+        ["default", "standup"],
+        selected="",
+        settings_default="ghost-template",
+    )
+    picker = sv._prompt_template_picker  # noqa: SLF001
     assert picker.currentIndex() == 0
-    assert sv.selected_prompt_template() == ""
+    assert picker.currentData() == ""
+
+
+def test_picker_per_session_override_wins_over_settings_default(qt_app):
+    """Per-session override takes priority over the Settings default
+    -- if the user explicitly picked 'standup' for this session, the
+    dropdown shows 'standup' even if Settings default is something
+    else."""
+    from meeting_notetaker.ui.session_view import SessionView
+
+    sv = SessionView()
+    sv.set_prompt_templates(
+        ["default", "standup", "one-on-one"],
+        selected="standup",
+        settings_default="one-on-one",
+    )
+    assert sv.selected_prompt_template() == "standup"
+
+
+def test_picker_ignores_literal_default_as_settings_default(qt_app):
+    """Settings default = 'default' is equivalent to no Settings
+    default (the bundled template). The dropdown should show the
+    placeholder, not try to find a 'default' row (which doesn't
+    exist; that template is collapsed into the placeholder)."""
+    from meeting_notetaker.ui.session_view import SessionView
+
+    sv = SessionView()
+    sv.set_prompt_templates(
+        ["default", "standup"],
+        selected="",
+        settings_default="default",
+    )
+    picker = sv._prompt_template_picker  # noqa: SLF001
+    assert picker.currentIndex() == 0
+    assert picker.itemText(0) == "(default)"
 
 
 def test_picker_placeholder_when_settings_default_empty(qt_app):

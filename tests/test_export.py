@@ -71,14 +71,19 @@ def test_unique_export_path_walks_until_free(tmp_path):
     assert unique_export_path(tmp_path / "doc.pdf") == tmp_path / "doc-4.pdf"
 
 
-def test_build_print_markdown_includes_title_and_tab():
+def test_build_print_markdown_uses_session_title_only(qt_app=None):
+    """The in-document H1 is just the session title (#78). The tab
+    identifier ('My Notes' / 'Synthesis') belongs in the filename
+    only -- duplicating it in the H1 was noise."""
     out = build_print_markdown(
         session_title="EDAPA-737 Sync",
         tab_label="My Notes",
         session_date=datetime(2026, 5, 17, 14, 30),
         body="# Attendees\n- Aaron\n",
     )
-    assert out.startswith("# EDAPA-737 Sync -- My Notes\n")
+    assert out.startswith("# EDAPA-737 Sync\n")
+    # Tab is no longer appended to the H1.
+    assert "EDAPA-737 Sync -- My Notes" not in out
     assert "*2026-05-17 14:30*" in out
     assert "---" in out
     # Body content survives intact, with a blank line before the rule.
@@ -94,7 +99,9 @@ def test_build_print_markdown_handles_missing_date():
     )
     # No italic-wrapped date line when session_date is None.
     assert "*" not in out.split("---")[0]
-    assert out.startswith("# X -- Synthesis")
+    # H1 is session title alone.
+    assert out.startswith("# X\n")
+    assert "X -- Synthesis" not in out
     assert "content" in out
 
 
@@ -105,6 +112,7 @@ def test_build_print_markdown_falls_back_for_empty_title():
         session_date=None,
         body="",
     )
-    # Both title and tab fall back rather than rendering a bare "-- ".
+    # Title falls back to "Untitled session"; tab no longer
+    # contributes to the H1.
     assert "Untitled session" in out
-    assert "Notes" in out
+    assert out.startswith("# Untitled session\n")

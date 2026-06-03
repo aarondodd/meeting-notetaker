@@ -526,3 +526,72 @@ def test_backup_validate_rejects_negative_retention(isolated_data_dir):
     errors = cfg.validate()
     assert any("retention_count" in e for e in errors)
     assert any("retention_days" in e for e in errors)
+
+
+# ---- issue #79: Notion + Confluence integrations -----------------------
+
+
+def test_notion_confluence_defaults_empty(isolated_data_dir):
+    """Fresh Config has no Notion or Confluence credentials. Defaults
+    must validate cleanly so the app starts up out of the box."""
+    cfg = Config()
+    assert cfg.notion.api_token == ""
+    assert cfg.notion.favorites == []
+    assert cfg.notion.recents == []
+    assert cfg.confluence.api_token == ""
+    assert cfg.confluence.base_url == ""
+    assert cfg.confluence.email == ""
+    assert cfg.validate() == []
+
+
+def test_notion_round_trip_with_favorites(isolated_data_dir):
+    cfg = Config()
+    cfg.notion.api_token = "secret_abc123"
+    cfg.notion.last_verified_at = "2026-06-02T14:30:00"
+    cfg.notion.favorites = [
+        {"id": "page-abc", "title": "Meetings / Weekly Sync"},
+        {"id": "page-def", "title": "Team / Status"},
+    ]
+    cfg.notion.recents = [
+        {"id": "page-ghi", "title": "Recent / One", "used_at": "2026-06-02T10:00:00"},
+    ]
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.notion.api_token == "secret_abc123"
+    assert loaded.notion.last_verified_at == "2026-06-02T14:30:00"
+    assert len(loaded.notion.favorites) == 2
+    assert loaded.notion.favorites[0]["id"] == "page-abc"
+    assert loaded.notion.favorites[0]["title"] == "Meetings / Weekly Sync"
+    assert loaded.notion.recents == [
+        {"id": "page-ghi", "title": "Recent / One", "used_at": "2026-06-02T10:00:00"},
+    ]
+
+
+def test_confluence_round_trip(isolated_data_dir):
+    cfg = Config()
+    cfg.confluence.base_url = "https://example.atlassian.net/wiki"
+    cfg.confluence.email = "user@example.com"
+    cfg.confluence.api_token = "ATATT3xFf..."
+    cfg.confluence.favorites = [
+        {"id": "12345", "title": "EDA / Meeting Notes"},
+    ]
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.confluence.base_url == "https://example.atlassian.net/wiki"
+    assert loaded.confluence.email == "user@example.com"
+    assert loaded.confluence.api_token == "ATATT3xFf..."
+    assert loaded.confluence.favorites[0]["title"] == "EDA / Meeting Notes"
+
+
+def test_confluence_validate_rejects_malformed_base_url(isolated_data_dir):
+    cfg = Config()
+    cfg.confluence.base_url = "example.atlassian.net/wiki"  # missing scheme
+    errors = cfg.validate()
+    assert any("confluence.base_url" in e for e in errors)
+
+
+def test_confluence_validate_accepts_empty_base_url(isolated_data_dir):
+    """Empty base_url is the unconfigured state -- must validate."""
+    cfg = Config()
+    cfg.confluence.base_url = ""
+    assert cfg.validate() == []

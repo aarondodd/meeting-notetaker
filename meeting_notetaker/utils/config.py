@@ -305,6 +305,44 @@ class BackupConfig:
 
 
 @dataclass
+class NotionConfig:
+    """Experimental Notion export (issue #79).
+
+    The user creates an internal integration at notion.so/my-integrations,
+    pastes the secret_XXX token here, and shares specific pages with that
+    integration. The picker dialog lists those shared pages.
+
+    ``favorites`` and ``recents`` carry pre-rendered titles so the
+    picker can render its rows without round-tripping to the API on
+    every dialog open. Both are stored as TOML arrays of inline tables.
+    """
+    api_token: str = ""
+    # Set by the Settings "Verify connection" path on a successful
+    # /v1/users/me call. Empty until verified.
+    last_verified_at: str = ""
+    # Each entry: {"id": "<page_id>", "title": "<display path>"}.
+    favorites: list[dict] = field(default_factory=list)
+    # Each entry: {"id": "<page_id>", "title": "...", "used_at": "<iso>"}.
+    recents: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ConfluenceConfig:
+    """Experimental Confluence export (issue #79).
+
+    Cloud or server -- the user provides their base URL (Cloud:
+    ``https://your-org.atlassian.net/wiki``; server: same shape).
+    Email + API token authenticate every call.
+    """
+    base_url: str = ""
+    email: str = ""
+    api_token: str = ""
+    last_verified_at: str = ""
+    favorites: list[dict] = field(default_factory=list)
+    recents: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
@@ -314,6 +352,8 @@ class Config:
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
     backup: BackupConfig = field(default_factory=BackupConfig)
+    notion: NotionConfig = field(default_factory=NotionConfig)
+    confluence: ConfluenceConfig = field(default_factory=ConfluenceConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -344,6 +384,12 @@ class Config:
             ),
             backup=BackupConfig(
                 **_filter_fields(BackupConfig, data.get("backup", {}))
+            ),
+            notion=NotionConfig(
+                **_filter_fields(NotionConfig, data.get("notion", {}))
+            ),
+            confluence=ConfluenceConfig(
+                **_filter_fields(ConfluenceConfig, data.get("confluence", {}))
             ),
         )
 
@@ -453,6 +499,17 @@ class Config:
                 "backup.retention_days must be between 0 and 3650 "
                 f"(0 disables), got {self.backup.retention_days}"
             )
+        # Issue #79: light validation on the experimental integration
+        # fields. The token + email shapes vary across tenants so
+        # we don't try to enforce them; just guard the URL shape so a
+        # typo doesn't strand the verify path with a confusing error.
+        if self.confluence.base_url:
+            url = self.confluence.base_url.strip()
+            if not (url.startswith("https://") or url.startswith("http://")):
+                errors.append(
+                    "confluence.base_url must start with https:// or http:// "
+                    f"(got {self.confluence.base_url!r})"
+                )
         if self.synthesis.claude_project_id:
             # Optional field; if set, must look like a UUID
             # (8-4-4-4-12 hex). Loose match -- Claude uses UUID-v7
@@ -484,6 +541,8 @@ class Config:
             ("detection", self.detection),
             ("synthesis", self.synthesis),
             ("backup", self.backup),
+            ("notion", self.notion),
+            ("confluence", self.confluence),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():
@@ -507,4 +566,11 @@ def _toml_repr(value: Any) -> str:
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     if isinstance(value, list):
         return "[" + ", ".join(_toml_repr(v) for v in value) + "]"
+    if isinstance(value, dict):
+        # TOML inline table: { k = v, ... }. Used for favorites /
+        # recents entries (issue #79) where each list item is a small
+        # {id, title, ...} record. tomllib loads inline tables back as
+        # dicts so the round-trip is clean.
+        parts = [f"{k} = {_toml_repr(v)}" for k, v in value.items()]
+        return "{ " + ", ".join(parts) + " }" if parts else "{}"
     raise TypeError(f"unsupported TOML value: {value!r}")
