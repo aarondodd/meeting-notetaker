@@ -9,7 +9,7 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.6. End-to-end capture, transcription, synthesis,
+> **Status:** v0.7.7-dev. End-to-end capture, transcription, synthesis,
 > screen capture, retained-audio playback + export, and transcript-
 > synchronized playback all working. v0.7.6 adds Notion and Confluence
 > as save-to destinations alongside PDF (with a Verify-gated picker
@@ -46,6 +46,23 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.7
+
+- **Import Transcript... (#80).** Bring a transcript from another
+  source into a session that has no local recording. Useful when
+  Teams generated the transcript but you couldn't capture audio
+  (off-mic call, late join, hardware issue). Pick a `.txt` / `.md`
+  / `.docx` file or paste from the clipboard; the dialog drops
+  Teams export chrome ("Started transcription", "View original
+  meeting", standalone date headers), folds the web-paste
+  speaker/timestamp/body three-line shape back into one labeled
+  line, and surfaces any detected speaker labels for a one-shot
+  remap. On import the body lands in `raw.transcript.md` and the
+  Send to Claude.ai + Save to... buttons unlock the same way they
+  do for recorded sessions. Reachable from File -> Import
+  Transcript... in the menu bar and from a sibling button on the
+  empty Transcript tab.
 
 ## What's new in v0.7.6
 
@@ -855,6 +872,49 @@ list:
   dialog tracks per-frame encode progress.
 - **Delete recording...** -- removes the audio files but keeps
   the transcript + notes.
+
+## Importing a transcript (no recording)
+
+Sometimes a meeting happens without a local recording -- you joined
+late, your mic was wrong, Teams recorded the call but the app
+didn't, or the meeting was a hallway call with someone else's
+transcript already on hand. You can still use the synthesis flow by
+importing the transcript directly into the session.
+
+1. Create a new session in the usual way (the **+ New** button in
+   the sessions list), or open an existing empty session.
+2. Click **Import Transcript...** on the empty Transcript tab, or
+   pick **File -> Import Transcript...** from the menu bar.
+3. In the dialog, either click **From file...** (accepts `.txt`,
+   `.md`, and `.docx`) or **Paste from clipboard**. The preview
+   pane shows the normalized body the app would save.
+
+   ![Import Transcript dialog](docs/screenshots/31-dialog-import-transcript.png)
+4. Leave **Strip Teams formatting** checked for transcripts that
+   came out of Teams. The cleanup pass drops boilerplate banners
+   ("Started transcription", "View original meeting"), folds the
+   web-paste three-line speaker/timestamp/body shape back into one
+   labeled line, and collapses runs of blank lines. Uncheck it to
+   import the source verbatim.
+5. If the preview shows `Name:`-prefixed lines the dialog lists each
+   detected speaker, how many lines they contributed, and lets you
+   type a remapped label. Useful when Teams used a generic
+   "Unknown Speaker" label or the user's display name is wrong.
+   Click **Apply remap to preview** to see the result.
+6. Click **Import**. The body is written to the session's
+   transcript and the **Send to Claude.ai** + **Save to...** buttons
+   become available the same way they do after a recording.
+
+Notes are merged in via the existing My Notes flow -- if you took
+running notes during the meeting they remain attached to the
+session and feed the synthesis prompt alongside the imported
+transcript. A flat caption blob with no speaker labels works fine;
+the synthesis prompt template treats `{{transcript}}` as opaque
+text, and Claude leans on your notes when speaker attribution is
+missing.
+
+Importing over an existing transcript prompts for confirmation to
+avoid accidentally wiping a recording's transcript.
 
 ## Synthesis: chatbot hand-off
 

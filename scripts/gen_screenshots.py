@@ -928,6 +928,35 @@ def shot_integrations_picker() -> None:
     dlg.close()
 
 
+def shot_import_transcript_dialog() -> None:
+    """v0.7.7 Import Transcript dialog (#80). Pre-seeds a synthetic
+    Teams-style body so the speakers table + preview show real
+    content."""
+    from meeting_notetaker.ui.import_transcript_dialog import (
+        ImportTranscriptDialog,
+    )
+
+    body = (
+        "Started transcription\n"
+        "Jun 4, 2026, 10:00 AM\n"
+        "\n"
+        "Jane Smith   0:00:01.234\n"
+        "Welcome everyone. Let's start with the roadmap update.\n"
+        "Aaron Dodd   0:00:08.117\n"
+        "Sounds good. I'll share the deck.\n"
+        "Jane Smith   0:00:14.500\n"
+        "Great. Walk us through the Q3 milestones.\n"
+        "View original meeting\n"
+    )
+    dlg = ImportTranscriptDialog(session_title="Q3 Platform Sync")
+    dlg.set_initial_body(body)
+    dlg.resize(900, 660)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "31-dialog-import-transcript.png", autosize=False)
+    dlg.close()
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -958,6 +987,8 @@ def main() -> int:
     shot_settings_integrations()
     shot_save_to_menu()
     shot_integrations_picker()
+    # v0.7.7 surfaces (#80).
+    shot_import_transcript_dialog()
     print("done.")
     return 0
 
