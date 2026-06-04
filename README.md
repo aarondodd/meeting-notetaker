@@ -63,6 +63,32 @@ leaves the machine; no API key required.
   do for recorded sessions. Reachable from File -> Import
   Transcript... in the menu bar and from a sibling button on the
   empty Transcript tab.
+- **Pop Out My Notes Preview.** Open a separate top-level window
+  showing the live preview of My Notes, designed for screen-share
+  during a call. Updates as you type (250 ms debounce so a typing
+  burst doesn't produce a flicker), with an Always on Top toggle
+  in the popout's own View menu. Geometry and the always-on-top
+  state persist across launches. Reachable from
+  View -> Pop Out My Notes Preview. Pure read-only -- no editor,
+  no toolbar -- so the audience sees a clean rendered surface.
+
+  ![Pop-out My Notes preview window](docs/screenshots/32-dialog-notes-popout.png)
+- **Editor + preview fonts in Settings.** New Fonts section under
+  Settings (also reachable as View -> Editor & Preview Fonts...).
+  The editor face is restricted to monospace families (Markdown
+  table / code-block / bulleted-list alignment matters); the
+  preview face is unrestricted. Sizes default to "platform default"
+  -- existing installs that don't open Settings see no change.
+  Also fixes a long-standing bug where the My Notes editor
+  inherited the platform proportional font instead of the monospace
+  the rest of the app expects.
+
+  ![Settings -> Fonts](docs/screenshots/33-dialog-settings-fonts.png)
+- **PDF link color.** Markdown hyperlinks now render as black
+  underlined text in PDF exports rather than cyan. The v0.7.6 fix
+  only set the default stylesheet (which Qt's Markdown parser
+  ignored at render time); the actual fix walks every anchor
+  fragment after `setMarkdown` and forces its character format.
 
 ## What's new in v0.7.6
 

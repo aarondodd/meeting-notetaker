@@ -928,6 +928,58 @@ def shot_integrations_picker() -> None:
     dlg.close()
 
 
+def shot_notes_popout() -> None:
+    """v0.7.7 pop-out preview window for screen-share. Pre-seeds a
+    realistic My Notes body so the screenshot shows what audience
+    members would actually see during a call."""
+    from meeting_notetaker.ui.notes_popout import LiveNotesPopout
+
+    body = (
+        "# Attendees\n\n"
+        "- Aaron Dodd (host)\n"
+        "- Jane Smith (Product)\n"
+        "- Chris Patel (Eng)\n\n"
+        "# Agenda\n\n"
+        "1. Q3 roadmap update\n"
+        "2. Vendor evaluation -- Acme Cloud vs Beta Systems\n"
+        "3. Open questions\n\n"
+        "# Notes\n\n"
+        "## Q3 roadmap\n\n"
+        "Acme Cloud demoed v3.1 yesterday; the SSO flow lands\n"
+        "next week. Beta Systems is still on their v2 release.\n\n"
+        "- Acme licensing is per-seat; Beta is per-host\n"
+        "- Migration risk: 12 weeks vs 4 weeks\n\n"
+        "# Action Items\n\n"
+        "- [ ] Aaron: draft vendor comparison memo by Friday\n"
+        "- [ ] Jane: confirm SSO requirements with Security\n"
+    )
+    po = LiveNotesPopout(
+        body=body,
+        window_title="My Notes Preview -- Q3 Platform Sync",
+    )
+    po.resize(620, 540)
+    po.show()
+    QApplication.processEvents()
+    _grab(po, "32-dialog-notes-popout.png", autosize=False)
+    po.close()
+
+
+def shot_settings_fonts() -> None:
+    """v0.7.7 Settings -> Fonts page (#80 followup). Pre-populated
+    so the editor + preview pickers + size spins are all on screen."""
+    cfg = Config()
+    cfg.ui.user_name = USER_NAME
+    cfg.ui.settings_active_section = "Fonts"
+    cfg.ui.editor_font_size = 12
+    cfg.ui.preview_font_size = 12
+    dlg = SettingsDialog(cfg)
+    dlg.resize(900, 600)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "33-dialog-settings-fonts.png", autosize=False)
+    dlg.close()
+
+
 def shot_import_transcript_dialog() -> None:
     """v0.7.7 Import Transcript dialog (#80). Pre-seeds a synthetic
     Teams-style body so the speakers table + preview show real
@@ -989,6 +1041,8 @@ def main() -> int:
     shot_integrations_picker()
     # v0.7.7 surfaces (#80).
     shot_import_transcript_dialog()
+    shot_notes_popout()
+    shot_settings_fonts()
     print("done.")
     return 0
 
