@@ -157,6 +157,11 @@ class MainWindow(QMainWindow):
     # MainApp opens the dialog, writes raw.transcript.md on accept, and
     # flips session.has_transcript=True so the Send/Save buttons unlock.
     import_transcript_requested = pyqtSignal()
+    # View menu (v0.7.7 new): pop-out preview window for My Notes
+    # (audience screenshare scenario) + shortcut to the Fonts section
+    # in Settings. MainApp owns both handlers.
+    pop_out_notes_preview_requested = pyqtSignal()
+    open_fonts_settings_requested = pyqtSignal()
     show_session_tab_requested = pyqtSignal(str, str, object)
     # session_id, tab_id ('transcript' | 'live_notes' | 'notes' | 'previous'),
     # optional archive_path (str | None); emitted by the cross-session
@@ -299,6 +304,37 @@ class MainWindow(QMainWindow):
         action_settings.setShortcut("Ctrl+,")
         action_settings.triggered.connect(self.open_settings_requested.emit)
         tools_menu.addAction(action_settings)
+
+        # View menu (v0.7.7) -- screenshare-friendly pop-out preview
+        # plus a shortcut to the Fonts section in Settings (the editor
+        # + preview font configuration). Sits between Tools and Help
+        # in the menu bar. Constructed before the per-session-action
+        # disable block below so its _action_pop_out_notes entry can
+        # join that list.
+        view_menu = menubar.addMenu("&View")
+        self._action_pop_out_notes = QAction(
+            "&Pop Out My Notes Preview", self,
+        )
+        self._action_pop_out_notes.setToolTip(
+            "Open a separate window showing the live preview of My "
+            "Notes for screen-sharing during a meeting. Updates as "
+            "you type."
+        )
+        self._action_pop_out_notes.triggered.connect(
+            self.pop_out_notes_preview_requested.emit,
+        )
+        view_menu.addAction(self._action_pop_out_notes)
+        view_menu.addSeparator()
+        action_fonts = QAction("&Editor && Preview Fonts...", self)
+        action_fonts.setToolTip(
+            "Open Settings on the Fonts section to change the editor "
+            "or preview font face and size."
+        )
+        action_fonts.triggered.connect(
+            self.open_fonts_settings_requested.emit,
+        )
+        view_menu.addAction(action_fonts)
+
         # Per-session File actions all start disabled; the
         # itemSelectionChanged slot calls _refresh_session_actions to
         # toggle them as the user picks rows. Setting initial state
@@ -316,6 +352,7 @@ class MainWindow(QMainWindow):
             self._action_save_pdf,
             self._action_save_notion,
             self._action_save_confluence,
+            self._action_pop_out_notes,
         ):
             action.setEnabled(False)
         self._file_export_menu.setEnabled(False)
@@ -779,6 +816,10 @@ class MainWindow(QMainWindow):
         # source-agnostic, so we don't gate on existing transcript here
         # (importing over an existing transcript is a valid replace).
         self._action_import_transcript.setEnabled(single is not None)
+        # Pop-out preview: single-session-only -- the popout mirrors
+        # the currently-selected session's live notes, so it has
+        # nothing useful to show when no session is loaded.
+        self._action_pop_out_notes.setEnabled(single is not None)
         # Export actions need a single session with retained audio
         # (except Full Session which only needs a single session).
         self._action_export_recording.setEnabled(has_audio)
