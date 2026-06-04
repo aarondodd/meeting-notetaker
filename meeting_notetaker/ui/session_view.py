@@ -820,7 +820,12 @@ class SessionView(QWidget):
             self.set_screencap_armed(False)
             return
         self._title_label.setText(session.title)
-        self._state_label.setText(_pretty_state(session.state))
+        self._state_label.setText(_pretty_state(
+            session.state,
+            has_live_transcript=(
+                session.has_transcript or bool(transcript.strip())
+            ),
+        ))
         self._raw_transcript_text = transcript
         self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
         self._refresh_transcript_timestamps()
@@ -870,10 +875,16 @@ class SessionView(QWidget):
         if self._session is None:
             return
         self._session.state = state
-        self._state_label.setText(_pretty_state(state))
+        has_live_transcript = (
+            self._session.has_transcript
+            or bool(self._transcript_view.toPlainText().strip())
+        )
+        self._state_label.setText(_pretty_state(
+            state, has_live_transcript=has_live_transcript,
+        ))
         self._set_buttons_for_state(
             state,
-            has_transcript=self._session.has_transcript or bool(self._transcript_view.toPlainText().strip()),
+            has_transcript=has_live_transcript,
             has_notes=self._session.has_notes or bool(self._notes_view.toPlainText().strip()),
         )
         self._refresh_sidebar_visibility()
@@ -2575,18 +2586,33 @@ class _ClickableTranscriptView(QPlainTextEdit):
             self.line_clicked.emit(block.blockNumber())
 
 
-def _pretty_state(state: str) -> str:
+def _pretty_state(state: str, *, has_live_transcript: bool = False) -> str:
     # The state-label is the small text to the right of the session
     # title. "Complete" was visual noise -- the session-list status
     # column already shows the green dot for completed sessions, so
     # the label string only carries weight DURING active work. Empty
     # string for STATE_COMPLETE / STATE_NEW lets the label collapse
     # to no horizontal footprint when nothing's happening.
+    #
+    # PROCESSING gets two phrasings. The "you can synthesize now"
+    # variant was correct under the v0.6.4-and-earlier default where
+    # live captions populated the transcript pane during recording
+    # and the batch pass refined an already-usable live transcript.
+    # Under the v0.6.5+ default (live transcription off) nothing is
+    # written to the transcript file until batch completes, so the
+    # session genuinely cannot be synthesized yet -- the claim that
+    # it can is misleading. `has_live_transcript` reflects whether
+    # the live engine wrote any segments at Stop (controller flips
+    # session.has_transcript=True in that path); when False, the
+    # quieter message says only that work is happening.
+    if state == STATE_PROCESSING:
+        if has_live_transcript:
+            return "Refining transcript -- you can synthesize now"
+        return "Refining transcript..."
     pretty = {
         STATE_NEW: "",
         STATE_RECORDING: "Recording",
         STATE_PAUSED: "Paused",
-        STATE_PROCESSING: "Refining transcript -- you can synthesize now",
         STATE_COMPLETE: "",
         STATE_ERROR: "Error",
     }
