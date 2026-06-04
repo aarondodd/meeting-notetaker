@@ -20,21 +20,33 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QImage, QPageLayout, QTextDocument
+from PyQt6.QtGui import (
+    QColor,
+    QImage,
+    QPageLayout,
+    QTextCharFormat,
+    QTextCursor,
+    QTextDocument,
+)
 
 from .markdown_preview import clamp_image_widths
 
 
-# Default stylesheet applied to every printable document. Sets the
-# anchor color to black with an underline so Markdown links remain
-# identifiable as links in the rendered PDF / printed page without
-# Qt's default cyan, which is hard to read on white. setHtml /
-# setMarkdown still emit clickable anchors in the PDF; only the
-# visual treatment changes (#78).
+# Default stylesheet kept as a belt-and-braces fallback. The character-
+# format walk in `force_anchor_styling` is the real fix; Qt's Markdown
+# parser populates each anchor fragment's QTextCharFormat at parse
+# time, and those character formats win over the document's default
+# CSS for color + underline at render time. The stylesheet only kicks
+# in on paths that don't run the walk (e.g. setHtml without a
+# subsequent walk call).
 _PRINT_STYLESHEET = """
 a { color: black; text-decoration: underline; }
 a:visited { color: black; }
 """
+
+# Black; matches body text. Pulled out so tests can assert against
+# the same constant the production code uses.
+_PRINT_ANCHOR_COLOR = QColor(0, 0, 0)
 
 
 class PrintTextDocument(QTextDocument):
@@ -76,6 +88,49 @@ class PrintTextDocument(QTextDocument):
                     self._image_cache[key] = img
                     return img
         return super().loadResource(resource_type, name)
+
+    def force_anchor_styling(self) -> int:
+        """Repaint every anchor fragment as black + underline.
+
+        Markdown links would otherwise render cyan in PDFs and
+        printouts (Qt's default Link palette color), unreadable on
+        white. Walks the document, finds each fragment whose
+        QTextCharFormat carries an `anchor` href, and merges in
+        foreground=black + underline. Returns the number of fragments
+        adjusted -- mostly useful for tests; production paths can
+        ignore it.
+
+        Must be called AFTER setMarkdown / setHtml; the parser
+        populates character formats at parse time and the walk
+        operates on those finalized formats.
+        """
+        cursor = QTextCursor(self)
+        cursor.beginEditBlock()
+        try:
+            override = QTextCharFormat()
+            override.setForeground(_PRINT_ANCHOR_COLOR)
+            override.setFontUnderline(True)
+            adjusted = 0
+            block = self.begin()
+            while block.isValid():
+                it = block.begin()
+                while not it.atEnd():
+                    frag = it.fragment()
+                    if frag.isValid():
+                        fmt = frag.charFormat()
+                        if fmt.isAnchor() and fmt.anchorHref():
+                            cursor.setPosition(frag.position())
+                            cursor.setPosition(
+                                frag.position() + frag.length(),
+                                QTextCursor.MoveMode.KeepAnchor,
+                            )
+                            cursor.mergeCharFormat(override)
+                            adjusted += 1
+                    it += 1
+                block = block.next()
+        finally:
+            cursor.endEditBlock()
+        return adjusted
 
     def clamp_images_to_printer(self, printer) -> int:
         """Pin every image's rendered width to fit the printer's page.

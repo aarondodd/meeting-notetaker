@@ -181,20 +181,104 @@ def test_clamp_images_to_printer_does_not_change_page_size(qt_app, tmp_path):
     assert doc.pageSize() == page_size_before
 
 
-def test_default_stylesheet_pins_anchor_color_black_underlined(qt_app, tmp_path):
-    """Markdown links in the printed PDF render with Qt's default
-    anchor color, which is cyan and unreadable on white. The print
-    document's default stylesheet forces black + underline so the
-    link still reads as a link without disappearing into the page
-    (#78)."""
+def test_default_stylesheet_carries_anchor_styling_as_fallback(qt_app, tmp_path):
+    """The default stylesheet pins anchor color + underline as a
+    belt-and-braces fallback for callers that don't run the
+    character-format walk. The real fix is force_anchor_styling
+    (next two tests) -- this one only checks the stylesheet
+    survives so paths that rely on it keep working."""
     doc = PrintTextDocument(tmp_path)
     sheet = doc.defaultStyleSheet()
-    # The styling lives in PrintTextDocument's _PRINT_STYLESHEET; the
-    # test pins the user-visible contract rather than the literal
-    # string so cosmetic edits (whitespace, ordering) don't break.
     assert "a {" in sheet
     assert "color: black" in sheet
     assert "text-decoration: underline" in sheet
+
+
+def test_force_anchor_styling_overrides_qt_default_link_color(qt_app, tmp_path):
+    """After setMarkdown, every anchor fragment should carry
+    foreground=black + underlined font. The v0.7.6 stylesheet-only
+    fix did not survive Qt's Markdown parser writing cyan directly
+    into the QTextCharFormat at parse time -- this is the actual
+    user-visible regression (#78 followup)."""
+    from PyQt6.QtGui import QColor  # noqa: PLC0415
+
+    doc = PrintTextDocument(tmp_path)
+    doc.setMarkdown(
+        "Plain text before [a link](https://example.com) and after.\n\n"
+        "Another paragraph with [a second link](https://example.org).\n"
+    )
+    # Before the walk: Qt's parser populates QTextCharFormat with the
+    # palette Link color (cyan-ish blue). Confirm at least one anchor
+    # exists so the test premise holds.
+    pre_anchors = _collect_anchor_formats(doc)
+    assert len(pre_anchors) >= 2, (
+        "test premise: setMarkdown should emit at least two anchors"
+    )
+    # Run the walk.
+    adjusted = doc.force_anchor_styling()
+    assert adjusted == 2
+    # After the walk: every anchor's foreground is black and
+    # underline is on.
+    post_anchors = _collect_anchor_formats(doc)
+    for fmt in post_anchors:
+        assert fmt.isAnchor()
+        assert fmt.anchorHref()
+        # Brush color comparison: Qt stores QColor in the brush.
+        color = fmt.foreground().color()
+        assert (color.red(), color.green(), color.blue()) == (0, 0, 0), (
+            f"anchor foreground should be black, got "
+            f"({color.red()}, {color.green()}, {color.blue()})"
+        )
+        assert fmt.fontUnderline() is True
+
+
+def test_force_anchor_styling_does_not_touch_non_anchor_text(qt_app, tmp_path):
+    """The walk targets fragments whose char format is an anchor;
+    plain body text formatting must survive untouched."""
+    doc = PrintTextDocument(tmp_path)
+    doc.setMarkdown("Plain body with [link](https://x.test) and more body.\n")
+    doc.force_anchor_styling()
+    # Find a plain-text fragment; confirm it isn't anchored and its
+    # underline didn't get switched on.
+    plain_seen = False
+    block = doc.begin()
+    while block.isValid():
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid():
+                fmt = frag.charFormat()
+                if not fmt.isAnchor() and frag.text().strip():
+                    plain_seen = True
+                    assert fmt.fontUnderline() is False, (
+                        f"plain text {frag.text()!r} got unexpected underline"
+                    )
+            it += 1
+        block = block.next()
+    assert plain_seen, "test premise: at least one plain fragment must exist"
+
+
+def test_force_anchor_styling_returns_zero_when_no_anchors(qt_app, tmp_path):
+    doc = PrintTextDocument(tmp_path)
+    doc.setMarkdown("# Heading\n\nJust plain text, no links anywhere.\n")
+    assert doc.force_anchor_styling() == 0
+
+
+def _collect_anchor_formats(doc):
+    """Walk every fragment in `doc` and return the anchor char formats."""
+    out = []
+    block = doc.begin()
+    while block.isValid():
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid():
+                fmt = frag.charFormat()
+                if fmt.isAnchor() and fmt.anchorHref():
+                    out.append(fmt)
+            it += 1
+        block = block.next()
+    return out
 
 
 def test_pdf_actually_embeds_image(qt_app, session_with_image, tmp_path):

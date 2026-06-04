@@ -1530,6 +1530,28 @@ class SessionView(QWidget):
             return
         self._session.created_at = cleaned
 
+    def apply_fonts(self, editor_font, preview_font) -> None:
+        """Push the resolved editor + preview fonts to every surface
+        that respects them: the My Notes editor + preview, the
+        Synthesis editor + preview, and the Previous Notes preview.
+
+        The Transcript view stays on its own dedicated monospace
+        ("Consolas" with Monospace style hint, hard-coded at
+        construction) because timestamps need column alignment that
+        depends on Qt picking a non-substituted monospace face even
+        if the user prefers a different one for editing prose.
+        Called by MainApp at startup + on Settings Save."""
+        self._live_notes_editor.apply_fonts(editor_font, preview_font)
+        self._notes_view.apply_fonts(editor_font, preview_font)
+        # Previous notes is a read-only preview; push the preview
+        # font but skip the editor side (it has none).
+        try:
+            self._previous_view.apply_fonts(preview_font)
+        except AttributeError:
+            # Older builds without the per-widget setter; harmless to
+            # skip -- preview reverts to the QApplication default.
+            pass
+
     def set_user_name(self, name: str) -> None:
         """Update the display label for the user's mic and refresh the transcript view."""
         new_name = (name or "").strip()
@@ -2349,6 +2371,13 @@ class SessionView(QWidget):
         sdir = session_dir(self._session.id)
         doc = PrintTextDocument(sdir, parent=self)
         doc.setMarkdown(printable)
+        # Force every Markdown anchor to render black + underline.
+        # Qt's Markdown parser writes cyan into the character format
+        # at parse time, which the defaultStyleSheet alone can't
+        # override; the walk has to happen after setMarkdown (#78
+        # followup -- the v0.7.6 stylesheet-only fix didn't take
+        # effect in the rendered PDF).
+        doc.force_anchor_styling()
         return doc, tab_label
 
     def _on_print(self) -> None:
