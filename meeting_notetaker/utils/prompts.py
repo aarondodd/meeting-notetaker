@@ -51,6 +51,12 @@ _PRIOR_BUNDLED_HASHES: dict[str, set[str]] = {
         # under each topic heading. Replaces the pure-prose Notes
         # spec from 0.6.2.
         "a634f536e575f07bff2998b1026524796a7cf07bedc5b2ec6185f6cd9be3afe4",
+        # v0.7.3 (as-shipped) through v0.7.6 -- this is the body that
+        # actually shipped from v0.7.3 onward. The hash above predates
+        # the v0.7.3 ship and never matched a released bundled body, so
+        # without this entry an Aaron-driven prompt update in v0.7.7
+        # wouldn't auto-refresh existing installs.
+        "a1da85a06ec2b5b29f64a17eeedfd48b16197dfe8e3c8568f1cf3b840c6098db",
     },
     "one-on-one.md": {
         "2a140d9fd7d1ae7687bfd5f7fba0d517b6f41135e467a98cdd13abd8e1ca87f5",
