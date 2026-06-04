@@ -152,6 +152,11 @@ class MainWindow(QMainWindow):
     save_to_pdf_requested = pyqtSignal()
     save_to_notion_requested = pyqtSignal()
     save_to_confluence_requested = pyqtSignal()
+    # Issue #80: File > Import transcript... -- pulls a transcript from
+    # an external source into the selected session (no recording needed).
+    # MainApp opens the dialog, writes raw.transcript.md on accept, and
+    # flips session.has_transcript=True so the Send/Save buttons unlock.
+    import_transcript_requested = pyqtSignal()
     show_session_tab_requested = pyqtSignal(str, str, object)
     # session_id, tab_id ('transcript' | 'live_notes' | 'notes' | 'previous'),
     # optional archive_path (str | None); emitted by the cross-session
@@ -196,6 +201,14 @@ class MainWindow(QMainWindow):
             self._edit_timestamp_selected,
         )
         file_menu.addAction(self._action_edit_timestamp)
+        # Import transcript (#80): pull a transcript from an external
+        # source (Teams .docx export, clipboard paste) into the selected
+        # session so synthesis lights up without a local recording.
+        self._action_import_transcript = QAction("&Import Transcript...", self)
+        self._action_import_transcript.triggered.connect(
+            self.import_transcript_requested.emit,
+        )
+        file_menu.addAction(self._action_import_transcript)
         # Export submenu mirrors the right-click Export-* entries so a
         # mouse-averse user has parity from the menu bar.
         export_menu = file_menu.addMenu("&Export")
@@ -294,6 +307,7 @@ class MainWindow(QMainWindow):
         for action in (
             self._action_rename_session,
             self._action_edit_timestamp,
+            self._action_import_transcript,
             self._action_export_recording,
             self._action_export_video,
             self._action_export_package,
@@ -761,6 +775,10 @@ class MainWindow(QMainWindow):
         # Rename + edit-timestamp are single-session-only.
         self._action_rename_session.setEnabled(single is not None)
         self._action_edit_timestamp.setEnabled(single is not None)
+        # Import transcript: single-session-only. The dialog itself is
+        # source-agnostic, so we don't gate on existing transcript here
+        # (importing over an existing transcript is a valid replace).
+        self._action_import_transcript.setEnabled(single is not None)
         # Export actions need a single session with retained audio
         # (except Full Session which only needs a single session).
         self._action_export_recording.setEnabled(has_audio)

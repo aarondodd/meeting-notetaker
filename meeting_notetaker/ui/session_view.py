@@ -81,6 +81,11 @@ class SessionView(QWidget):
     # when the user has the feature enabled in Settings. Carries the
     # session id and the LLM target key ("claude" / "copilot").
     send_to_llm_clicked = pyqtSignal(str, str)      # session_id, target
+    # Issue #80: empty-state affordance on the Transcript tab. MainApp
+    # opens the ImportTranscriptDialog and writes the result to
+    # raw.transcript.md. Carries the session id for symmetry with the
+    # other per-session signals.
+    import_transcript_clicked = pyqtSignal(str)    # session_id
     copy_tab_clicked = pyqtSignal(str, str)        # session_id, tab_id
     retain_audio_toggled = pyqtSignal(str, bool)   # session_id, value
     live_notes_changed = pyqtSignal(str, str)      # session_id, body
@@ -601,6 +606,35 @@ class SessionView(QWidget):
         # set_transcript_playback_split_top_pct from MainApp at startup).
         self._playback_split_top_pct: int = 70
         playback_layout.addWidget(self._transcript_playback_splitter, 1)
+
+        # Issue #80: empty-state affordance. Shown above the editor
+        # when the session has no transcript on disk yet (e.g. a
+        # newly-created session, or one where the user attended a
+        # meeting they couldn't record). Hidden as soon as content
+        # arrives -- either from a recording or from this very import.
+        self._transcript_empty_row = QWidget(transcript_page)
+        empty_row_layout = QHBoxLayout(self._transcript_empty_row)
+        empty_row_layout.setContentsMargins(0, 0, 0, 6)
+        empty_row_layout.setSpacing(8)
+        empty_msg = QLabel(
+            "No transcript yet. Record a meeting, or import one from "
+            "another source (Teams export, clipboard).",
+            self._transcript_empty_row,
+        )
+        empty_msg.setStyleSheet("color: palette(placeholder-text);")
+        empty_row_layout.addWidget(empty_msg, 1)
+        self._import_transcript_btn = QPushButton(
+            "Import Transcript...", self._transcript_empty_row,
+        )
+        self._import_transcript_btn.setToolTip(
+            "Bring in a transcript from a Teams export, a .txt/.md file, "
+            "or the clipboard. Unlocks Send to Claude.ai and Save to... "
+            "for this session."
+        )
+        self._import_transcript_btn.clicked.connect(self._on_import_transcript_clicked)
+        empty_row_layout.addWidget(self._import_transcript_btn, 0)
+        self._transcript_empty_row.setVisible(False)
+        transcript_layout.addWidget(self._transcript_empty_row, 0)
 
         self._transcript_layout_stack = QStackedWidget(transcript_page)
         self._transcript_layout_stack.addWidget(self._transcript_idle_page)
@@ -1648,6 +1682,12 @@ class SessionView(QWidget):
                 self._session.id, self._automation_target
             )
 
+    def _on_import_transcript_clicked(self) -> None:
+        """Fire the per-session import signal so MainApp opens the
+        ImportTranscriptDialog scoped to this session."""
+        if self._session is not None:
+            self.import_transcript_clicked.emit(self._session.id)
+
     def set_synthesis_in_progress(
         self, session_id: str, in_progress: bool, *, status_text: Optional[str] = None
     ) -> None:
@@ -2093,6 +2133,13 @@ class SessionView(QWidget):
                     "Start capturing mic + system audio for this session."
                 )
         self._refresh_screencap_button_enabled()
+        # Empty-state affordance on the Transcript tab (#80). Visible
+        # whenever a session is loaded but has no transcript yet AND
+        # the session isn't actively recording (the live captions take
+        # the visual real estate during a recording).
+        self._transcript_empty_row.setVisible(
+            has_session and not has_transcript and not is_recording
+        )
         # Generate/paste are available as soon as a transcript exists. The
         # batch-refinement pass after Stop runs in the background and is
         # explicitly NOT a gate on synthesis -- the live transcript is good

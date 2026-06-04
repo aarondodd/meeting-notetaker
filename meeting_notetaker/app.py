@@ -1191,6 +1191,11 @@ class MainApp(QObject):
         self.window.save_to_confluence_requested.connect(
             self._on_file_menu_save_to_confluence,
         )
+        # File > Import Transcript... (#80) -- routes to the same
+        # handler the SessionView's empty-state Import button uses.
+        self.window.import_transcript_requested.connect(
+            self._on_file_menu_import_transcript,
+        )
         # SessionView -> classification chip mutations
         sv = self.window.session_view
         sv.add_topic_requested.connect(self._on_add_topic_requested)
@@ -1213,6 +1218,8 @@ class MainApp(QObject):
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
         sv.send_to_llm_clicked.connect(self._on_send_to_llm)
+        # Issue #80: empty-state import button on the Transcript tab.
+        sv.import_transcript_clicked.connect(self._on_import_transcript)
         sv.copy_tab_clicked.connect(self._on_copy_tab)
         sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
@@ -2502,6 +2509,71 @@ class MainApp(QObject):
             return
         body, label = sv._active_tab_body_and_label()  # noqa: SLF001
         self._on_export_to_confluence(sv._session.id, label, body)  # noqa: SLF001
+
+    def _on_file_menu_import_transcript(self) -> None:
+        """File > Import Transcript... -- forwards to the same handler
+        the SessionView's empty-state button fires. Pulls the session id
+        off the selected session so a menu-bar user gets the same flow."""
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            QMessageBox.information(
+                self.window, "Import Transcript",
+                "Select a session in the list first, then choose "
+                "File > Import Transcript...",
+            )
+            return
+        self._on_import_transcript(sv._session.id)  # noqa: SLF001
+
+    def _on_import_transcript(self, session_id: str) -> None:
+        """Open the ImportTranscriptDialog scoped to session_id; on
+        accept, write the body to raw.transcript.md, flip
+        session.has_transcript=True, and refresh the session view so the
+        Send/Save buttons reevaluate.
+
+        Importing over an existing transcript is allowed -- the user
+        gets a confirm dialog if there's content already so they don't
+        wipe a recording's transcript by mistake.
+        """
+        from .ui.import_transcript_dialog import ImportTranscriptDialog  # noqa: PLC0415
+
+        session = self.store.get_session(session_id)
+        if session is None:
+            return
+        store = TranscriptStore(session_id)
+        existing = store.read_transcript().strip()
+        if existing:
+            reply = QMessageBox.question(
+                self.window,
+                "Import Transcript",
+                "This session already has a transcript. Importing will "
+                "replace it. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        dlg = ImportTranscriptDialog(self.window, session_title=session.title)
+        if dlg.exec() != ImportTranscriptDialog.DialogCode.Accepted:
+            return
+        body = dlg.result_body
+        if not body.strip():
+            return
+        try:
+            store.set_imported_transcript(body)
+        except OSError as exc:
+            QMessageBox.warning(
+                self.window, "Import Transcript",
+                f"Could not write the transcript file: {exc}",
+            )
+            return
+        self.store.update_session(session_id, has_transcript=True)
+        # Re-run the content-load path so the Transcript tab repopulates
+        # and the button-state path sees the on-disk transcript.
+        self._on_session_selected(session_id)
+        self.window.status(
+            "Transcript imported. Send to Claude.ai and Save to... are now available.",
+            timeout_ms=6000,
+        )
 
     def _on_restore_previous_notes(self, session_id: str, archive_path) -> None:
         """Replace notes.md with a selected archive's contents. The
