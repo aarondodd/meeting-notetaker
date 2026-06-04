@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QDesktopServices, QFontDatabase
 
 from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
 from ..automation import installer
@@ -604,6 +604,81 @@ class SettingsDialog(QDialog):
         ui_form.addRow("Your name:", self._user_name_edit)
         self._add_section("Interface", ui_group)
 
+        # Fonts ---------------------------------------------------------
+        # Editor face is restricted to monospace fonts (column
+        # alignment matters for Markdown tables, code blocks,
+        # bulleted lists). Preview face is unrestricted.
+        # `editor_font_size == 0` / `preview_font_size == 0` mean
+        # "use the platform default" so existing installs that
+        # never opened this section don't suddenly downsize their
+        # text on first launch of v0.7.7.
+        fonts_group = QGroupBox("Fonts", self)
+        fonts_layout = QVBoxLayout(fonts_group)
+        fonts_blurb = QLabel(
+            "Font face and size used by the My Notes editor and the "
+            "Markdown preview panes. Editor face is restricted to "
+            "monospace fonts so Markdown tables, code blocks, and "
+            "bulleted lists line up cleanly. Changes apply on Save.",
+            self,
+        )
+        fonts_blurb.setWordWrap(True)
+        fonts_layout.addWidget(fonts_blurb)
+
+        editor_group = QGroupBox("Editor (My Notes)", fonts_group)
+        editor_form = QFormLayout(editor_group)
+        self._editor_font_picker = QComboBox(self)
+        self._editor_font_picker.setEditable(False)
+        # Populate with monospace families only. QFontDatabase.families()
+        # returns every installed family; the isFixedPitch() filter keeps
+        # the dropdown manageable.
+        mono_families = sorted(
+            f for f in QFontDatabase.families()
+            if QFontDatabase.isFixedPitch(f)
+        )
+        # Auto-default entry sentinel comes first; its data is the
+        # empty string so the round-trip into config matches.
+        self._editor_font_picker.addItem("(auto: Consolas / monospace)", "")
+        for fam in mono_families:
+            self._editor_font_picker.addItem(fam, fam)
+        # Restore the saved family if it's still available; otherwise
+        # land on the auto sentinel.
+        saved_editor_family = config.ui.editor_font_family
+        idx = self._editor_font_picker.findData(saved_editor_family)
+        self._editor_font_picker.setCurrentIndex(idx if idx >= 0 else 0)
+        editor_form.addRow("Font:", self._editor_font_picker)
+        self._editor_font_size = QSpinBox(self)
+        # 0 = use platform default (signaled as "(default)" placeholder
+        # via specialValueText so the user sees what the empty value
+        # means).
+        self._editor_font_size.setRange(0, 72)
+        self._editor_font_size.setSpecialValueText("(default)")
+        self._editor_font_size.setValue(config.ui.editor_font_size)
+        self._editor_font_size.setSuffix(" pt")
+        editor_form.addRow("Size:", self._editor_font_size)
+        fonts_layout.addWidget(editor_group)
+
+        preview_group = QGroupBox("Preview (Synthesis / Live Notes preview)", fonts_group)
+        preview_form = QFormLayout(preview_group)
+        self._preview_font_picker = QComboBox(self)
+        self._preview_font_picker.setEditable(False)
+        self._preview_font_picker.addItem("(auto: system default)", "")
+        # Preview face is unrestricted: every family is on offer.
+        for fam in sorted(QFontDatabase.families()):
+            self._preview_font_picker.addItem(fam, fam)
+        saved_preview_family = config.ui.preview_font_family
+        idx = self._preview_font_picker.findData(saved_preview_family)
+        self._preview_font_picker.setCurrentIndex(idx if idx >= 0 else 0)
+        preview_form.addRow("Font:", self._preview_font_picker)
+        self._preview_font_size = QSpinBox(self)
+        self._preview_font_size.setRange(0, 72)
+        self._preview_font_size.setSpecialValueText("(default)")
+        self._preview_font_size.setValue(config.ui.preview_font_size)
+        self._preview_font_size.setSuffix(" pt")
+        preview_form.addRow("Size:", self._preview_font_size)
+        fonts_layout.addWidget(preview_group)
+
+        self._add_section("Fonts", fonts_group)
+
         # Synthesis (combined Automation + Prompt Templates) ---------
         # Both sub-groups live on a single page so the user finds
         # everything LLM-related in one place. The sub-groups keep
@@ -1079,6 +1154,15 @@ class SettingsDialog(QDialog):
         self._config.ui.screen_capture_auto_dedup_threshold = int(
             self._screencap_dedup_threshold.value()
         )
+        # Font preferences. Empty data string = auto sentinel.
+        self._config.ui.editor_font_family = (
+            self._editor_font_picker.currentData() or ""
+        )
+        self._config.ui.editor_font_size = int(self._editor_font_size.value())
+        self._config.ui.preview_font_family = (
+            self._preview_font_picker.currentData() or ""
+        )
+        self._config.ui.preview_font_size = int(self._preview_font_size.value())
         self._config.synthesis.automation_enabled = self._auto_enabled.isChecked()
         self._config.synthesis.llm_target = (
             self._auto_target.currentData() or "claude"

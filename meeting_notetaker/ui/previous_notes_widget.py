@@ -126,6 +126,13 @@ class PreviousNotesWidget(QWidget):
         """
         return self._preview
 
+    def apply_fonts(self, preview_font) -> None:
+        """Push the resolved preview font to the inner preview pane.
+
+        Read-only widget; no editor side. Called by SessionView's
+        apply_fonts as part of the cross-surface font refresh."""
+        self._preview.setFont(preview_font)
+
     def select_archive_by_name(self, archive_name: str) -> bool:
         """Pick the list row whose Path basename matches `archive_name`.
 

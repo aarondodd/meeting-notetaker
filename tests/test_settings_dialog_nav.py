@@ -74,9 +74,9 @@ def test_expected_sections_present(qt_app):
     finally:
         dlg.deleteLater()
     expected = {
-        "Audio", "Backups", "Calendar", "Export", "Integrations",
-        "Interface", "Meeting Detection", "Screen Capture", "Speakers",
-        "Synthesis", "Transcription",
+        "Audio", "Backups", "Calendar", "Export", "Fonts",
+        "Integrations", "Interface", "Meeting Detection",
+        "Screen Capture", "Speakers", "Synthesis", "Transcription",
     }
     assert expected == labels
 
