@@ -30,19 +30,20 @@ from __future__ import annotations
 from typing import Iterable, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QHBoxLayout,
-    QInputDialog,
     QLabel,
-    QMenu,
     QPushButton,
     QSizePolicy,
-    QToolButton,
     QWidget,
 )
 
 from ..models.classification import SessionClassification
+from .assignment_popup import (
+    AssignmentRow,
+    SeriesAssignmentPopup,
+    TopicsAssignmentPopup,
+)
 
 
 class ClassificationBar(QWidget):
@@ -89,21 +90,20 @@ class ClassificationBar(QWidget):
         self._sep1.setStyleSheet("color: gray;")
         layout.addWidget(self._sep1)
 
-        # Topics: QToolButton + popup menu, with an extra Suggestions
-        # section in the menu for auto-extracted-but-unaccepted
-        # topic candidates.
-        self._topics_btn = QToolButton(self)
-        self._topics_btn.setText("Topics")
-        self._topics_btn.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonTextOnly
+        # Topics: QPushButton that opens the typeahead multi-select
+        # popup (#82). The popup is lazily constructed on first use
+        # and reused across opens so its filter input retains its
+        # natural reset behavior between invocations.
+        self._topics_btn = QPushButton("Topics", self)
+        self._topics_btn.setToolTip(
+            "View, add, accept, or remove topic tags for this session."
         )
-        self._topics_btn.setPopupMode(
-            QToolButton.ToolButtonPopupMode.InstantPopup
-        )
-        self._topics_menu = QMenu(self._topics_btn)
-        self._topics_btn.setMenu(self._topics_menu)
-        self._topics_menu.aboutToShow.connect(self._rebuild_topics_menu)
+        self._topics_btn.clicked.connect(self._on_topics_clicked)
         layout.addWidget(self._topics_btn)
+
+        # Popups are lazy. Created on the first open.
+        self._topics_popup: Optional[TopicsAssignmentPopup] = None
+        self._series_popup: Optional[SeriesAssignmentPopup] = None
 
         layout.addStretch(1)
         self.set_session(None, SessionClassification())
@@ -181,113 +181,123 @@ class ClassificationBar(QWidget):
         else:
             self._topics_btn.setText(f"Topics ({len(accepted)})")
 
-    # ---- menu builders ----
-    def _rebuild_topics_menu(self) -> None:
-        menu = self._topics_menu
-        menu.clear()
-        add_action = QAction("+ Add Topic...", menu)
-        add_action.triggered.connect(self._on_add_topic)
-        menu.addAction(add_action)
-        accepted = [t for t in self._classification.topics if t.accepted]
-        suggestions = [t for t in self._classification.topics if not t.accepted]
-        if not accepted and not suggestions:
-            menu.addSeparator()
-            empty = QAction("(no topics)", menu)
-            empty.setEnabled(False)
-            menu.addAction(empty)
-            return
-        if accepted:
-            menu.addSeparator()
-            for st in accepted:
-                tid = st.topic.id
-                label = f"x  {st.topic.name}"
-                act = QAction(label, menu)
-                act.setToolTip("Remove this topic from the session")
-                act.triggered.connect(
-                    lambda _checked=False, tid=tid: self._emit_remove_topic(tid)
-                )
-                menu.addAction(act)
-        if suggestions:
-            menu.addSeparator()
-            header = QAction("Suggestions:", menu)
-            header.setEnabled(False)
-            menu.addAction(header)
-            for st in suggestions:
-                tid = st.topic.id
-                # Accept + (separately) reject for suggestions. Two
-                # menu rows per suggestion keeps the click intent
-                # unambiguous: "+ accept" vs "x reject".
-                accept_act = QAction(f"+  {st.topic.name}", menu)
-                accept_act.setToolTip("Accept this suggested topic")
-                accept_act.triggered.connect(
-                    lambda _checked=False, tid=tid: self._emit_accept_topic(tid)
-                )
-                menu.addAction(accept_act)
-                reject_act = QAction(f"     x  {st.topic.name} (reject)", menu)
-                reject_act.setToolTip("Drop this suggestion without accepting")
-                reject_act.triggered.connect(
-                    lambda _checked=False, tid=tid: self._emit_remove_topic(tid)
-                )
-                menu.addAction(reject_act)
+    # ---- popup builders (#82, v0.7.8) ------------------------------
 
-    # ---- handlers ----
-    _CLEAR_SENTINEL = "-- clear (unfile) --"
+    def _build_topic_rows(self) -> list[AssignmentRow]:
+        """Construct the rows the Topics popup shows: every known
+        topic with its assigned + suggested state for this session.
+
+        Suggested rows are those linked to the session with
+        ``accepted=False`` (auto-extract output not yet confirmed by
+        the user). A row's ``assigned`` flag stays True for both
+        accepted and suggested links so the popup shows the user
+        every topic currently on this session in one glance; the
+        suggestion badge tells them which need confirmation.
+
+        Topics that aren't on this session at all are also listed,
+        with ``assigned=False`` -- clicking one adds it.
+        """
+        on_session: dict[str, tuple[int, bool, bool]] = {}
+        for st in self._classification.topics:
+            # (topic_id, assigned-to-session, is-suggestion)
+            on_session[st.topic.name.casefold()] = (
+                st.topic.id, True, not st.accepted,
+            )
+        rows: list[AssignmentRow] = []
+        # Build the row list from the known-topics catalog (the
+        # full universe). Add any session-only entries that aren't
+        # in the catalog at the bottom so the user can still see /
+        # toggle them.
+        catalog: list[str] = list(self._known_topics)
+        catalog_keys = {n.casefold() for n in catalog}
+        for st in self._classification.topics:
+            if st.topic.name.casefold() not in catalog_keys:
+                catalog.append(st.topic.name)
+                catalog_keys.add(st.topic.name.casefold())
+        for name in catalog:
+            key = name.casefold()
+            assigned = key in on_session
+            suggested = assigned and on_session[key][2]
+            rows.append(AssignmentRow(
+                name=name, assigned=assigned, suggested=suggested,
+            ))
+        rows.sort(key=lambda r: r.name.casefold())
+        return rows
+
+    def _ensure_topics_popup(self) -> TopicsAssignmentPopup:
+        if self._topics_popup is None:
+            popup = TopicsAssignmentPopup(parent=self)
+            popup.toggle_requested.connect(self._on_topic_toggle_requested)
+            self._topics_popup = popup
+        return self._topics_popup
+
+    def _ensure_series_popup(self) -> SeriesAssignmentPopup:
+        if self._series_popup is None:
+            popup = SeriesAssignmentPopup(parent=self)
+            popup.series_chosen.connect(self._on_series_chosen)
+            self._series_popup = popup
+        return self._series_popup
+
+    # ---- click handlers -------------------------------------------
+
+    def _on_topics_clicked(self) -> None:
+        if not self._session_id:
+            return
+        popup = self._ensure_topics_popup()
+        popup.set_rows(self._build_topic_rows())
+        popup.show_for_widget(self._topics_btn)
 
     def _on_change_series(self) -> None:
         if not self._session_id:
             return
+        popup = self._ensure_series_popup()
         current = (
             self._classification.series.name
             if self._classification.series else ""
         )
-        items = [self._CLEAR_SENTINEL] + sorted(self._known_series)
-        try:
-            current_idx = items.index(current) if current else 0
-        except ValueError:
-            current_idx = 0
-        choice, ok = QInputDialog.getItem(
-            self, "Set Series",
-            "Pick an existing series, type a new one, "
-            "or pick \"clear (unfile)\":",
-            items, current_idx, True,
+        popup.set_rows_and_current(sorted(self._known_series), current)
+        popup.show_for_widget(self._series_btn)
+
+    def _on_topic_toggle_requested(
+        self, name: str, currently_assigned: bool,
+    ) -> None:
+        """Translate the popup's name+after-toggle-state signal into
+        the existing add / accept / remove signals MainApp already
+        wires."""
+        if not self._session_id:
+            return
+        # Look up the session-side entry by name. Three cases:
+        #   1. Was a suggestion (link exists, accepted=False) and
+        #      user flipped it on -> accept_topic_requested
+        #   2. Was already accepted and user flipped it off
+        #      -> remove_topic_requested
+        #   3. Wasn't on the session at all and user flipped it on
+        #      -> add_topic_requested (creates the link)
+        existing = next(
+            (st for st in self._classification.topics
+             if st.topic.name.casefold() == name.casefold()),
+            None,
         )
-        if not ok:
+        if existing is None:
+            # Not on session before; user added it.
+            if currently_assigned:
+                self.add_topic_requested.emit(self._session_id, name)
             return
-        chosen = choice.strip()
-        if chosen == self._CLEAR_SENTINEL or not chosen:
-            self.set_series_requested.emit(self._session_id, "")
-            return
-        self.set_series_requested.emit(self._session_id, chosen)
+        if currently_assigned:
+            # Toggled on while existing -> must have been a
+            # suggestion previously. Confirm-accept.
+            if not existing.accepted:
+                self.accept_topic_requested.emit(
+                    self._session_id, existing.topic.id,
+                )
+        else:
+            # Toggled off -> remove the link.
+            self.remove_topic_requested.emit(
+                self._session_id, existing.topic.id,
+            )
 
-    def _on_add_topic(self) -> None:
+    def _on_series_chosen(self, name: str) -> None:
         if not self._session_id:
             return
-        already_on_session = {
-            st.topic.name.casefold()
-            for st in self._classification.topics
-        }
-        items = [
-            name for name in sorted(self._known_topics)
-            if name.casefold() not in already_on_session
-        ]
-        choice, ok = QInputDialog.getItem(
-            self, "Add Topic",
-            "Pick an existing topic or type a new one:",
-            items, 0, True,
-        )
-        if not ok:
-            return
-        name = choice.strip()
-        if not name:
-            return
-        self.add_topic_requested.emit(self._session_id, name)
-
-    def _emit_remove_topic(self, topic_id: int) -> None:
-        if not self._session_id:
-            return
-        self.remove_topic_requested.emit(self._session_id, topic_id)
-
-    def _emit_accept_topic(self, topic_id: int) -> None:
-        if not self._session_id:
-            return
-        self.accept_topic_requested.emit(self._session_id, topic_id)
+        # name == "" is the "(none)" sentinel emitted by the popup.
+        self.set_series_requested.emit(self._session_id, name)
