@@ -948,6 +948,58 @@ def shot_integrations_picker() -> None:
     dlg.close()
 
 
+def shot_topics_popup() -> None:
+    """v0.7.8 typeahead Topics popup (#82). Pre-seeds with a mix of
+    accepted, suggested, and catalog-only topics so the screenshot
+    shows the multi-state visual treatment."""
+    from meeting_notetaker.ui.assignment_popup import (
+        AssignmentRow,
+        TopicsAssignmentPopup,
+    )
+
+    po = TopicsAssignmentPopup()
+    po.set_rows([
+        AssignmentRow("Acme Cloud", assigned=True),
+        AssignmentRow("Backend migration", assigned=True),
+        AssignmentRow("Beta Systems", assigned=True),
+        AssignmentRow("Vendor comparison", assigned=True, suggested=True),
+        AssignmentRow("PostgreSQL", assigned=True, suggested=True),
+        AssignmentRow("Frontend"),
+        AssignmentRow("Q3 hiring"),
+        AssignmentRow("Q3 planning"),
+        AssignmentRow("Roadmap"),
+        AssignmentRow("Vendor evaluation"),
+    ])
+    po.resize(340, 360)
+    po.show()
+    QApplication.processEvents()
+    _grab(po, "34-popup-topics-typeahead.png", autosize=False)
+    po.close()
+
+
+def shot_series_popup() -> None:
+    """v0.7.8 typeahead Series popup (#82). Single-select variant
+    with the "(none)" sentinel + current pick rendered with the
+    filled radio dot."""
+    from meeting_notetaker.ui.assignment_popup import SeriesAssignmentPopup
+
+    po = SeriesAssignmentPopup()
+    po.set_rows_and_current(
+        [
+            "Daily Standup",
+            "Platform Architecture Review",
+            "Q3 Planning",
+            "Weekly 1:1 with Manager",
+        ],
+        current="Weekly 1:1 with Manager",
+    )
+    po.resize(340, 320)
+    po.show()
+    QApplication.processEvents()
+    _grab(po, "35-popup-series-typeahead.png", autosize=False)
+    po.close()
+
+
 def shot_notes_popout() -> None:
     """v0.7.7 pop-out preview window for screen-share. Pre-seeds a
     realistic My Notes body so the screenshot shows what audience
@@ -1063,6 +1115,9 @@ def main() -> int:
     shot_import_transcript_dialog()
     shot_notes_popout()
     shot_settings_fonts()
+    # v0.7.8 surfaces (#82).
+    shot_topics_popup()
+    shot_series_popup()
     print("done.")
     return 0
 
