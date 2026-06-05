@@ -148,6 +148,93 @@ def test_popout_set_session_dir_rebinds_search_path(qt_app, tmp_path):
         po.close()
 
 
+def test_popout_preserves_scroll_position_across_rerender(qt_app):
+    """Regression for Aaron's screenshare bug: every keystroke in
+    the editor was re-running setMarkdown on the popout's preview,
+    which reset the QTextBrowser scroll bars to zero. With the
+    audience watching a section 3/4 of the way down the page, that
+    yanked them back to the top on every edit.
+
+    The fix captures the vertical scroll position before
+    setMarkdown and restores it after, so edits that don't affect
+    the upper portion of the document leave the visible region
+    stable for the audience."""
+    long_body = "\n\n".join(
+        f"## Section {i}\n\nParagraph body for section {i}. " * 4
+        for i in range(20)
+    )
+    po = LiveNotesPopout(body=long_body)
+    try:
+        po.show()
+        qt_app.processEvents()
+        inner = po._preview.preview()  # noqa: SLF001
+        # Force a layout so the scroll bar has a meaningful max.
+        # QTextBrowser computes its document layout lazily; nudge
+        # it by reading the maximum and asserting it's nonzero.
+        qt_app.processEvents()
+        bar = inner.verticalScrollBar()
+        assert bar.maximum() > 0, (
+            "test premise: long body must produce a scrollable preview"
+        )
+        # Scroll to roughly 3/4 of the way down.
+        target = (bar.maximum() * 3) // 4
+        bar.setValue(target)
+        qt_app.processEvents()
+        assert bar.value() == target
+
+        # Now trigger a re-render (Aaron edits a paragraph). The
+        # body changes slightly but the document length is similar
+        # -- the audience should not get yanked to the top.
+        new_body = long_body.replace(
+            "Paragraph body for section 5",
+            "EDITED body for section 5",
+        )
+        po.set_body(new_body, immediate=True)
+        qt_app.processEvents()
+        # Scroll position survives within bar.maximum() bounds.
+        # Tolerance: the new document may have a slightly different
+        # max if section 5's paragraph grew/shrank; we just confirm
+        # the popout did NOT reset to 0.
+        assert bar.value() > 0, (
+            "scroll position reset to top -- screenshare regression"
+        )
+        # And we didn't end up past the new bottom.
+        assert bar.value() <= bar.maximum()
+    finally:
+        po.close()
+
+
+def test_popout_clamps_scroll_when_body_shrinks(qt_app):
+    """If the new body is much shorter than the old, the prior
+    scroll position would point past the end. Clamp to the new
+    maximum so we land at the actual bottom rather than off-page."""
+    long_body = "\n\n".join(
+        f"## Section {i}\n\nParagraph " * 6 for i in range(20)
+    )
+    po = LiveNotesPopout(body=long_body)
+    try:
+        po.show()
+        qt_app.processEvents()
+        inner = po._preview.preview()  # noqa: SLF001
+        bar = inner.verticalScrollBar()
+        # Scroll to the bottom.
+        bar.setValue(bar.maximum())
+        qt_app.processEvents()
+        prior_max = bar.maximum()
+        assert prior_max > 0
+
+        # Shrink the body dramatically.
+        short_body = "Just one short line.\n"
+        po.set_body(short_body, immediate=True)
+        qt_app.processEvents()
+        # New max is much smaller; we should be clamped to it,
+        # not stranded at the prior (now-invalid) offset.
+        assert bar.value() <= bar.maximum()
+        assert bar.maximum() < prior_max
+    finally:
+        po.close()
+
+
 def test_popout_is_a_top_level_window(qt_app):
     """The popout must be a real OS window so screen-share targets
     work. parent=None + Qt.Window flag combined."""

@@ -170,7 +170,25 @@ class LiveNotesPopout(QMainWindow):
 
     def _render_pending_body(self) -> None:
         body = self._pending_body
+        # Preserve the audience's scroll position across re-renders.
+        # setMarkdown replaces the underlying QTextDocument, which
+        # resets the scroll bars to zero; without this dance, every
+        # keystroke in the editor would yank the popout back to the
+        # top -- useless during a screenshare where the presenter has
+        # scrolled three-quarters of the way down to discuss
+        # something concrete. Pixel-pinning is the right behavior
+        # for the common case (editing somewhere below the audience's
+        # current view); the clamp keeps us in-bounds when the
+        # document shrinks. (#80 followup: Aaron's report after the
+        # initial popout ship.)
+        try:
+            inner = self._preview.preview()
+        except AttributeError:
+            inner = self._preview
+        bar = inner.verticalScrollBar()
+        prior_scroll = bar.value()
         self._preview.setMarkdown(body)
+        bar.setValue(min(prior_scroll, bar.maximum()))
         self._last_rendered = body
 
     def _on_always_on_top_toggled(self, on: bool) -> None:
