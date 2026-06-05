@@ -9,7 +9,7 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.7-dev. End-to-end capture, transcription, synthesis,
+> **Status:** v0.7.7. End-to-end capture, transcription, synthesis,
 > screen capture, retained-audio playback + export, and transcript-
 > synchronized playback all working. v0.7.6 adds Notion and Confluence
 > as save-to destinations alongside PDF (with a Verify-gated picker
@@ -67,8 +67,11 @@ leaves the machine; no API key required.
   showing the live preview of My Notes, designed for screen-share
   during a call. Updates as you type (250 ms debounce so a typing
   burst doesn't produce a flicker), with an Always on Top toggle
-  in the popout's own View menu. Geometry and the always-on-top
-  state persist across launches. Reachable from
+  in the popout's own View menu. The popout's scroll position is
+  preserved across re-renders -- if you've scrolled three-quarters
+  down to present a specific section, edits elsewhere in the
+  document don't yank the audience back to the top. Geometry +
+  always-on-top state persist across launches. Reachable from
   View -> Pop Out My Notes Preview. Pure read-only -- no editor,
   no toolbar -- so the audience sees a clean rendered surface.
 
@@ -100,6 +103,16 @@ leaves the machine; no API key required.
   brand-new name creates the series on accept.
 
   ![New Session dialog with series picker](docs/screenshots/06-dialog-new-session.png)
+
+- **Sharper topic suggestions.** The LLM's "Suggested Topics"
+  output is reframed from "section headings or themes" (which
+  produced summary phrases like "Vendor A vs Vendor B") to atomic
+  reusable tags. Compound or comparative phrases are decomposed
+  ("Vendor A vs Vendor B" -> "Vendor A", "Vendor B", "Vendor
+  comparison") and the prompt carries five worked input/output
+  examples that teach the pattern. The downstream parser contract
+  is unchanged, so existing classification flows pick up the
+  improvement automatically.
 
 ## What's new in v0.7.6
 
