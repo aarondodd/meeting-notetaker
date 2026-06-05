@@ -422,6 +422,90 @@ class ClassificationStore:
             return best_series
         return None
 
+    def suggest_series_from_history(
+        self,
+        title: str,
+        *,
+        prior_session_titles_by_series: Optional[dict[int, list[str]]] = None,
+        threshold: float = 0.7,
+    ) -> Optional[Series]:
+        """Suggest a series for a new session title by scoring against
+        both prior session titles and series names.
+
+        ``find_series_for_title`` only scores against series names,
+        which misses the common case where the series name doesn't
+        lexically appear in the title (a series named "Weekly Jane
+        1:1" wouldn't match a new session titled "Aaron + Jane catch
+        up" even though every prior session in that series follows
+        that shape). This method also accepts an optional mapping of
+        prior session titles grouped by series id; when provided,
+        it scores the candidate title against each prior title and
+        a high score there returns the series of the matched prior
+        session.
+
+        Session titles live in the SessionStore (a separate sqlite
+        file), not here. The caller (MainApp) prepares
+        ``prior_session_titles_by_series`` by joining the two
+        stores cheaply before invoking this method. Omitting the
+        arg degrades gracefully to series-name-only scoring (same
+        signal ``find_series_for_title`` provides, with this
+        method's lower threshold).
+
+        Threshold is 0.7 rather than ``find_series_for_title``'s 0.8
+        because session titles drift more than series names ("1:1
+        with Jane 6/4" vs "1:1 with Jane 6/11"). A 0.95 boost still
+        applies when one normalized form fully contains the other.
+
+        Returns None when no candidate clears the threshold or the
+        store has no series yet.
+        """
+        normalized_title = _normalize_title(title)
+        if not normalized_title:
+            return None
+        best_score = 0.0
+        best_series_id: Optional[int] = None
+        # Pass 1: prior session titles (caller-supplied). For each
+        # series, score the candidate against every prior title in
+        # that series and keep the maximum.
+        if prior_session_titles_by_series:
+            for series_id, prior_titles in prior_session_titles_by_series.items():
+                for prior_title in prior_titles:
+                    normalized_prior = _normalize_title(prior_title or "")
+                    if not normalized_prior:
+                        continue
+                    score = SequenceMatcher(
+                        None, normalized_title, normalized_prior,
+                    ).ratio()
+                    if normalized_prior in normalized_title or normalized_title in normalized_prior:
+                        score = max(score, 0.95)
+                    if score > best_score:
+                        best_score = score
+                        best_series_id = int(series_id)
+        # Pass 2: series names (same matcher as find_series_for_title
+        # but uses the new method's threshold so a series-name match
+        # competes with prior-title match on equal footing). Series
+        # with no prior sessions still get a chance through this
+        # pass.
+        for s in self.list_series():
+            normalized_name = _normalize_title(s.name)
+            if not normalized_name:
+                continue
+            score = SequenceMatcher(
+                None, normalized_title, normalized_name,
+            ).ratio()
+            if normalized_name in normalized_title:
+                score = max(score, 0.95)
+            if score > best_score:
+                best_score = score
+                best_series_id = s.id
+        if best_score < threshold or best_series_id is None:
+            return None
+        # Resolve the winning series_id to a Series dataclass.
+        row = self._conn.execute(
+            "SELECT * FROM series WHERE id = ?", (best_series_id,),
+        ).fetchone()
+        return _row_to_series(row) if row else None
+
     def rename_series(self, series_id: int, new_name: str) -> None:
         new_name = new_name.strip()
         if not new_name:

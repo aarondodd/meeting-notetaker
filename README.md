@@ -89,6 +89,17 @@ leaves the machine; no API key required.
   only set the default stylesheet (which Qt's Markdown parser
   ignored at render time); the actual fix walks every anchor
   fragment after `setMarkdown` and forces its character format.
+- **Series picker in New Session.** The New Session dialog gains
+  a Series row -- an editable combobox listing existing series
+  with a "(none)" sentinel first. As you type the title, the
+  picker auto-suggests by fuzzy-matching against prior session
+  titles AND series names (a stronger signal than v0.7.6's
+  series-name-only match, which missed cases where the series
+  name didn't lexically appear in the title). Touch the picker
+  once and the auto-suggest stops fighting your pick; typing a
+  brand-new name creates the series on accept.
+
+  ![New Session dialog with series picker](docs/screenshots/06-dialog-new-session.png)
 
 ## What's new in v0.7.6
 

@@ -470,12 +470,32 @@ def shot_main_attachments() -> None:
 
 def shot_new_session() -> None:
     # allow_calendar_pick=False keeps the dialog compact and consistent on
-    # Linux where Outlook is unavailable anyway.
+    # Linux where Outlook is unavailable anyway. v0.7.7: pre-seed the
+    # series picker with a few synthetic recurring meetings and an
+    # auto-suggest hit so the screenshot shows the headline feature.
+    def suggest(title):
+        if "standup" in title.lower():
+            return "Daily Standup"
+        return None
+
     dlg = NewSessionDialog(
         retain_audio_default=False,
         allow_calendar_pick=False,
+        series_names=[
+            "Daily Standup",
+            "Platform Architecture Review",
+            "Weekly 1:1 with Manager",
+            "Q3 Planning",
+        ],
+        suggest_series=suggest,
+        title_prefill="Standup 2026-06-05",
     )
-    dlg.resize(440, 200)
+    # Flush the deferred suggest so the screenshot catches the
+    # picker already pointing at Daily Standup.
+    QApplication.processEvents()
+    dlg._suggest_timer.stop()  # noqa: SLF001
+    dlg._run_series_suggest()  # noqa: SLF001
+    dlg.resize(480, 280)
     dlg.show()
     QApplication.processEvents()
     _grab(dlg, "06-dialog-new-session.png", autosize=False)

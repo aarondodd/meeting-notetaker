@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
@@ -1611,9 +1611,12 @@ class MainApp(QObject):
     # ---- session lifecycle handlers ---------------------------------------
 
     def _on_new_session(self) -> None:
+        series_names, suggest_series = self._dialog_series_args()
         dialog = NewSessionDialog(
             retain_audio_default=self.config.audio.retain_audio_default,
             capture_only_default=self.config.transcription.capture_only_mode,
+            series_names=series_names,
+            suggest_series=suggest_series,
             parent=self.window,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -1628,10 +1631,13 @@ class MainApp(QObject):
         if result.calendar_meeting is not None:
             self._align_created_at_to_meeting(session.id, result.calendar_meeting)
             self._seed_live_notes_from_meeting(session.id, result.calendar_meeting)
-        # Best-effort recurring-meeting series link from the title.
-        # Runs AFTER calendar seed so the seeded attendees flow into
-        # _sync_attendees_to_people on the first live_notes_changed.
-        self._auto_link_series_for_new_session(session.id, result.title)
+        # Series: the dialog now owns auto-pick + manual override
+        # (v0.7.7); MainApp just applies whatever the dialog returned.
+        # The legacy _auto_link_series_for_new_session helper is no
+        # longer wired here -- a user who explicitly leaves the
+        # picker on "(none)" gets no series, instead of getting one
+        # silently re-suggested behind their back.
+        self._apply_series_to_new_session(session.id, result.series_name)
         self._refresh_session_list(select=session.id)
 
     def _seed_live_notes_from_meeting(
@@ -4596,10 +4602,11 @@ class MainApp(QObject):
     def _auto_link_series_for_new_session(self, session_id: str, title: str) -> None:
         """Best-effort: fuzzy-match the title against known series + link.
 
-        Called from _on_new_session and the calendar-creation path
-        after the session row exists. Silent on no-match -- the
-        chips bar will show "Series: (none)" and the user can pick
-        one manually.
+        Historically called from _on_new_session as a post-create
+        hook. The NewSessionDialog now owns the picker (v0.7.7) so
+        that call site dropped it; this method survives for any
+        future entry points that need silent auto-link without a
+        dialog (none today).
         """
         if self.classification is None or not title.strip():
             return
@@ -4609,6 +4616,76 @@ class MainApp(QObject):
                 self.classification.assign_series(session_id, series.id)
         except Exception:
             log.exception("series auto-link failed for %s", session_id)
+
+    def _dialog_series_args(self) -> tuple[list[str], Optional[Callable[[str], Optional[str]]]]:
+        """Return (series_names, suggest_series) for the
+        NewSessionDialog. Empty list + None when no classification
+        store is configured (tests, or store init failure).
+
+        suggest_series joins the SessionStore titles to the
+        ClassificationStore's session_series assignments so the
+        fuzzy match scores against prior session titles, not just
+        series names. The join happens here -- the two stores live
+        in different sqlite files, so ClassificationStore.
+        suggest_series_from_history takes the prepared mapping as
+        an arg rather than reaching across.
+        """
+        if self.classification is None:
+            return [], None
+        try:
+            series = self.classification.list_series()
+        except Exception:
+            log.exception("list_series failed; dialog will skip the picker")
+            return [], None
+        names = sorted((s.name for s in series), key=str.lower)
+
+        # Build the prior-titles-by-series map once at dialog open
+        # rather than on every keystroke. For a typical install with
+        # tens of series and a few hundred sessions, this is a
+        # millisecond-class scan and the dialog stays snappy under
+        # the suggest debounce.
+        titles_by_series: dict[int, list[str]] = {}
+        try:
+            for s in series:
+                session_ids = self.classification.session_ids_for_series(s.id)
+                titles: list[str] = []
+                for sid in session_ids:
+                    sess = self.store.get_session(sid)
+                    if sess is not None and sess.title:
+                        titles.append(sess.title)
+                if titles:
+                    titles_by_series[s.id] = titles
+        except Exception:
+            log.exception("title map build failed; suggest falls back to series-name scoring")
+            titles_by_series = {}
+
+        def _suggest(title: str) -> Optional[str]:
+            try:
+                hit = self.classification.suggest_series_from_history(
+                    title,
+                    prior_session_titles_by_series=titles_by_series,
+                )
+            except Exception:
+                log.exception("suggest_series_from_history failed for %r", title)
+                return None
+            return hit.name if hit else None
+
+        return names, _suggest
+
+    def _apply_series_to_new_session(self, session_id: str, series_name: str) -> None:
+        """Link the new session to the named series, creating the
+        series row if it didn't already exist. Empty name is a
+        deliberate "no series" pick and runs no link."""
+        name = series_name.strip()
+        if not name or self.classification is None:
+            return
+        try:
+            series = self.classification.get_or_create_series(name)
+            self.classification.assign_series(session_id, series.id)
+        except Exception:
+            log.exception(
+                "failed to apply series %r to %s", name, session_id,
+            )
 
     def _sync_attendees_to_people(self, session_id: str, body: str) -> None:
         """Mirror the live notes' # Attendees list into the session's
@@ -5332,6 +5409,7 @@ class MainApp(QObject):
 
     def _on_create_session_from_calendar(self, info: MeetingInfo) -> None:
         self._foreground_window()
+        series_names, suggest_series = self._dialog_series_args()
         dialog = NewSessionDialog(
             retain_audio_default=self.config.audio.retain_audio_default,
             title_prefill=info.subject,
@@ -5342,6 +5420,8 @@ class MainApp(QObject):
             ),
             calendar_meeting=info,
             allow_calendar_pick=False,
+            series_names=series_names,
+            suggest_series=suggest_series,
             parent=self.window,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -5353,6 +5433,7 @@ class MainApp(QObject):
         meeting = result.calendar_meeting or info
         self._align_created_at_to_meeting(session.id, meeting)
         self._seed_live_notes_from_meeting(session.id, meeting)
+        self._apply_series_to_new_session(session.id, result.series_name)
         self._refresh_session_list(select=session.id)
         self.window.status(
             f"Created session from calendar: {info.subject}", timeout_ms=5000
@@ -5435,6 +5516,7 @@ class MainApp(QObject):
     def _on_create_session_from_audio(self, info: MeetingAudioInfo) -> None:
         self._foreground_window()
         prefill_title = f"{info.app_label} - {info.first_detected_at.strftime('%Y-%m-%d %H:%M')}"
+        series_names, suggest_series = self._dialog_series_args()
         dialog = NewSessionDialog(
             retain_audio_default=self.config.audio.retain_audio_default,
             title_prefill=prefill_title,
@@ -5443,6 +5525,8 @@ class MainApp(QObject):
                 "Rename the session if you'd like, then click OK to "
                 "create it -- recording starts only when you click Start."
             ),
+            series_names=series_names,
+            suggest_series=suggest_series,
             parent=self.window,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -5451,6 +5535,7 @@ class MainApp(QObject):
         session = self.store.create_session(
             title=result.title, retain_audio=result.retain_audio
         )
+        self._apply_series_to_new_session(session.id, result.series_name)
         self._refresh_session_list(select=session.id)
         self.window.status(
             f"Created session from {info.app_label} audio.", timeout_ms=5000
