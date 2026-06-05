@@ -168,6 +168,19 @@ class TranscriptStore:
             return ""
         return self.transcript_path.read_text(encoding="utf-8")
 
+    def set_imported_transcript(self, body: str) -> Path:
+        """Overwrite raw.transcript.md with an externally-imported body.
+
+        Used by the Import Transcript flow (#80) when the session has
+        no recording but the user has a transcript from another source
+        (Teams export, live captions paste). The body is written
+        verbatim -- the caller is responsible for normalization and
+        speaker remap. Returns the path so callers can refresh views.
+        """
+        text = body if body.endswith("\n") or not body else body + "\n"
+        _atomic_write_text(self.transcript_path, text)
+        return self.transcript_path
+
     # ---- live notes (user-authored, in parallel with the recording) ----
     def read_live_notes(self) -> str:
         """Return live_notes.md, seeding the template if the file is missing."""

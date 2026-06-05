@@ -9,7 +9,7 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.6. End-to-end capture, transcription, synthesis,
+> **Status:** v0.7.7. End-to-end capture, transcription, synthesis,
 > screen capture, retained-audio playback + export, and transcript-
 > synchronized playback all working. v0.7.6 adds Notion and Confluence
 > as save-to destinations alongside PDF (with a Verify-gated picker
@@ -46,6 +46,73 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.7
+
+- **Import Transcript... (#80).** Bring a transcript from another
+  source into a session that has no local recording. Useful when
+  Teams generated the transcript but you couldn't capture audio
+  (off-mic call, late join, hardware issue). Pick a `.txt` / `.md`
+  / `.docx` file or paste from the clipboard; the dialog drops
+  Teams export chrome ("Started transcription", "View original
+  meeting", standalone date headers), folds the web-paste
+  speaker/timestamp/body three-line shape back into one labeled
+  line, and surfaces any detected speaker labels for a one-shot
+  remap. On import the body lands in `raw.transcript.md` and the
+  Send to Claude.ai + Save to... buttons unlock the same way they
+  do for recorded sessions. Reachable from File -> Import
+  Transcript... in the menu bar and from a sibling button on the
+  empty Transcript tab.
+- **Pop Out My Notes Preview.** Open a separate top-level window
+  showing the live preview of My Notes, designed for screen-share
+  during a call. Updates as you type (250 ms debounce so a typing
+  burst doesn't produce a flicker), with an Always on Top toggle
+  in the popout's own View menu. The popout's scroll position is
+  preserved across re-renders -- if you've scrolled three-quarters
+  down to present a specific section, edits elsewhere in the
+  document don't yank the audience back to the top. Geometry +
+  always-on-top state persist across launches. Reachable from
+  View -> Pop Out My Notes Preview. Pure read-only -- no editor,
+  no toolbar -- so the audience sees a clean rendered surface.
+
+  ![Pop-out My Notes preview window](docs/screenshots/32-dialog-notes-popout.png)
+- **Editor + preview fonts in Settings.** New Fonts section under
+  Settings (also reachable as View -> Editor & Preview Fonts...).
+  The editor face is restricted to monospace families (Markdown
+  table / code-block / bulleted-list alignment matters); the
+  preview face is unrestricted. Sizes default to "platform default"
+  -- existing installs that don't open Settings see no change.
+  Also fixes a long-standing bug where the My Notes editor
+  inherited the platform proportional font instead of the monospace
+  the rest of the app expects.
+
+  ![Settings -> Fonts](docs/screenshots/33-dialog-settings-fonts.png)
+- **PDF link color.** Markdown hyperlinks now render as black
+  underlined text in PDF exports rather than cyan. The v0.7.6 fix
+  only set the default stylesheet (which Qt's Markdown parser
+  ignored at render time); the actual fix walks every anchor
+  fragment after `setMarkdown` and forces its character format.
+- **Series picker in New Session.** The New Session dialog gains
+  a Series row -- an editable combobox listing existing series
+  with a "(none)" sentinel first. As you type the title, the
+  picker auto-suggests by fuzzy-matching against prior session
+  titles AND series names (a stronger signal than v0.7.6's
+  series-name-only match, which missed cases where the series
+  name didn't lexically appear in the title). Touch the picker
+  once and the auto-suggest stops fighting your pick; typing a
+  brand-new name creates the series on accept.
+
+  ![New Session dialog with series picker](docs/screenshots/06-dialog-new-session.png)
+
+- **Sharper topic suggestions.** The LLM's "Suggested Topics"
+  output is reframed from "section headings or themes" (which
+  produced summary phrases like "Vendor A vs Vendor B") to atomic
+  reusable tags. Compound or comparative phrases are decomposed
+  ("Vendor A vs Vendor B" -> "Vendor A", "Vendor B", "Vendor
+  comparison") and the prompt carries five worked input/output
+  examples that teach the pattern. The downstream parser contract
+  is unchanged, so existing classification flows pick up the
+  improvement automatically.
 
 ## What's new in v0.7.6
 
@@ -855,6 +922,49 @@ list:
   dialog tracks per-frame encode progress.
 - **Delete recording...** -- removes the audio files but keeps
   the transcript + notes.
+
+## Importing a transcript (no recording)
+
+Sometimes a meeting happens without a local recording -- you joined
+late, your mic was wrong, Teams recorded the call but the app
+didn't, or the meeting was a hallway call with someone else's
+transcript already on hand. You can still use the synthesis flow by
+importing the transcript directly into the session.
+
+1. Create a new session in the usual way (the **+ New** button in
+   the sessions list), or open an existing empty session.
+2. Click **Import Transcript...** on the empty Transcript tab, or
+   pick **File -> Import Transcript...** from the menu bar.
+3. In the dialog, either click **From file...** (accepts `.txt`,
+   `.md`, and `.docx`) or **Paste from clipboard**. The preview
+   pane shows the normalized body the app would save.
+
+   ![Import Transcript dialog](docs/screenshots/31-dialog-import-transcript.png)
+4. Leave **Strip Teams formatting** checked for transcripts that
+   came out of Teams. The cleanup pass drops boilerplate banners
+   ("Started transcription", "View original meeting"), folds the
+   web-paste three-line speaker/timestamp/body shape back into one
+   labeled line, and collapses runs of blank lines. Uncheck it to
+   import the source verbatim.
+5. If the preview shows `Name:`-prefixed lines the dialog lists each
+   detected speaker, how many lines they contributed, and lets you
+   type a remapped label. Useful when Teams used a generic
+   "Unknown Speaker" label or the user's display name is wrong.
+   Click **Apply remap to preview** to see the result.
+6. Click **Import**. The body is written to the session's
+   transcript and the **Send to Claude.ai** + **Save to...** buttons
+   become available the same way they do after a recording.
+
+Notes are merged in via the existing My Notes flow -- if you took
+running notes during the meeting they remain attached to the
+session and feed the synthesis prompt alongside the imported
+transcript. A flat caption blob with no speaker labels works fine;
+the synthesis prompt template treats `{{transcript}}` as opaque
+text, and Claude leans on your notes when speaker attribution is
+missing.
+
+Importing over an existing transcript prompts for confirmation to
+avoid accidentally wiping a recording's transcript.
 
 ## Synthesis: chatbot hand-off
 

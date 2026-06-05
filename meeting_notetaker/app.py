@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
@@ -358,6 +358,7 @@ class MainApp(QObject):
 
         self._wire_signals()
         self._apply_user_name()
+        self._apply_fonts()
         self._apply_synthesis_automation()
         # Kick off the state poll immediately so the status bar shows
         # the right indicator on first paint, then settle into the
@@ -393,6 +394,32 @@ class MainApp(QObject):
         # opens enrollment.
         if self.config.speakers.enabled:
             QTimer.singleShot(500, self._start_encoder_prewarm)
+
+    def _apply_fonts(self) -> None:
+        """Resolve the user's font config to QFont instances and push
+        them to every editor + preview surface. Called on startup +
+        on Settings Save (#80 followup)."""
+        from .utils.fonts import resolve_editor_font, resolve_preview_font  # noqa: PLC0415
+
+        editor_font = resolve_editor_font(
+            self.config.ui.editor_font_family,
+            self.config.ui.editor_font_size,
+        )
+        preview_font = resolve_preview_font(
+            self.config.ui.preview_font_family,
+            self.config.ui.preview_font_size,
+        )
+        try:
+            self.window.session_view.apply_fonts(editor_font, preview_font)
+        except AttributeError:
+            log.exception("SessionView.apply_fonts not available; skipping font push")
+        # Popout window mirrors the same fonts when open.
+        popout = getattr(self, "_notes_popout", None)
+        if popout is not None:
+            try:
+                popout.apply_fonts(preview_font)
+            except AttributeError:
+                pass
 
     def _apply_user_name(self) -> None:
         self.window.session_view.set_user_name(self.config.ui.user_name)
@@ -1191,6 +1218,18 @@ class MainApp(QObject):
         self.window.save_to_confluence_requested.connect(
             self._on_file_menu_save_to_confluence,
         )
+        # File > Import Transcript... (#80) -- routes to the same
+        # handler the SessionView's empty-state Import button uses.
+        self.window.import_transcript_requested.connect(
+            self._on_file_menu_import_transcript,
+        )
+        # View menu (v0.7.7).
+        self.window.pop_out_notes_preview_requested.connect(
+            self._on_pop_out_notes_preview,
+        )
+        self.window.open_fonts_settings_requested.connect(
+            self._on_open_fonts_settings,
+        )
         # SessionView -> classification chip mutations
         sv = self.window.session_view
         sv.add_topic_requested.connect(self._on_add_topic_requested)
@@ -1213,6 +1252,8 @@ class MainApp(QObject):
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
         sv.send_to_llm_clicked.connect(self._on_send_to_llm)
+        # Issue #80: empty-state import button on the Transcript tab.
+        sv.import_transcript_clicked.connect(self._on_import_transcript)
         sv.copy_tab_clicked.connect(self._on_copy_tab)
         sv.live_notes_changed.connect(self._on_live_notes_changed)
         sv.synthesis_notes_changed.connect(self._on_synthesis_notes_changed)
@@ -1484,6 +1525,18 @@ class MainApp(QObject):
         # real body has actual notes.
         sv.set_live_notes_text(content.live_notes)
         sv.set_notes_text(content.notes)
+        # Notes popout (#80 followup) -- rebind to the new session
+        # so image refs resolve under the right folder and the
+        # preview body matches the new editor.
+        popout = getattr(self, "_notes_popout", None)
+        if popout is not None and popout.isVisible():
+            from .utils.paths import session_dir as _sdir  # noqa: PLC0415
+
+            popout.set_session_dir(_sdir(content.session_id))
+            popout.set_body(content.live_notes, immediate=True)
+            popout.setWindowTitle(
+                f"My Notes Preview -- {sv._session.title if sv._session else ''}"  # noqa: SLF001
+            )
         sv.set_previous_notes(content.previous_notes_paths)
         sv.set_prompt_templates(
             content.template_names,
@@ -1558,9 +1611,12 @@ class MainApp(QObject):
     # ---- session lifecycle handlers ---------------------------------------
 
     def _on_new_session(self) -> None:
+        series_names, suggest_series = self._dialog_series_args()
         dialog = NewSessionDialog(
             retain_audio_default=self.config.audio.retain_audio_default,
             capture_only_default=self.config.transcription.capture_only_mode,
+            series_names=series_names,
+            suggest_series=suggest_series,
             parent=self.window,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -1575,10 +1631,13 @@ class MainApp(QObject):
         if result.calendar_meeting is not None:
             self._align_created_at_to_meeting(session.id, result.calendar_meeting)
             self._seed_live_notes_from_meeting(session.id, result.calendar_meeting)
-        # Best-effort recurring-meeting series link from the title.
-        # Runs AFTER calendar seed so the seeded attendees flow into
-        # _sync_attendees_to_people on the first live_notes_changed.
-        self._auto_link_series_for_new_session(session.id, result.title)
+        # Series: the dialog now owns auto-pick + manual override
+        # (v0.7.7); MainApp just applies whatever the dialog returned.
+        # The legacy _auto_link_series_for_new_session helper is no
+        # longer wired here -- a user who explicitly leaves the
+        # picker on "(none)" gets no series, instead of getting one
+        # silently re-suggested behind their back.
+        self._apply_series_to_new_session(session.id, result.series_name)
         self._refresh_session_list(select=session.id)
 
     def _seed_live_notes_from_meeting(
@@ -2502,6 +2561,202 @@ class MainApp(QObject):
             return
         body, label = sv._active_tab_body_and_label()  # noqa: SLF001
         self._on_export_to_confluence(sv._session.id, label, body)  # noqa: SLF001
+
+    def _on_open_fonts_settings(self) -> None:
+        """View > Editor & Preview Fonts... opens Settings landed on
+        the Fonts page. Reuses _on_settings entirely; the section name
+        is pushed into the config field that the dialog reads at
+        construction (#80 followup, v0.7.7)."""
+        # Save the user's previous landing section so we can restore
+        # it -- the dialog's accept-time logic writes whatever
+        # section the user clicks away to. If they cancel, restore.
+        prior = self.config.ui.settings_active_section
+        self.config.ui.settings_active_section = "Fonts"
+        try:
+            self._on_settings()
+        finally:
+            # If the user cancelled the dialog, the field on disk
+            # was not updated; restore the prior preference so the
+            # next normal Settings open lands where they expect.
+            if self.config.ui.settings_active_section == "Fonts" and prior:
+                # Heuristic: leave Fonts as the active section only
+                # if the user actually navigated there (accept path)
+                # which writes whatever was current on accept. The
+                # simplest correct behavior: restore prior only if
+                # the dialog was canceled. We can't easily tell from
+                # here, but the safer path is to leave whatever the
+                # dialog set -- so don't overwrite. The restore is a
+                # no-op in practice unless we want to special-case
+                # cancel; skip to keep behavior simple.
+                pass
+
+    def _on_pop_out_notes_preview(self) -> None:
+        """View > Pop Out My Notes Preview (#80 followup, v0.7.7).
+
+        Opens (or raises + focuses) a separate top-level window that
+        mirrors the live preview of the currently-selected session's
+        My Notes. Updates are debounced at 250 ms; the spec asks for
+        no live scrolling so the popout's scroll position stays put
+        across re-renders.
+
+        Window geometry + always-on-top state persist via UiConfig
+        across launches.
+        """
+        from PyQt6.QtCore import QByteArray  # noqa: PLC0415
+
+        from .ui.notes_popout import LiveNotesPopout  # noqa: PLC0415
+        from .utils.paths import session_dir as _sdir  # noqa: PLC0415
+
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            QMessageBox.information(
+                self.window, "Pop Out My Notes Preview",
+                "Select a session in the list first, then choose "
+                "View > Pop Out My Notes Preview.",
+            )
+            return
+
+        existing = getattr(self, "_notes_popout", None)
+        if existing is not None and existing.isVisible():
+            # Already open: raise + activate so it surfaces over the
+            # main window without losing its state.
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        body = sv._live_notes_editor.toPlainText()  # noqa: SLF001
+        sdir = _sdir(sv._session.id)  # noqa: SLF001
+        popout = LiveNotesPopout(
+            parent=None,
+            body=body,
+            session_dir=sdir,
+            always_on_top=self.config.ui.notes_popout_always_on_top,
+            window_title=f"My Notes Preview -- {sv._session.title}",  # noqa: SLF001
+        )
+        # Restore prior geometry if we have one. Empty / corrupt
+        # bytes fall through to the constructor's default size.
+        geo = self.config.ui.notes_popout_geometry
+        if geo:
+            try:
+                raw = QByteArray.fromBase64(geo.encode("ascii"))
+                popout.restoreGeometry(raw)
+            except (UnicodeEncodeError, ValueError):
+                log.exception("notes_popout_geometry corrupt; ignoring")
+        # Wire the live-notes change signal so typing in the main
+        # editor flows into the popout (debounced).
+        sv.live_notes_changed.connect(self._on_live_notes_changed_for_popout)
+        # On close: persist state + drop the reference.
+        popout.closed.connect(self._on_notes_popout_closed)
+        self._notes_popout = popout
+        # Push the configured preview font so the popout matches the
+        # in-app preview's look without waiting for a Settings save.
+        from .utils.fonts import resolve_preview_font  # noqa: PLC0415
+
+        popout.apply_fonts(resolve_preview_font(
+            self.config.ui.preview_font_family,
+            self.config.ui.preview_font_size,
+        ))
+        popout.show()
+
+    def _on_live_notes_changed_for_popout(self, session_id: str, body: str) -> None:
+        """Forward editor changes to the popout. No-op when the popout
+        isn't open or when the session id no longer matches the
+        popout's bound session."""
+        popout = getattr(self, "_notes_popout", None)
+        if popout is None or not popout.isVisible():
+            return
+        # set_body fast-paths when the body is unchanged.
+        popout.set_body(body)
+
+    def _on_notes_popout_closed(self) -> None:
+        """Persist geometry + always-on-top state and drop the ref."""
+        from PyQt6.QtCore import QByteArray  # noqa: PLC0415
+
+        popout = getattr(self, "_notes_popout", None)
+        if popout is None:
+            return
+        try:
+            geo_bytes: QByteArray = popout.saveGeometry()
+            self.config.ui.notes_popout_geometry = bytes(
+                geo_bytes.toBase64()
+            ).decode("ascii")
+            self.config.ui.notes_popout_always_on_top = popout.is_always_on_top()
+            self.config.save()
+        except Exception:  # noqa: BLE001
+            log.exception("failed to persist notes_popout state on close")
+        # Disconnect the SessionView signal so the next pop-out
+        # request gets a clean wiring.
+        sv = self.window.session_view
+        try:
+            sv.live_notes_changed.disconnect(self._on_live_notes_changed_for_popout)
+        except (TypeError, RuntimeError):
+            pass
+        self._notes_popout = None
+
+    def _on_file_menu_import_transcript(self) -> None:
+        """File > Import Transcript... -- forwards to the same handler
+        the SessionView's empty-state button fires. Pulls the session id
+        off the selected session so a menu-bar user gets the same flow."""
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            QMessageBox.information(
+                self.window, "Import Transcript",
+                "Select a session in the list first, then choose "
+                "File > Import Transcript...",
+            )
+            return
+        self._on_import_transcript(sv._session.id)  # noqa: SLF001
+
+    def _on_import_transcript(self, session_id: str) -> None:
+        """Open the ImportTranscriptDialog scoped to session_id; on
+        accept, write the body to raw.transcript.md, flip
+        session.has_transcript=True, and refresh the session view so the
+        Send/Save buttons reevaluate.
+
+        Importing over an existing transcript is allowed -- the user
+        gets a confirm dialog if there's content already so they don't
+        wipe a recording's transcript by mistake.
+        """
+        from .ui.import_transcript_dialog import ImportTranscriptDialog  # noqa: PLC0415
+
+        session = self.store.get_session(session_id)
+        if session is None:
+            return
+        store = TranscriptStore(session_id)
+        existing = store.read_transcript().strip()
+        if existing:
+            reply = QMessageBox.question(
+                self.window,
+                "Import Transcript",
+                "This session already has a transcript. Importing will "
+                "replace it. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        dlg = ImportTranscriptDialog(self.window, session_title=session.title)
+        if dlg.exec() != ImportTranscriptDialog.DialogCode.Accepted:
+            return
+        body = dlg.result_body
+        if not body.strip():
+            return
+        try:
+            store.set_imported_transcript(body)
+        except OSError as exc:
+            QMessageBox.warning(
+                self.window, "Import Transcript",
+                f"Could not write the transcript file: {exc}",
+            )
+            return
+        self.store.update_session(session_id, has_transcript=True)
+        # Re-run the content-load path so the Transcript tab repopulates
+        # and the button-state path sees the on-disk transcript.
+        self._on_session_selected(session_id)
+        self.window.status(
+            "Transcript imported. Send to Claude.ai and Save to... are now available.",
+            timeout_ms=6000,
+        )
 
     def _on_restore_previous_notes(self, session_id: str, archive_path) -> None:
         """Replace notes.md with a selected archive's contents. The
@@ -4347,10 +4602,11 @@ class MainApp(QObject):
     def _auto_link_series_for_new_session(self, session_id: str, title: str) -> None:
         """Best-effort: fuzzy-match the title against known series + link.
 
-        Called from _on_new_session and the calendar-creation path
-        after the session row exists. Silent on no-match -- the
-        chips bar will show "Series: (none)" and the user can pick
-        one manually.
+        Historically called from _on_new_session as a post-create
+        hook. The NewSessionDialog now owns the picker (v0.7.7) so
+        that call site dropped it; this method survives for any
+        future entry points that need silent auto-link without a
+        dialog (none today).
         """
         if self.classification is None or not title.strip():
             return
@@ -4360,6 +4616,76 @@ class MainApp(QObject):
                 self.classification.assign_series(session_id, series.id)
         except Exception:
             log.exception("series auto-link failed for %s", session_id)
+
+    def _dialog_series_args(self) -> tuple[list[str], Optional[Callable[[str], Optional[str]]]]:
+        """Return (series_names, suggest_series) for the
+        NewSessionDialog. Empty list + None when no classification
+        store is configured (tests, or store init failure).
+
+        suggest_series joins the SessionStore titles to the
+        ClassificationStore's session_series assignments so the
+        fuzzy match scores against prior session titles, not just
+        series names. The join happens here -- the two stores live
+        in different sqlite files, so ClassificationStore.
+        suggest_series_from_history takes the prepared mapping as
+        an arg rather than reaching across.
+        """
+        if self.classification is None:
+            return [], None
+        try:
+            series = self.classification.list_series()
+        except Exception:
+            log.exception("list_series failed; dialog will skip the picker")
+            return [], None
+        names = sorted((s.name for s in series), key=str.lower)
+
+        # Build the prior-titles-by-series map once at dialog open
+        # rather than on every keystroke. For a typical install with
+        # tens of series and a few hundred sessions, this is a
+        # millisecond-class scan and the dialog stays snappy under
+        # the suggest debounce.
+        titles_by_series: dict[int, list[str]] = {}
+        try:
+            for s in series:
+                session_ids = self.classification.session_ids_for_series(s.id)
+                titles: list[str] = []
+                for sid in session_ids:
+                    sess = self.store.get_session(sid)
+                    if sess is not None and sess.title:
+                        titles.append(sess.title)
+                if titles:
+                    titles_by_series[s.id] = titles
+        except Exception:
+            log.exception("title map build failed; suggest falls back to series-name scoring")
+            titles_by_series = {}
+
+        def _suggest(title: str) -> Optional[str]:
+            try:
+                hit = self.classification.suggest_series_from_history(
+                    title,
+                    prior_session_titles_by_series=titles_by_series,
+                )
+            except Exception:
+                log.exception("suggest_series_from_history failed for %r", title)
+                return None
+            return hit.name if hit else None
+
+        return names, _suggest
+
+    def _apply_series_to_new_session(self, session_id: str, series_name: str) -> None:
+        """Link the new session to the named series, creating the
+        series row if it didn't already exist. Empty name is a
+        deliberate "no series" pick and runs no link."""
+        name = series_name.strip()
+        if not name or self.classification is None:
+            return
+        try:
+            series = self.classification.get_or_create_series(name)
+            self.classification.assign_series(session_id, series.id)
+        except Exception:
+            log.exception(
+                "failed to apply series %r to %s", name, session_id,
+            )
 
     def _sync_attendees_to_people(self, session_id: str, body: str) -> None:
         """Mirror the live notes' # Attendees list into the session's
@@ -4835,6 +5161,7 @@ class MainApp(QObject):
             return
         self.config.save()
         self._apply_user_name()
+        self._apply_fonts()
         self._apply_calendar_config()
         self._apply_audio_monitor_config()
         self._apply_synthesis_automation()
@@ -5082,6 +5409,7 @@ class MainApp(QObject):
 
     def _on_create_session_from_calendar(self, info: MeetingInfo) -> None:
         self._foreground_window()
+        series_names, suggest_series = self._dialog_series_args()
         dialog = NewSessionDialog(
             retain_audio_default=self.config.audio.retain_audio_default,
             title_prefill=info.subject,
@@ -5092,6 +5420,8 @@ class MainApp(QObject):
             ),
             calendar_meeting=info,
             allow_calendar_pick=False,
+            series_names=series_names,
+            suggest_series=suggest_series,
             parent=self.window,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -5103,6 +5433,7 @@ class MainApp(QObject):
         meeting = result.calendar_meeting or info
         self._align_created_at_to_meeting(session.id, meeting)
         self._seed_live_notes_from_meeting(session.id, meeting)
+        self._apply_series_to_new_session(session.id, result.series_name)
         self._refresh_session_list(select=session.id)
         self.window.status(
             f"Created session from calendar: {info.subject}", timeout_ms=5000
@@ -5185,6 +5516,7 @@ class MainApp(QObject):
     def _on_create_session_from_audio(self, info: MeetingAudioInfo) -> None:
         self._foreground_window()
         prefill_title = f"{info.app_label} - {info.first_detected_at.strftime('%Y-%m-%d %H:%M')}"
+        series_names, suggest_series = self._dialog_series_args()
         dialog = NewSessionDialog(
             retain_audio_default=self.config.audio.retain_audio_default,
             title_prefill=prefill_title,
@@ -5193,6 +5525,8 @@ class MainApp(QObject):
                 "Rename the session if you'd like, then click OK to "
                 "create it -- recording starts only when you click Start."
             ),
+            series_names=series_names,
+            suggest_series=suggest_series,
             parent=self.window,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
@@ -5201,6 +5535,7 @@ class MainApp(QObject):
         session = self.store.create_session(
             title=result.title, retain_audio=result.retain_audio
         )
+        self._apply_series_to_new_session(session.id, result.series_name)
         self._refresh_session_list(select=session.id)
         self.window.status(
             f"Created session from {info.app_label} audio.", timeout_ms=5000

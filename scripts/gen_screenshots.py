@@ -470,12 +470,32 @@ def shot_main_attachments() -> None:
 
 def shot_new_session() -> None:
     # allow_calendar_pick=False keeps the dialog compact and consistent on
-    # Linux where Outlook is unavailable anyway.
+    # Linux where Outlook is unavailable anyway. v0.7.7: pre-seed the
+    # series picker with a few synthetic recurring meetings and an
+    # auto-suggest hit so the screenshot shows the headline feature.
+    def suggest(title):
+        if "standup" in title.lower():
+            return "Daily Standup"
+        return None
+
     dlg = NewSessionDialog(
         retain_audio_default=False,
         allow_calendar_pick=False,
+        series_names=[
+            "Daily Standup",
+            "Platform Architecture Review",
+            "Weekly 1:1 with Manager",
+            "Q3 Planning",
+        ],
+        suggest_series=suggest,
+        title_prefill="Standup 2026-06-05",
     )
-    dlg.resize(440, 200)
+    # Flush the deferred suggest so the screenshot catches the
+    # picker already pointing at Daily Standup.
+    QApplication.processEvents()
+    dlg._suggest_timer.stop()  # noqa: SLF001
+    dlg._run_series_suggest()  # noqa: SLF001
+    dlg.resize(480, 280)
     dlg.show()
     QApplication.processEvents()
     _grab(dlg, "06-dialog-new-session.png", autosize=False)
@@ -928,6 +948,87 @@ def shot_integrations_picker() -> None:
     dlg.close()
 
 
+def shot_notes_popout() -> None:
+    """v0.7.7 pop-out preview window for screen-share. Pre-seeds a
+    realistic My Notes body so the screenshot shows what audience
+    members would actually see during a call."""
+    from meeting_notetaker.ui.notes_popout import LiveNotesPopout
+
+    body = (
+        "# Attendees\n\n"
+        "- Aaron Dodd (host)\n"
+        "- Jane Smith (Product)\n"
+        "- Chris Patel (Eng)\n\n"
+        "# Agenda\n\n"
+        "1. Q3 roadmap update\n"
+        "2. Vendor evaluation -- Acme Cloud vs Beta Systems\n"
+        "3. Open questions\n\n"
+        "# Notes\n\n"
+        "## Q3 roadmap\n\n"
+        "Acme Cloud demoed v3.1 yesterday; the SSO flow lands\n"
+        "next week. Beta Systems is still on their v2 release.\n\n"
+        "- Acme licensing is per-seat; Beta is per-host\n"
+        "- Migration risk: 12 weeks vs 4 weeks\n\n"
+        "# Action Items\n\n"
+        "- [ ] Aaron: draft vendor comparison memo by Friday\n"
+        "- [ ] Jane: confirm SSO requirements with Security\n"
+    )
+    po = LiveNotesPopout(
+        body=body,
+        window_title="My Notes Preview -- Q3 Platform Sync",
+    )
+    po.resize(620, 540)
+    po.show()
+    QApplication.processEvents()
+    _grab(po, "32-dialog-notes-popout.png", autosize=False)
+    po.close()
+
+
+def shot_settings_fonts() -> None:
+    """v0.7.7 Settings -> Fonts page (#80 followup). Pre-populated
+    so the editor + preview pickers + size spins are all on screen."""
+    cfg = Config()
+    cfg.ui.user_name = USER_NAME
+    cfg.ui.settings_active_section = "Fonts"
+    cfg.ui.editor_font_size = 12
+    cfg.ui.preview_font_size = 12
+    dlg = SettingsDialog(cfg)
+    dlg.resize(900, 600)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "33-dialog-settings-fonts.png", autosize=False)
+    dlg.close()
+
+
+def shot_import_transcript_dialog() -> None:
+    """v0.7.7 Import Transcript dialog (#80). Pre-seeds a synthetic
+    Teams-style body so the speakers table + preview show real
+    content."""
+    from meeting_notetaker.ui.import_transcript_dialog import (
+        ImportTranscriptDialog,
+    )
+
+    body = (
+        "Started transcription\n"
+        "Jun 4, 2026, 10:00 AM\n"
+        "\n"
+        "Jane Smith   0:00:01.234\n"
+        "Welcome everyone. Let's start with the roadmap update.\n"
+        "Aaron Dodd   0:00:08.117\n"
+        "Sounds good. I'll share the deck.\n"
+        "Jane Smith   0:00:14.500\n"
+        "Great. Walk us through the Q3 milestones.\n"
+        "View original meeting\n"
+    )
+    dlg = ImportTranscriptDialog(session_title="Q3 Platform Sync")
+    dlg.set_initial_body(body)
+    dlg.resize(900, 660)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "31-dialog-import-transcript.png", autosize=False)
+    dlg.close()
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -958,6 +1059,10 @@ def main() -> int:
     shot_settings_integrations()
     shot_save_to_menu()
     shot_integrations_picker()
+    # v0.7.7 surfaces (#80).
+    shot_import_transcript_dialog()
+    shot_notes_popout()
+    shot_settings_fonts()
     print("done.")
     return 0
 

@@ -81,6 +81,11 @@ class SessionView(QWidget):
     # when the user has the feature enabled in Settings. Carries the
     # session id and the LLM target key ("claude" / "copilot").
     send_to_llm_clicked = pyqtSignal(str, str)      # session_id, target
+    # Issue #80: empty-state affordance on the Transcript tab. MainApp
+    # opens the ImportTranscriptDialog and writes the result to
+    # raw.transcript.md. Carries the session id for symmetry with the
+    # other per-session signals.
+    import_transcript_clicked = pyqtSignal(str)    # session_id
     copy_tab_clicked = pyqtSignal(str, str)        # session_id, tab_id
     retain_audio_toggled = pyqtSignal(str, bool)   # session_id, value
     live_notes_changed = pyqtSignal(str, str)      # session_id, body
@@ -602,6 +607,35 @@ class SessionView(QWidget):
         self._playback_split_top_pct: int = 70
         playback_layout.addWidget(self._transcript_playback_splitter, 1)
 
+        # Issue #80: empty-state affordance. Shown above the editor
+        # when the session has no transcript on disk yet (e.g. a
+        # newly-created session, or one where the user attended a
+        # meeting they couldn't record). Hidden as soon as content
+        # arrives -- either from a recording or from this very import.
+        self._transcript_empty_row = QWidget(transcript_page)
+        empty_row_layout = QHBoxLayout(self._transcript_empty_row)
+        empty_row_layout.setContentsMargins(0, 0, 0, 6)
+        empty_row_layout.setSpacing(8)
+        empty_msg = QLabel(
+            "No transcript yet. Record a meeting, or import one from "
+            "another source (Teams export, clipboard).",
+            self._transcript_empty_row,
+        )
+        empty_msg.setStyleSheet("color: palette(placeholder-text);")
+        empty_row_layout.addWidget(empty_msg, 1)
+        self._import_transcript_btn = QPushButton(
+            "Import Transcript...", self._transcript_empty_row,
+        )
+        self._import_transcript_btn.setToolTip(
+            "Bring in a transcript from a Teams export, a .txt/.md file, "
+            "or the clipboard. Unlocks Send to Claude.ai and Save to... "
+            "for this session."
+        )
+        self._import_transcript_btn.clicked.connect(self._on_import_transcript_clicked)
+        empty_row_layout.addWidget(self._import_transcript_btn, 0)
+        self._transcript_empty_row.setVisible(False)
+        transcript_layout.addWidget(self._transcript_empty_row, 0)
+
         self._transcript_layout_stack = QStackedWidget(transcript_page)
         self._transcript_layout_stack.addWidget(self._transcript_idle_page)
         self._transcript_layout_stack.addWidget(self._transcript_playback_page)
@@ -786,7 +820,12 @@ class SessionView(QWidget):
             self.set_screencap_armed(False)
             return
         self._title_label.setText(session.title)
-        self._state_label.setText(_pretty_state(session.state))
+        self._state_label.setText(_pretty_state(
+            session.state,
+            has_live_transcript=(
+                session.has_transcript or bool(transcript.strip())
+            ),
+        ))
         self._raw_transcript_text = transcript
         self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
         self._refresh_transcript_timestamps()
@@ -836,10 +875,16 @@ class SessionView(QWidget):
         if self._session is None:
             return
         self._session.state = state
-        self._state_label.setText(_pretty_state(state))
+        has_live_transcript = (
+            self._session.has_transcript
+            or bool(self._transcript_view.toPlainText().strip())
+        )
+        self._state_label.setText(_pretty_state(
+            state, has_live_transcript=has_live_transcript,
+        ))
         self._set_buttons_for_state(
             state,
-            has_transcript=self._session.has_transcript or bool(self._transcript_view.toPlainText().strip()),
+            has_transcript=has_live_transcript,
             has_notes=self._session.has_notes or bool(self._notes_view.toPlainText().strip()),
         )
         self._refresh_sidebar_visibility()
@@ -1485,6 +1530,28 @@ class SessionView(QWidget):
             return
         self._session.created_at = cleaned
 
+    def apply_fonts(self, editor_font, preview_font) -> None:
+        """Push the resolved editor + preview fonts to every surface
+        that respects them: the My Notes editor + preview, the
+        Synthesis editor + preview, and the Previous Notes preview.
+
+        The Transcript view stays on its own dedicated monospace
+        ("Consolas" with Monospace style hint, hard-coded at
+        construction) because timestamps need column alignment that
+        depends on Qt picking a non-substituted monospace face even
+        if the user prefers a different one for editing prose.
+        Called by MainApp at startup + on Settings Save."""
+        self._live_notes_editor.apply_fonts(editor_font, preview_font)
+        self._notes_view.apply_fonts(editor_font, preview_font)
+        # Previous notes is a read-only preview; push the preview
+        # font but skip the editor side (it has none).
+        try:
+            self._previous_view.apply_fonts(preview_font)
+        except AttributeError:
+            # Older builds without the per-widget setter; harmless to
+            # skip -- preview reverts to the QApplication default.
+            pass
+
     def set_user_name(self, name: str) -> None:
         """Update the display label for the user's mic and refresh the transcript view."""
         new_name = (name or "").strip()
@@ -1647,6 +1714,12 @@ class SessionView(QWidget):
             self.send_to_llm_clicked.emit(
                 self._session.id, self._automation_target
             )
+
+    def _on_import_transcript_clicked(self) -> None:
+        """Fire the per-session import signal so MainApp opens the
+        ImportTranscriptDialog scoped to this session."""
+        if self._session is not None:
+            self.import_transcript_clicked.emit(self._session.id)
 
     def set_synthesis_in_progress(
         self, session_id: str, in_progress: bool, *, status_text: Optional[str] = None
@@ -2093,6 +2166,13 @@ class SessionView(QWidget):
                     "Start capturing mic + system audio for this session."
                 )
         self._refresh_screencap_button_enabled()
+        # Empty-state affordance on the Transcript tab (#80). Visible
+        # whenever a session is loaded but has no transcript yet AND
+        # the session isn't actively recording (the live captions take
+        # the visual real estate during a recording).
+        self._transcript_empty_row.setVisible(
+            has_session and not has_transcript and not is_recording
+        )
         # Generate/paste are available as soon as a transcript exists. The
         # batch-refinement pass after Stop runs in the background and is
         # explicitly NOT a gate on synthesis -- the live transcript is good
@@ -2291,6 +2371,13 @@ class SessionView(QWidget):
         sdir = session_dir(self._session.id)
         doc = PrintTextDocument(sdir, parent=self)
         doc.setMarkdown(printable)
+        # Force every Markdown anchor to render black + underline.
+        # Qt's Markdown parser writes cyan into the character format
+        # at parse time, which the defaultStyleSheet alone can't
+        # override; the walk has to happen after setMarkdown (#78
+        # followup -- the v0.7.6 stylesheet-only fix didn't take
+        # effect in the rendered PDF).
+        doc.force_anchor_styling()
         return doc, tab_label
 
     def _on_print(self) -> None:
@@ -2528,18 +2615,33 @@ class _ClickableTranscriptView(QPlainTextEdit):
             self.line_clicked.emit(block.blockNumber())
 
 
-def _pretty_state(state: str) -> str:
+def _pretty_state(state: str, *, has_live_transcript: bool = False) -> str:
     # The state-label is the small text to the right of the session
     # title. "Complete" was visual noise -- the session-list status
     # column already shows the green dot for completed sessions, so
     # the label string only carries weight DURING active work. Empty
     # string for STATE_COMPLETE / STATE_NEW lets the label collapse
     # to no horizontal footprint when nothing's happening.
+    #
+    # PROCESSING gets two phrasings. The "you can synthesize now"
+    # variant was correct under the v0.6.4-and-earlier default where
+    # live captions populated the transcript pane during recording
+    # and the batch pass refined an already-usable live transcript.
+    # Under the v0.6.5+ default (live transcription off) nothing is
+    # written to the transcript file until batch completes, so the
+    # session genuinely cannot be synthesized yet -- the claim that
+    # it can is misleading. `has_live_transcript` reflects whether
+    # the live engine wrote any segments at Stop (controller flips
+    # session.has_transcript=True in that path); when False, the
+    # quieter message says only that work is happening.
+    if state == STATE_PROCESSING:
+        if has_live_transcript:
+            return "Refining transcript -- you can synthesize now"
+        return "Refining transcript..."
     pretty = {
         STATE_NEW: "",
         STATE_RECORDING: "Recording",
         STATE_PAUSED: "Paused",
-        STATE_PROCESSING: "Refining transcript -- you can synthesize now",
         STATE_COMPLETE: "",
         STATE_ERROR: "Error",
     }

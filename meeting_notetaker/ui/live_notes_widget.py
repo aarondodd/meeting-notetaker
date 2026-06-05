@@ -149,6 +149,27 @@ class LiveNotesWidget(QWidget):
 
     # ---- public API --------------------------------------------------------
 
+    def apply_fonts(self, editor_font, preview_font) -> None:
+        """Push the resolved editor + preview fonts onto the inner
+        widgets. Called by SessionView at construction (initial seed
+        from user config) and again on Settings save.
+
+        Both args are QFont; the editor must be monospace (caller
+        guarantees via utils.fonts.resolve_editor_font). Preview
+        face is unconstrained -- the preview widget passes the font
+        straight to its inner QTextBrowser which uses it as the base
+        for body text; headings and code blocks still pick up their
+        intrinsic styling via the Markdown render path."""
+        self._editor.setFont(editor_font)
+        # PreviewWithToc exposes the inner MarkdownPreview via
+        # .preview() so we can push the font without breaking the
+        # composite's encapsulation.
+        try:
+            inner = self._preview.preview()
+        except AttributeError:
+            inner = self._preview
+        inner.setFont(preview_font)
+
     def toPlainText(self) -> str:
         return self._editor.toPlainText()
 

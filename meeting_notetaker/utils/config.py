@@ -152,6 +152,27 @@ class UiConfig:
     # Empty string = first launch, alphabetical default ("Audio").
     # Persisted on accept so reopening Settings lands on the same page.
     settings_active_section: str = ""
+    # Font preferences for the editor + preview surfaces (#80
+    # followup, v0.7.7). Editor face must be monospace -- Markdown
+    # editing benefits from column alignment for tables, code
+    # blocks, and bulleted lists. Preview face is whatever the user
+    # wants. Empty family strings mean "auto-pick a platform-
+    # appropriate default" -- Consolas / Cascadia Mono on Windows
+    # for the editor; system sans for the preview. Sizes 0 mean
+    # "use the platform default" so existing installs that don't
+    # carry the field don't suddenly downsize all their text.
+    editor_font_family: str = ""
+    editor_font_size: int = 0
+    preview_font_family: str = ""
+    preview_font_size: int = 0
+    # Pop-out notes preview window state (#80 followup, v0.7.7).
+    # Geometry mirrors the main_window_geometry round-trip pattern
+    # so the popout reopens where the user left it. Empty string =
+    # never opened or geometry was lost (e.g. external monitor
+    # removed). Always-on-top toggle is sticky so reopening
+    # preserves the screenshare-friendly setup.
+    notes_popout_geometry: str = ""
+    notes_popout_always_on_top: bool = False
 
 
 @dataclass
