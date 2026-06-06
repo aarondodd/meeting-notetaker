@@ -555,27 +555,45 @@ class SessionController(QObject):
             self._mic_recorder.start()
 
             # Loopback recorder (Windows only; fail soft if unavailable).
+            # When multi_endpoint_capture is on (default), the
+            # MultiEndpointLoopbackRecorder orchestrator captures every
+            # WASAPI output endpoint to a sidecar WAV and mixes at
+            # Stop. Issue #84: this is the primary defense against the
+            # "Teams routed to a different endpoint than the one we
+            # bound to" failure mode. Single-endpoint mode stays
+            # available as a fallback for users hitting WASAPI quirks.
             from .audio.loopback_recorder import LoopbackRecorder, LoopbackUnavailable
-            if LoopbackRecorder.is_available():
+            from .audio.multi_loopback import MultiEndpointLoopbackRecorder
+            multi = self.config.audio.multi_endpoint_capture
+            if MultiEndpointLoopbackRecorder.is_available() and multi:
+                self._loopback_recorder = MultiEndpointLoopbackRecorder(
+                    self._chunk_buffer,
+                    self._sys_wav,
+                    source_name=SYS,
+                )
+            elif LoopbackRecorder.is_available():
                 self._loopback_recorder = LoopbackRecorder(
                     self._chunk_buffer,
                     self._sys_wav,
                     source_name=SYS,
                     device_name=self.config.audio.loopback_device_name,
                 )
+            else:
+                self._loopback_recorder = None
+                self.status.emit("PyAudioWPatch not installed; recording mic only.")
+
+            if self._loopback_recorder is not None:
                 self._loopback_recorder.error.connect(self.error.emit)
-                # Same shape as the mic path. Tag with session id so
-                # the app can correlate the warning to a specific
-                # recording when surfacing it.
+                # Tag warnings with session id so the app correlates
+                # the warning to a specific recording.
                 lb_session_id = session.id
                 self._loopback_recorder.capture_warning.connect(
                     lambda msg, sid=lb_session_id: self.capture_warning.emit(sid, msg)
                 )
-                # Mid-recording silence detector (#84). When the
-                # rolling RMS stays below floor for the tracker's full
-                # window, cross-reference with audio_session_monitor
-                # so the banner can name the meeting app that's
-                # producing audio elsewhere.
+                # Mid-recording silence detector (#84). The handler
+                # cross-references with audio_session_monitor so the
+                # banner can name the meeting app rendering audio
+                # elsewhere (the diagnostic the user needs to act on).
                 self._loopback_recorder.silence_detected.connect(
                     lambda sid=lb_session_id: self._on_loopback_silence_detected(sid)
                 )
@@ -588,8 +606,6 @@ class SessionController(QObject):
                     log.warning("loopback unavailable: %s", exc)
                     self._loopback_recorder = None
                     self.status.emit("System-audio loopback unavailable; recording mic only.")
-            else:
-                self.status.emit("PyAudioWPatch not installed; recording mic only.")
 
             self._t_start_wall = time.monotonic()
             self._active_elapsed_accumulated_sec = 0.0

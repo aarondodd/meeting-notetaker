@@ -9,6 +9,7 @@ Schema (config.toml):
     vad_min_silence_ms = 500
     mic_device_name = ""               # empty -> system default; substring match
     loopback_device_name = ""          # empty -> system default; substring match (Windows-only)
+    multi_endpoint_capture = true      # capture every WASAPI output endpoint and mix at finalize (Windows-only)
 
     [transcription]
     model_size = "small.en"
@@ -80,6 +81,15 @@ class AudioConfig:
     vad_min_silence_ms: int = 500
     mic_device_name: str = ""
     loopback_device_name: str = ""
+    # Multi-endpoint loopback capture (#85). When True, the recorder
+    # opens one loopback stream per WASAPI output endpoint and mixes
+    # at finalize. Defaults ON because Aaron's #84 case is the
+    # canonical Windows multi-monitor failure mode (Teams routes to a
+    # different endpoint than the one the user expected) and the
+    # disk cost is held to near-single-endpoint by per-endpoint RMS
+    # gating. Users who hit WASAPI stale-handle quirks at start can
+    # toggle this off to fall back to single-endpoint mode.
+    multi_endpoint_capture: bool = True
 
 
 @dataclass
