@@ -185,43 +185,64 @@ class ClassificationBar(QWidget):
 
     def _build_topic_rows(self) -> list[AssignmentRow]:
         """Construct the rows the Topics popup shows: every known
-        topic with its assigned + suggested state for this session.
+        topic with its accepted + suggested state for this session.
 
-        Suggested rows are those linked to the session with
-        ``accepted=False`` (auto-extract output not yet confirmed by
-        the user). A row's ``assigned`` flag stays True for both
-        accepted and suggested links so the popup shows the user
-        every topic currently on this session in one glance; the
-        suggestion badge tells them which need confirmation.
+        Mental model: ``assigned`` means "the user has confirmed
+        this topic for this session." Suggestions (LLM auto-extract
+        output not yet confirmed) are NOT assigned -- they're a
+        third state, signalled by ``suggested=True`` and rendered
+        with an italicized "(suggested)" badge in the popup, with
+        the checkbox left unchecked. Conflating "linked-but-
+        unaccepted" with "user-confirmed" inside the checkbox
+        state misled the user (#82 followup, v0.7.8); the badge
+        carries the suggestion semantic on its own.
 
-        Topics that aren't on this session at all are also listed,
-        with ``assigned=False`` -- clicking one adds it.
+        Sort: suggestions alphabetical first, then everything
+        else alphabetical. A user scanning the popup after a fresh
+        synthesis sees the candidate tags at the top without
+        scrolling through the full catalog.
+
+        Topics that aren't on the session and aren't suggestions
+        appear with ``assigned=False, suggested=False`` -- clicking
+        adds them.
         """
-        on_session: dict[str, tuple[int, bool, bool]] = {}
+        # accepted_keys: names the user has confirmed on this
+        # session. suggestion_id_by_key: names linked to the session
+        # via the LLM auto-extract path that haven't been confirmed
+        # yet (accepted=False on the SessionTopic link).
+        accepted_keys: set[str] = set()
+        suggestion_id_by_key: dict[str, int] = {}
         for st in self._classification.topics:
-            # (topic_id, assigned-to-session, is-suggestion)
-            on_session[st.topic.name.casefold()] = (
-                st.topic.id, True, not st.accepted,
-            )
-        rows: list[AssignmentRow] = []
-        # Build the row list from the known-topics catalog (the
-        # full universe). Add any session-only entries that aren't
-        # in the catalog at the bottom so the user can still see /
-        # toggle them.
+            key = st.topic.name.casefold()
+            if st.accepted:
+                accepted_keys.add(key)
+            else:
+                suggestion_id_by_key[key] = st.topic.id
+
+        # Catalog is the known-topics universe plus any topics on the
+        # session that aren't in the catalog yet (so the user can
+        # still see + toggle / reject a session-only entry).
         catalog: list[str] = list(self._known_topics)
         catalog_keys = {n.casefold() for n in catalog}
         for st in self._classification.topics:
             if st.topic.name.casefold() not in catalog_keys:
                 catalog.append(st.topic.name)
                 catalog_keys.add(st.topic.name.casefold())
+
+        rows: list[AssignmentRow] = []
         for name in catalog:
             key = name.casefold()
-            assigned = key in on_session
-            suggested = assigned and on_session[key][2]
+            is_suggested = key in suggestion_id_by_key
+            is_accepted = key in accepted_keys
             rows.append(AssignmentRow(
-                name=name, assigned=assigned, suggested=suggested,
+                name=name,
+                assigned=is_accepted,
+                suggested=is_suggested,
             ))
-        rows.sort(key=lambda r: r.name.casefold())
+        # Sort: suggestions first (each group alphabetical). Python
+        # sorts False < True, so `not r.suggested` puts True-suggested
+        # rows (key=False) ahead of non-suggested rows (key=True).
+        rows.sort(key=lambda r: (not r.suggested, r.name.casefold()))
         return rows
 
     def _ensure_topics_popup(self) -> TopicsAssignmentPopup:

@@ -409,7 +409,13 @@ def _make_classification_with_topics(
 def test_bar_topics_popup_opens_with_session_state(qt_app):
     """The bar's Topics button opens the popup populated with
     the session's accepted + suggested + non-session catalog
-    items."""
+    items.
+
+    Suggestion rows now report ``assigned=False`` so the checkbox
+    stays unchecked until the user confirms (v0.7.8 followup --
+    the prior behaviour conflated "linked-but-unaccepted" with
+    "user-confirmed" inside the check state and misled the user).
+    """
     bar = ClassificationBar()
     try:
         cls = _make_classification_with_topics(
@@ -422,12 +428,57 @@ def test_bar_topics_popup_opens_with_session_state(qt_app):
         popup = bar._topics_popup  # noqa: SLF001
         assert popup is not None
         rows_by_name = {r.name: r for r in popup._rows}  # noqa: SLF001
+        # Accepted topic: checked + not flagged as suggestion.
         assert rows_by_name["backend"].assigned is True
         assert rows_by_name["backend"].suggested is False
-        assert rows_by_name["postgres"].assigned is True
+        # Suggestion: NOT checked (regression pin), but flagged so
+        # the popup renders the italic "(suggested)" badge.
+        assert rows_by_name["postgres"].assigned is False
         assert rows_by_name["postgres"].suggested is True
+        # Plain catalog entries: unchecked + not flagged.
         assert rows_by_name["frontend"].assigned is False
+        assert rows_by_name["frontend"].suggested is False
         assert rows_by_name["design"].assigned is False
+        assert rows_by_name["design"].suggested is False
+    finally:
+        bar.deleteLater()
+
+
+def test_bar_topics_popup_sorts_suggestions_first(qt_app):
+    """Suggestions appear at the top of the list (alphabetical),
+    then the rest of the catalog (alphabetical). A user scanning
+    after a fresh synthesis sees the candidate tags without
+    scrolling. Pinned because the sort key is a Python
+    ``(not r.suggested, r.name.casefold())`` tuple that's easy to
+    invert by accident."""
+    bar = ClassificationBar()
+    try:
+        cls = _make_classification_with_topics(
+            accepted=["alpha-accepted", "zulu-accepted"],
+            suggested=["bravo-suggested", "alpha-suggested"],
+        )
+        bar.set_known_lists(topics=[
+            "alpha-accepted",
+            "zulu-accepted",
+            "bravo-suggested",
+            "alpha-suggested",
+            "charlie-other",
+            "alpha-other",
+        ])
+        bar.set_session("sess-1", cls)
+        bar._on_topics_clicked()  # noqa: SLF001
+        popup = bar._topics_popup  # noqa: SLF001
+        order = [r.name for r in popup._rows]  # noqa: SLF001
+        # First: suggestions, alphabetized.
+        suggestion_names = [r.name for r in popup._rows if r.suggested]  # noqa: SLF001
+        assert suggestion_names == ["alpha-suggested", "bravo-suggested"]
+        # The first two rows ARE the suggestion rows -- top of list.
+        assert order[:2] == ["alpha-suggested", "bravo-suggested"]
+        # Then everything else, alphabetized.
+        non_suggestion_order = [r.name for r in popup._rows if not r.suggested]  # noqa: SLF001
+        assert non_suggestion_order == sorted(
+            non_suggestion_order, key=str.casefold,
+        )
     finally:
         bar.deleteLater()
 

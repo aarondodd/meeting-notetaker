@@ -957,13 +957,20 @@ def shot_topics_popup() -> None:
         TopicsAssignmentPopup,
     )
 
+    # Row layout mirrors ClassificationBar._build_topic_rows for
+    # v0.7.8: suggestions at the top (alpha within group, unchecked)
+    # so users can scan candidate tags first; then accepted topics
+    # (checked); then plain catalog entries (unchecked).
     po = TopicsAssignmentPopup()
     po.set_rows([
+        # Suggestions (alpha): unchecked + italic "(suggested)" badge.
+        AssignmentRow("PostgreSQL", assigned=False, suggested=True),
+        AssignmentRow("Vendor comparison", assigned=False, suggested=True),
+        # Accepted (alpha): checked.
         AssignmentRow("Acme Cloud", assigned=True),
         AssignmentRow("Backend migration", assigned=True),
         AssignmentRow("Beta Systems", assigned=True),
-        AssignmentRow("Vendor comparison", assigned=True, suggested=True),
-        AssignmentRow("PostgreSQL", assigned=True, suggested=True),
+        # Plain catalog entries (alpha): unchecked.
         AssignmentRow("Frontend"),
         AssignmentRow("Q3 hiring"),
         AssignmentRow("Q3 planning"),
