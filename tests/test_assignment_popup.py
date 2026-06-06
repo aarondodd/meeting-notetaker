@@ -331,6 +331,28 @@ def test_topics_popup_rows_use_native_checkable_flag(qt_app):
         po.close()
 
 
+def test_popup_slots_tolerate_none_item_pointer(qt_app):
+    """Regression: on Windows the indicator-click sequence fires
+    itemChanged synchronously, our handler used to call
+    _refresh_list inline (destroying the QListWidgetItem the
+    trailing itemClicked emit was about to reference), and PyQt6
+    delivered the trailing slot with a None wrapper -- crashing
+    on item.data() with 'NoneType has no attribute data'. The fix
+    defers the rebuild via QTimer.singleShot AND guards both
+    slots against None; this test pins the guard so a future
+    refactor that drops it surfaces here, not in production."""
+    po = TopicsAssignmentPopup()
+    po.set_rows([AssignmentRow("backend")])
+    try:
+        # Neither slot must crash with item=None. Equivalent to
+        # the trailing itemClicked emit after the rebuild destroyed
+        # the item the click started against.
+        po._on_item_clicked(None)  # noqa: SLF001
+        po._on_item_check_changed(None)  # noqa: SLF001
+    finally:
+        po.close()
+
+
 def test_topics_popup_indicator_click_path_emits_toggle(qt_app):
     """The user can click the checkbox indicator directly (Qt
     flips checkState and fires itemChanged) or anywhere on the

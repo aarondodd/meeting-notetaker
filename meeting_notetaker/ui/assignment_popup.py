@@ -44,7 +44,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from PyQt6.QtCore import QPoint, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QKeyEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -290,13 +290,23 @@ class _AssignmentPopupBase(QFrame):
         if not self._create_btn.isHidden():
             self._on_create_clicked()
 
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+    def _on_item_clicked(self, item: Optional[QListWidgetItem]) -> None:
         """A click anywhere on the row body. When the click landed
         on the indicator itself Qt already toggled checkState and
         fired itemChanged (handled in _on_item_check_changed). For
         a click on the text we have to do the toggle manually so
-        the user doesn't have to land precisely on the checkbox."""
-        if self._rebuild_guard:
+        the user doesn't have to land precisely on the checkbox.
+
+        Defensive: ``item`` can be ``None`` when Qt emits this
+        slot with a stale item pointer -- the indicator-click path
+        fires itemChanged first, our handler rebuilds the list (so
+        the C++ QListWidgetItem the click signal carries is
+        destroyed), and PyQt6 then routes the trailing itemClicked
+        emit with a None wrapper. The rebuild was the trigger, and
+        we now defer rebuilds via QTimer.singleShot so the emit
+        chain finishes against a stable list; this guard catches
+        any residual race + clicks on the empty area of the list."""
+        if self._rebuild_guard or item is None:
             return
         name = item.data(Qt.ItemDataRole.UserRole)
         if not name:
@@ -321,10 +331,11 @@ class _AssignmentPopupBase(QFrame):
         )
         item.setCheckState(new_state)
 
-    def _on_item_check_changed(self, item: QListWidgetItem) -> None:
+    def _on_item_check_changed(self, item: Optional[QListWidgetItem]) -> None:
         """itemChanged routes here. Guard against rebuild-induced
-        emits, then defer to the subclass _activate_row hook."""
-        if self._rebuild_guard:
+        emits + stale item pointers, then defer to the subclass
+        _activate_row hook."""
+        if self._rebuild_guard or item is None:
             return
         name = item.data(Qt.ItemDataRole.UserRole)
         if not name:
@@ -337,6 +348,19 @@ class _AssignmentPopupBase(QFrame):
         # Subclasses can further mutate (Series flips siblings off).
         row.assigned = item.checkState() == Qt.CheckState.Checked
         self._activate_row(row)
+
+    def _schedule_refresh(self) -> None:
+        """Defer ``_refresh_list`` to the next event-loop tick.
+
+        Calling _refresh_list directly from a click slot mutates
+        the QListWidget while Qt is still walking through that
+        click's emit chain. Items in flight get destroyed, and the
+        trailing itemClicked emit arrives with a None wrapper that
+        crashes the next slot in the chain. Deferring via
+        ``QTimer.singleShot(0, ...)`` lets the current emit chain
+        complete against the stable list before we rebuild it.
+        """
+        QTimer.singleShot(0, self._refresh_list)
 
     def _on_create_clicked(self) -> None:
         name = self._filter.text().strip()
@@ -380,10 +404,13 @@ class TopicsAssignmentPopup(_AssignmentPopupBase):
 
     def _activate_row(self, row: AssignmentRow) -> None:
         # _on_item_check_changed already flipped row.assigned via
-        # the item's checkState before calling us. Re-render the
-        # list so the visible state matches the model and emit
-        # the host signal.
-        self._refresh_list()
+        # the item's checkState before calling us. Defer the
+        # rebuild to the next tick so Qt's click emit chain
+        # finishes against the existing list (rebuilding mid-emit
+        # destroys items that trailing slots still hold a pointer
+        # to, which surfaced as an AttributeError crash on Windows
+        # -- see _on_item_clicked docstring).
+        self._schedule_refresh()
         self.toggle_requested.emit(row.name, row.assigned)
 
     def _create_new(self, name: str) -> None:
@@ -397,7 +424,7 @@ class TopicsAssignmentPopup(_AssignmentPopupBase):
         # Clear the filter so the created row is visible in the
         # refreshed list.
         self._filter.clear()
-        self._refresh_list()
+        self._schedule_refresh()
         self.toggle_requested.emit(name, True)
 
     def _make_item(self, row: AssignmentRow, filter_text: str) -> QListWidgetItem:
