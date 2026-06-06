@@ -406,6 +406,10 @@ class SessionController(QObject):
         self._active_recording_session: Optional[Session] = None
         self._mic_recorder = None
         self._loopback_recorder = None
+        # Hot-plug watcher for multi-endpoint mode (#85.6). Owns a
+        # QTimer-driven poll over the WASAPI output endpoint set;
+        # debounces flapping connectors before extending capture.
+        self._endpoint_watcher = None
         self._chunk_buffer: Optional[ChunkBuffer] = None
         self._workers: list[LiveTranscriptionWorker] = []
         self._t_start_wall: Optional[float] = None
@@ -582,6 +586,25 @@ class SessionController(QObject):
                 self._loopback_recorder = None
                 self.status.emit("PyAudioWPatch not installed; recording mic only.")
 
+            # Endpoint hot-plug watcher (#85.6). Only meaningful in
+            # multi-endpoint mode -- when a USB headset / monitor
+            # appears mid-call we extend capture to include it. Single-
+            # endpoint mode treats hot-plug as a no-op.
+            self._endpoint_watcher = None
+            if (
+                isinstance(self._loopback_recorder, MultiEndpointLoopbackRecorder)
+                and self._loopback_recorder is not None
+            ):
+                try:
+                    from .audio.endpoint_watcher import EndpointWatcher
+                except ImportError:
+                    EndpointWatcher = None
+                if EndpointWatcher is not None:
+                    self._endpoint_watcher = EndpointWatcher(parent=self)
+                    self._endpoint_watcher.endpoints_changed.connect(
+                        self._on_endpoints_changed
+                    )
+
             if self._loopback_recorder is not None:
                 self._loopback_recorder.error.connect(self.error.emit)
                 # Tag warnings with session id so the app correlates
@@ -602,9 +625,17 @@ class SessionController(QObject):
                 )
                 try:
                     self._loopback_recorder.start()
+                    if self._endpoint_watcher is not None:
+                        self._endpoint_watcher.start()
                 except LoopbackUnavailable as exc:
                     log.warning("loopback unavailable: %s", exc)
                     self._loopback_recorder = None
+                    if self._endpoint_watcher is not None:
+                        try:
+                            self._endpoint_watcher.stop()
+                        except Exception:
+                            log.exception("endpoint watcher stop after loopback fail")
+                        self._endpoint_watcher = None
                     self.status.emit("System-audio loopback unavailable; recording mic only.")
 
             self._t_start_wall = time.monotonic()
@@ -764,6 +795,12 @@ class SessionController(QObject):
                 self._loopback_recorder.stop()
         except Exception:
             log.exception("loopback stop failed")
+        try:
+            if self._endpoint_watcher is not None:
+                self._endpoint_watcher.stop()
+                self._endpoint_watcher = None
+        except Exception:
+            log.exception("endpoint watcher stop failed")
 
         # Stop live workers (drains remaining ChunkBuffer).
         for worker in self._workers:
@@ -1241,6 +1278,25 @@ class SessionController(QObject):
             )
         log.info("loopback silence_detected for %s: %s", session_id, msg)
         self.capture_warning.emit(session_id, msg)
+
+    # ---- hot-plug endpoint changes (#85.6) ------------------------------
+
+    def _on_endpoints_changed(self, change) -> None:
+        """Forward an endpoint-set change to the multi-endpoint
+        orchestrator. Only the `added` set drives action -- a removed
+        endpoint stays in the capture set so its tail silence is
+        captured + padded at finalize (the sub-recorder will detect
+        the device gone via stalled callbacks and warn through the
+        existing capture_warning path)."""
+        from .audio.multi_loopback import MultiEndpointLoopbackRecorder
+        if not isinstance(self._loopback_recorder, MultiEndpointLoopbackRecorder):
+            return
+        for name in change.added:
+            ok = self._loopback_recorder.extend_to_endpoint(name)
+            log.info(
+                "controller: hot-plug extend_to_endpoint(%r) -> %s",
+                name, ok,
+            )
 
     def _on_loopback_silence_cleared(self, session_id: str) -> None:
         """The loopback callback started receiving above-floor audio

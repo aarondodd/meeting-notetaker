@@ -361,6 +361,67 @@ class MultiEndpointLoopbackRecorder(QObject):
         self._sub_silence_state = {}
         self.stopped.emit()
 
+    # ---- hot-plug extension (#85.6) ------------------------------------
+
+    def extend_to_endpoint(self, endpoint_name: str) -> bool:
+        """Open a new sub-recorder for an endpoint that appeared mid-call.
+
+        Looks up the named endpoint in the current device list, opens
+        a LoopbackRecorder pointed at it, wires the same signal
+        bridging the constructor does for the start() set, and starts
+        it. Returns True on success.
+
+        Idempotent: if the endpoint is already in the active capture
+        set (by name), the call is a no-op.
+
+        Failure modes (endpoint not found, probe failure, open
+        rejection) are logged but not raised; the orchestrator keeps
+        whatever sub-recorders it already has.
+        """
+        if not self._is_recording:
+            return False
+        active_names = {sub.device_name for sub in self._sub_recorders}
+        if endpoint_name in active_names:
+            return True
+        endpoints = discover_output_endpoints()
+        target = next((ep for ep in endpoints if ep["name"] == endpoint_name), None)
+        if target is None:
+            log.info(
+                "extend_to_endpoint: %r not found in current device list",
+                endpoint_name,
+            )
+            return False
+        idx = len(self._sub_recorders)
+        sidecar = self._sidecar_path(idx)
+        sub = LoopbackRecorder(
+            chunk_buffer=None,
+            wav_path=sidecar,
+            source_name=f"{self.source_name}.{idx}",
+            device_name=endpoint_name,
+        )
+        sub.error.connect(lambda msg: self.error.emit(msg))
+        sub.capture_warning.connect(lambda msg: self.capture_warning.emit(msg))
+        sub.silence_detected.connect(
+            lambda s=sub: self._on_sub_silence_detected(s)
+        )
+        sub.silence_cleared.connect(
+            lambda s=sub: self._on_sub_silence_cleared(s)
+        )
+        try:
+            sub.start()
+        except Exception:
+            log.exception("extend_to_endpoint: failed to open %r", endpoint_name)
+            return False
+        self._sub_recorders.append(sub)
+        self._sidecar_paths.append(sidecar)
+        self._sub_silence_state[id(sub)] = False
+        log.info(
+            "MultiEndpointLoopbackRecorder: extended capture to %r "
+            "(now %d endpoints)",
+            endpoint_name, len(self._sub_recorders),
+        )
+        return True
+
     # ---- aggregate silence routing -------------------------------------
 
     def _on_sub_silence_detected(self, sub: LoopbackRecorder) -> None:
