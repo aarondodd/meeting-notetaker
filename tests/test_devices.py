@@ -5,7 +5,11 @@ is covered here.
 """
 from __future__ import annotations
 
-from meeting_notetaker.audio.devices import AudioDevice, resolve_device_index
+from meeting_notetaker.audio.devices import (
+    AudioDevice,
+    probe_input_device,
+    resolve_device_index,
+)
 
 
 def _dev(idx: int, name: str) -> AudioDevice:
@@ -67,3 +71,69 @@ def test_match_against_first_when_multiple_substring_candidates():
         _dev(1, "Microphone Array (Intel)"),
     ]
     assert resolve_device_index("Microphone", devices) == 0
+
+
+# ---- probe_input_device --------------------------------------------------
+
+class _FakePa:
+    """Minimal pyaudio.PyAudio stand-in. Records the calls so the test
+    can assert what the probe asked, and configurable to fail.
+    """
+    paInt16 = 8
+
+    def __init__(self, *, fail_with: Exception | None = None,
+                 result_for: dict | None = None) -> None:
+        self.fail_with = fail_with
+        self.result_for = result_for or {}
+        self.calls: list[dict] = []
+
+    def is_format_supported(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail_with is not None:
+            raise self.fail_with
+        idx = kwargs.get("input_device")
+        return self.result_for.get(idx, True)
+
+
+def test_probe_returns_true_when_format_supported():
+    pa = _FakePa()
+    info = {"index": 3, "name": "Speakers", "defaultSampleRate": 48000,
+            "maxInputChannels": 2}
+    assert probe_input_device(pa, info) is True
+    assert pa.calls == [
+        {"rate": 48000, "input_device": 3, "input_channels": 2,
+         "input_format": _FakePa.paInt16}
+    ]
+
+
+def test_probe_returns_false_on_exception():
+    pa = _FakePa(fail_with=OSError("Device is invalid"))
+    info = {"index": 9, "name": "Ghost Speakers", "defaultSampleRate": 48000,
+            "maxInputChannels": 2}
+    assert probe_input_device(pa, info) is False
+
+
+def test_probe_returns_false_on_falsy_result():
+    pa = _FakePa(result_for={5: False})
+    info = {"index": 5, "name": "Disabled Speakers", "defaultSampleRate": 44100,
+            "maxInputChannels": 2}
+    assert probe_input_device(pa, info) is False
+
+
+def test_probe_fills_defaults_when_metadata_missing():
+    """Defunct endpoints sometimes report 0 channels / 0 rate. The probe
+    falls back to safe defaults (48 kHz, mono) so it still exercises
+    PortAudio rather than crashing on an arithmetic-on-zero error."""
+    pa = _FakePa()
+    info = {"index": 0, "name": "Weird Device"}
+    assert probe_input_device(pa, info) is True
+    assert pa.calls[0]["rate"] == 48000
+    assert pa.calls[0]["input_channels"] == 1
+
+
+def test_probe_explicit_channels_override():
+    pa = _FakePa()
+    info = {"index": 0, "name": "Stereo", "defaultSampleRate": 48000,
+            "maxInputChannels": 2}
+    probe_input_device(pa, info, channels=1)
+    assert pa.calls[0]["input_channels"] == 1

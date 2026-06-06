@@ -128,7 +128,15 @@ class LoopbackRecorder(QObject):
         If `saved_name` is set, prefer the loopback whose name matches
         (exact, then case-insensitive substring). Otherwise return the
         loopback paired with the system default output.
+
+        Substring matches are probed via `probe_input_device` before
+        being returned. A stale endpoint that survives in PortAudio's
+        enumeration after a Windows topology change can pass the name
+        comparison but reject stream creation; the probe fails the
+        match and the lookup falls through to the default-output
+        loopback instead of locking onto a ghost device.
         """
+        from .devices import probe_input_device
         try:
             import pyaudiowpatch as pyaudio
         except ImportError:
@@ -142,19 +150,32 @@ class LoopbackRecorder(QObject):
                 for loopback in pa.get_loopback_device_info_generator():
                     name = str(loopback.get("name", ""))
                     if name == target:
-                        return loopback
+                        if probe_input_device(pa, loopback):
+                            return loopback
+                        log.warning(
+                            "exact-match loopback %r failed probe; falling through",
+                            name,
+                        )
+                        break
                     if substring_match is None and target_lower and target_lower in name.lower():
                         substring_match = loopback
                 if substring_match is not None:
-                    log.info(
-                        "picked loopback device (substring match for saved %r): %s",
-                        saved_name, substring_match.get("name", "?"),
+                    if probe_input_device(pa, substring_match):
+                        log.info(
+                            "picked loopback device (substring match for saved %r): %s",
+                            saved_name, substring_match.get("name", "?"),
+                        )
+                        return substring_match
+                    log.warning(
+                        "substring-match loopback %r failed probe (saved %r is stale); "
+                        "falling back to default-output loopback",
+                        substring_match.get("name", "?"), saved_name,
                     )
-                    return substring_match
-                log.warning(
-                    "saved loopback device %r not found; falling back to default-output loopback",
-                    saved_name,
-                )
+                else:
+                    log.warning(
+                        "saved loopback device %r not found; falling back to default-output loopback",
+                        saved_name,
+                    )
 
             wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
             default_speakers = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])

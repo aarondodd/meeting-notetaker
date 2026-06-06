@@ -86,6 +86,44 @@ def list_input_devices() -> list[AudioDevice]:
     return out
 
 
+def probe_input_device(
+    pa, device_info: dict, *, channels: Optional[int] = None,
+) -> bool:
+    """Return True if the device is currently openable as an input stream.
+
+    Used to guard against locking onto a "ghost" endpoint that's still
+    enumerated by Windows after a topology change (sleep/wake, USB
+    replug, monitor power cycle). A substring saved-name match can pick
+    a stale device whose entry survives in PortAudio's device list but
+    whose underlying endpoint no longer accepts streams; the recorder
+    binds successfully, then captures nothing.
+
+    The probe uses `pa.is_format_supported` -- it is metadata-level
+    (no PCM flows yet), but exercises enough of the WASAPI session
+    creation path that defunct endpoints reject it. Any exception or
+    falsy return means "do not use."
+    """
+    try:
+        rate = int(device_info.get("defaultSampleRate") or 0) or 48000
+        ch = channels if channels is not None else int(
+            device_info.get("maxInputChannels") or 0
+        ) or 1
+        idx = int(device_info.get("index") or 0)
+        ok = pa.is_format_supported(
+            rate=rate,
+            input_device=idx,
+            input_channels=ch,
+            input_format=getattr(pa, "paInt16", 8),
+        )
+        return bool(ok)
+    except Exception as exc:
+        log.info(
+            "probe_input_device: %s rejected by is_format_supported (%s)",
+            device_info.get("name", "?"), exc,
+        )
+        return False
+
+
 def list_loopback_devices() -> list[AudioDevice]:
     """Enumerate WASAPI loopback devices via pyaudiowpatch.
 
