@@ -571,6 +571,17 @@ class SessionController(QObject):
                 self._loopback_recorder.capture_warning.connect(
                     lambda msg, sid=lb_session_id: self.capture_warning.emit(sid, msg)
                 )
+                # Mid-recording silence detector (#84). When the
+                # rolling RMS stays below floor for the tracker's full
+                # window, cross-reference with audio_session_monitor
+                # so the banner can name the meeting app that's
+                # producing audio elsewhere.
+                self._loopback_recorder.silence_detected.connect(
+                    lambda sid=lb_session_id: self._on_loopback_silence_detected(sid)
+                )
+                self._loopback_recorder.silence_cleared.connect(
+                    lambda sid=lb_session_id: self._on_loopback_silence_cleared(sid)
+                )
                 try:
                     self._loopback_recorder.start()
                 except LoopbackUnavailable as exc:
@@ -1165,6 +1176,62 @@ class SessionController(QObject):
         self._sys_wav = None
         if error:
             self._live_segments = []
+
+    # ---- mid-recording silence detection (#84) --------------------------
+
+    def _on_loopback_silence_detected(self, session_id: str) -> None:
+        """The loopback's rolling-window RMS dropped below floor for the
+        full window. Compose a user-facing message that names a meeting
+        app currently rendering audio elsewhere, if one is active --
+        that is the diagnostic the user needs to know which knob to
+        change (Teams output device, Windows default, recorder
+        endpoint). Falls back to a generic copy when no cross-reference
+        signal is available."""
+        try:
+            from .integrations import audio_session_monitor
+            sessions = audio_session_monitor.enumerate_active_sessions()
+        except Exception:
+            log.exception("audio_session_monitor lookup failed during silence event")
+            sessions = []
+        # Filter to known meeting apps; the rest aren't load-bearing
+        # for the user-facing diagnosis (a YouTube tab playing music
+        # elsewhere is noise, not signal).
+        try:
+            from .integrations.audio_session_monitor import (
+                DEFAULT_APP_ALLOWLIST,
+                display_name_for,
+            )
+            allow = {a.lower() for a in DEFAULT_APP_ALLOWLIST}
+            meeting_apps = sorted({
+                display_name_for(s.process_name)
+                for s in sessions
+                if s.process_name.lower() in allow
+            })
+        except Exception:
+            meeting_apps = []
+        if meeting_apps:
+            apps_label = ", ".join(meeting_apps)
+            msg = (
+                f"System audio appears silent for the past 30 seconds, but "
+                f"{apps_label} is rendering audio. The recorder may be "
+                f"bound to a different output device. Check your meeting "
+                f"app's output device in its audio settings."
+            )
+        else:
+            msg = (
+                "System audio appears silent for the past 30 seconds. If "
+                "you expect audio to be playing, check the output device "
+                "in your meeting app's audio settings."
+            )
+        log.info("loopback silence_detected for %s: %s", session_id, msg)
+        self.capture_warning.emit(session_id, msg)
+
+    def _on_loopback_silence_cleared(self, session_id: str) -> None:
+        """The loopback callback started receiving above-floor audio
+        again. Used today for log diagnostics; SessionView's banner
+        is one-shot (the user can dismiss the warning manually) so we
+        don't auto-clear from here."""
+        log.info("loopback silence_cleared for %s", session_id)
 
     # ---- live segment routing ---------------------------------------------
 

@@ -35,3 +35,4 @@ Thumbs.db
 # Local-only ad-hoc fixtures
 tests/data/private/
 Output/
+experiments/
