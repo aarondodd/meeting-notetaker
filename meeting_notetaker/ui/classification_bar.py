@@ -197,10 +197,13 @@ class ClassificationBar(QWidget):
         state misled the user (#82 followup, v0.7.8); the badge
         carries the suggestion semantic on its own.
 
-        Sort: suggestions alphabetical first, then everything
-        else alphabetical. A user scanning the popup after a fresh
-        synthesis sees the candidate tags at the top without
-        scrolling through the full catalog.
+        Sort (three buckets, alphabetical within each):
+          1. Currently assigned (accepted) topics
+          2. Suggestions
+          3. The rest of the catalog
+        The list doubles as an "at a glance" view of what's already
+        on the session AND the place to add/accept more, so the
+        confirmed picks belong at the top.
 
         Topics that aren't on the session and aren't suggestions
         appear with ``assigned=False, suggested=False`` -- clicking
@@ -239,10 +242,15 @@ class ClassificationBar(QWidget):
                 assigned=is_accepted,
                 suggested=is_suggested,
             ))
-        # Sort: suggestions first (each group alphabetical). Python
-        # sorts False < True, so `not r.suggested` puts True-suggested
-        # rows (key=False) ahead of non-suggested rows (key=True).
-        rows.sort(key=lambda r: (not r.suggested, r.name.casefold()))
+        # Bucket: 0 = assigned (top), 1 = suggested (middle),
+        # 2 = neither (bottom). Within each bucket, alphabetical.
+        def _bucket(r: AssignmentRow) -> int:
+            if r.assigned:
+                return 0
+            if r.suggested:
+                return 1
+            return 2
+        rows.sort(key=lambda r: (_bucket(r), r.name.casefold()))
         return rows
 
     def _ensure_topics_popup(self) -> TopicsAssignmentPopup:

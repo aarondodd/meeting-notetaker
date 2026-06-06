@@ -444,13 +444,13 @@ def test_bar_topics_popup_opens_with_session_state(qt_app):
         bar.deleteLater()
 
 
-def test_bar_topics_popup_sorts_suggestions_first(qt_app):
-    """Suggestions appear at the top of the list (alphabetical),
-    then the rest of the catalog (alphabetical). A user scanning
-    after a fresh synthesis sees the candidate tags without
-    scrolling. Pinned because the sort key is a Python
-    ``(not r.suggested, r.name.casefold())`` tuple that's easy to
-    invert by accident."""
+def test_bar_topics_popup_sorts_assigned_then_suggested_then_rest(qt_app):
+    """Three-bucket sort: currently assigned (accepted) topics at
+    the top, then suggestions, then the rest of the catalog.
+    Alphabetical within each bucket. The list serves both as a
+    quick "what's on this session" view AND the assignment surface,
+    so the confirmed picks belong at the top (v0.7.8 followup --
+    the prior pin only sorted suggestions to the top)."""
     bar = ClassificationBar()
     try:
         cls = _make_classification_with_topics(
@@ -469,16 +469,21 @@ def test_bar_topics_popup_sorts_suggestions_first(qt_app):
         bar._on_topics_clicked()  # noqa: SLF001
         popup = bar._topics_popup  # noqa: SLF001
         order = [r.name for r in popup._rows]  # noqa: SLF001
-        # First: suggestions, alphabetized.
-        suggestion_names = [r.name for r in popup._rows if r.suggested]  # noqa: SLF001
-        assert suggestion_names == ["alpha-suggested", "bravo-suggested"]
-        # The first two rows ARE the suggestion rows -- top of list.
-        assert order[:2] == ["alpha-suggested", "bravo-suggested"]
-        # Then everything else, alphabetized.
-        non_suggestion_order = [r.name for r in popup._rows if not r.suggested]  # noqa: SLF001
-        assert non_suggestion_order == sorted(
-            non_suggestion_order, key=str.casefold,
-        )
+        # Bucket 1: assigned (accepted), alphabetized.
+        assert order[:2] == ["alpha-accepted", "zulu-accepted"]
+        # Bucket 2: suggestions, alphabetized.
+        assert order[2:4] == ["alpha-suggested", "bravo-suggested"]
+        # Bucket 3: the rest, alphabetized.
+        assert order[4:] == ["alpha-other", "charlie-other"]
+        # Bucket assignments line up with the assigned/suggested
+        # flags so the visible state (checked / italic-suggested /
+        # plain) matches the row's group.
+        rows_by_name = {r.name: r for r in popup._rows}  # noqa: SLF001
+        assert rows_by_name["alpha-accepted"].assigned is True
+        assert rows_by_name["alpha-suggested"].suggested is True
+        assert rows_by_name["alpha-suggested"].assigned is False
+        assert rows_by_name["alpha-other"].assigned is False
+        assert rows_by_name["alpha-other"].suggested is False
     finally:
         bar.deleteLater()
 
