@@ -62,6 +62,32 @@ def test_load_unsupported_extension(tmp_path):
     assert exc_info.value.suggest_paste is True
 
 
+def test_load_accepts_vtt_srt_and_json_extensions(tmp_path):
+    """Regression: the v0.7.8 file picker advertises .vtt / .srt /
+    .json but the reader's extension allowlist was never extended
+    to match -- clicking 'From file...' on any of those reported
+    'Unsupported file type' even though clipboard paste of the
+    same body worked fine. The reader now treats them as text-mode
+    reads; the format-aware dialog parses on top of the loaded
+    body."""
+    vtt_path = tmp_path / "sample.vtt"
+    vtt_body = (
+        "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\n<v Spk>Hello</v>\n"
+    )
+    vtt_path.write_text(vtt_body, encoding="utf-8")
+    assert load_transcript_from_file(vtt_path) == vtt_body
+
+    srt_path = tmp_path / "sample.srt"
+    srt_body = "1\n00:00:00,000 --> 00:00:03,000\nHello\n"
+    srt_path.write_text(srt_body, encoding="utf-8")
+    assert load_transcript_from_file(srt_path) == srt_body
+
+    json_path = tmp_path / "sample.json"
+    json_body = '{"segments": [{"start": 0.0, "end": 1.0, "text": "Hi"}]}'
+    json_path.write_text(json_body, encoding="utf-8")
+    assert load_transcript_from_file(json_path) == json_body
+
+
 def test_load_docx_missing_dep_surfaces_paste_hint(tmp_path):
     """If python-docx isn't installed (likely in test env), the error
     message must steer the user to the paste path rather than dying."""

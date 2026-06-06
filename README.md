@@ -9,7 +9,7 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.7. End-to-end capture, transcription, synthesis,
+> **Status:** v0.7.8-dev. End-to-end capture, transcription, synthesis,
 > screen capture, retained-audio playback + export, and transcript-
 > synchronized playback all working. v0.7.6 adds Notion and Confluence
 > as save-to destinations alongside PDF (with a Verify-gated picker
@@ -46,6 +46,44 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.8
+
+- **Structured-format transcript import.** The Import Transcript
+  dialog now recognizes WebVTT (`.vtt`), SubRip (`.srt`), and
+  Whisper JSON in addition to plain text / Markdown / `.docx`.
+  A Format dropdown above the preview pane defaults to
+  Auto-detect (file-extension hint plus content sniff) and lets
+  the user override when detection misfires. Structured formats
+  parse into timestamped cues and render as
+  `[HH:MM:SS] Speaker: text` -- the same shape the player uses
+  for click-to-seek + position highlighting, so importing a VTT
+  alongside an audio file unlocks playback sync the same way a
+  locally-recorded session does. The "Strip Teams formatting"
+  toggle only applies in Plain mode; structured formats handle
+  their own cleanup. Voice tags (`<v Speaker>text</v>`) and
+  leading "Name: " prefixes both contribute speaker attribution.
+
+  ![Import Transcript with VTT input](docs/screenshots/36-dialog-import-transcript-vtt.png)
+
+- **Typeahead pickers for Topics + Series (#82).** The
+  classification chips on the right pane replace their legacy
+  widgets with a unified GitHub-label-style popup. The Topics
+  picker is multi-select: clicking a row toggles assignment and
+  the popup stays open, so adding several topics is one open +
+  multiple clicks + Escape (the v0.7.7 QMenu closed after every
+  click, forcing a re-open per topic). Suggestion state is
+  visually distinct via a "(suggested)" badge on the row rather
+  than a separate accept/reject pair, and clicking a suggestion
+  confirms it via accept rather than re-adding it. The Series
+  picker is single-select with a pinned "(none)" sentinel at the
+  top; one click sets and dismisses. Both pickers carry a filter
+  input that doubles as the "+ Create '...'" affordance when the
+  typed text doesn't match an existing entry.
+
+  ![Topics typeahead popup](docs/screenshots/34-popup-topics-typeahead.png)
+
+  ![Series typeahead popup](docs/screenshots/35-popup-series-typeahead.png)
 
 ## What's new in v0.7.7
 

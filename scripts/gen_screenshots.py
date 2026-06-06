@@ -948,6 +948,66 @@ def shot_integrations_picker() -> None:
     dlg.close()
 
 
+def shot_topics_popup() -> None:
+    """v0.7.8 typeahead Topics popup (#82). Pre-seeds with a mix of
+    accepted, suggested, and catalog-only topics so the screenshot
+    shows the multi-state visual treatment."""
+    from meeting_notetaker.ui.assignment_popup import (
+        AssignmentRow,
+        TopicsAssignmentPopup,
+    )
+
+    # Row layout mirrors ClassificationBar._build_topic_rows for
+    # v0.7.8: accepted topics at the top so the list doubles as
+    # a "what's on this session" view, then suggestions (italic +
+    # badge, unchecked), then plain catalog entries. Alphabetical
+    # within each bucket.
+    po = TopicsAssignmentPopup()
+    po.set_rows([
+        # Accepted (alpha): checked.
+        AssignmentRow("Acme Cloud", assigned=True),
+        AssignmentRow("Backend migration", assigned=True),
+        AssignmentRow("Beta Systems", assigned=True),
+        # Suggestions (alpha): unchecked + italic "(suggested)" badge.
+        AssignmentRow("PostgreSQL", assigned=False, suggested=True),
+        AssignmentRow("Vendor comparison", assigned=False, suggested=True),
+        # Plain catalog entries (alpha): unchecked.
+        AssignmentRow("Frontend"),
+        AssignmentRow("Q3 hiring"),
+        AssignmentRow("Q3 planning"),
+        AssignmentRow("Roadmap"),
+        AssignmentRow("Vendor evaluation"),
+    ])
+    po.resize(340, 360)
+    po.show()
+    QApplication.processEvents()
+    _grab(po, "34-popup-topics-typeahead.png", autosize=False)
+    po.close()
+
+
+def shot_series_popup() -> None:
+    """v0.7.8 typeahead Series popup (#82). Single-select variant
+    with the "(none)" sentinel + current pick rendered with the
+    filled radio dot."""
+    from meeting_notetaker.ui.assignment_popup import SeriesAssignmentPopup
+
+    po = SeriesAssignmentPopup()
+    po.set_rows_and_current(
+        [
+            "Daily Standup",
+            "Platform Architecture Review",
+            "Q3 Planning",
+            "Weekly 1:1 with Manager",
+        ],
+        current="Weekly 1:1 with Manager",
+    )
+    po.resize(340, 320)
+    po.show()
+    QApplication.processEvents()
+    _grab(po, "35-popup-series-typeahead.png", autosize=False)
+    po.close()
+
+
 def shot_notes_popout() -> None:
     """v0.7.7 pop-out preview window for screen-share. Pre-seeds a
     realistic My Notes body so the screenshot shows what audience
@@ -1029,6 +1089,39 @@ def shot_import_transcript_dialog() -> None:
     dlg.close()
 
 
+def shot_import_transcript_vtt() -> None:
+    """v0.7.8 Import Transcript dialog with a VTT input. Shows the
+    Format dropdown auto-detected to WebVTT and the preview
+    rendered as the player-friendly [HH:MM:SS] Speaker: text shape
+    (#80 followup, v0.7.8)."""
+    from meeting_notetaker.ui.import_transcript_dialog import (
+        ImportTranscriptDialog,
+    )
+
+    vtt = (
+        "WEBVTT\n"
+        "\n"
+        "00:00:00.000 --> 00:00:03.500\n"
+        "<v Jane Smith>Welcome everyone. Let's start with the roadmap update.</v>\n"
+        "\n"
+        "00:00:03.500 --> 00:00:08.000\n"
+        "<v Aaron Dodd>Sounds good. I'll share the deck.</v>\n"
+        "\n"
+        "00:00:08.000 --> 00:00:14.500\n"
+        "<v Jane Smith>Great. Walk us through the Q3 milestones.</v>\n"
+        "\n"
+        "00:00:14.500 --> 00:00:21.000\n"
+        "<v Aaron Dodd>Q3 lands the platform migration and the vendor comparison memo.</v>\n"
+    )
+    dlg = ImportTranscriptDialog(session_title="Q3 Platform Sync")
+    dlg.set_initial_body(vtt)
+    dlg.resize(900, 660)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "36-dialog-import-transcript-vtt.png", autosize=False)
+    dlg.close()
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1063,6 +1156,10 @@ def main() -> int:
     shot_import_transcript_dialog()
     shot_notes_popout()
     shot_settings_fonts()
+    # v0.7.8 surfaces (#82 + transcript format support).
+    shot_topics_popup()
+    shot_series_popup()
+    shot_import_transcript_vtt()
     print("done.")
     return 0
 
