@@ -59,7 +59,9 @@ class SegmentState:
     """Drives one StatusSegment widget."""
 
     color: str = "gray"
-    # Short label that always shows -- e.g. "Mic", "Cal", "Syn".
+    # Short label that always shows -- e.g. "Calendar", "Synthesis",
+    # "Meeting Detect", "Voiceprint". 1-2 words; cryptic 3-letter
+    # abbreviations are no longer used.
     short_label: str = ""
     # Optional payload after the short label -- e.g. device name (Mic)
     # or count (Spk). Empty string means "label only, no payload".

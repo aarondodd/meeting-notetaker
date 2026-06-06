@@ -5244,7 +5244,7 @@ class MainApp(QObject):
             if running:
                 return SegmentState(
                     color="green",
-                    short_label="Cal",
+                    short_label="Calendar",
                     tooltip=(
                         f"Watching Outlook calendar; notifying within "
                         f"+- {self.config.calendar.window_minutes} min of "
@@ -5253,7 +5253,7 @@ class MainApp(QObject):
                 )
             return SegmentState(
                 color="yellow",
-                short_label="Cal",
+                short_label="Calendar",
                 tooltip=(
                     "Calendar watching is enabled but the monitor is not "
                     "running. Try toggling it off and on in Settings."
@@ -5261,7 +5261,7 @@ class MainApp(QObject):
             )
         return SegmentState(
             color="red",
-            short_label="Cal",
+            short_label="Calendar",
             tooltip=(
                 "Calendar watching is enabled, but Outlook (or pywin32) is "
                 "not reachable. Help > Diagnose Outlook... reports which "
@@ -5282,7 +5282,7 @@ class MainApp(QObject):
         state = self._synth_state
         return SegmentState(
             color=state.dot_color(),
-            short_label="Syn",
+            short_label="Synthesis",
             tooltip=state.status_tooltip(),
         )
 
@@ -5297,7 +5297,7 @@ class MainApp(QObject):
         if not audio_session_monitor.is_available():
             return SegmentState(
                 color="red",
-                short_label="Det",
+                short_label="Meeting Detect",
                 tooltip=(
                     "Ad-hoc meeting detection is enabled, but pycaw / "
                     "psutil are not importable. Install them in this "
@@ -5309,7 +5309,7 @@ class MainApp(QObject):
             allowlist_size = len(self.config.detection.app_allowlist)
             return SegmentState(
                 color="green",
-                short_label="Det",
+                short_label="Meeting Detect",
                 tooltip=(
                     f"Watching system audio for {allowlist_size} known "
                     f"meeting app(s); prompting after audio sustains "
@@ -5318,7 +5318,7 @@ class MainApp(QObject):
             )
         return SegmentState(
             color="yellow",
-            short_label="Det",
+            short_label="Meeting Detect",
             tooltip=(
                 "Ad-hoc meeting detection is enabled but the monitor is "
                 "not running. Try toggling it off and on in Settings."
