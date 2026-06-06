@@ -123,11 +123,11 @@ def test_topics_popup_stays_open_after_toggle(qt_app):
     try:
         # Activate the first row.
         po._list.setCurrentRow(0)  # noqa: SLF001
-        po._on_item_activated(po._list.item(0))  # noqa: SLF001
+        po._on_item_clicked(po._list.item(0))  # noqa: SLF001
         # Popup is still visible after the toggle.
         assert po.isVisible() is True
         # And the second toggle still works without re-opening.
-        po._on_item_activated(po._list.item(1))  # noqa: SLF001
+        po._on_item_clicked(po._list.item(1))  # noqa: SLF001
         assert po.isVisible() is True
         assert len(captured) == 2
     finally:
@@ -144,10 +144,10 @@ def test_topics_popup_toggle_flips_assigned_state(qt_app):
     captured: list[tuple[str, bool]] = []
     po.toggle_requested.connect(lambda n, a: captured.append((n, a)))
     try:
-        po._on_item_activated(po._list.item(0))  # noqa: SLF001
+        po._on_item_clicked(po._list.item(0))  # noqa: SLF001
         assert captured == [("backend", True)]
         # Second click toggles off.
-        po._on_item_activated(po._list.item(0))  # noqa: SLF001
+        po._on_item_clicked(po._list.item(0))  # noqa: SLF001
         assert captured == [("backend", True), ("backend", False)]
     finally:
         po.close()
@@ -224,7 +224,7 @@ def test_series_popup_close_then_emit_on_pick(qt_app):
             i for i in range(po._list.count())  # noqa: SLF001
             if po._list.item(i).data(Qt.ItemDataRole.UserRole) == "Daily Standup"  # noqa: SLF001
         )
-        po._on_item_activated(po._list.item(target))  # noqa: SLF001
+        po._on_item_clicked(po._list.item(target))  # noqa: SLF001
         qt_app.processEvents()
         assert captured == ["Daily Standup"]
         # Popup closes itself before emit.
@@ -242,7 +242,7 @@ def test_series_popup_none_sentinel_emits_empty_string(qt_app):
     po.series_chosen.connect(lambda n: captured.append(n))
     try:
         # (none) is at index 0 with name == SeriesAssignmentPopup.NONE_SENTINEL.
-        po._on_item_activated(po._list.item(0))  # noqa: SLF001
+        po._on_item_clicked(po._list.item(0))  # noqa: SLF001
         assert captured == [""]
     finally:
         po.close()
@@ -266,21 +266,90 @@ def test_series_popup_create_from_typed_text(qt_app):
         po.close()
 
 
-def test_series_popup_current_pick_marked_with_radio_dot(qt_app):
-    """Visual contract: the current series row renders with "(*) "
-    prefix; others with "( ) ". Pins the single-select treatment."""
+def test_series_popup_current_pick_marked_via_check_state(qt_app):
+    """Visual contract (v0.7.8 followup): single-select rows carry
+    native Qt CheckState. The current pick is Checked; others are
+    Unchecked. A custom delegate paints a radio button at the
+    indicator position (visual smoke is its own concern; this test
+    pins the model contract the click handlers and the delegate
+    both key off)."""
     po = SeriesAssignmentPopup()
     po.set_rows_and_current(["A", "B", "C"], current="B")
     try:
-        rendered = [
-            po._list.item(i).text()  # noqa: SLF001
+        states = {
+            po._list.item(i).data(Qt.ItemDataRole.UserRole):  # noqa: SLF001
+                po._list.item(i).checkState()  # noqa: SLF001
             for i in range(po._list.count())  # noqa: SLF001
-        ]
-        # Find the row for "B" and confirm it has the filled marker.
-        b_row = next(t for t in rendered if t.endswith(" B"))
-        assert b_row.startswith("(*) ")
-        a_row = next(t for t in rendered if t.endswith(" A"))
-        assert a_row.startswith("( ) ")
+        }
+        # "B" is the current pick; checked. "A", "C", and the
+        # "(none)" sentinel are unchecked.
+        assert states["B"] == Qt.CheckState.Checked
+        assert states["A"] == Qt.CheckState.Unchecked
+        assert states["C"] == Qt.CheckState.Unchecked
+        assert states[po.NONE_SENTINEL] == Qt.CheckState.Unchecked
+        # All rows are checkable (regardless of state); the delegate
+        # paints the indicator as a radio button.
+        for i in range(po._list.count()):  # noqa: SLF001
+            flags = po._list.item(i).flags()  # noqa: SLF001
+            assert bool(flags & Qt.ItemFlag.ItemIsUserCheckable)
+    finally:
+        po.close()
+
+
+def test_topics_popup_rows_use_native_checkable_flag(qt_app):
+    """Multi-select rows are checkable items so Qt renders a real
+    native checkbox at the indicator position. Assigned rows are
+    Checked; unassigned are Unchecked."""
+    po = TopicsAssignmentPopup()
+    po.set_rows([
+        AssignmentRow("backend", assigned=True),
+        AssignmentRow("frontend", assigned=False),
+        AssignmentRow("postgres", assigned=True, suggested=True),
+    ])
+    try:
+        for i in range(po._list.count()):  # noqa: SLF001
+            item = po._list.item(i)  # noqa: SLF001
+            assert bool(item.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+        states = {
+            po._list.item(i).data(Qt.ItemDataRole.UserRole):  # noqa: SLF001
+                po._list.item(i).checkState()  # noqa: SLF001
+            for i in range(po._list.count())  # noqa: SLF001
+        }
+        assert states["backend"] == Qt.CheckState.Checked
+        assert states["frontend"] == Qt.CheckState.Unchecked
+        assert states["postgres"] == Qt.CheckState.Checked
+        # Suggestion rows carry the badge text + italic font so the
+        # user can distinguish a confirmed topic from a candidate.
+        suggested = next(
+            po._list.item(i)  # noqa: SLF001
+            for i in range(po._list.count())  # noqa: SLF001
+            if po._list.item(i).data(Qt.ItemDataRole.UserRole) == "postgres"  # noqa: SLF001
+        )
+        assert "(suggested)" in suggested.text()
+        assert suggested.font().italic() is True
+    finally:
+        po.close()
+
+
+def test_topics_popup_indicator_click_path_emits_toggle(qt_app):
+    """The user can click the checkbox indicator directly (Qt
+    flips checkState and fires itemChanged) or anywhere on the
+    row body (we toggle manually via itemClicked). Both paths
+    must route to the same toggle_requested emit."""
+    po = TopicsAssignmentPopup()
+    po.set_rows([AssignmentRow("backend", assigned=False)])
+    captured: list[tuple[str, bool]] = []
+    po.toggle_requested.connect(lambda n, a: captured.append((n, a)))
+    try:
+        # Simulate the indicator-click path: Qt has already toggled
+        # checkState by the time itemChanged fires.
+        item = po._list.item(0)  # noqa: SLF001
+        item.setCheckState(Qt.CheckState.Checked)
+        # itemChanged fires synchronously from setCheckState.
+        assert captured == [("backend", True)]
+        # The internal row model also flipped to assigned=True so
+        # subsequent rebuilds render the correct check state.
+        assert po._rows[0].assigned is True  # noqa: SLF001
     finally:
         po.close()
 

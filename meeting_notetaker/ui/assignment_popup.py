@@ -45,8 +45,9 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal
-from PyQt6.QtGui import QKeyEvent
+from PyQt6.QtGui import QFont, QKeyEvent
 from PyQt6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -54,6 +55,10 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QStyle,
+    QStyleOptionButton,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -130,8 +135,20 @@ class _AssignmentPopupBase(QFrame):
         # Pin a slightly tighter row height so the popup fits more
         # items at a glance without scrolling.
         self._list.setSpacing(0)
-        self._list.itemActivated.connect(self._on_item_activated)
-        self._list.itemClicked.connect(self._on_item_activated)
+        # Two click paths to handle for checkable items:
+        #   itemChanged fires when the user clicks the checkbox/radio
+        #     indicator itself (Qt toggles the state automatically)
+        #   itemClicked fires when the user clicks anywhere on the row;
+        #     we re-toggle the state in code so a click on the text
+        #     also counts as a pick, not just a click on the indicator
+        # Both paths route to the same subclass _activate_row hook.
+        self._list.itemActivated.connect(self._on_item_clicked)
+        self._list.itemClicked.connect(self._on_item_clicked)
+        self._list.itemChanged.connect(self._on_item_check_changed)
+        # Guards against re-entrant emits during set_rows / _refresh_list:
+        # seeding rows via setCheckState fires itemChanged for each item,
+        # which we must NOT translate into a phantom user toggle.
+        self._rebuild_guard = False
         layout.addWidget(self._list, 1)
 
         # Footer: shows the "+ Create 'X'" hint when allow_create is
@@ -196,14 +213,23 @@ class _AssignmentPopupBase(QFrame):
         raise NotImplementedError
 
     def _make_item(self, row: AssignmentRow, filter_text: str) -> QListWidgetItem:
-        """Subclass override: build the QListWidgetItem with the
-        appropriate visual treatment (check vs radio, suggestion
-        badge, reject icon). Default carries a plain check mark
-        when assigned."""
-        prefix = "[x] " if row.assigned else "[ ] "
-        suffix = "  (suggested)" if row.suggested else ""
-        item = QListWidgetItem(f"{prefix}{row.name}{suffix}")
+        """Build a QListWidgetItem with native Qt indicator state.
+
+        The Qt.ItemFlag.ItemIsUserCheckable flag turns on a real
+        native checkbox at the item's leading edge; the Series
+        subclass installs a delegate that overpaints the checkbox
+        with a radio-button indicator so single-select reads
+        correctly. Subclasses may override to embellish the
+        display text (e.g. Topics adds a suggestion badge), but
+        should keep the check state semantics intact -- the click
+        handlers below all key off ``checkState()``.
+        """
+        item = QListWidgetItem(row.name)
         item.setData(Qt.ItemDataRole.UserRole, row.name)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(
+            Qt.CheckState.Checked if row.assigned else Qt.CheckState.Unchecked,
+        )
         return item
 
     # ---- filter + list rebuild -------------------------------------
@@ -215,14 +241,21 @@ class _AssignmentPopupBase(QFrame):
         if filter_text is None:
             filter_text = self._filter.text()
         needle = filter_text.strip().casefold()
-        self._list.clear()
-        any_visible_match = False
-        for row in self._rows:
-            if needle and needle not in row.name.casefold():
-                continue
-            any_visible_match = True
-            item = self._make_item(row, filter_text)
-            self._list.addItem(item)
+        # Seeding rows via setCheckState fires itemChanged for each
+        # item; guard so the subclass handler doesn't translate the
+        # seed into a phantom user toggle.
+        self._rebuild_guard = True
+        try:
+            self._list.clear()
+            any_visible_match = False
+            for row in self._rows:
+                if needle and needle not in row.name.casefold():
+                    continue
+                any_visible_match = True
+                item = self._make_item(row, filter_text)
+                self._list.addItem(item)
+        finally:
+            self._rebuild_guard = False
         # Create-new footer: only when allow_create is on AND the
         # filter has text AND no existing row's name matches the
         # typed text case-insensitively (so the user can't create
@@ -252,18 +285,57 @@ class _AssignmentPopupBase(QFrame):
         is the case under offscreen tests that never call show()."""
         current = self._list.currentItem()
         if current is not None:
-            self._on_item_activated(current)
+            self._on_item_clicked(current)
             return
         if not self._create_btn.isHidden():
             self._on_create_clicked()
 
-    def _on_item_activated(self, item: QListWidgetItem) -> None:
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        """A click anywhere on the row body. When the click landed
+        on the indicator itself Qt already toggled checkState and
+        fired itemChanged (handled in _on_item_check_changed). For
+        a click on the text we have to do the toggle manually so
+        the user doesn't have to land precisely on the checkbox."""
+        if self._rebuild_guard:
+            return
         name = item.data(Qt.ItemDataRole.UserRole)
         if not name:
             return
         row = next((r for r in self._rows if r.name == name), None)
         if row is None:
             return
+        # If the indicator already flipped (the user clicked the
+        # checkbox area), itemChanged has fired for it and our
+        # internal row state was updated. Detect by comparing the
+        # item's checkState to the row's assigned flag.
+        item_assigned = item.checkState() == Qt.CheckState.Checked
+        if item_assigned != row.assigned:
+            # Indicator-click path already did the work; let
+            # _on_item_check_changed own the emit.
+            return
+        # Click on text -- flip the indicator ourselves; the
+        # itemChanged signal will fire and our handler emits.
+        new_state = (
+            Qt.CheckState.Unchecked if row.assigned
+            else Qt.CheckState.Checked
+        )
+        item.setCheckState(new_state)
+
+    def _on_item_check_changed(self, item: QListWidgetItem) -> None:
+        """itemChanged routes here. Guard against rebuild-induced
+        emits, then defer to the subclass _activate_row hook."""
+        if self._rebuild_guard:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        if not name:
+            return
+        row = next((r for r in self._rows if r.name == name), None)
+        if row is None:
+            return
+        # Update the internal model so subsequent _refresh_list
+        # calls render the correct check state from row.assigned.
+        # Subclasses can further mutate (Series flips siblings off).
+        row.assigned = item.checkState() == Qt.CheckState.Checked
         self._activate_row(row)
 
     def _on_create_clicked(self) -> None:
@@ -307,13 +379,10 @@ class TopicsAssignmentPopup(_AssignmentPopupBase):
         )
 
     def _activate_row(self, row: AssignmentRow) -> None:
-        # Optimistically flip the visible state so the popup feels
-        # snappy; the host's update_assignments call will reconcile
-        # if anything diverges.
-        for r in self._rows:
-            if r.name == row.name:
-                r.assigned = not r.assigned
-                break
+        # _on_item_check_changed already flipped row.assigned via
+        # the item's checkState before calling us. Re-render the
+        # list so the visible state matches the model and emit
+        # the host signal.
         self._refresh_list()
         self.toggle_requested.emit(row.name, row.assigned)
 
@@ -330,6 +399,74 @@ class TopicsAssignmentPopup(_AssignmentPopupBase):
         self._filter.clear()
         self._refresh_list()
         self.toggle_requested.emit(name, True)
+
+    def _make_item(self, row: AssignmentRow, filter_text: str) -> QListWidgetItem:
+        """Same checkable item as the base, plus a "(suggested)"
+        suffix + italic font for suggestion rows so the user can
+        distinguish LLM-extracted candidates from confirmed topics
+        at a glance without a separate accept/reject row pair."""
+        item = super()._make_item(row, filter_text)
+        if row.suggested:
+            item.setText(f"{row.name}    (suggested)")
+            font = item.font()
+            font.setItalic(True)
+            item.setFont(font)
+        return item
+
+
+class _RadioIndicatorDelegate(QStyledItemDelegate):
+    """Item delegate that draws a radio-button indicator in place
+    of the default checkbox. Used by SeriesAssignmentPopup so the
+    single-select semantics read visually as a radio choice without
+    abandoning the QListWidgetItem checkState model that the click
+    handlers in _AssignmentPopupBase key off.
+
+    The trick: tell Qt's view-item painter the item does NOT have
+    a check indicator (clear ``HasCheckIndicator`` from features),
+    let the base paint the row text + selection highlight without
+    it, then overpaint a native radio button at the same rect the
+    checkbox would have occupied. The click hit-zone is unchanged
+    because Qt's edit-trigger logic also keys off the same
+    indicator rect via subElementRect.
+    """
+
+    def paint(self, painter, option, index):  # type: ignore[override]
+        # Step 1: let the base painter draw the whole row normally
+        # (background + selection highlight + the check indicator
+        # at the left + text shifted right to make room for it).
+        # We deliberately do NOT strip HasCheckIndicator -- if we
+        # do, the text reflows leftward into the indicator's slot
+        # and the radio overpaint ends up on top of it.
+        super().paint(painter, option, index)
+        # Step 2: now compute the same indicator rect the base
+        # painter used and overpaint a radio button on top of the
+        # checkbox we just drew. The radio occludes the checkbox
+        # fully; the row text was already shifted right around it,
+        # so it stays clear.
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        indicator_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemCheckIndicator, opt, widget,
+        )
+        check_state = index.data(Qt.ItemDataRole.CheckStateRole)
+        if check_state is None or indicator_rect.isEmpty():
+            return
+        # The CheckStateRole value coming through the QAbstractItemModel
+        # path is an int (the underlying Qt::CheckState enum value),
+        # not a Qt.CheckState. Compare via int(...) so we accept both.
+        is_checked = int(check_state) == int(Qt.CheckState.Checked.value)
+        radio_opt = QStyleOptionButton()
+        radio_opt.rect = indicator_rect
+        radio_opt.state = QStyle.StateFlag.State_Enabled | (
+            QStyle.StateFlag.State_On if is_checked
+            else QStyle.StateFlag.State_Off
+        )
+        style.drawPrimitive(
+            QStyle.PrimitiveElement.PE_IndicatorRadioButton,
+            radio_opt, painter, widget,
+        )
 
 
 class SeriesAssignmentPopup(_AssignmentPopupBase):
@@ -354,6 +491,10 @@ class SeriesAssignmentPopup(_AssignmentPopupBase):
             allow_create=True,
             parent=parent,
         )
+        # Radio-style overpaint of the checkbox indicator so
+        # single-select reads correctly. The base class' click
+        # handling stays unchanged -- check state is the model.
+        self._list.setItemDelegate(_RadioIndicatorDelegate(self._list))
 
     def set_rows_and_current(
         self,
@@ -385,11 +526,27 @@ class SeriesAssignmentPopup(_AssignmentPopupBase):
         self.close()
         self.series_chosen.emit(name)
 
-    def _make_item(self, row: AssignmentRow, filter_text: str) -> QListWidgetItem:
-        # Single-select: render the current pick with a filled
-        # bullet, others with a hollow bullet. (No suggested concept
-        # for series.)
-        prefix = "(*) " if row.assigned else "( ) "
-        item = QListWidgetItem(f"{prefix}{row.name}")
-        item.setData(Qt.ItemDataRole.UserRole, row.name)
-        return item
+    def _on_item_check_changed(self, item: QListWidgetItem) -> None:
+        """Single-select semantics: when a row's radio flips on,
+        the others must flip off. The base handler updates
+        row.assigned for the clicked item and calls _activate_row;
+        we additionally clear sibling rows before delegating so the
+        in-memory model matches the visible state. We never reach
+        the "assigned -> unassigned" path here because the close()
+        in _activate_row dismisses the popup the moment a pick
+        lands, so the user can't toggle the same row off."""
+        if self._rebuild_guard:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        if not name:
+            return
+        # Only act on the "row just got picked" transition.
+        if item.checkState() != Qt.CheckState.Checked:
+            return
+        # Clear sibling rows' assigned flag so a subsequent
+        # rebuild (or programmatic set_rows_and_current call)
+        # renders correctly.
+        for r in self._rows:
+            r.assigned = (r.name == name)
+        # Defer to the base behaviour for the emit path.
+        super()._on_item_check_changed(item)
