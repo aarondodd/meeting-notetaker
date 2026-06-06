@@ -49,6 +49,23 @@ leaves the machine; no API key required.
 
 ## What's new in v0.7.8
 
+- **Structured-format transcript import.** The Import Transcript
+  dialog now recognizes WebVTT (`.vtt`), SubRip (`.srt`), and
+  Whisper JSON in addition to plain text / Markdown / `.docx`.
+  A Format dropdown above the preview pane defaults to
+  Auto-detect (file-extension hint plus content sniff) and lets
+  the user override when detection misfires. Structured formats
+  parse into timestamped cues and render as
+  `[HH:MM:SS] Speaker: text` -- the same shape the player uses
+  for click-to-seek + position highlighting, so importing a VTT
+  alongside an audio file unlocks playback sync the same way a
+  locally-recorded session does. The "Strip Teams formatting"
+  toggle only applies in Plain mode; structured formats handle
+  their own cleanup. Voice tags (`<v Speaker>text</v>`) and
+  leading "Name: " prefixes both contribute speaker attribution.
+
+  ![Import Transcript with VTT input](docs/screenshots/36-dialog-import-transcript-vtt.png)
+
 - **Typeahead pickers for Topics + Series (#82).** The
   classification chips on the right pane replace their legacy
   widgets with a unified GitHub-label-style popup. The Topics

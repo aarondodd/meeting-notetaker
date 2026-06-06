@@ -26,6 +26,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -43,18 +44,46 @@ from PyQt6.QtWidgets import (
 )
 
 from ..integrations.transcript_import import (
+    ALL_FORMATS,
+    FORMAT_PLAIN,
+    FORMAT_SRT,
+    FORMAT_VTT,
+    FORMAT_WHISPER_JSON,
     TranscriptImportError,
     apply_speaker_map,
+    detect_format,
     detect_speakers,
     iter_speakers_with_counts,
     load_transcript_from_file,
     normalize_text,
+    parse_srt,
+    parse_vtt,
+    parse_whisper_json,
+    segments_to_transcript_md,
 )
 
 
 _FILE_FILTER = (
-    "Transcript files (*.txt *.md *.docx);;Text (*.txt *.md);;Word (*.docx);;All files (*)"
+    "Transcript files (*.txt *.md *.docx *.vtt *.srt *.json);;"
+    "Text (*.txt *.md);;"
+    "Word (*.docx);;"
+    "WebVTT (*.vtt);;"
+    "SubRip (*.srt);;"
+    "Whisper JSON (*.json);;"
+    "All files (*)"
 )
+
+
+# Format dropdown labels + the FORMAT_* constants they map to. "Auto"
+# is the sentinel that runs detect_format on the loaded body.
+_FORMAT_AUTO = "auto"
+_FORMAT_PICKER_ENTRIES: list[tuple[str, str]] = [
+    ("Auto-detect", _FORMAT_AUTO),
+    ("Plain text / Markdown", FORMAT_PLAIN),
+    ("WebVTT (.vtt)", FORMAT_VTT),
+    ("SubRip (.srt)", FORMAT_SRT),
+    ("Whisper JSON", FORMAT_WHISPER_JSON),
+]
 
 
 class ImportTranscriptDialog(QDialog):
@@ -80,6 +109,11 @@ class ImportTranscriptDialog(QDialog):
         # so the user can toggle "Strip Teams formatting" without
         # re-reading the file.
         self._source_body: str = ""
+        # Optional path the source body was loaded from. Lets the
+        # auto-detect heuristic use the extension as a strong hint
+        # when the user picks a file (vs the weaker content-sniff
+        # only when they paste).
+        self._source_path: Optional[Path] = None
         # Cached normalized body so speaker-detect + apply are cheap.
         self._normalized_body: str = ""
         # Result fields populated on accept.
@@ -118,11 +152,43 @@ class ImportTranscriptDialog(QDialog):
         self._strip_chrome.setToolTip(
             "Drop Teams banners ('Started transcription', 'View original "
             "meeting'), fold split timestamp lines into the preceding "
-            "speaker label, and collapse runs of blank lines."
+            "speaker label, and collapse runs of blank lines. Only "
+            "applies to plain text imports; structured formats (VTT, "
+            "SRT, Whisper JSON) skip this pass."
         )
         self._strip_chrome.stateChanged.connect(self._on_strip_toggle)
         source_row.addWidget(self._strip_chrome)
         outer.addLayout(source_row)
+
+        # --- Format row (v0.7.8): force a parser when auto-detect
+        # misfires, or to recognize a .txt file that's actually
+        # VTT/SRT pasted in.
+        format_row = QHBoxLayout()
+        format_row.addWidget(QLabel("Format:", self))
+        self._format_picker = QComboBox(self)
+        for label, key in _FORMAT_PICKER_ENTRIES:
+            self._format_picker.addItem(label, key)
+        self._format_picker.setCurrentIndex(0)  # Auto-detect default
+        self._format_picker.setToolTip(
+            "Plain text and Markdown get the Teams-cleanup pass. "
+            "WebVTT / SubRip / Whisper JSON get parsed into "
+            "timestamped lines so the player can seek to anything "
+            "you click. Auto-detect uses the file extension and "
+            "content sniff."
+        )
+        self._format_picker.currentIndexChanged.connect(
+            self._on_format_changed,
+        )
+        format_row.addWidget(self._format_picker)
+        format_row.addStretch(1)
+        # Status indicator: when auto-detect chooses a non-plain
+        # format, surface what it picked so the user can override.
+        self._format_status = QLabel("", self)
+        self._format_status.setStyleSheet(
+            "color: palette(placeholder-text); font-style: italic;"
+        )
+        format_row.addWidget(self._format_status)
+        outer.addLayout(format_row)
 
         self._status_label = QLabel("", self)
         self._status_label.setStyleSheet("color: palette(placeholder-text);")
@@ -188,6 +254,7 @@ class ImportTranscriptDialog(QDialog):
         tests and by the clipboard-preseed path when MainApp opens the
         dialog with the clipboard already populated."""
         self._source_body = body
+        self._source_path = None
         self._rerender()
 
     # --------- source actions -------------------------------------------
@@ -213,6 +280,7 @@ class ImportTranscriptDialog(QDialog):
             )
             return
         self._source_body = body
+        self._source_path = Path(path_str)
         self._status_label.setText(f"Loaded {Path(path_str).name}")
         self._rerender()
 
@@ -232,12 +300,17 @@ class ImportTranscriptDialog(QDialog):
             )
             return
         self._source_body = text
+        self._source_path = None
         self._status_label.setText(
             f"Pasted {len(text):,} characters from clipboard"
         )
         self._rerender()
 
     def _on_strip_toggle(self, _state: int) -> None:
+        if self._source_body:
+            self._rerender()
+
+    def _on_format_changed(self, _index: int) -> None:
         if self._source_body:
             self._rerender()
 
@@ -254,16 +327,98 @@ class ImportTranscriptDialog(QDialog):
         self._populate_speakers_table(self._normalized_body)
 
     # --------- rendering -------------------------------------------------
+    def _resolve_format(self) -> str:
+        """Return the effective format for the current source body.
+
+        ``_FORMAT_AUTO`` runs detect_format with the optional path
+        hint; any explicit pick wins. Public so tests can assert
+        the resolved choice without driving the combobox."""
+        chosen = self._format_picker.currentData()
+        if chosen != _FORMAT_AUTO:
+            return chosen
+        return detect_format(self._source_body, filename=self._source_path)
+
     def _rerender(self) -> None:
-        """Normalize the source body and refresh the preview + speakers."""
-        body = normalize_text(
-            self._source_body,
-            strip_teams_chrome=self._strip_chrome.isChecked(),
+        """Refresh the preview + speakers from the source body.
+
+        Branches on format: plain text runs the existing
+        normalize_text + Teams-cleanup pass; structured formats
+        (VTT, SRT, Whisper JSON) parse to TranscriptCue and render
+        through segments_to_transcript_md so the player's
+        ``[HH:MM:SS] Label: text`` shape carries timestamps that
+        drive playback sync after the audio is added.
+        """
+        fmt = self._resolve_format()
+        # Strip-Teams toggle is only meaningful for plain bodies;
+        # disable + dim it when a structured format is active so
+        # the user isn't misled into thinking it does anything.
+        is_plain = fmt == FORMAT_PLAIN
+        self._strip_chrome.setEnabled(is_plain)
+        if not is_plain:
+            self._strip_chrome.setToolTip(
+                "Disabled for structured formats; the parser strips "
+                "format-specific noise on its own."
+            )
+        else:
+            self._strip_chrome.setToolTip(
+                "Drop Teams banners ('Started transcription', 'View "
+                "original meeting'), fold split timestamp lines into "
+                "the preceding speaker label, and collapse runs of "
+                "blank lines."
+            )
+        # Status text reflects auto-detect's pick (vs an explicit
+        # override which the user already sees in the combobox).
+        chosen_label = (
+            "auto-detected"
+            if self._format_picker.currentData() == _FORMAT_AUTO
+            else "selected"
         )
+        self._format_status.setText(
+            f"{chosen_label}: {_format_label_for_key(fmt)}"
+        )
+
+        try:
+            body = self._render_body_for_format(fmt)
+        except TranscriptImportError as exc:
+            self._normalized_body = ""
+            self._preview.setPlainText(
+                f"Could not parse as {_format_label_for_key(fmt)}.\n\n"
+                f"{exc.reason}\n\n"
+                "Pick a different format or fall back to Plain text "
+                "from the Format dropdown above."
+            )
+            self._ok_btn.setEnabled(False)
+            self._populate_speakers_table("")
+            return
+
         self._normalized_body = body
         self._preview.setPlainText(body)
         self._ok_btn.setEnabled(bool(body.strip()))
         self._populate_speakers_table(body)
+
+    def _render_body_for_format(self, fmt: str) -> str:
+        """Dispatch the source body through the right parser +
+        renderer for ``fmt``. Raises TranscriptImportError when a
+        structured format's input is malformed."""
+        if fmt == FORMAT_PLAIN:
+            return normalize_text(
+                self._source_body,
+                strip_teams_chrome=self._strip_chrome.isChecked(),
+            )
+        if fmt == FORMAT_VTT:
+            cues = parse_vtt(self._source_body)
+            return segments_to_transcript_md(cues, default_speaker="Speaker")
+        if fmt == FORMAT_SRT:
+            cues = parse_srt(self._source_body)
+            return segments_to_transcript_md(cues, default_speaker="Speaker")
+        if fmt == FORMAT_WHISPER_JSON:
+            cues = parse_whisper_json(self._source_body)
+            return segments_to_transcript_md(cues, default_speaker="Speaker")
+        # Unknown format -- safest fall-back is the plain pass.
+        return normalize_text(
+            self._source_body,
+            strip_teams_chrome=self._strip_chrome.isChecked(),
+        )
 
     def _populate_speakers_table(self, body: str) -> None:
         speakers = detect_speakers(body)
@@ -318,3 +473,12 @@ def _escape(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _format_label_for_key(key: str) -> str:
+    """Return the user-facing label for a FORMAT_* key. Used by
+    the status indicator under the Format dropdown."""
+    for label, k in _FORMAT_PICKER_ENTRIES:
+        if k == key:
+            return label
+    return key

@@ -1081,6 +1081,39 @@ def shot_import_transcript_dialog() -> None:
     dlg.close()
 
 
+def shot_import_transcript_vtt() -> None:
+    """v0.7.8 Import Transcript dialog with a VTT input. Shows the
+    Format dropdown auto-detected to WebVTT and the preview
+    rendered as the player-friendly [HH:MM:SS] Speaker: text shape
+    (#80 followup, v0.7.8)."""
+    from meeting_notetaker.ui.import_transcript_dialog import (
+        ImportTranscriptDialog,
+    )
+
+    vtt = (
+        "WEBVTT\n"
+        "\n"
+        "00:00:00.000 --> 00:00:03.500\n"
+        "<v Jane Smith>Welcome everyone. Let's start with the roadmap update.</v>\n"
+        "\n"
+        "00:00:03.500 --> 00:00:08.000\n"
+        "<v Aaron Dodd>Sounds good. I'll share the deck.</v>\n"
+        "\n"
+        "00:00:08.000 --> 00:00:14.500\n"
+        "<v Jane Smith>Great. Walk us through the Q3 milestones.</v>\n"
+        "\n"
+        "00:00:14.500 --> 00:00:21.000\n"
+        "<v Aaron Dodd>Q3 lands the platform migration and the vendor comparison memo.</v>\n"
+    )
+    dlg = ImportTranscriptDialog(session_title="Q3 Platform Sync")
+    dlg.set_initial_body(vtt)
+    dlg.resize(900, 660)
+    dlg.show()
+    QApplication.processEvents()
+    _grab(dlg, "36-dialog-import-transcript-vtt.png", autosize=False)
+    dlg.close()
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1115,9 +1148,10 @@ def main() -> int:
     shot_import_transcript_dialog()
     shot_notes_popout()
     shot_settings_fonts()
-    # v0.7.8 surfaces (#82).
+    # v0.7.8 surfaces (#82 + transcript format support).
     shot_topics_popup()
     shot_series_popup()
+    shot_import_transcript_vtt()
     print("done.")
     return 0
 
