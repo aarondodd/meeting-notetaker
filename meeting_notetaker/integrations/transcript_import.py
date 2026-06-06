@@ -158,21 +158,30 @@ class SpeakerOccurrence:
 def load_transcript_from_file(path: Path) -> str:
     """Read a transcript from disk.
 
-    Supported: .txt, .md (read as UTF-8 with a fallback to latin-1 if
-    UTF-8 decoding fails), .docx (via python-docx if installed).
-    Anything else raises TranscriptImportError so the dialog can
-    surface a clear "paste the body instead" message.
+    Supported: .txt, .md, .vtt, .srt, .json (all read as UTF-8 with
+    a fallback to latin-1 if UTF-8 decoding fails -- VTT/SRT/JSON
+    are text formats; the dialog's format-aware parser handles the
+    actual structure on top of the loaded body). .docx is read via
+    python-docx when installed. Anything else raises
+    TranscriptImportError so the dialog can surface a clear "paste
+    the body instead" message.
 
-    Note: this does NOT normalize -- normalization is a separate step
-    so the dialog can re-run it when the user toggles the checkbox
-    without re-reading the file.
+    Note: this does NOT normalize or parse -- those are separate
+    steps so the dialog can re-run them when the user toggles the
+    Strip-Teams checkbox or picks a different Format without re-
+    reading the file.
     """
     if not path.exists():
         raise TranscriptImportError(
             f"File not found: {path}", suggest_paste=False,
         )
     suffix = path.suffix.lower()
-    if suffix in (".txt", ".md", ""):
+    # Text-mode reads cover both the plain-text formats (.txt, .md)
+    # and the structured ones we know how to parse downstream (.vtt,
+    # .srt, .json). The format-aware dialog re-renders against the
+    # loaded body, so the reader just needs to hand back decoded
+    # bytes -- it does not need to know the cue shape.
+    if suffix in (".txt", ".md", ".vtt", ".srt", ".json", ""):
         try:
             return path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -200,8 +209,9 @@ def load_transcript_from_file(path: Path) -> str:
         # sees the same line structure the file has visually.
         return "\n".join(p.text for p in doc.paragraphs)
     raise TranscriptImportError(
-        f"Unsupported file type '{suffix}'. Supported: .txt, .md, .docx. "
-        "If you have the transcript in another format, use 'Paste from clipboard'.",
+        f"Unsupported file type '{suffix}'. Supported: .txt, .md, "
+        ".docx, .vtt, .srt, .json. If you have the transcript in "
+        "another format, use 'Paste from clipboard'.",
         suggest_paste=True,
     )
 
