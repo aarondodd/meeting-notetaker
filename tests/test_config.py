@@ -85,6 +85,22 @@ def test_device_name_defaults_to_empty(isolated_data_dir):
     assert cfg.audio.loopback_device_name == ""
 
 
+def test_multi_endpoint_capture_defaults_on(isolated_data_dir):
+    """#85: multi-endpoint capture is the new default, so a fresh
+    install defends against the #84 Windows routing failure mode
+    without any user action."""
+    cfg = Config()
+    assert cfg.audio.multi_endpoint_capture is True
+
+
+def test_multi_endpoint_capture_round_trip(isolated_data_dir):
+    cfg = Config()
+    cfg.audio.multi_endpoint_capture = False
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.audio.multi_endpoint_capture is False
+
+
 def test_calendar_defaults_and_round_trip(isolated_data_dir):
     cfg = Config()
     assert cfg.calendar.watch_calendar is False

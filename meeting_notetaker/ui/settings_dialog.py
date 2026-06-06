@@ -247,9 +247,42 @@ class SettingsDialog(QDialog):
         else:
             self._loopback_picker.setToolTip(
                 "System audio capture (WASAPI loopback). (System default) picks "
-                "the loopback paired with the OS default output."
+                "the loopback paired with the OS default output. Ignored when "
+                "'Capture all audio outputs' is on -- that mode opens every "
+                "output endpoint and mixes at finalize."
             )
         audio_form.addRow("Loopback device:", self._loopback_picker)
+
+        # Multi-endpoint capture toggle (#85). Default ON. When on,
+        # the orchestrator opens one stream per WASAPI output endpoint
+        # and mixes sidecars at finalize so a meeting app routing to
+        # a non-default endpoint mid-call still gets captured. Users
+        # who hit WASAPI quirks on their hardware can flip off to
+        # fall back to the single-endpoint path.
+        self._multi_endpoint = QCheckBox("Capture all audio outputs (recommended)", self)
+        self._multi_endpoint.setChecked(config.audio.multi_endpoint_capture)
+        self._multi_endpoint.setToolTip(
+            "When on (default), the recorder opens every WASAPI output "
+            "endpoint -- laptop speakers, headphones, monitor speakers, "
+            "HDMI -- and mixes them into one sys.wav at stop. Protects "
+            "against Windows / meeting-app routing changes mid-call. "
+            "Sidecar WAVs are temporarily created during recording and "
+            "removed at stop. Flip off to fall back to single-endpoint "
+            "capture if you hit WASAPI errors on your hardware."
+        )
+        audio_form.addRow(self._multi_endpoint)
+        if not self._loopback_devices:
+            self._multi_endpoint.setEnabled(False)
+        # Caption beneath the toggle so the trade-off is visible
+        # without hovering the tooltip.
+        multi_caption = QLabel(
+            "<i>Captures every Windows output endpoint and mixes at stop "
+            "(default). Off: captures only the picked loopback device.</i>",
+            self,
+        )
+        multi_caption.setWordWrap(True)
+        multi_caption.setStyleSheet("color: palette(mid);")
+        audio_form.addRow(multi_caption)
 
         self._retain_default = QCheckBox(
             "Retain audio files after transcription (default for new sessions)", self
@@ -1134,6 +1167,7 @@ class SettingsDialog(QDialog):
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()
         self._config.audio.mic_device_name = self._mic_picker.currentData() or ""
         self._config.audio.loopback_device_name = self._loopback_picker.currentData() or ""
+        self._config.audio.multi_endpoint_capture = self._multi_endpoint.isChecked()
         self._config.calendar.watch_calendar = self._watch_calendar.isChecked()
         self._config.calendar.window_minutes = int(self._window_slider.value())
         self._config.speakers.enabled = self._speakers_enabled.isChecked()
