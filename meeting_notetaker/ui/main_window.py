@@ -136,6 +136,8 @@ class MainWindow(QMainWindow):
     manage_series_requested = pyqtSignal()
     manage_classification_requested = pyqtSignal()
     address_book_requested = pyqtSignal()
+    # Tools > Edit Prompts... (#89) -- opens the in-app prompt editor.
+    edit_prompts_requested = pyqtSignal()
     classification_filter_changed = pyqtSignal(str, object)
     # view (str -- one of VIEW_*), value_id (Optional[int]); emitted by
     # the navigator when the user picks a different filter.
@@ -313,6 +315,14 @@ class MainWindow(QMainWindow):
             self.address_book_requested.emit,
         )
         tools_menu.addAction(action_address_book)
+        # Prompt editor (#89): replaces the AppData-folder edit workflow.
+        # Sits with the other catalog editors so the user finds it
+        # alongside Manage Classification + Address Book.
+        action_edit_prompts = QAction("&Edit Prompts...", self)
+        action_edit_prompts.triggered.connect(
+            self.edit_prompts_requested.emit,
+        )
+        tools_menu.addAction(action_edit_prompts)
         tools_menu.addSeparator()
         action_settings = QAction("&Settings...", self)
         action_settings.setShortcut("Ctrl+,")

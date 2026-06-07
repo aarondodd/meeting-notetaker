@@ -1207,6 +1207,8 @@ class MainApp(QObject):
             self._on_manage_classification,
         )
         self.window.address_book_requested.connect(self._on_address_book)
+        # Tools > Edit Prompts... (#89) -- open the in-app prompt editor.
+        self.window.edit_prompts_requested.connect(self._on_edit_prompts)
         # File > Save to ... mirrors the SessionView's right-pane
         # Save to... button. Route both through the same handlers so
         # body resolution + worker spawn stay in one place (#79).
@@ -5007,6 +5009,47 @@ class MainApp(QObject):
         sv = self.window.session_view
         if sv._session is not None:
             self._refresh_session_classification(sv._session.id)
+
+    def _on_edit_prompts(self) -> None:
+        """Tools > Edit Prompts... (#89)
+
+        Open the in-app prompt editor. On close, refresh the prompt
+        dropdowns in the SessionView so newly-created prompts show
+        up and deleted ones drop out without an app restart.
+        """
+        from .ui.prompt_editor_dialog import PromptEditorDialog  # noqa: PLC0415
+
+        dlg = PromptEditorDialog(parent=self.window)
+        dlg.exec()
+        self._refresh_prompt_pickers()
+
+    def _refresh_prompt_pickers(self) -> None:
+        """Push the current set of prompt templates back into the
+        SessionView's per-session prompt picker. Settings rebuilds its
+        own picker inside _open_prompt_editor."""
+        from .utils import prompts as prompts_mod  # noqa: PLC0415
+
+        try:
+            templates = prompts_mod.list_templates()
+        except Exception:
+            log.exception("Failed to refresh prompts after editor close")
+            return
+        sv = self.window.session_view
+        # Preserve the per-session override if the user has one set;
+        # picking it up via the session_view's current selection.
+        current_override = ""
+        try:
+            current_override = sv._prompt_template_picker.currentData() or ""  # noqa: SLF001
+        except Exception:
+            pass
+        settings_default = getattr(
+            self.config.synthesis, "default_prompt_template_name", "",
+        )
+        sv.set_prompt_templates(
+            [t.name for t in templates],
+            selected=current_override,
+            settings_default=settings_default,
+        )
 
     def _on_address_book(self) -> None:
         """File > Address Book. Manages Contacts (the master

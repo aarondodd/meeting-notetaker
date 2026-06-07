@@ -3,17 +3,70 @@
 User-editable templates live in %APPDATA%/MeetingNotetaker/prompts/. Bundled
 templates ship in meeting_notetaker/resources/prompts/ and are copied into
 the user directory on first run (user files always win after that).
+
+Prompt editor support (#89, v0.7.9): the user can edit / create / duplicate /
+delete templates via the in-app editor. Each save archives the prior body to
+prompts/_archive/<name>/<timestamp>.md so the user can revert without
+losing work. The archive cap is _ARCHIVE_MAX_PER_NAME (oldest dropped first
+beyond that), bounded to keep the archive dir healthy.
 """
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import live_notes as live_notes_mod
 from .paths import prompts_dir, resource_path
+
+
+# Archive cap (per prompt name). Beyond this, the oldest archive is
+# dropped on each save. Sized so a heavy editor day (~50 saves) still
+# leaves several days of revert history.
+_ARCHIVE_MAX_PER_NAME = 100
+
+# Archive subfolder. Hidden-by-convention "_archive" so the user's
+# prompts/ folder stays uncluttered when they Open Prompts Folder.
+_ARCHIVE_SUBDIR = "_archive"
+
+# Template-name validation. ASCII letters/digits/dash/underscore only,
+# 1-64 chars, no leading dot or underscore (reserves _archive + any
+# future _-prefixed convention).
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+class PromptError(ValueError):
+    """Raised when a prompt operation can't proceed.
+
+    Distinct from ValueError so the UI can catch it and surface
+    user-readable messages without swallowing programming errors.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def validate_prompt_name(name: str) -> str:
+    """Normalize + validate a prompt name. Returns the normalized form.
+
+    Strips whitespace, refuses empty / overly-long / unsafe names.
+    Allowed characters: A-Z, a-z, 0-9, hyphen, underscore. Must start
+    with an alphanumeric (reserves underscore prefixes for internal
+    conventions like the _archive subdir).
+    """
+    stripped = (name or "").strip()
+    if not stripped:
+        raise PromptError("Prompt name is required.")
+    if not _NAME_RE.match(stripped):
+        raise PromptError(
+            "Prompt name must be 1-64 characters of letters, digits, "
+            "dash, or underscore and start with a letter or digit."
+        )
+    return stripped
 
 
 # SHA-256 of bundled prompt bodies shipped in prior versions, computed against
@@ -269,3 +322,288 @@ def render(
                 + "\n"
             )
     return rendered
+
+
+# ---------------------------------------------------------------------------
+# In-app prompt editor support (#89)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ArchivedPrompt:
+    """One archived snapshot of a prompt body."""
+
+    name: str
+    path: Path
+    saved_at: datetime
+    body: str
+
+    @property
+    def saved_at_display(self) -> str:
+        return self.saved_at.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _archive_dir_for(name: str, user_dir: Path | None = None) -> Path:
+    user_dir = user_dir or prompts_dir()
+    return user_dir / _ARCHIVE_SUBDIR / name
+
+
+def _parse_archive_timestamp(stem: str) -> datetime | None:
+    """Decode the YYYYMMDD-HHMMSS-ffffff stem back to a UTC datetime.
+
+    Archive filenames carry microseconds so two saves within a wall-
+    clock second still sort correctly (a same-second collision under
+    second-only timestamps left newest-first ordering broken).
+    """
+    try:
+        parts = stem.split("-")
+        if len(parts) < 2:
+            return None
+        date_part = parts[0]
+        time_part = parts[1]
+        if len(date_part) != 8 or len(time_part) < 6:
+            return None
+        micros = 0
+        if len(parts) >= 3 and parts[2].isdigit():
+            micros = int(parts[2].ljust(6, "0")[:6])
+        return datetime.strptime(
+            date_part + time_part[:6], "%Y%m%d%H%M%S",
+        ).replace(microsecond=micros, tzinfo=timezone.utc)
+    except (IndexError, ValueError):
+        return None
+
+
+def list_archived_versions(
+    name: str, user_dir: Path | None = None,
+) -> list[ArchivedPrompt]:
+    """Return all archived snapshots for `name`, newest first.
+
+    Reads each archive's body so the UI can preview without re-opening
+    files. Returns [] when no archive dir exists yet.
+    """
+    name = validate_prompt_name(name)
+    archive_dir = _archive_dir_for(name, user_dir=user_dir)
+    if not archive_dir.is_dir():
+        return []
+    items: list[ArchivedPrompt] = []
+    for p in sorted(archive_dir.glob("*.md"), reverse=True):
+        try:
+            body = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        saved_at = _parse_archive_timestamp(p.stem)
+        if saved_at is None:
+            # Archive file without a recognizable timestamp -- include
+            # it anyway, with mtime as the fallback timestamp, so the
+            # user can still see + restore it.
+            try:
+                saved_at = datetime.fromtimestamp(
+                    p.stat().st_mtime, tz=timezone.utc,
+                )
+            except OSError:
+                continue
+        items.append(ArchivedPrompt(
+            name=name, path=p, saved_at=saved_at, body=body,
+        ))
+    return items
+
+
+def _archive_existing_body(
+    name: str, user_dir: Path | None = None,
+) -> Path | None:
+    """Move the current prompt body into the archive directory.
+
+    Called from `save_prompt` before the new body is written, so the
+    archive holds the immediately-prior version (not the version-before
+    that). Returns the archive path, or None if no current body exists.
+
+    The most-recently-saved archive's timestamp comes from "now" rather
+    than the file's mtime so two saves within a single second still
+    sort correctly (the -N counter handles same-second collisions).
+    """
+    user_dir = user_dir or prompts_dir()
+    src = user_dir / f"{name}.md"
+    if not src.exists():
+        return None
+    try:
+        current = src.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not current.strip():
+        return None
+    archive_dir = _archive_dir_for(name, user_dir=user_dir)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    # Microsecond resolution so same-second saves sort correctly.
+    # Format: YYYYMMDD-HHMMSS-ffffff. _parse_archive_timestamp consumes
+    # the same shape on the way out.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    dst = archive_dir / f"{stamp}.md"
+    counter = 1
+    while dst.exists():
+        dst = archive_dir / f"{stamp}-{counter}.md"
+        counter += 1
+    dst.write_text(current, encoding="utf-8")
+    # Prune oldest archives beyond the cap so the archive dir doesn't
+    # grow unbounded under heavy editing.
+    _prune_old_archives(archive_dir)
+    return dst
+
+
+def _prune_old_archives(archive_dir: Path) -> int:
+    """Drop archive files beyond _ARCHIVE_MAX_PER_NAME, oldest first."""
+    if not archive_dir.is_dir():
+        return 0
+    files = sorted(archive_dir.glob("*.md"), reverse=True)
+    if len(files) <= _ARCHIVE_MAX_PER_NAME:
+        return 0
+    removed = 0
+    for path in files[_ARCHIVE_MAX_PER_NAME:]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def save_prompt(
+    name: str,
+    body: str,
+    *,
+    user_dir: Path | None = None,
+) -> Path:
+    """Write `body` to the named prompt, archiving the prior body if any.
+
+    Returns the path to the saved prompt. Raises PromptError on invalid
+    name. An empty body is allowed (the user can deliberately blank a
+    prompt and rewrite it from scratch); the archive still gets the
+    prior non-empty body.
+
+    The active prompts/ folder is touched ATOMICALLY (write to tmp +
+    rename) so a crash mid-write can't corrupt the source-of-truth.
+    """
+    name = validate_prompt_name(name)
+    user_dir = user_dir or prompts_dir()
+    user_dir.mkdir(parents=True, exist_ok=True)
+    _archive_existing_body(name, user_dir=user_dir)
+    dst = user_dir / f"{name}.md"
+    tmp = dst.with_suffix(".md.tmp")
+    tmp.write_text(body, encoding="utf-8")
+    tmp.replace(dst)
+    return dst
+
+
+def create_prompt(
+    name: str,
+    *,
+    body: str = "",
+    user_dir: Path | None = None,
+) -> Path:
+    """Create a new prompt with the given body.
+
+    Refuses to overwrite an existing prompt; the caller must pick a
+    unique name. Body defaults to empty so the user can start from
+    scratch in the editor. Returns the path to the new prompt.
+    """
+    name = validate_prompt_name(name)
+    user_dir = user_dir or prompts_dir()
+    user_dir.mkdir(parents=True, exist_ok=True)
+    dst = user_dir / f"{name}.md"
+    if dst.exists():
+        raise PromptError(
+            f"A prompt named {name!r} already exists. Pick a different name."
+        )
+    dst.write_text(body, encoding="utf-8")
+    return dst
+
+
+def duplicate_prompt(
+    source_name: str,
+    dest_name: str,
+    *,
+    user_dir: Path | None = None,
+) -> Path:
+    """Copy `source_name`'s current body into a new prompt `dest_name`.
+
+    Wraps create_prompt so the destination is refused if it already
+    exists. The archive of the source is NOT carried over -- the new
+    prompt starts fresh.
+    """
+    source = get_template(source_name, user_dir=user_dir)
+    if source is None:
+        raise PromptError(f"Source prompt {source_name!r} not found.")
+    return create_prompt(dest_name, body=source.body, user_dir=user_dir)
+
+
+def restore_archived_version(
+    name: str,
+    archive_path: Path,
+    *,
+    user_dir: Path | None = None,
+) -> Path:
+    """Replace the active prompt with the contents of an archived version.
+
+    The current body is archived first (same mechanism as save_prompt),
+    so the operation is reversible -- the user can revert the revert.
+    Raises PromptError if the archive isn't under this prompt's
+    archive dir (protects against path-confused calls).
+    """
+    name = validate_prompt_name(name)
+    archive_path = Path(archive_path)
+    expected_dir = _archive_dir_for(name, user_dir=user_dir)
+    if archive_path.parent != expected_dir:
+        raise PromptError(
+            f"Archive {archive_path} is not in {expected_dir}; "
+            "cross-prompt restore is not allowed."
+        )
+    if not archive_path.exists():
+        raise PromptError(f"Archived version not found: {archive_path}")
+    body = archive_path.read_text(encoding="utf-8")
+    return save_prompt(name, body, user_dir=user_dir)
+
+
+def delete_prompt(
+    name: str,
+    *,
+    user_dir: Path | None = None,
+    archive_first: bool = True,
+) -> bool:
+    """Remove a prompt from the active prompts dir.
+
+    `archive_first=True` (default) snapshots the current body into the
+    archive before deletion so the user can recover it. Returns True
+    if a prompt was deleted, False if the prompt didn't exist.
+
+    Note: deleting a bundled prompt is allowed -- seed_user_prompts
+    will re-create the user file from the bundled source on next
+    list_templates call. The user can also choose to keep their custom
+    body by saving over the re-seeded version. Deleting + re-seeding
+    is the path to "factory reset this prompt."
+    """
+    name = validate_prompt_name(name)
+    user_dir = user_dir or prompts_dir()
+    target = user_dir / f"{name}.md"
+    if not target.exists():
+        return False
+    if archive_first:
+        _archive_existing_body(name, user_dir=user_dir)
+    try:
+        target.unlink()
+    except OSError as exc:
+        raise PromptError(f"Could not delete {target}: {exc}") from exc
+    return True
+
+
+def is_bundled_prompt(name: str) -> bool:
+    """True if `name` ships as a bundled default.
+
+    The UI uses this to show a small badge ("bundled") and to confirm
+    before delete (a delete of a bundled prompt is harmless because
+    seed_user_prompts re-creates it, but the user should know).
+    """
+    try:
+        validated = validate_prompt_name(name)
+    except PromptError:
+        return False
+    bundled = _bundled_prompts_dir()
+    return (bundled / f"{validated}.md").exists()
