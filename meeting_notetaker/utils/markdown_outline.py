@@ -227,6 +227,65 @@ def inject_toc(
 
 # ---- orchestrator ------------------------------------------------------
 
+def inject_pdf_anchors(text: str) -> str:
+    """Prepend ``<a name="slug"></a>`` HTML before every heading line.
+
+    Qt's ``QTextDocument.setMarkdown`` parses ``[text](#slug)`` links
+    but doesn't reliably emit them as PDF named destinations on
+    every Qt version. Pre-injecting an explicit named anchor as
+    inline HTML before each heading gives the PDF writer a hard
+    target it can resolve.
+
+    Slug uses the standard ``slugify`` so the auto-generated TOC's
+    ``[Heading](#slug)`` links resolve to the same name we emit
+    here. Idempotent: lines already prefixed by an anchor pass
+    through unchanged.
+
+    Fenced code blocks are skipped so heading-shaped lines inside
+    code samples don't get spurious anchors.
+
+    Used by the PDF render path (#94). Markdown renderers + the
+    Preview / Notion / Confluence paths ignore inline HTML they
+    don't understand (or treat ``<a name="...">`` as harmless
+    anchor markers), so the same body can flow through every
+    output without conditional branches.
+    """
+    if not text:
+        return ""
+    lines = text.splitlines(keepends=True)
+    out: List[str] = []
+    in_fence = False
+    for line in lines:
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        m = _HEADING_RE.match(line)
+        if m is None:
+            out.append(line)
+            continue
+        body = m.group(3).strip()
+        if not body:
+            out.append(line)
+            continue
+        slug = slugify(body)
+        if not slug:
+            out.append(line)
+            continue
+        # Idempotency: if the previous emitted line is already the
+        # same anchor, don't emit a duplicate.
+        marker = f'<a name="{slug}"></a>\n'
+        if out and out[-1] == marker:
+            out.append(line)
+            continue
+        out.append(marker)
+        out.append(line)
+    return "".join(out)
+
+
 def apply_outline(
     text: str,
     *,

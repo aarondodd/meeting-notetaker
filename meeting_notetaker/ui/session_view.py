@@ -2518,6 +2518,9 @@ class SessionView(QWidget):
                 toc=self._export_toc,
                 max_depth=self._export_toc_max_depth,
             )
+            # #94: inject named anchors for the PDF so TOC links navigate.
+            from ..utils.markdown_outline import inject_pdf_anchors  # noqa: PLC0415
+            body_for_print = inject_pdf_anchors(body_for_print)
 
         printable = build_print_markdown(
             session_title=self._session.title,

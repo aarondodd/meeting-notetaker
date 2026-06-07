@@ -458,6 +458,14 @@ def render_session_pdf(
             body, number=number_headings, toc=include_toc,
             max_depth=toc_max_depth,
         )
+    # #94: prepend `<a name="slug">` anchors before every heading so
+    # the TOC's [text](#slug) links carry into the PDF as named
+    # destinations. Runs unconditionally -- harmless overhead on
+    # non-TOC PDFs (a few bytes per heading) and skipping it would
+    # require a parallel branch.
+    if number_headings or include_toc:
+        from .markdown_outline import inject_pdf_anchors  # noqa: PLC0415
+        body = inject_pdf_anchors(body)
 
     printable = build_print_markdown(
         session_title=session_title,

@@ -10,6 +10,7 @@ from meeting_notetaker.utils.markdown_outline import (
     TOC_HEADING,
     apply_outline,
     generate_toc,
+    inject_pdf_anchors,
     inject_toc,
     iter_headings,
     number_headings,
@@ -331,3 +332,70 @@ def test_outline_round_trip_with_complex_doc():
     # TOC at top + separator.
     assert out.find(TOC_HEADING) < out.find("# 1 Project Overview")
     assert "---" in out
+
+
+# ---- inject_pdf_anchors (#94) -------------------------------------------
+
+def test_inject_pdf_anchors_single_h1():
+    src = "# Project Overview\n\nbody\n"
+    out = inject_pdf_anchors(src)
+    assert out.startswith('<a name="project-overview"></a>\n# Project Overview\n')
+
+
+def test_inject_pdf_anchors_multiple_levels():
+    src = "# A\n\n## B\n\n### C\n"
+    out = inject_pdf_anchors(src)
+    assert '<a name="a"></a>\n# A' in out
+    assert '<a name="b"></a>\n## B' in out
+    assert '<a name="c"></a>\n### C' in out
+
+
+def test_inject_pdf_anchors_skips_fenced_code():
+    """Heading-shaped lines inside a fenced code block shouldn't
+    get anchored."""
+    src = "# Real\n\n```python\n# Not a heading\n```\n"
+    out = inject_pdf_anchors(src)
+    assert '<a name="real"></a>' in out
+    # No anchor for "Not a heading" -- it's inside a fence.
+    assert '<a name="not-a-heading"></a>' not in out
+
+
+def test_inject_pdf_anchors_idempotent():
+    """Running twice produces the same output -- no duplicate anchors."""
+    src = "# A\n\n## B\n"
+    once = inject_pdf_anchors(src)
+    twice = inject_pdf_anchors(once)
+    assert once == twice
+
+
+def test_inject_pdf_anchors_slug_matches_slugify():
+    """The injected anchor name must equal the slug the TOC links
+    would target, otherwise click-to-jump breaks."""
+    src = "# Q3 / Q4 Planning\n"
+    out = inject_pdf_anchors(src)
+    assert f'<a name="{slugify("Q3 / Q4 Planning")}"></a>' in out
+    assert '<a name="q3-q4-planning"></a>' in out
+
+
+def test_inject_pdf_anchors_numbered_headings_use_numbered_slug():
+    """After number_headings runs, the prefix is part of the
+    heading text, so its slug includes the prefix. inject_pdf_anchors
+    must match it."""
+    src = "# 1.2.3 Some Heading\n"
+    out = inject_pdf_anchors(src)
+    assert '<a name="1-2-3-some-heading"></a>' in out
+
+
+def test_inject_pdf_anchors_empty_body_skipped():
+    """A bare `##` with nothing after gets no anchor."""
+    src = "##\n# Real\n"
+    out = inject_pdf_anchors(src)
+    # Real gets anchored.
+    assert '<a name="real"></a>' in out
+
+
+def test_inject_pdf_anchors_preserves_non_heading_lines():
+    src = "intro paragraph\n\n# A\nmore text\n"
+    out = inject_pdf_anchors(src)
+    assert "intro paragraph" in out
+    assert "more text" in out
