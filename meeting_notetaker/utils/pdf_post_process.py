@@ -1,27 +1,23 @@
-"""Post-process a Qt-generated PDF to add navigation (#94).
+"""Post-process a Qt-generated PDF to add TOC navigation (#94).
 
-Qt's ``QTextDocument`` print path doesn't emit PDF link annotations
-even when the source markup carries ``<a href="#x">`` /
-``<a name="x">`` anchors. The user sees the TOC entries as visible
-underlined text but clicking them doesn't jump anywhere.
+Qt's ``QTextDocument`` print path already does most of the work:
+it writes Link annotations with the correct rectangles and named
+destination references (e.g. ``/Dest = '1-introduction'``). What it
+*doesn't* write is the ``/Names/Dests`` dictionary that resolves
+each name to a page + position. Without that dictionary, the link
+annotations exist but resolve nowhere -- Acrobat shows them as
+clickable but they "go nowhere"; Edge/Chrome don't show them as
+clickable at all.
 
-The robust fix is to open the rendered PDF with pypdf and add the
-navigation features Qt didn't write:
+The fix is to read the rendered PDF, walk the body markdown to
+build a slug -> page mapping (slugs match what Qt used because we
+control both sides via the existing ``slugify`` helper), and write
+the named destinations into the PDF's name dictionary. Qt's
+already-correctly-placed Link annotations then resolve.
 
-  1. **Outline (bookmarks)** -- one entry per heading. Most PDF
-     viewers (Edge, Acrobat, SumatraPDF, Preview, Foxit) show this
-     in a sidebar with click-to-jump behavior. Robust because we
-     only need the page index for each heading.
-
-  2. **Link annotations** on the in-page TOC entries -- clickable
-     rectangles overlaid on each TOC line that jump to the matching
-     heading's page. More fragile because it requires extracting
-     text positions from the PDF, but functional for the typical
-     case where the TOC entry text matches the heading text
-     verbatim (which is how ``generate_toc`` builds them).
-
-Both ship together so even if some link annotations fail to match,
-the sidebar navigation still works.
+We also add outline entries (PDF sidebar bookmarks) for each
+heading -- gives users a navigable sidebar in every modern viewer,
+robust because it only needs the heading's page index.
 
 Pure-Python; the only deps are pypdf (added to requirements) and
 the markdown_outline helpers (slugify + iter_headings).
@@ -36,6 +32,7 @@ from .markdown_outline import (
     DEFAULT_TOC_MAX_DEPTH,
     TOC_HEADING,
     iter_headings,
+    slugify,
 )
 
 
@@ -48,21 +45,19 @@ def add_pdf_navigation(
     *,
     toc_max_depth: int = DEFAULT_TOC_MAX_DEPTH,
 ) -> dict:
-    """Open ``pdf_path``, add outline + link annotations, write back.
+    """Open ``pdf_path``, register named destinations + outline, write back.
 
-    Returns a small stats dict (``{"outline_added": N,
-    "links_added": M, "error": str|None}``) so callers can log
-    what happened.
+    Returns a stats dict (``{"named_dests_added": N,
+    "outline_added": M, "error": str|None}``).
 
     Failures here are non-fatal -- a corrupted post-process pass
     shouldn't break PDF export. The original Qt PDF stays on disk
     if anything goes wrong; we only overwrite on a complete clean
     run.
     """
-    stats = {"outline_added": 0, "links_added": 0, "error": None}
+    stats = {"named_dests_added": 0, "outline_added": 0, "error": None}
     try:
         import pypdf
-        from pypdf.annotations import Link as _PdfLink
     except ImportError as exc:
         stats["error"] = f"pypdf not installed: {exc}"
         return stats
@@ -74,40 +69,35 @@ def add_pdf_navigation(
         body_headings = _collect_body_headings(
             markdown_body, max_depth=toc_max_depth,
         )
-        toc_entries = _collect_toc_entries(
-            markdown_body, max_depth=toc_max_depth,
-        )
         reader = pypdf.PdfReader(str(pdf_path))
         writer = pypdf.PdfWriter(clone_from=reader)
-        # Walk pages once, extracting text with positions. Build:
-        #   heading_text -> first page_idx where heading appears
-        #   toc_text -> [(page_idx, rect), ...]
+        # Heading text -> page index where each heading appears.
         heading_pages = _find_heading_pages(writer, body_headings)
-        toc_positions = _find_toc_positions(
-            writer, toc_entries, heading_pages,
-        )
-        for heading_text, page_idx in heading_pages.items():
+        # Heading text -> slug. Qt writes its in-document link
+        # annotations with /Dest = the slug. We register a named
+        # destination with the same slug pointing at the heading
+        # page; Qt's link annotations then resolve.
+        for heading_text in body_headings:
+            page_idx = heading_pages.get(heading_text)
             if page_idx is None:
                 continue
+            slug = slugify(heading_text)
+            if not slug:
+                continue
+            try:
+                writer.add_named_destination(slug, page_idx)
+                stats["named_dests_added"] += 1
+            except Exception:
+                log.debug(
+                    "named destination add failed for %r (slug %r)",
+                    heading_text, slug, exc_info=True,
+                )
             try:
                 writer.add_outline_item(heading_text, page_idx)
                 stats["outline_added"] += 1
             except Exception:
                 log.debug(
                     "outline add failed for %r", heading_text,
-                    exc_info=True,
-                )
-        for toc_text, page_idx, rect, dest_page_idx in toc_positions:
-            try:
-                link = _PdfLink(
-                    rect=rect,
-                    target_page_index=dest_page_idx,
-                )
-                writer.add_annotation(page_idx, link)
-                stats["links_added"] += 1
-            except Exception:
-                log.debug(
-                    "link add failed for TOC entry %r", toc_text,
                     exc_info=True,
                 )
         tmp_path = pdf_path.with_suffix(".pdf.tmp")
@@ -232,7 +222,7 @@ def _find_heading_pages(writer, headings: list[str]) -> dict[str, Optional[int]]
     return result
 
 
-def _find_toc_positions(
+def _find_toc_positions(  # pragma: no cover -- not used by add_pdf_navigation
     writer, toc_entries: list[str], heading_pages: dict[str, Optional[int]],
 ) -> list[tuple[str, int, tuple[float, float, float, float], int]]:
     """For each TOC entry, find its rendered bounding box and the

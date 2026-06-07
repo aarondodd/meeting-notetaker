@@ -151,9 +151,15 @@ def _has_qprinter() -> bool:
 
 
 @pytest.mark.skipif(not _has_qprinter(), reason="QPrinter not available")
-def test_end_to_end_adds_outline_and_links():
-    """Render a small PDF via Qt, post-process, verify pypdf reports
-    outline items + link annotations."""
+def test_end_to_end_adds_named_destinations_and_outline():
+    """Render a small PDF via Qt, post-process. Verify:
+
+    1. Qt's pre-existing link annotations on the TOC entries have
+       named-destination refs (e.g. dest='1-introduction').
+    2. After post-processing, the PDF carries /Names/Dests entries
+       mapping those slugs to the right pages.
+    3. Outline items are added for the body headings (sidebar nav).
+    """
     from PyQt6.QtPrintSupport import QPrinter
     from PyQt6.QtWidgets import QApplication
 
@@ -188,31 +194,35 @@ def test_end_to_end_adds_outline_and_links():
         doc.print(printer)
         stats = add_pdf_navigation(out_path, src)
         assert stats["error"] is None
-        # Two body headings -> two outline items.
+        # Two body headings -> two named destinations + two outline.
+        assert stats["named_dests_added"] == 2
         assert stats["outline_added"] == 2
-        # Two TOC entries -> two link annotations.
-        assert stats["links_added"] == 2
 
-        # Verify the post-processed PDF actually carries the new
-        # structures.
+        # Named destinations exist after post-processing.
         reader = pypdf.PdfReader(str(out_path))
+        named = reader.named_destinations
+        assert "1-introduction" in named
+        assert "2-architecture" in named
+        # Each named destination resolves to a real page number.
+        assert reader.get_destination_page_number(named["1-introduction"]) is not None
+        assert reader.get_destination_page_number(named["2-architecture"]) is not None
+
+        # Outline carries the heading titles.
         outline_titles = [
             getattr(item, "title", "") for item in reader.outline
         ]
         assert "1 Introduction" in outline_titles
         assert "2 Architecture" in outline_titles
 
-        # Page 0 should carry the new Link annotations (in addition
-        # to whatever Qt wrote).
+        # Qt's link annotations on page 0 (the TOC page) reference
+        # the named destinations.
         page0 = reader.pages[0]
-        annots = page0.get("/Annots") or []
-        link_count = 0
-        for ref in annots:
+        link_dests = set()
+        for ref in page0.get("/Annots", []):
             obj = ref.get_object()
             if obj.get("/Subtype") == "/Link":
-                link_count += 1
-        # Qt writes its own (non-navigable) link annotations for the
-        # markdown link text; we add navigable Link annotations on
-        # top. Either way, at least 2 should exist after the
-        # post-process (one per TOC entry we added).
-        assert link_count >= 2
+                dest = obj.get("/Dest")
+                if isinstance(dest, str):
+                    link_dests.add(dest)
+        assert "1-introduction" in link_dests
+        assert "2-architecture" in link_dests
