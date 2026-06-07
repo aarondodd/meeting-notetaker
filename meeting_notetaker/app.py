@@ -442,6 +442,9 @@ class MainApp(QObject):
                 number_headings=self.config.synthesis.heading_numbering,
                 include_toc=self.config.synthesis.toc_in_exports,
                 toc_max_depth=toc_max_depth,
+                use_word_for_pdf=getattr(
+                    self.config.synthesis, "use_word_for_pdf", False,
+                ),
             )
         except AttributeError:
             pass

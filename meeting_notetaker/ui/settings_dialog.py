@@ -1083,6 +1083,38 @@ class SettingsDialog(QDialog):
         toc_depth_row.addStretch(1)
         export_form.addRow(toc_depth_row)
 
+        # #94: route PDF export through Word when available so the
+        # PDF gets Word's native clickable TOC + sidebar bookmarks
+        # without any post-processing. Disabled if win32com isn't
+        # importable (non-Windows or Windows without pywin32) -- the
+        # cross-platform Qt + pypdf path stays the default fallback.
+        from ..utils.word_export import is_word_com_available  # noqa: PLC0415
+        word_com_ok = is_word_com_available()
+        self._use_word_for_pdf = QCheckBox(
+            "Use Word for PDF export (Windows only)", self,
+        )
+        self._use_word_for_pdf.setChecked(
+            getattr(config.synthesis, "use_word_for_pdf", False)
+            and word_com_ok,
+        )
+        self._use_word_for_pdf.setEnabled(word_com_ok)
+        if word_com_ok:
+            self._use_word_for_pdf.setToolTip(
+                "Render the PDF via Word's native PDF export instead "
+                "of Qt's PDF backend. Produces a PDF with Word's "
+                "native sidebar bookmarks and clickable table of "
+                "contents -- no post-processing needed. Requires "
+                "Word to be installed."
+            )
+        else:
+            self._use_word_for_pdf.setToolTip(
+                "Disabled because Word COM (pywin32 + installed "
+                "Word) is unavailable on this host. The Qt PDF path "
+                "still emits clickable TOC entries via the #94 post-"
+                "process."
+            )
+        export_form.addRow(self._use_word_for_pdf)
+
         self._add_section("Export", export_group)
 
         # Backups group (#67) ---------------------------------------------
@@ -1305,6 +1337,9 @@ class SettingsDialog(QDialog):
         self._config.synthesis.heading_numbering = self._heading_numbering.isChecked()
         self._config.synthesis.toc_in_exports = self._toc_in_exports.isChecked()
         self._config.synthesis.toc_max_depth = int(self._toc_max_depth.value())
+        self._config.synthesis.use_word_for_pdf = (
+            self._use_word_for_pdf.isChecked()
+        )
         self._config.backup.folder = self._backup_folder_edit.text().strip()
         if self._backup_sched_on_close.isChecked():
             self._config.backup.schedule = "on_close"

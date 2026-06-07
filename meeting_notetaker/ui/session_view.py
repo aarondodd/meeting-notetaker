@@ -225,6 +225,10 @@ class SessionView(QWidget):
         self._export_heading_numbering: bool = False
         self._export_toc: bool = False
         self._export_toc_max_depth: int = 3
+        # #94: when True AND Word COM is available, "Save as PDF..."
+        # routes through Word for native TOC + bookmarks instead of
+        # Qt's PDF backend + pypdf post-process.
+        self._use_word_for_pdf: bool = False
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -420,6 +424,14 @@ class SessionView(QWidget):
         self._export_menu = QMenu(self._export_btn)
         self._export_pdf_action = self._export_menu.addAction("Save as PDF...")
         self._export_pdf_action.triggered.connect(self._on_export_pdf)
+        # #94: Save as Word (.docx). Inserts Word's native TOC field
+        # that auto-populates the first time the user opens the file
+        # in Word. Always visible -- the docx itself is cross-
+        # platform, only the optional TOC-population step needs Word.
+        self._export_word_action = self._export_menu.addAction(
+            "Save as Word..."
+        )
+        self._export_word_action.triggered.connect(self._on_export_word)
         # Notion + Confluence actions; visibility re-evaluated whenever
         # the session changes or settings are saved.
         self._export_notion_action = self._export_menu.addAction(
@@ -1649,14 +1661,23 @@ class SessionView(QWidget):
         number_headings: bool,
         include_toc: bool,
         toc_max_depth: int = 3,
+        use_word_for_pdf: bool = False,
     ) -> None:
-        """Push the export outline preferences (#92) into the session
-        view. Used by the per-tab Export PDF / Print path -- the body
-        is transformed before render so PDFs match the configured
-        preferences. Idempotent."""
+        """Push the export outline preferences (#92, #94) into the
+        session view. Used by the per-tab Export PDF / Print path --
+        the body is transformed before render so PDFs match the
+        configured preferences. Idempotent.
+
+        ``use_word_for_pdf`` -- #94 follow-up. When True AND Word COM
+        is available, "Save as PDF..." renders via Word's native TOC +
+        PDF export pipeline rather than Qt's PDF backend. When True
+        on a non-Windows host (or Windows without Word), the flag is
+        silently ignored; the Qt path stays the fallback.
+        """
         self._export_heading_numbering = bool(number_headings)
         self._export_toc = bool(include_toc)
         self._export_toc_max_depth = max(1, min(6, int(toc_max_depth)))
+        self._use_word_for_pdf = bool(use_word_for_pdf)
 
     def set_heading_numbering(self, enabled: bool) -> None:
         """Toggle preview heading numbering (#92) on every preview-bearing
@@ -2691,6 +2712,25 @@ class SessionView(QWidget):
         if target.suffix.lower() != ".pdf":
             target = target.with_suffix(".pdf")
 
+        # #94: when the user opted into "Use Word for PDF export" AND
+        # Word COM is available, render via Word -- the resulting PDF
+        # has Word's native sidebar bookmarks + clickable TOC entries
+        # without any post-processing. Otherwise fall back to Qt's
+        # PDF backend + pypdf post-process.
+        if self._use_word_for_pdf:
+            from ..utils.word_export import is_word_com_available  # noqa: PLC0415
+            if is_word_com_available():
+                body_md = getattr(doc, "_mn_body_markdown", "") or ""
+                if self._render_pdf_via_word(
+                    body_md=body_md, dst=target, tab_label=tab_label,
+                ):
+                    self.window().statusBar().showMessage(
+                        f"Exported PDF (via Word) to {target.name}", 5000,
+                    )
+                    return
+                # Word path failed -- fall through to Qt so the user
+                # still gets a PDF rather than a silent no-op.
+
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(str(target))
@@ -2721,6 +2761,108 @@ class SessionView(QWidget):
         self.window().statusBar().showMessage(
             f"Exported PDF to {target.name}", 5000
         )
+
+    def _on_export_word(self) -> None:
+        """Save the active tab as a Word (.docx) document.
+
+        Renders the markdown body via python-docx with a Word native
+        TOC field (when the TOC export setting is on) -- Word
+        populates the TOC the first time the file is opened. On
+        Windows with Word installed, we additionally invoke Word COM
+        to populate the TOC server-side so the file opens fully
+        rendered.
+        """
+        doc, tab_label = self._build_print_document(
+            appendix_defaults=self._appendix_export_defaults,
+        )
+        if doc is None or self._session is None:
+            return
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+        suggested_name = default_export_filename(
+            self._session.title, tab_label, ".docx"
+        )
+        suggested_path = export_initial_save_path(
+            self._export_default_folder,
+            session_dir(self._session.id),
+            suggested_name,
+        )
+        path_str, _filter = QFileDialog.getSaveFileName(
+            self,
+            f"Export {tab_label} as Word",
+            suggested_path,
+            "Word documents (*.docx)",
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        if target.suffix.lower() != ".docx":
+            target = target.with_suffix(".docx")
+
+        body_md = getattr(doc, "_mn_body_markdown", "") or ""
+        from ..utils.word_export import (  # noqa: PLC0415
+            export_to_docx,
+            is_word_com_available,
+            populate_toc_via_word,
+        )
+        stats = export_to_docx(
+            body_md,
+            target,
+            base_dir=session_dir(self._session.id),
+            title=self._session.title,
+            include_toc=self._export_toc,
+            toc_max_depth=self._export_toc_max_depth,
+        )
+        if stats.error:
+            QMessageBox.warning(
+                self, "Export Word",
+                f"Could not write Word document: {stats.error}",
+            )
+            return
+        # Best-effort TOC population via Word COM -- skipped silently
+        # on non-Windows / no Word. Without this, Word shows the TOC
+        # placeholder until the user updates the field manually.
+        if self._export_toc and is_word_com_available():
+            populate_toc_via_word(target, save_in_place=True)
+        self.window().statusBar().showMessage(
+            f"Exported Word document to {target.name}", 5000,
+        )
+
+    def _render_pdf_via_word(
+        self, *, body_md: str, dst: Path, tab_label: str,
+    ) -> bool:
+        """Word-COM PDF render path (#94 follow-up).
+
+        Renders markdown -> .docx with a native TOC field, then drives
+        Word to populate the TOC and ExportAsFixedFormat -> PDF. Word
+        emits a PDF with native sidebar bookmarks and clickable TOC
+        hyperlinks via the CreateBookmarks=1 flag.
+
+        Returns True on success, False on any failure. The .docx
+        intermediate is written to a temp path next to the PDF and
+        cleaned up at the end so the user only sees the PDF.
+        """
+        if self._session is None or not body_md:
+            return False
+        from ..utils.word_export import (  # noqa: PLC0415
+            export_to_docx,
+            export_to_pdf_via_word,
+        )
+        import tempfile  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_docx = Path(td) / f"{dst.stem}.docx"
+            stats = export_to_docx(
+                body_md,
+                tmp_docx,
+                base_dir=session_dir(self._session.id),
+                title=self._session.title,
+                include_toc=self._export_toc,
+                toc_max_depth=self._export_toc_max_depth,
+            )
+            if stats.error:
+                return False
+            return export_to_pdf_via_word(tmp_docx, dst)
 
 
 _TIMESTAMP_RE = re.compile(r"^\[(\d+):(\d{2}):(\d{2})\]")

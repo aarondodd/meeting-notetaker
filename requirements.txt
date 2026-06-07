@@ -37,6 +37,14 @@ mistune>=3.0
 # anchors are present, so post-processing is the robust path.
 # Pure Python, BSD-3, ~350 KB wheel.
 pypdf>=5.0
+# Issue #94 follow-up: render the synthesis body as a Word .docx
+# (cross-platform via python-docx, no COM required). Inserts a
+# native TOC field that auto-populates the first time the user
+# opens the file in Word. On Windows with Word installed, the
+# session view additionally drives Word COM to populate the TOC
+# in-place + the optional PDF-via-Word export path. Pure-Python
+# wheel + lxml transitively.
+python-docx>=1.1
 requests>=2.28
 sounddevice>=0.4.6
 tomli>=2.0.0; python_version < '3.11'

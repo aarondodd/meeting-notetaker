@@ -17,7 +17,7 @@ TOCs are:
 | Confluence | `<ac:structured-macro ac:name="toc">` macro with `maxLevel` parameter | Implemented (#92 / #94). See `confluence_storage.build_toc_macro` and `export.export_to_confluence`. |
 | Notion | `table_of_contents` block | Implemented (#94). See `notion_blocks.build_toc_block` and `export.export_to_notion`. |
 | PDF | Named destinations + Link annotations (Qt path) | Implemented (#94). Qt writes the link annotations correctly but the post-processor in `utils/pdf_post_process.py` rewrites their `/Dest` from name-strings to inline arrays so PDFium-based viewers (Chrome / Edge) navigate them. |
-| Word (.docx) | `Word.Application.TablesOfContents.Add` via COM | Pending -- see #94 follow-up. |
+| Word (.docx) | TOC field (`TOC \o "1-N" \h \z \u`) inserted via `python-docx`; populated by Word on first open OR by our `populate_toc_via_word` COM helper on Windows | Implemented (#94 follow-up). See `utils/word_export.export_to_docx`, `populate_toc_via_word`, `export_to_pdf_via_word`. |
 
 ## How the integration should handle TOC
 
@@ -53,4 +53,3 @@ the document's structure.
 | Google Docs | `documents.batchUpdate -> Doc TOC` | TOC support via API exists -- use it. |
 | Microsoft OneNote | No native TOC primitive | Fall back to markdown TOC. |
 | Obsidian (vault save) | `[[wikilinks]]` + Outliner plugin | Vault doesn't have a native TOC; markdown TOC works because Obsidian's renderer respects `[text](#slug)` anchors. |
-| Word (.docx) | `Word.TablesOfContents.Add` via COM | When the file is opened in Word, the field auto-populates. |

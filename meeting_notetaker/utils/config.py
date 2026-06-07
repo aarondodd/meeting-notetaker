@@ -306,6 +306,14 @@ class SynthesisConfig:
     # TOC depth ceiling. Default 3 (H1-H3, or H2-H4 when skip_h1).
     # Constrained to 1-6 to match markdown's heading range.
     toc_max_depth: int = 3
+    # #94: when True AND the host is Windows AND Word is installed,
+    # "Save as PDF..." renders to a temp .docx first, opens it in
+    # Word, populates the native TOC field, and exports to PDF via
+    # Word's ExportAsFixedFormat. The PDF gets Word's native sidebar
+    # bookmarks + clickable TOC entries with no post-processing. Off
+    # by default; Qt's native PDF path (with pypdf post-processing
+    # for clickable TOC entries) is the cross-platform fallback.
+    use_word_for_pdf: bool = False
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for
