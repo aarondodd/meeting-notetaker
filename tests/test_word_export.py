@@ -243,3 +243,103 @@ def test_export_to_docx_handles_empty_input(tmp_path):
     assert stats.error is None
     assert dst.exists()
     assert stats.headings_emitted == 0
+
+
+# ---- table rendering -----------------------------------------------------
+
+
+def test_export_to_docx_renders_table(tmp_path):
+    """Markdown tables (the appendix Attendees / Topics / Links
+    sections rely on these) must render as Word tables, not vanish.
+    """
+    src = (
+        "# Title\n\n"
+        "| Name | Email |\n"
+        "|------|-------|\n"
+        "| Alice | a@b.com |\n"
+        "| Bob | b@c.com |\n"
+    )
+    dst = tmp_path / "out.docx"
+    stats = export_to_docx(src, dst)
+    assert stats.error is None
+    with zipfile.ZipFile(dst) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8")
+    # The docx wraps a table in a <w:tbl> element.
+    assert "<w:tbl" in xml
+    # Header + body cells are visible.
+    for cell in ("Name", "Email", "Alice", "a@b.com", "Bob", "b@c.com"):
+        assert cell in xml, f"missing cell content {cell!r} in docx"
+
+
+def test_export_to_docx_table_with_inline_formatting(tmp_path):
+    """Bold / italic / code spans inside table cells survive into
+    the docx as runs with the matching formatting -- the appendix
+    rendering relies on this for emphasized cells."""
+    src = (
+        "| Field | Value |\n"
+        "|-------|-------|\n"
+        "| Status | **Active** |\n"
+        "| Code | `tracking_id` |\n"
+    )
+    dst = tmp_path / "out.docx"
+    stats = export_to_docx(src, dst)
+    assert stats.error is None
+    with zipfile.ZipFile(dst) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8")
+    assert "<w:tbl" in xml
+    assert "Active" in xml
+    assert "tracking_id" in xml
+
+
+# ---- title-block placement -----------------------------------------------
+
+
+def test_export_to_docx_title_appears_before_toc(tmp_path):
+    """The build_print_markdown header (H1 + date paragraph + hr)
+    must land ABOVE Word's native TOC field when a TOC is requested,
+    so the document opens with the session title rather than the
+    'Right-click to populate' TOC placeholder."""
+    src = (
+        "# Daily standup 2026-06-08\n\n"
+        "*2026-06-08 09:00*\n\n"
+        "---\n\n"
+        "# 1 Discussion\n\n"
+        "body.\n\n"
+        "# 2 Action items\n\n"
+        "more body.\n"
+    )
+    dst = tmp_path / "out.docx"
+    stats = export_to_docx(src, dst, include_toc=True, toc_max_depth=3)
+    assert stats.error is None
+    assert stats.toc_inserted is True
+    with zipfile.ZipFile(dst) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8")
+    title_pos = xml.find("Daily standup")
+    toc_pos = xml.find('TOC \\o "1-3"')
+    assert title_pos > 0, "title not present"
+    assert toc_pos > 0, "TOC field not present"
+    assert title_pos < toc_pos, (
+        f"title (pos {title_pos}) must precede TOC field "
+        f"(pos {toc_pos}) in the rendered document"
+    )
+
+
+def test_export_to_docx_toc_at_top_when_no_title_block(tmp_path):
+    """When the body doesn't open with an H1 / date / hr, the TOC
+    falls back to top-of-document so it still appears in the
+    rendered file -- skipping it entirely would silently break the
+    contract."""
+    src = "Just a plain paragraph.\n\n# Body Heading\n\nbody.\n"
+    dst = tmp_path / "out.docx"
+    stats = export_to_docx(src, dst, include_toc=True)
+    assert stats.error is None
+    assert stats.toc_inserted is True
+    with zipfile.ZipFile(dst) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8")
+    toc_pos = xml.find('TOC \\o ')
+    para_pos = xml.find("Just a plain paragraph")
+    assert toc_pos > 0
+    assert para_pos > 0
+    assert toc_pos < para_pos, (
+        "TOC should sit above the body when no title block is detected"
+    )

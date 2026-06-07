@@ -150,48 +150,31 @@ def export_to_docx(
     document = Document()
     document.core_properties.title = title or ""
 
-    if include_toc:
-        _insert_toc_field(document, toc_max_depth=toc_max_depth)
-        stats.toc_inserted = True
-
     parser = mistune.create_markdown(**_PARSER_OPTIONS)
     nodes = parser(markdown_text or "")
     if skip_toc_list:
         nodes = _drop_toc_block(nodes)
 
-    for node in nodes:
-        ntype = node.get("type")
-        if ntype == "heading":
-            level = int(node.get("attrs", {}).get("level", 1))
-            text = _flatten_inline_text(node.get("children", []))
-            heading = document.add_heading(text, level=min(level, 9))
-            stats.headings_emitted += 1
-        elif ntype == "paragraph":
-            _emit_paragraph(
+    # When a TOC was requested AND the body opens with the
+    # build_print_markdown title block (H1 + italic date paragraph +
+    # thematic_break), emit those FIRST so the TOC sits beneath the
+    # title rather than above it -- otherwise the doc opens with
+    # "Right-click to populate" placeholder text above the user-
+    # visible title, which looks wrong.
+    title_block_end = 0
+    if include_toc:
+        title_block_end = _title_block_length(nodes)
+        for node in nodes[:title_block_end]:
+            _emit_node(
                 document, node, base_dir=base_dir, stats=stats,
             )
-            stats.paragraphs_emitted += 1
-        elif ntype == "list":
-            ordered = bool(node.get("attrs", {}).get("ordered"))
-            _emit_list(
-                document, node, ordered=ordered,
-                base_dir=base_dir, stats=stats,
-            )
-        elif ntype == "block_code":
-            _emit_code_block(document, node)
-        elif ntype == "block_quote":
-            _emit_quote(document, node)
-        elif ntype == "thematic_break":
-            document.add_paragraph("_" * 40)
-        elif ntype == "block_html":
-            # Best-effort: emit raw HTML as a plain paragraph. python-
-            # docx can't render arbitrary HTML and we don't want to.
-            text = (node.get("raw") or "").strip()
-            if text:
-                document.add_paragraph(text)
-        # Other node types (table, etc.) are not yet supported -- they
-        # land as nothing rather than crashing. Tables can be added
-        # later if user feedback shows the need.
+
+    if include_toc:
+        _insert_toc_field(document, toc_max_depth=toc_max_depth)
+        stats.toc_inserted = True
+
+    for node in nodes[title_block_end:]:
+        _emit_node(document, node, base_dir=base_dir, stats=stats)
 
     try:
         document.save(str(dst))
@@ -199,6 +182,171 @@ def export_to_docx(
         stats.error = str(exc)
         return stats
     return stats
+
+
+def _emit_node(
+    document, node: dict, *, base_dir: Path, stats: WordExportStats,
+) -> None:
+    """Dispatch a single mistune AST node into the docx document.
+
+    Shared by the title-block emission (which runs before the TOC
+    field so the title sits above the table of contents) and the
+    main body emission. Unknown node types are best-effort: emit
+    inline text if a ``raw`` attribute is available, otherwise
+    silently skip so a single unsupported node doesn't sink the
+    whole export.
+    """
+    ntype = node.get("type")
+    if ntype == "heading":
+        level = int(node.get("attrs", {}).get("level", 1))
+        text = _flatten_inline_text(node.get("children", []))
+        document.add_heading(text, level=min(level, 9))
+        stats.headings_emitted += 1
+    elif ntype == "paragraph":
+        _emit_paragraph(document, node, base_dir=base_dir, stats=stats)
+        stats.paragraphs_emitted += 1
+    elif ntype == "list":
+        ordered = bool(node.get("attrs", {}).get("ordered"))
+        _emit_list(
+            document, node, ordered=ordered,
+            base_dir=base_dir, stats=stats,
+        )
+    elif ntype == "block_code":
+        _emit_code_block(document, node)
+    elif ntype == "block_quote":
+        _emit_quote(document, node)
+    elif ntype == "thematic_break":
+        document.add_paragraph("_" * 40)
+    elif ntype == "table":
+        _emit_table(document, node, base_dir=base_dir, stats=stats)
+    elif ntype == "block_html":
+        text = (node.get("raw") or "").strip()
+        if text:
+            document.add_paragraph(text)
+    elif ntype == "blank_line":
+        # mistune emits these between blocks; word docs handle
+        # paragraph spacing intrinsically so we don't need to emit
+        # anything.
+        return
+
+
+def _title_block_length(nodes: list[dict]) -> int:
+    """Count the leading nodes that form ``build_print_markdown``'s
+    title block: H1 + optional emphasized-date paragraph + optional
+    thematic_break (plus surrounding blank_line padding).
+
+    Returns 0 when the body doesn't open with an H1, so the TOC
+    falls back to top-of-document placement.
+    """
+    if not nodes:
+        return 0
+    idx = _skip_blank_lines(nodes, 0)
+    if idx >= len(nodes):
+        return 0
+    first = nodes[idx]
+    if first.get("type") != "heading":
+        return 0
+    if int(first.get("attrs", {}).get("level", 0)) != 1:
+        return 0
+    end = idx + 1
+    # Optional emphasized-date paragraph immediately after.
+    after = _skip_blank_lines(nodes, end)
+    if (
+        after < len(nodes)
+        and nodes[after].get("type") == "paragraph"
+        and _is_pure_emphasis(nodes[after])
+    ):
+        end = after + 1
+    after = _skip_blank_lines(nodes, end)
+    if after < len(nodes) and nodes[after].get("type") == "thematic_break":
+        end = after + 1
+    return end
+
+
+def _skip_blank_lines(nodes: list[dict], start: int) -> int:
+    i = start
+    while i < len(nodes) and nodes[i].get("type") == "blank_line":
+        i += 1
+    return i
+
+
+def _is_pure_emphasis(paragraph_node: dict) -> bool:
+    """True if a paragraph's only children are emphasis nodes (e.g.
+    the build_print_markdown date paragraph ``*2026-06-07*``)."""
+    children = paragraph_node.get("children", []) or []
+    if not children:
+        return False
+    return all(c.get("type") == "emphasis" for c in children)
+
+
+def _emit_table(
+    document, node: dict, *, base_dir: Path, stats: WordExportStats,
+) -> None:
+    """Render a markdown table as a Word table.
+
+    Walks the mistune AST shape ``table -> table_head | table_body
+    -> table_row -> table_cell``. The header row uses a header style
+    so Word renders it bold; body cells are plain. Inline content
+    inside cells flows through the same inline emitter as
+    paragraphs (preserving bold / italic / code / links).
+    """
+    rows: list[list[dict]] = []
+    head_row: Optional[list[dict]] = None
+    for section in node.get("children", []):
+        section_type = section.get("type")
+        if section_type == "table_head":
+            head_row = list(section.get("children", []))
+        elif section_type == "table_body":
+            for row in section.get("children", []):
+                if row.get("type") == "table_row":
+                    rows.append(list(row.get("children", [])))
+    if head_row is None and not rows:
+        return
+    if head_row is None:
+        head_row = rows[0] if rows else []
+        rows = rows[1:]
+
+    cols = max(
+        len(head_row),
+        max((len(r) for r in rows), default=0),
+    )
+    if cols <= 0:
+        return
+
+    table = document.add_table(rows=1 + len(rows), cols=cols)
+    try:
+        table.style = document.styles["Table Grid"]
+    except KeyError:
+        pass
+
+    # Header row.
+    header_cells = table.rows[0].cells
+    for col_idx in range(cols):
+        cell = header_cells[col_idx]
+        cell.text = ""
+        paragraph = cell.paragraphs[0]
+        if col_idx < len(head_row):
+            _emit_inline_children(
+                paragraph,
+                head_row[col_idx].get("children", []),
+                base_dir=base_dir, stats=stats,
+            )
+        for run in paragraph.runs:
+            run.bold = True
+
+    # Body rows.
+    for row_idx, body_row in enumerate(rows, start=1):
+        body_cells = table.rows[row_idx].cells
+        for col_idx in range(cols):
+            cell = body_cells[col_idx]
+            cell.text = ""
+            paragraph = cell.paragraphs[0]
+            if col_idx < len(body_row):
+                _emit_inline_children(
+                    paragraph,
+                    body_row[col_idx].get("children", []),
+                    base_dir=base_dir, stats=stats,
+                )
 
 
 def _insert_toc_field(document, *, toc_max_depth: int) -> None:
