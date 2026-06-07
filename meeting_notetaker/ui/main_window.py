@@ -157,6 +157,11 @@ class MainWindow(QMainWindow):
     # MainApp opens the dialog, writes raw.transcript.md on accept, and
     # flips session.has_transcript=True so the Send/Save buttons unlock.
     import_transcript_requested = pyqtSignal()
+    # Issue #88: File > Import Audio Recording... -- decode an external
+    # audio (or video-with-audio) file into the selected session's audio
+    # slot and trigger the standard batch transcription + speaker
+    # refinement pipeline.
+    import_audio_requested = pyqtSignal()
     # View menu (v0.7.7 new): pop-out preview window for My Notes
     # (audience screenshare scenario) + shortcut to the Fonts section
     # in Settings. MainApp owns both handlers.
@@ -214,6 +219,15 @@ class MainWindow(QMainWindow):
             self.import_transcript_requested.emit,
         )
         file_menu.addAction(self._action_import_transcript)
+        # Import audio (#88): decode an external recording into the
+        # session's audio slot and run the standard transcribe + speaker
+        # pipeline. Sits right beside Import Transcript so the two
+        # related entry points are obvious.
+        self._action_import_audio = QAction("Import &Audio Recording...", self)
+        self._action_import_audio.triggered.connect(
+            self.import_audio_requested.emit,
+        )
+        file_menu.addAction(self._action_import_audio)
         # Export submenu mirrors the right-click Export-* entries so a
         # mouse-averse user has parity from the menu bar.
         export_menu = file_menu.addMenu("&Export")
@@ -344,6 +358,7 @@ class MainWindow(QMainWindow):
             self._action_rename_session,
             self._action_edit_timestamp,
             self._action_import_transcript,
+            self._action_import_audio,
             self._action_export_recording,
             self._action_export_video,
             self._action_export_package,
@@ -816,6 +831,10 @@ class MainWindow(QMainWindow):
         # source-agnostic, so we don't gate on existing transcript here
         # (importing over an existing transcript is a valid replace).
         self._action_import_transcript.setEnabled(single is not None)
+        # Import audio: same gate -- single-session-only. The dialog
+        # handles refusal-to-overwrite-existing-audio inside the
+        # controller hook (#88).
+        self._action_import_audio.setEnabled(single is not None)
         # Pop-out preview: single-session-only -- the popout mirrors
         # the currently-selected session's live notes, so it has
         # nothing useful to show when no session is loaded.

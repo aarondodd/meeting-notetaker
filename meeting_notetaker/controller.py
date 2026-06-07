@@ -779,6 +779,117 @@ class SessionController(QObject):
         if store.remove_last_for(name):
             self.speaker_tags_changed.emit(session.id, store.counts())
 
+    # ---- imported audio entry (#88) ------------------------------------
+
+    def start_processing_imported_session(
+        self,
+        session: Session,
+        *,
+        mic_wav: Optional[Path] = None,
+        sys_wav: Optional[Path] = None,
+        run_diarization: bool = True,
+    ) -> None:
+        """Pump a session's already-on-disk audio through the standard
+        batch transcription + (optional) speaker refinement pipeline.
+
+        Used by the audio-import dialog (#88) after it has decoded the
+        user's source file (any format PyAV accepts) into the canonical
+        16 kHz mono int16 WAV at the right slot in the session folder.
+
+        Exactly one of `mic_wav` / `sys_wav` should be set per the
+        import dialog's speaker-treatment dropdown:
+
+          - 'Single combined recording'       -> sys_wav (diarization on)
+          - 'My own voice only'               -> mic_wav (diarization off)
+          - 'Other people's voices'           -> sys_wav (diarization on,
+                                                  no user-voiceprint match)
+
+        Mirrors the post-Stop processing path: construct a
+        _ProcessingState, plan the phases, fire the batch thread, and
+        let the existing _on_batch_done / _finalize_session sequence
+        commit the transcript. From the user's perspective the session
+        looks identical to a live recording that just finished, except
+        the audio came from a file rather than the microphone.
+
+        Refuses to run when a live recording is active or when this
+        session is already being processed.
+        """
+        if self._active_recording_session is not None:
+            self.error.emit(
+                "Stop the active recording before importing audio."
+            )
+            return
+        if session.id in self._processing_sessions:
+            self.error.emit(
+                "This session is already being processed; wait for it "
+                "to finish before importing more audio."
+            )
+            return
+        if mic_wav is None and sys_wav is None:
+            self.error.emit(
+                "Import audio: neither mic nor system track was provided."
+            )
+            return
+
+        hotwords = self._collect_hotwords(session)
+        proc_state = _ProcessingState(
+            session=session,
+            mic_wav=mic_wav,
+            sys_wav=sys_wav,
+            live_segments=[],
+            speaker_tags=[],
+        )
+        self._processing_sessions[session.id] = proc_state
+        skip_batch = self.config.transcription.skip_batch_refinement
+        will_run_refinement = bool(
+            run_diarization
+            and self.config.speakers.enabled
+            and sys_wav is not None
+            and sys_wav.exists()
+        )
+        self._phase_plans[session.id] = self._build_phase_plan(
+            will_run_batch=not skip_batch,
+            will_run_refinement=will_run_refinement,
+        )
+
+        # Imported sessions don't have an Outlook-style ended_at; set it
+        # to now so the session list shows them as completed.
+        self.store.update_session(
+            session.id,
+            ended_at=utc_now_iso(),
+        )
+
+        if skip_batch:
+            self._finalize_session(session.id, batch_segments=None)
+            return
+
+        self.store.update_session(session.id, state=STATE_PROCESSING)
+        session.state = STATE_PROCESSING
+        self.state_changed.emit(session.id, STATE_PROCESSING)
+        self._emit_unified_progress(session.id, "batch", 0)
+
+        beam_size = 1 if self.config.transcription.fast_batch else 5
+        batch_thread = _BatchTranscribeThread(
+            proc_state.mic_wav,
+            proc_state.sys_wav,
+            self.config.transcription.model_size,
+            vad_filter=self.config.audio.vad_enabled,
+            vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
+            beam_size=beam_size,
+            hotwords=hotwords,
+            cpu_threads=self.config.transcription.resolved_cpu_threads(),
+            num_workers=self.config.transcription.num_workers,
+        )
+        batch_thread.progress.connect(self.status.emit)
+        sid = session.id
+        batch_thread.progress_pct.connect(
+            lambda pct, _sid=sid: self._emit_unified_progress(_sid, "batch", pct)
+        )
+        batch_thread.done.connect(lambda segs, _sid=sid: self._on_batch_done(_sid, segs))
+        batch_thread.failed.connect(lambda msg, _sid=sid: self._on_batch_failed(_sid, msg))
+        proc_state.batch_thread = batch_thread
+        batch_thread.start()
+
     def stop_session(self) -> None:
         if self._active_recording_session is None:
             return

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from .automation import messages as automation_messages
 from .automation.bridge import Bridge, HandshakeState
@@ -99,6 +99,7 @@ from .utils.paths import (
     calendar_state_path,
     log_path,
     rotate_log_on_launch,
+    session_audio_dir,
 )
 from .utils.single_instance import acquire as acquire_lock, release as release_lock
 from .utils.vocabulary import seed_vocabulary_file
@@ -1222,6 +1223,12 @@ class MainApp(QObject):
         # handler the SessionView's empty-state Import button uses.
         self.window.import_transcript_requested.connect(
             self._on_file_menu_import_transcript,
+        )
+        # File > Import Audio Recording... (#88) -- decode an external
+        # audio file into the selected session and run the standard
+        # transcribe + speaker pipeline against it.
+        self.window.import_audio_requested.connect(
+            self._on_file_menu_import_audio,
         )
         # View menu (v0.7.7).
         self.window.pop_out_notes_preview_requested.connect(
@@ -2692,6 +2699,61 @@ class MainApp(QObject):
         except (TypeError, RuntimeError):
             pass
         self._notes_popout = None
+
+    def _on_file_menu_import_audio(self) -> None:
+        """File > Import Audio Recording... (#88)
+
+        Decode an external audio file into the selected session's
+        audio dir and trigger the standard transcribe + speaker
+        pipeline against it. Refuses if there's no session selected,
+        if the session already has audio (don't clobber a real
+        recording), or if a live recording is in flight."""
+        from .ui.import_audio_dialog import ImportAudioDialog  # noqa: PLC0415
+
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            QMessageBox.information(
+                self.window, "Import Audio Recording",
+                "Select a session in the list first, then choose "
+                "File > Import Audio Recording...",
+            )
+            return
+        session = sv._session  # noqa: SLF001
+        # Refuse to overwrite an existing recording. The user should
+        # create a new session if they want to import audio.
+        audio_dir = session_audio_dir(session.id)
+        existing = [
+            p for p in (audio_dir / "mic.wav", audio_dir / "sys.wav")
+            if p.exists() and p.stat().st_size > 44
+        ]
+        if existing:
+            QMessageBox.warning(
+                self.window, "Import Audio Recording",
+                "This session already has audio. Import to a new session "
+                "instead so the existing recording isn't overwritten.",
+            )
+            return
+        if self.controller.active_session is not None:
+            QMessageBox.warning(
+                self.window, "Import Audio Recording",
+                "Stop the active recording before importing audio.",
+            )
+            return
+        dlg = ImportAudioDialog(audio_dir, parent=self.window)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        result = dlg.result_payload
+        if result is None:
+            return
+        # Hand off to the controller. The pipeline marks the session
+        # as STATE_PROCESSING and runs the same downstream batch +
+        # speaker passes a live recording would.
+        self.controller.start_processing_imported_session(
+            session,
+            mic_wav=result.decoded_wav_path if result.slot == "mic" else None,
+            sys_wav=result.decoded_wav_path if result.slot == "sys" else None,
+            run_diarization=result.run_diarization,
+        )
 
     def _on_file_menu_import_transcript(self) -> None:
         """File > Import Transcript... -- forwards to the same handler
