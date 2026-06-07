@@ -294,52 +294,70 @@ def test_export_to_docx_table_with_inline_formatting(tmp_path):
 # ---- title-block placement -----------------------------------------------
 
 
-def test_export_to_docx_title_appears_before_toc(tmp_path):
-    """The build_print_markdown header (H1 + date paragraph + hr)
-    must land ABOVE Word's native TOC field when a TOC is requested,
-    so the document opens with the session title rather than the
-    'Right-click to populate' TOC placeholder."""
-    src = (
-        "# Daily standup 2026-06-08\n\n"
-        "*2026-06-08 09:00*\n\n"
-        "---\n\n"
-        "# 1 Discussion\n\n"
-        "body.\n\n"
-        "# 2 Action items\n\n"
-        "more body.\n"
-    )
+def test_export_to_docx_word_title_appears_before_toc(tmp_path):
+    """When ``title`` is supplied, the doc opens with a Title-styled
+    paragraph, then Word's native TOC field beneath it. The body's
+    leading H1 (if any) is unchanged and renders below the TOC."""
+    src = "# Section A\n\nbody.\n\n# Section B\n\nmore body.\n"
     dst = tmp_path / "out.docx"
-    stats = export_to_docx(src, dst, include_toc=True, toc_max_depth=3)
+    stats = export_to_docx(
+        src, dst,
+        title="Daily standup -- Synthesis -- 2026-06-08",
+        include_toc=True, toc_max_depth=3,
+    )
     assert stats.error is None
     assert stats.toc_inserted is True
+    assert stats.title_emitted is True
     with zipfile.ZipFile(dst) as zf:
         xml = zf.read("word/document.xml").decode("utf-8")
     title_pos = xml.find("Daily standup")
     toc_pos = xml.find('TOC \\o "1-3"')
-    assert title_pos > 0, "title not present"
-    assert toc_pos > 0, "TOC field not present"
-    assert title_pos < toc_pos, (
-        f"title (pos {title_pos}) must precede TOC field "
-        f"(pos {toc_pos}) in the rendered document"
+    section_pos = xml.find("Section A")
+    assert title_pos > 0, "Word Title not rendered"
+    assert toc_pos > 0, "TOC field not rendered"
+    assert section_pos > 0, "body heading not rendered"
+    assert title_pos < toc_pos < section_pos, (
+        f"expected order title < TOC < body; got "
+        f"title={title_pos} toc={toc_pos} section={section_pos}"
     )
+    # Title style is "Title" -- verify via pStyle.
+    assert 'w:val="Title"' in xml
 
 
-def test_export_to_docx_toc_at_top_when_no_title_block(tmp_path):
-    """When the body doesn't open with an H1 / date / hr, the TOC
-    falls back to top-of-document so it still appears in the
-    rendered file -- skipping it entirely would silently break the
-    contract."""
-    src = "Just a plain paragraph.\n\n# Body Heading\n\nbody.\n"
+def test_export_to_docx_no_title_means_no_title_paragraph(tmp_path):
+    """When ``title`` is empty, don't emit a Title paragraph -- the
+    doc starts with the TOC (if requested) and then the body."""
+    src = "Just a paragraph.\n\n# Heading\n\nbody.\n"
     dst = tmp_path / "out.docx"
-    stats = export_to_docx(src, dst, include_toc=True)
+    stats = export_to_docx(src, dst, title="", include_toc=True)
     assert stats.error is None
-    assert stats.toc_inserted is True
+    assert stats.title_emitted is False
     with zipfile.ZipFile(dst) as zf:
         xml = zf.read("word/document.xml").decode("utf-8")
     toc_pos = xml.find('TOC \\o ')
-    para_pos = xml.find("Just a plain paragraph")
+    para_pos = xml.find("Just a paragraph")
     assert toc_pos > 0
     assert para_pos > 0
-    assert toc_pos < para_pos, (
-        "TOC should sit above the body when no title block is detected"
+    assert toc_pos < para_pos
+
+
+def test_default_export_document_title_matches_filename_components():
+    """The Word document Title uses the same building blocks as
+    default_export_filename so the file and the doc identify
+    themselves the same way."""
+    from datetime import datetime
+    from meeting_notetaker.utils.export import (
+        default_export_document_title,
+        default_export_filename,
     )
+    now = datetime(2026, 6, 8, 12, 0, 0)
+    title = default_export_document_title(
+        "Daily standup", "Synthesis", now=now,
+    )
+    fname = default_export_filename(
+        "Daily standup", "Synthesis", ".docx", now=now,
+    )
+    assert title == "Daily standup -- Synthesis -- 2026-06-08"
+    # The filename sanitizes; the document title does not, but the
+    # human-readable shape lines up for ASCII inputs.
+    assert fname.startswith("Daily standup -- Synthesis -- 2026-06-08")

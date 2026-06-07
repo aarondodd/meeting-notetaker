@@ -42,6 +42,7 @@ from ..models.transcript import (
 )
 from ..utils.export import (
     build_print_markdown,
+    default_export_document_title,
     default_export_filename,
     export_initial_save_path,
 )
@@ -2807,11 +2808,17 @@ class SessionView(QWidget):
             is_word_com_available,
             populate_toc_via_word,
         )
+        # Word doc Title = same components as the filename
+        # (session title + tab label + date), unsanitized so the
+        # rendered title keeps any special characters.
+        doc_title = default_export_document_title(
+            self._session.title, tab_label,
+        )
         stats = export_to_docx(
             body_md,
             target,
             base_dir=session_dir(self._session.id),
-            title=self._session.title,
+            title=doc_title,
             include_toc=self._export_toc,
             toc_max_depth=self._export_toc_max_depth,
         )
@@ -2852,13 +2859,16 @@ class SessionView(QWidget):
         )
         import tempfile  # noqa: PLC0415
 
+        doc_title = default_export_document_title(
+            self._session.title, tab_label,
+        )
         with tempfile.TemporaryDirectory() as td:
             tmp_docx = Path(td) / f"{dst.stem}.docx"
             stats = export_to_docx(
                 body_md,
                 tmp_docx,
                 base_dir=session_dir(self._session.id),
-                title=self._session.title,
+                title=doc_title,
                 include_toc=self._export_toc,
                 toc_max_depth=self._export_toc_max_depth,
             )

@@ -64,6 +64,7 @@ class WordExportStats:
     images_embedded: int = 0
     images_missing: int = 0
     toc_inserted: bool = False
+    title_emitted: bool = False
     error: Optional[str] = None
 
 
@@ -150,30 +151,24 @@ def export_to_docx(
     document = Document()
     document.core_properties.title = title or ""
 
-    parser = mistune.create_markdown(**_PARSER_OPTIONS)
-    nodes = parser(markdown_text or "")
-    if skip_toc_list:
-        nodes = _drop_toc_block(nodes)
-
-    # When a TOC was requested AND the body opens with the
-    # build_print_markdown title block (H1 + italic date paragraph +
-    # thematic_break), emit those FIRST so the TOC sits beneath the
-    # title rather than above it -- otherwise the doc opens with
-    # "Right-click to populate" placeholder text above the user-
-    # visible title, which looks wrong.
-    title_block_end = 0
-    if include_toc:
-        title_block_end = _title_block_length(nodes)
-        for node in nodes[:title_block_end]:
-            _emit_node(
-                document, node, base_dir=base_dir, stats=stats,
-            )
+    # Render the Word Title paragraph at the top of the doc using
+    # the "Title" style so the doc opens with the same identity its
+    # filename carries. Then the TOC field (if requested) sits
+    # beneath the title rather than above it.
+    if title:
+        _emit_word_title(document, title)
+        stats.title_emitted = True
 
     if include_toc:
         _insert_toc_field(document, toc_max_depth=toc_max_depth)
         stats.toc_inserted = True
 
-    for node in nodes[title_block_end:]:
+    parser = mistune.create_markdown(**_PARSER_OPTIONS)
+    nodes = parser(markdown_text or "")
+    if skip_toc_list:
+        nodes = _drop_toc_block(nodes)
+
+    for node in nodes:
         _emit_node(document, node, base_dir=base_dir, stats=stats)
 
     try:
@@ -230,53 +225,19 @@ def _emit_node(
         return
 
 
-def _title_block_length(nodes: list[dict]) -> int:
-    """Count the leading nodes that form ``build_print_markdown``'s
-    title block: H1 + optional emphasized-date paragraph + optional
-    thematic_break (plus surrounding blank_line padding).
+def _emit_word_title(document, title: str) -> None:
+    """Add a visible Title paragraph at the top of the document.
 
-    Returns 0 when the body doesn't open with an H1, so the TOC
-    falls back to top-of-document placement.
+    Uses Word's built-in "Title" style so the doc opens with the
+    same identity the filename carries. Falls back to Heading 1 on
+    docs that don't expose a Title style (rare; python-docx's
+    default template includes it).
     """
-    if not nodes:
-        return 0
-    idx = _skip_blank_lines(nodes, 0)
-    if idx >= len(nodes):
-        return 0
-    first = nodes[idx]
-    if first.get("type") != "heading":
-        return 0
-    if int(first.get("attrs", {}).get("level", 0)) != 1:
-        return 0
-    end = idx + 1
-    # Optional emphasized-date paragraph immediately after.
-    after = _skip_blank_lines(nodes, end)
-    if (
-        after < len(nodes)
-        and nodes[after].get("type") == "paragraph"
-        and _is_pure_emphasis(nodes[after])
-    ):
-        end = after + 1
-    after = _skip_blank_lines(nodes, end)
-    if after < len(nodes) and nodes[after].get("type") == "thematic_break":
-        end = after + 1
-    return end
-
-
-def _skip_blank_lines(nodes: list[dict], start: int) -> int:
-    i = start
-    while i < len(nodes) and nodes[i].get("type") == "blank_line":
-        i += 1
-    return i
-
-
-def _is_pure_emphasis(paragraph_node: dict) -> bool:
-    """True if a paragraph's only children are emphasis nodes (e.g.
-    the build_print_markdown date paragraph ``*2026-06-07*``)."""
-    children = paragraph_node.get("children", []) or []
-    if not children:
-        return False
-    return all(c.get("type") == "emphasis" for c in children)
+    try:
+        paragraph = document.add_paragraph(title, style="Title")
+    except KeyError:
+        paragraph = document.add_heading(title, level=0)
+    _ = paragraph
 
 
 def _emit_table(

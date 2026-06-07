@@ -50,6 +50,23 @@ def default_export_filename(
     return f"{stem}{ext}"
 
 
+def default_export_document_title(
+    session_title: str,
+    tab_label: str,
+    *,
+    now: Optional[datetime] = None,
+) -> str:
+    """Build the document Title for embedded-title exports (Word).
+
+    Same components as ``default_export_filename`` (session title,
+    tab label, date) but without filename sanitization -- a
+    document Title can carry characters a filename can't (slashes,
+    colons, etc.) and we don't want the rendered title to lose them.
+    """
+    when = (now or datetime.now()).strftime("%Y-%m-%d")
+    return f"{(session_title or 'Untitled session').strip()} -- {tab_label} -- {when}"
+
+
 def resolve_export_initial_dir(
     configured: str,
     fallback: Path,
