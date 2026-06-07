@@ -2745,10 +2745,12 @@ class SessionView(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Export PDF", f"Could not write PDF: {exc}")
             return
-        # #94: post-process the rendered PDF so the in-page TOC
-        # entries are clickable + the heading hierarchy shows in the
-        # viewer's sidebar. Non-fatal -- if pypdf can't read the
-        # PDF we wrote, the original stays on disk untouched.
+        # #94: post-process the rendered PDF. Qt writes the exact
+        # destination per heading in /Names/Dests during print; the
+        # post-processor copies those entries inline onto each Link
+        # annotation so PDFium-based viewers (Chrome / Edge) actually
+        # navigate to the heading. Non-fatal -- failure leaves the
+        # raw Qt PDF on disk.
         if self._export_toc or self._export_heading_numbering:
             body_md = getattr(doc, "_mn_body_markdown", "") or ""
             if body_md:

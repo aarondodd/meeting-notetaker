@@ -91,8 +91,11 @@ class _PrintHtmlRenderer(mistune.HTMLRenderer):
         slug = slugify(plain) if self._anchor_headings else ""
         level = max(1, min(6, int(level)))
         anchor = f'<a name="{slug}"></a>' if slug else ""
-        # Render the anchor BEFORE the heading element. Qt's PDF
-        # writer respects this shape; putting the anchor INSIDE the
-        # heading (`<h1><a name=...></a>X</h1>`) works too but the
-        # before-form is more compatible with older Qt versions.
-        return f"{anchor}<h{level}>{text}</h{level}>\n"
+        # Render the anchor INSIDE the heading element, immediately
+        # before the text. Qt's HTML parser silently drops empty
+        # `<a name>` elements that sit at block level BEFORE a
+        # heading; placing the anchor inside the heading guarantees
+        # it survives into the QTextDocument's character formats
+        # (which the post-process step queries to find each
+        # heading's page+y).
+        return f"<h{level}>{anchor}{text}</h{level}>\n"

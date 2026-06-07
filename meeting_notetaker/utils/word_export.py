@@ -260,6 +260,8 @@ def _drop_toc_block(nodes: list[dict]) -> list[dict]:
     out: list[dict] = []
     # State: 0 = passthrough; 1 = saw "## Contents", waiting for the
     # bullet list; 2 = list consumed, drop one optional <hr/> next.
+    # blank_line nodes are skipped transparently in states 1 + 2 so a
+    # blank line between Contents / list / hr doesn't break the run.
     state = 0
     for node in nodes:
         ntype = node.get("type")
@@ -272,15 +274,18 @@ def _drop_toc_block(nodes: list[dict]) -> list[dict]:
             out.append(node)
             continue
         if state == 1:
+            if ntype == "blank_line":
+                continue
             if ntype == "list":
                 state = 2
                 continue
-            # Defensive: if for some reason there's no list after the
-            # "Contents" heading, bail out without losing content.
+            # No list after "Contents" -- bail out, restore the node.
             state = 0
             out.append(node)
             continue
         if state == 2:
+            if ntype == "blank_line":
+                continue
             if ntype == "thematic_break":
                 state = 0
                 continue

@@ -11,12 +11,15 @@ from meeting_notetaker.utils.print_html import markdown_to_print_html
 
 # ---- anchor injection ---------------------------------------------------
 
-def test_heading_anchor_emitted_before_heading():
+def test_heading_anchor_emitted_inside_heading():
     out = markdown_to_print_html("# Project Overview\n")
-    # Anchor sits immediately before the heading tag so Qt's PDF
-    # writer carries it as a named destination at the heading's
-    # position in the rendered document.
-    assert out.startswith('<a name="project-overview"></a><h1>')
+    # Anchor sits INSIDE the heading element, immediately before the
+    # text. Qt's HTML parser silently drops empty `<a name>` elements
+    # at block level BEFORE a heading; inside-the-heading is the
+    # form that survives into the QTextDocument's character formats
+    # so the PDF post-process can find the heading's page+y in
+    # /Names/Dests.
+    assert out.startswith('<h1><a name="project-overview"></a>')
 
 
 def test_heading_anchor_slug_matches_outline_slug():
@@ -38,9 +41,9 @@ def test_numbered_heading_anchor_uses_numbered_slug():
 
 def test_multiple_heading_levels_each_get_anchors():
     out = markdown_to_print_html("# A\n\n## B\n\n### C\n")
-    assert '<a name="a"></a><h1>A</h1>' in out
-    assert '<a name="b"></a><h2>B</h2>' in out
-    assert '<a name="c"></a><h3>C</h3>' in out
+    assert '<h1><a name="a"></a>A</h1>' in out
+    assert '<h2><a name="b"></a>B</h2>' in out
+    assert '<h3><a name="c"></a>C</h3>' in out
 
 
 def test_anchor_injection_can_be_disabled():
@@ -70,8 +73,9 @@ def test_toc_internal_link_carries_through_as_href():
     out = markdown_to_print_html(src)
     # Link in TOC list.
     assert '<a href="#1-intro">1 Intro</a>' in out
-    # Anchor at heading.
-    assert '<a name="1-intro"></a><h1>1 Intro</h1>' in out
+    # Anchor at heading -- inside the heading element so Qt
+    # preserves it (see test_heading_anchor_emitted_inside_heading).
+    assert '<h1><a name="1-intro"></a>1 Intro</h1>' in out
 
 
 # ---- markdown surface compatibility -------------------------------------

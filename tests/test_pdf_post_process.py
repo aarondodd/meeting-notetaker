@@ -162,13 +162,19 @@ def _has_pdfium() -> bool:
     not (_has_qprinter() and _has_pdfium()),
     reason="QPrinter or pypdfium2 not available",
 )
-def test_end_to_end_links_navigable_in_pdfium():
-    """The acceptance test: render a PDF, post-process, then open
-    with PDFium (Chrome / Edge's PDF engine) and verify each TOC
-    link annotation has a resolvable destination page.
+def test_end_to_end_links_actually_navigate_to_target_headings():
+    """The acceptance test: render a PDF, post-process, then for each
+    TOC link follow its destination and verify the text immediately
+    AT the destination y on the destination page is the target
+    heading.
 
-    PDFium is the same engine browsers use, so a link that resolves
-    here is a link the user can click in their PDF viewer."""
+    Earlier iterations only checked that ``FPDFLink_GetDest`` returned
+    a non-null destination -- which it did, even when the destination
+    pointed at "page 0 top" (the TOC itself), producing a "link
+    clickable but click does nothing" symptom in real viewers. This
+    test follows the link the same way Chrome / Edge / Acrobat do
+    and asserts the destination lands on the target heading text.
+    """
     import ctypes
 
     from PyQt6.QtPrintSupport import QPrinter
@@ -182,18 +188,33 @@ def test_end_to_end_links_navigable_in_pdfium():
 
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
 
+    # Three headings spread over enough body to force a multi-page
+    # layout. Verifies cross-page navigation AND same-page mid-page
+    # navigation (the first heading sits right after the TOC, so
+    # its destination is page 0 but well below the TOC).
     src = (
         "## Contents\n\n"
         "- [1 Introduction](#1-introduction)\n"
-        "- [2 Architecture](#2-architecture)\n\n"
+        "- [2 Architecture](#2-architecture)\n"
+        "- [3 Results](#3-results)\n\n"
         "---\n\n"
         "# 1 Introduction\n\n"
-        + ("Intro body. " * 80)
+        + ("Intro body paragraph text. " * 300)
         + "\n\n"
         "# 2 Architecture\n\n"
-        + ("Arch body. " * 80)
+        + ("Architecture body paragraph text. " * 300)
+        + "\n\n"
+        "# 3 Results\n\n"
+        + ("Results body paragraph text. " * 200)
         + "\n"
     )
+    # Source TOC link slug -> heading text the destination should
+    # land on.
+    expected: dict[str, str] = {
+        "1-introduction": "1 Introduction",
+        "2-architecture": "2 Architecture",
+        "3-results": "3 Results",
+    }
 
     with tempfile.TemporaryDirectory() as td:
         out_path = Path(td) / "test.pdf"
@@ -205,13 +226,40 @@ def test_end_to_end_links_navigable_in_pdfium():
         doc.print(printer)
         stats = add_pdf_navigation(out_path, src)
         assert stats["error"] is None
-        assert stats["links_rewritten"] == 2
-        assert stats["outline_added"] == 2
+        assert stats["links_rewritten"] == 3, stats
+        assert stats["outline_added"] == 3, stats
 
-        # Validate via PDFium (Chrome's engine).
+        # Use pypdf to find which slug each link points at; this
+        # gives us a deterministic source-slug -> dest-page+y map
+        # to validate against `expected`.
+        import pypdf
+        reader = pypdf.PdfReader(str(out_path))
+        # First scan the unaltered link annots for their pre-post-
+        # process slug text so we know what each Link "asked for"
+        # before the rewrite -- pypdf walks objects, so even after
+        # the rewrite we can still read the rewritten /Dest array
+        # and identify the slug via its source rect position in the
+        # TOC. Simpler: re-read the source PDF before post-process.
+        # ...but that requires running the post-process twice. Use a
+        # second pass over a re-print to get the slug map.
+        second_pdf = Path(td) / "raw.pdf"
+        printer2 = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer2.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer2.setOutputFileName(str(second_pdf))
+        doc.print(printer2)
+        raw_reader = pypdf.PdfReader(str(second_pdf))
+        rect_to_slug: dict[tuple, str] = {}
+        for page in raw_reader.pages:
+            for annot_ref in page.get("/Annots", []) or []:
+                obj = annot_ref.get_object()
+                if obj.get("/Subtype") != "/Link":
+                    continue
+                dest = obj.get("/Dest")
+                rect = obj.get("/Rect")
+                if isinstance(dest, str) and rect is not None:
+                    rect_to_slug[tuple(round(float(x), 2) for x in rect)] = dest
+
         pdf = pdfium.PdfDocument(str(out_path))
-        navigable_count = 0
-        broken_count = 0
         try:
             for page_idx in range(len(pdf)):
                 page = pdf[page_idx]
@@ -221,23 +269,63 @@ def test_end_to_end_links_navigable_in_pdfium():
                     page.raw, ctypes.byref(start_pos),
                     ctypes.byref(link_handle),
                 ):
+                    rect_f = pdfium_raw.FS_RECTF()
+                    pdfium_raw.FPDFLink_GetAnnotRect(
+                        link_handle, ctypes.byref(rect_f),
+                    )
+                    src_rect = (
+                        round(rect_f.left, 2),
+                        round(rect_f.bottom, 2),
+                        round(rect_f.right, 2),
+                        round(rect_f.top, 2),
+                    )
+                    slug = rect_to_slug.get(src_rect)
+                    if slug not in expected:
+                        continue
                     dest = pdfium_raw.FPDFLink_GetDest(pdf.raw, link_handle)
-                    dest_page = -1
-                    if dest:
-                        dest_page = pdfium_raw.FPDFDest_GetDestPageIndex(
-                            pdf.raw, dest,
-                        )
-                    if dest_page >= 0:
-                        navigable_count += 1
-                    else:
-                        broken_count += 1
+                    assert dest, f"link for slug {slug!r} has no destination"
+                    dest_page = pdfium_raw.FPDFDest_GetDestPageIndex(
+                        pdf.raw, dest,
+                    )
+                    assert dest_page >= 0, (
+                        f"slug {slug!r} has unresolved destination page"
+                    )
+                    # Read the destination y from the view params.
+                    nparams = ctypes.c_ulong(0)
+                    params = (ctypes.c_float * 4)()
+                    view_type = pdfium_raw.FPDFDest_GetView(
+                        dest, ctypes.byref(nparams), params,
+                    )
+                    # Qt writes /XYZ (view_type 1) with params (x, y, zoom).
+                    # The post-process preserves Qt's destination form.
+                    assert view_type == 1, (
+                        f"slug {slug!r}: expected /XYZ destination "
+                        f"(view_type=1), got {view_type}"
+                    )
+                    dest_y = params[1]
+                    # Now extract the text at and below the
+                    # destination y on the destination page. The
+                    # target heading must appear in that slice; if
+                    # the destination pointed at the TOC or page top
+                    # (the "click does nothing" bug), the slice
+                    # would contain body text or be empty.
+                    dest_page_obj = pdf[dest_page]
+                    page_h = float(dest_page_obj.get_size()[1])
+                    tp = dest_page_obj.get_textpage()
+                    try:
+                        near = tp.get_text_bounded(
+                            left=0, bottom=max(0.0, dest_y - 40.0),
+                            right=2000.0,
+                            top=min(page_h, dest_y + 10.0),
+                        ) or ""
+                    finally:
+                        tp.close()
+                    expected_heading = expected[slug]
+                    assert expected_heading in near, (
+                        f"slug {slug!r}: destination at "
+                        f"page={dest_page} y={dest_y:.1f} should "
+                        f"render heading {expected_heading!r}; got "
+                        f"text {near!r}"
+                    )
         finally:
             pdf.close()
-        # Exactly the two TOC-entry links should be navigable.
-        # Without the post-process they'd both be broken (Qt's
-        # /Dest = string with no name tree).
-        assert navigable_count == 2, (
-            f"expected 2 navigable links, got {navigable_count} "
-            f"(broken={broken_count})"
-        )
-        assert broken_count == 0
