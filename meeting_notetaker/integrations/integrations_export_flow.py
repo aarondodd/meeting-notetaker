@@ -95,6 +95,12 @@ def run_notion_export(
         include_toc=getattr(
             main_app.config.synthesis, "toc_in_exports", False,
         ),
+        skip_h1=getattr(
+            main_app.config.synthesis, "heading_numbering_skip_h1", False,
+        ),
+        toc_max_depth=int(getattr(
+            main_app.config.synthesis, "toc_max_depth", 3,
+        ) or 3),
     )
     del tab_label  # picker title carries the user's wording now
     _run_worker_with_progress(
@@ -162,6 +168,12 @@ def run_confluence_export(
         include_toc=getattr(
             main_app.config.synthesis, "toc_in_exports", False,
         ),
+        skip_h1=getattr(
+            main_app.config.synthesis, "heading_numbering_skip_h1", False,
+        ),
+        toc_max_depth=int(getattr(
+            main_app.config.synthesis, "toc_max_depth", 3,
+        ) or 3),
     )
     del tab_label  # picker title carries the user's wording now
     _run_worker_with_progress(

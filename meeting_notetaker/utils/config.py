@@ -302,7 +302,14 @@ class SynthesisConfig:
     #     Confluence) -- the Preview already has a sidebar TOC via
     #     PreviewWithToc, so an inline TOC would duplicate.
     heading_numbering: bool = False
+    # When True, H1 stays unnumbered (treated as the document title)
+    # and H2 becomes the top-level numbering slot. Same effect for
+    # the TOC (H1 omitted; H2 entries un-indented).
+    heading_numbering_skip_h1: bool = False
     toc_in_exports: bool = False
+    # TOC depth ceiling. Default 3 (H1-H3, or H2-H4 when skip_h1).
+    # Constrained to 1-6 to match markdown's heading range.
+    toc_max_depth: int = 3
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

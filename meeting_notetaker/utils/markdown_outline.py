@@ -104,7 +104,7 @@ def iter_headings(text: str) -> Iterator[Tuple[int, int, str]]:
 
 # ---- numbering ----------------------------------------------------------
 
-def number_headings(text: str) -> str:
+def number_headings(text: str, *, skip_h1: bool = False) -> str:
     """Prepend dotted-decimal numbering to every heading.
 
     Counters are tracked per level (1-6). A heading at level N
@@ -113,6 +113,12 @@ def number_headings(text: str) -> str:
     intermediate counter stays 0 and is suppressed from the prefix
     so output stays clean ("1.0.1 Foo" would be ugly -- we emit
     "1.1 Foo" instead).
+
+    When `skip_h1` is True, H1 headings are treated as document
+    titles and left unnumbered. H2 becomes the top-level numbering
+    slot ("1"), H3 becomes "1.1", and so on. Useful when the doc
+    convention reserves H1 for the page title and the user wants
+    the numbered outline to start one level deeper.
 
     Skips fenced code blocks. Heading lines that lack body text are
     left alone (a bare "##" with nothing after it doesn't make sense
@@ -136,13 +142,19 @@ def number_headings(text: str) -> str:
         if not body:
             continue
         level = len(m.group(1))
-        counters[level - 1] += 1
+        # When skip_h1 is on, H1 stays untouched and H2 becomes the
+        # top-level counter slot. effective_level < 1 means "no
+        # numbering" (i.e. an H1 we should leave alone).
+        effective_level = level - 1 if skip_h1 else level
+        if effective_level < 1:
+            continue
+        counters[effective_level - 1] += 1
         # Reset deeper levels.
-        for j in range(level, 6):
+        for j in range(effective_level, 6):
             counters[j] = 0
         # Compose prefix from non-zero counters (suppresses gaps
         # left by skipped levels).
-        parts = [str(c) for c in counters[:level] if c > 0]
+        parts = [str(c) for c in counters[:effective_level] if c > 0]
         if not parts:
             continue
         prefix = ".".join(parts)
@@ -160,7 +172,12 @@ def number_headings(text: str) -> str:
 
 # ---- TOC generation -----------------------------------------------------
 
-def generate_toc(text: str, *, max_depth: int = DEFAULT_TOC_MAX_DEPTH) -> str:
+def generate_toc(
+    text: str,
+    *,
+    max_depth: int = DEFAULT_TOC_MAX_DEPTH,
+    skip_h1: bool = False,
+) -> str:
     """Return a markdown TOC for `text`, or "" if no headings exist.
 
     Output shape:
@@ -182,13 +199,25 @@ def generate_toc(text: str, *, max_depth: int = DEFAULT_TOC_MAX_DEPTH) -> str:
     Heading levels deeper than `max_depth` are omitted. Headings
     inside fenced code are skipped.
 
+    When `skip_h1` is True, H1 headings are omitted from the TOC
+    (treated as the document title) and H2 becomes the top-level
+    entry. The `max_depth` is interpreted against the post-skip
+    level so `max_depth=3` with `skip_h1=True` includes H2 through
+    H4 -- matching the numbering's effective-level semantic.
+
     Returns the empty string when no headings are present, so the
     caller's `prefix + body` composition is harmless either way.
     """
-    headings = [
-        (level, body) for _, level, body in iter_headings(text)
-        if level <= max_depth and body
-    ]
+    if max_depth < 1:
+        return ""
+    headings: List[Tuple[int, str]] = []
+    for _, level, body in iter_headings(text):
+        if not body:
+            continue
+        effective_level = level - 1 if skip_h1 else level
+        if effective_level < 1 or effective_level > max_depth:
+            continue
+        headings.append((effective_level, body))
     if not headings:
         return ""
     out: List[str] = [TOC_HEADING, ""]
@@ -204,9 +233,14 @@ def generate_toc(text: str, *, max_depth: int = DEFAULT_TOC_MAX_DEPTH) -> str:
     return "\n".join(out) + "\n"
 
 
-def inject_toc(text: str, *, max_depth: int = DEFAULT_TOC_MAX_DEPTH) -> str:
+def inject_toc(
+    text: str,
+    *,
+    max_depth: int = DEFAULT_TOC_MAX_DEPTH,
+    skip_h1: bool = False,
+) -> str:
     """Prepend a generated TOC to `text`. No-op when no headings."""
-    toc = generate_toc(text, max_depth=max_depth)
+    toc = generate_toc(text, max_depth=max_depth, skip_h1=skip_h1)
     if not toc:
         return text
     return toc + text
@@ -219,6 +253,7 @@ def apply_outline(
     *,
     number: bool = False,
     toc: bool = False,
+    skip_h1: bool = False,
     max_depth: int = DEFAULT_TOC_MAX_DEPTH,
 ) -> str:
     """Apply numbering and/or TOC transforms in the correct order.
@@ -228,9 +263,13 @@ def apply_outline(
     entry like "1.2 Goals" matches the numbered heading exactly,
     which is what users expect and what makes the slug-based
     anchor link find its target.
+
+    `skip_h1` and `max_depth` are forwarded to both transforms so
+    "H1 is the title" is handled consistently across numbering and
+    TOC.
     """
     if number:
-        text = number_headings(text)
+        text = number_headings(text, skip_h1=skip_h1)
     if toc:
-        text = inject_toc(text, max_depth=max_depth)
+        text = inject_toc(text, max_depth=max_depth, skip_h1=skip_h1)
     return text

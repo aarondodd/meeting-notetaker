@@ -425,9 +425,16 @@ class MainApp(QObject):
             pass
         # Push heading-numbering preference (#92). Same try/except
         # pattern so older SessionView shapes degrade cleanly.
+        skip_h1 = getattr(
+            self.config.synthesis, "heading_numbering_skip_h1", False,
+        )
+        toc_max_depth = int(
+            getattr(self.config.synthesis, "toc_max_depth", 3) or 3,
+        )
         try:
             self.window.session_view.set_heading_numbering(
-                self.config.synthesis.heading_numbering
+                self.config.synthesis.heading_numbering,
+                skip_h1=skip_h1,
             )
         except AttributeError:
             pass
@@ -438,6 +445,8 @@ class MainApp(QObject):
             self.window.session_view.set_export_outline_options(
                 number_headings=self.config.synthesis.heading_numbering,
                 include_toc=self.config.synthesis.toc_in_exports,
+                skip_h1=skip_h1,
+                toc_max_depth=toc_max_depth,
             )
         except AttributeError:
             pass
@@ -4056,6 +4065,12 @@ class MainApp(QObject):
             outline_toc = getattr(
                 self.config.synthesis, "toc_in_exports", False,
             )
+            outline_skip_h1 = getattr(
+                self.config.synthesis, "heading_numbering_skip_h1", False,
+            )
+            outline_max_depth = int(getattr(
+                self.config.synthesis, "toc_max_depth", 3,
+            ) or 3)
             if notes_md.strip():
                 notes_pdf_path = pdf_temp_dir / "my-notes.pdf"
                 render_session_pdf(
@@ -4069,6 +4084,8 @@ class MainApp(QObject):
                     appendix_data=appendix_data,
                     number_headings=outline_number,
                     include_toc=outline_toc,
+                    skip_h1=outline_skip_h1,
+                    toc_max_depth=outline_max_depth,
                 )
             if synthesis_md.strip():
                 synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
@@ -4083,6 +4100,8 @@ class MainApp(QObject):
                     appendix_data=appendix_data,
                     number_headings=outline_number,
                     include_toc=outline_toc,
+                    skip_h1=outline_skip_h1,
+                    toc_max_depth=outline_max_depth,
                 )
         except Exception:
             log.exception("PDF pre-render failed for %s", session_id)

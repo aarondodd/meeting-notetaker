@@ -223,7 +223,12 @@ class SessionView(QWidget):
         # #92 outline transforms. MainApp pushes the config values via
         # set_export_outline_options on startup + Settings save.
         self._export_heading_numbering: bool = False
+        self._export_skip_h1: bool = False
         self._export_toc: bool = False
+        self._export_toc_max_depth: int = 3
+        # Mirror of the preview-side numbering flag so set_heading_numbering
+        # can forward skip_h1 without an extra setter.
+        self._preview_skip_h1: bool = False
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -1621,30 +1626,40 @@ class SessionView(QWidget):
             pass
 
     def set_export_outline_options(
-        self, *, number_headings: bool, include_toc: bool,
+        self,
+        *,
+        number_headings: bool,
+        include_toc: bool,
+        skip_h1: bool = False,
+        toc_max_depth: int = 3,
     ) -> None:
         """Push the export outline preferences (#92) into the session
         view. Used by the per-tab Export PDF / Print path -- the body
         is transformed before render so PDFs match the configured
         preferences. Idempotent."""
         self._export_heading_numbering = bool(number_headings)
+        self._export_skip_h1 = bool(skip_h1)
         self._export_toc = bool(include_toc)
+        self._export_toc_max_depth = max(1, min(6, int(toc_max_depth)))
 
-    def set_heading_numbering(self, enabled: bool) -> None:
+    def set_heading_numbering(
+        self, enabled: bool, *, skip_h1: bool = False,
+    ) -> None:
         """Toggle preview heading numbering (#92) on every preview-bearing
         widget. SessionView routes to My Notes, Synthesis, Previous
         Notes -- so the user sees consistent numbering across tabs.
         The widgets re-render themselves so the change shows
         immediately without a session switch."""
+        self._preview_skip_h1 = bool(skip_h1)
         for widget in (self._live_notes_editor, self._notes_view):
             try:
-                widget.set_heading_numbering(enabled)
+                widget.set_heading_numbering(enabled, skip_h1=skip_h1)
             except AttributeError:
                 continue
         # Previous Notes preview is a separate widget; forward through
         # if it implements the toggle.
         try:
-            self._previous_view.set_heading_numbering(enabled)
+            self._previous_view.set_heading_numbering(enabled, skip_h1=skip_h1)
         except AttributeError:
             pass
 
@@ -2490,6 +2505,8 @@ class SessionView(QWidget):
                 body_for_print,
                 number=self._export_heading_numbering,
                 toc=self._export_toc,
+                skip_h1=self._export_skip_h1,
+                max_depth=self._export_toc_max_depth,
             )
 
         printable = build_print_markdown(

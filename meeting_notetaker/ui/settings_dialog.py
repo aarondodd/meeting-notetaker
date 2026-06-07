@@ -1049,6 +1049,26 @@ class SettingsDialog(QDialog):
         )
         export_form.addRow(self._heading_numbering)
 
+        # Sub-option: skip H1 (treat as title).
+        self._heading_numbering_skip_h1 = QCheckBox(
+            "    Skip H1 (treat as document title)", self,
+        )
+        self._heading_numbering_skip_h1.setChecked(
+            getattr(config.synthesis, "heading_numbering_skip_h1", False),
+        )
+        self._heading_numbering_skip_h1.setToolTip(
+            "When on, H1 headings stay unnumbered and H2 becomes the "
+            "top-level number ('1', '1.1', etc.). Useful when the "
+            "document convention reserves H1 for the page title."
+        )
+        self._heading_numbering_skip_h1.setEnabled(
+            self._heading_numbering.isChecked()
+        )
+        self._heading_numbering.toggled.connect(
+            self._heading_numbering_skip_h1.setEnabled,
+        )
+        export_form.addRow(self._heading_numbering_skip_h1)
+
         self._toc_in_exports = QCheckBox(
             "Generate table of contents in exports", self,
         )
@@ -1063,6 +1083,25 @@ class SettingsDialog(QDialog):
             "click-to-navigate depends on the PDF viewer."
         )
         export_form.addRow(self._toc_in_exports)
+
+        # Sub-option: TOC max depth.
+        toc_depth_row = QHBoxLayout()
+        toc_depth_row.addWidget(QLabel("    Max depth:", self))
+        self._toc_max_depth = QSpinBox(self)
+        self._toc_max_depth.setRange(1, 6)
+        self._toc_max_depth.setValue(
+            getattr(config.synthesis, "toc_max_depth", 3),
+        )
+        self._toc_max_depth.setToolTip(
+            "Heading levels to include in the TOC. 3 (H1-H3) is a "
+            "reasonable default; deeper exports include sub-sub-"
+            "sections at the cost of a longer TOC."
+        )
+        self._toc_max_depth.setEnabled(self._toc_in_exports.isChecked())
+        self._toc_in_exports.toggled.connect(self._toc_max_depth.setEnabled)
+        toc_depth_row.addWidget(self._toc_max_depth)
+        toc_depth_row.addStretch(1)
+        export_form.addRow(toc_depth_row)
 
         self._add_section("Export", export_group)
 
@@ -1284,7 +1323,11 @@ class SettingsDialog(QDialog):
         for field, cb in self._appendix_section_checkboxes.items():
             setattr(self._config.synthesis, field, cb.isChecked())
         self._config.synthesis.heading_numbering = self._heading_numbering.isChecked()
+        self._config.synthesis.heading_numbering_skip_h1 = (
+            self._heading_numbering_skip_h1.isChecked()
+        )
         self._config.synthesis.toc_in_exports = self._toc_in_exports.isChecked()
+        self._config.synthesis.toc_max_depth = int(self._toc_max_depth.value())
         self._config.backup.folder = self._backup_folder_edit.text().strip()
         if self._backup_sched_on_close.isChecked():
             self._config.backup.schedule = "on_close"

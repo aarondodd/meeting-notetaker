@@ -93,3 +93,54 @@ def test_config_synthesis_outline_toggles_round_trip(isolated_data_dir):
     loaded = Config.load()
     assert loaded.synthesis.heading_numbering is True
     assert loaded.synthesis.toc_in_exports is True
+
+
+def test_config_carries_skip_h1_and_max_depth(isolated_data_dir):
+    """#92 follow-up: per-Aaron Settings should expose skip_h1
+    and toc_max_depth with sensible defaults."""
+    from meeting_notetaker.utils.config import Config
+
+    cfg = Config()
+    assert hasattr(cfg.synthesis, "heading_numbering_skip_h1")
+    assert hasattr(cfg.synthesis, "toc_max_depth")
+    # Defaults: include H1, depth 3.
+    assert cfg.synthesis.heading_numbering_skip_h1 is False
+    assert cfg.synthesis.toc_max_depth == 3
+
+
+def test_config_skip_h1_and_max_depth_round_trip(isolated_data_dir):
+    from meeting_notetaker.utils.config import Config
+
+    cfg = Config()
+    cfg.synthesis.heading_numbering_skip_h1 = True
+    cfg.synthesis.toc_max_depth = 5
+    cfg.save()
+    loaded = Config.load()
+    assert loaded.synthesis.heading_numbering_skip_h1 is True
+    assert loaded.synthesis.toc_max_depth == 5
+
+
+# ---- signature pin for the new kwargs ----------------------------------
+
+def test_export_to_notion_accepts_skip_h1_and_max_depth():
+    from meeting_notetaker.integrations.export import export_to_notion
+    sig = inspect.signature(export_to_notion)
+    assert "skip_h1" in sig.parameters
+    assert "toc_max_depth" in sig.parameters
+    assert sig.parameters["skip_h1"].default is False
+    assert sig.parameters["toc_max_depth"].default == 3
+
+
+def test_export_to_confluence_accepts_skip_h1_and_max_depth():
+    from meeting_notetaker.integrations.export import export_to_confluence
+    sig = inspect.signature(export_to_confluence)
+    assert "skip_h1" in sig.parameters
+    assert "toc_max_depth" in sig.parameters
+
+
+def test_render_session_pdf_accepts_skip_h1_and_max_depth():
+    from meeting_notetaker.utils.export_package import render_session_pdf
+    sig = inspect.signature(render_session_pdf)
+    assert "skip_h1" in sig.parameters
+    assert "toc_max_depth" in sig.parameters
+    assert sig.parameters["toc_max_depth"].default == 3

@@ -76,8 +76,11 @@ class PreviewWithToc(QWidget):
         # passed to setMarkdown AND the sidebar TOC reflect the
         # numbering, so they stay consistent.
         self._number_headings_enabled: bool = False
+        self._number_headings_skip_h1: bool = False
 
-    def set_heading_numbering(self, enabled: bool) -> None:
+    def set_heading_numbering(
+        self, enabled: bool, *, skip_h1: bool = False,
+    ) -> None:
         """Toggle heading auto-numbering for the wrapped preview (#92).
 
         The transform applies at this level so both the rendered
@@ -86,14 +89,17 @@ class PreviewWithToc(QWidget):
         setMarkdown call into the inner widget stays consistent.
         """
         self._number_headings_enabled = bool(enabled)
-        self._preview.set_heading_numbering(enabled)
+        self._number_headings_skip_h1 = bool(skip_h1)
+        self._preview.set_heading_numbering(enabled, skip_h1=skip_h1)
 
     # ---- MarkdownPreview-shaped public API ----
     def setMarkdown(self, text: str) -> None:  # noqa: N802 (Qt convention)
         self._current_body = text or ""
         if self._number_headings_enabled:
             from ..utils.markdown_outline import number_headings  # noqa: PLC0415
-            rendered = number_headings(self._current_body)
+            rendered = number_headings(
+                self._current_body, skip_h1=self._number_headings_skip_h1,
+            )
         else:
             rendered = self._current_body
         # Inner MarkdownPreview also has the toggle wired; passing
