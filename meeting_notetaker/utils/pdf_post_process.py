@@ -1,26 +1,34 @@
 """Post-process a Qt-generated PDF to add TOC navigation (#94).
 
-Qt's ``QTextDocument`` print path already does most of the work:
-it writes Link annotations with the correct rectangles and named
-destination references (e.g. ``/Dest = '1-introduction'``). What it
-*doesn't* write is the ``/Names/Dests`` dictionary that resolves
-each name to a page + position. Without that dictionary, the link
-annotations exist but resolve nowhere -- Acrobat shows them as
-clickable but they "go nowhere"; Edge/Chrome don't show them as
-clickable at all.
+Qt's ``QTextDocument`` print path writes Link annotations with the
+correct rectangles and named destination references (e.g.
+``/Dest = '1-introduction'``). But the named destinations are
+broken in two ways that prevent any PDF viewer from navigating:
 
-The fix is to read the rendered PDF, walk the body markdown to
-build a slug -> page mapping (slugs match what Qt used because we
-control both sides via the existing ``slugify`` helper), and write
-the named destinations into the PDF's name dictionary. Qt's
-already-correctly-placed Link annotations then resolve.
+  1. Qt doesn't write a ``/Names/Dests`` dictionary at all.
+  2. Even when we add one (verified via PDFium / pypdfium2, which
+     is Chrome's embedded PDF engine), browsers don't follow the
+     string-name lookup from a link annotation's ``/Dest`` to a
+     name tree entry in this form. Acrobat shows the rect as
+     clickable but it resolves nowhere; Chrome / Edge don't even
+     show it as clickable.
+
+The fix that PDFium validates as navigable: rewrite each Link
+annotation's ``/Dest`` from a string-name reference to an inline
+destination array ``[page_ref /FitH top]``. PDFium follows inline
+destination arrays directly without consulting the name tree.
 
 We also add outline entries (PDF sidebar bookmarks) for each
-heading -- gives users a navigable sidebar in every modern viewer,
-robust because it only needs the heading's page index.
+heading so the viewer's sidebar tree gives a second navigation
+path.
 
-Pure-Python; the only deps are pypdf (added to requirements) and
-the markdown_outline helpers (slugify + iter_headings).
+Validation: this module is exercised against the Qt-generated PDF
+in tests using pypdfium2 (the same PDF engine Chrome and Edge use),
+so "navigable in the test" maps directly to "navigable in the
+user's browser PDF viewer."
+
+Pure-Python; deps are pypdf (post-process write) and pypdfium2
+(validation; only loaded in tests).
 """
 from __future__ import annotations
 
@@ -45,19 +53,27 @@ def add_pdf_navigation(
     *,
     toc_max_depth: int = DEFAULT_TOC_MAX_DEPTH,
 ) -> dict:
-    """Open ``pdf_path``, register named destinations + outline, write back.
+    """Rewrite TOC link destinations + add sidebar outline, write back.
 
-    Returns a stats dict (``{"named_dests_added": N,
-    "outline_added": M, "error": str|None}``).
+    For each Qt-written Link annotation whose ``/Dest`` is a slug
+    string matching one of our body headings, replace the string
+    reference with an inline destination array
+    ``[page_ref /FitH top]``. This is the only form PDFium (Chrome /
+    Edge's PDF engine) honors for in-document navigation from a Link
+    annotation. Validated end-to-end against pypdfium2 in the test
+    suite so this isn't a guess.
 
-    Failures here are non-fatal -- a corrupted post-process pass
-    shouldn't break PDF export. The original Qt PDF stays on disk
-    if anything goes wrong; we only overwrite on a complete clean
-    run.
+    Also adds a PDF outline (sidebar bookmarks) entry per heading.
+
+    Returns ``{"links_rewritten": N, "outline_added": M, "error": str|None}``.
+
+    Failures are non-fatal -- a corrupted post-process leaves the
+    original Qt PDF on disk untouched.
     """
-    stats = {"named_dests_added": 0, "outline_added": 0, "error": None}
+    stats = {"links_rewritten": 0, "outline_added": 0, "error": None}
     try:
         import pypdf
+        from pypdf.generic import ArrayObject, FloatObject, NameObject
     except ImportError as exc:
         stats["error"] = f"pypdf not installed: {exc}"
         return stats
@@ -71,27 +87,17 @@ def add_pdf_navigation(
         )
         reader = pypdf.PdfReader(str(pdf_path))
         writer = pypdf.PdfWriter(clone_from=reader)
-        # Heading text -> page index where each heading appears.
         heading_pages = _find_heading_pages(writer, body_headings)
-        # Heading text -> slug. Qt writes its in-document link
-        # annotations with /Dest = the slug. We register a named
-        # destination with the same slug pointing at the heading
-        # page; Qt's link annotations then resolve.
+        # slug -> page index for the link rewrite. Sidebar outline
+        # is independent of link navigation; we add both.
+        slug_to_page: dict[str, int] = {}
         for heading_text in body_headings:
             page_idx = heading_pages.get(heading_text)
             if page_idx is None:
                 continue
             slug = slugify(heading_text)
-            if not slug:
-                continue
-            try:
-                writer.add_named_destination(slug, page_idx)
-                stats["named_dests_added"] += 1
-            except Exception:
-                log.debug(
-                    "named destination add failed for %r (slug %r)",
-                    heading_text, slug, exc_info=True,
-                )
+            if slug:
+                slug_to_page[slug] = page_idx
             try:
                 writer.add_outline_item(heading_text, page_idx)
                 stats["outline_added"] += 1
@@ -100,6 +106,40 @@ def add_pdf_navigation(
                     "outline add failed for %r", heading_text,
                     exc_info=True,
                 )
+        # Walk every Link annotation; rewrite /Dest from a slug
+        # string to an inline destination array. The string form
+        # would require a /Names/Dests name tree which PDFium
+        # doesn't follow from a link annotation; inline arrays it
+        # does honor.
+        for page in writer.pages:
+            for annot_ref in page.get("/Annots", []) or []:
+                obj = annot_ref.get_object()
+                if obj.get("/Subtype") != "/Link":
+                    continue
+                dest = obj.get("/Dest")
+                if not isinstance(dest, str):
+                    continue
+                target_page = slug_to_page.get(dest)
+                if target_page is None:
+                    continue
+                try:
+                    target_page_obj = writer.pages[target_page]
+                    target_page_ref = target_page_obj.indirect_reference
+                    # /FitH top = fit width, position vertical coord
+                    # `top` at the top of the visible area. Use the
+                    # page height so the heading lands at the top.
+                    page_height = float(target_page_obj.mediabox.height)
+                    obj[NameObject("/Dest")] = ArrayObject([
+                        target_page_ref,
+                        NameObject("/FitH"),
+                        FloatObject(page_height),
+                    ])
+                    stats["links_rewritten"] += 1
+                except Exception:
+                    log.debug(
+                        "link rewrite failed for slug %r", dest,
+                        exc_info=True,
+                    )
         tmp_path = pdf_path.with_suffix(".pdf.tmp")
         with open(tmp_path, "wb") as fh:
             writer.write(fh)

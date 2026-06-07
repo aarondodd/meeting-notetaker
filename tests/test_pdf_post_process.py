@@ -150,20 +150,31 @@ def _has_qprinter() -> bool:
         return False
 
 
-@pytest.mark.skipif(not _has_qprinter(), reason="QPrinter not available")
-def test_end_to_end_adds_named_destinations_and_outline():
-    """Render a small PDF via Qt, post-process. Verify:
+def _has_pdfium() -> bool:
+    try:
+        import pypdfium2  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-    1. Qt's pre-existing link annotations on the TOC entries have
-       named-destination refs (e.g. dest='1-introduction').
-    2. After post-processing, the PDF carries /Names/Dests entries
-       mapping those slugs to the right pages.
-    3. Outline items are added for the body headings (sidebar nav).
-    """
+
+@pytest.mark.skipif(
+    not (_has_qprinter() and _has_pdfium()),
+    reason="QPrinter or pypdfium2 not available",
+)
+def test_end_to_end_links_navigable_in_pdfium():
+    """The acceptance test: render a PDF, post-process, then open
+    with PDFium (Chrome / Edge's PDF engine) and verify each TOC
+    link annotation has a resolvable destination page.
+
+    PDFium is the same engine browsers use, so a link that resolves
+    here is a link the user can click in their PDF viewer."""
+    import ctypes
+
     from PyQt6.QtPrintSupport import QPrinter
     from PyQt6.QtWidgets import QApplication
-
-    import pypdf
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_raw
 
     from meeting_notetaker.ui.print_document import PrintTextDocument
     from meeting_notetaker.utils.pdf_post_process import add_pdf_navigation
@@ -194,35 +205,39 @@ def test_end_to_end_adds_named_destinations_and_outline():
         doc.print(printer)
         stats = add_pdf_navigation(out_path, src)
         assert stats["error"] is None
-        # Two body headings -> two named destinations + two outline.
-        assert stats["named_dests_added"] == 2
+        assert stats["links_rewritten"] == 2
         assert stats["outline_added"] == 2
 
-        # Named destinations exist after post-processing.
-        reader = pypdf.PdfReader(str(out_path))
-        named = reader.named_destinations
-        assert "1-introduction" in named
-        assert "2-architecture" in named
-        # Each named destination resolves to a real page number.
-        assert reader.get_destination_page_number(named["1-introduction"]) is not None
-        assert reader.get_destination_page_number(named["2-architecture"]) is not None
-
-        # Outline carries the heading titles.
-        outline_titles = [
-            getattr(item, "title", "") for item in reader.outline
-        ]
-        assert "1 Introduction" in outline_titles
-        assert "2 Architecture" in outline_titles
-
-        # Qt's link annotations on page 0 (the TOC page) reference
-        # the named destinations.
-        page0 = reader.pages[0]
-        link_dests = set()
-        for ref in page0.get("/Annots", []):
-            obj = ref.get_object()
-            if obj.get("/Subtype") == "/Link":
-                dest = obj.get("/Dest")
-                if isinstance(dest, str):
-                    link_dests.add(dest)
-        assert "1-introduction" in link_dests
-        assert "2-architecture" in link_dests
+        # Validate via PDFium (Chrome's engine).
+        pdf = pdfium.PdfDocument(str(out_path))
+        navigable_count = 0
+        broken_count = 0
+        try:
+            for page_idx in range(len(pdf)):
+                page = pdf[page_idx]
+                start_pos = ctypes.c_int(0)
+                link_handle = pdfium_raw.FPDF_LINK()
+                while pdfium_raw.FPDFLink_Enumerate(
+                    page.raw, ctypes.byref(start_pos),
+                    ctypes.byref(link_handle),
+                ):
+                    dest = pdfium_raw.FPDFLink_GetDest(pdf.raw, link_handle)
+                    dest_page = -1
+                    if dest:
+                        dest_page = pdfium_raw.FPDFDest_GetDestPageIndex(
+                            pdf.raw, dest,
+                        )
+                    if dest_page >= 0:
+                        navigable_count += 1
+                    else:
+                        broken_count += 1
+        finally:
+            pdf.close()
+        # Exactly the two TOC-entry links should be navigable.
+        # Without the post-process they'd both be broken (Qt's
+        # /Dest = string with no name tree).
+        assert navigable_count == 2, (
+            f"expected 2 navigable links, got {navigable_count} "
+            f"(broken={broken_count})"
+        )
+        assert broken_count == 0

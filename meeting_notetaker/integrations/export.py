@@ -34,6 +34,7 @@ import mistune
 from .confluence_api import ConfluenceClient
 from .confluence_storage import build_toc_macro, markdown_to_storage
 from .notion_api import NotionClient
+from .notion_blocks import build_toc_block as build_notion_toc_block
 from .notion_blocks import markdown_to_blocks
 
 
@@ -164,14 +165,17 @@ def export_to_notion(
         if progress:
             progress(msg)
 
-    # #92: heading numbering + TOC. Applied BEFORE the image-ref
-    # collection + block conversion so the headings the user sees in
-    # Notion match what they'd see in the in-app preview and in PDF.
-    if number_headings or include_toc:
+    # #92 + #94: apply heading numbering before the block conversion
+    # so the numbered headings flow through to Notion. The TOC is
+    # NOT injected as a markdown list -- Notion has a native
+    # `table_of_contents` block that auto-generates a clickable
+    # nested list of headings server-side. Strictly better fit
+    # than a markdown list (which Notion renders as static text).
+    # Numbering still happens; only the markdown TOC list is skipped.
+    if number_headings:
         from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
         markdown_body = apply_outline(
-            markdown_body, number=number_headings, toc=include_toc,
-            max_depth=toc_max_depth,
+            markdown_body, number=True, toc=False,
         )
 
     # 1. Scan for local image refs, upload each, build a url->file_upload_id map.
@@ -211,6 +215,11 @@ def export_to_notion(
     # 2. Convert + create.
     report("Converting Markdown to Notion blocks...")
     children = markdown_to_blocks(markdown_body, image_resolver=image_resolver)
+    # #94: prepend Notion's native table_of_contents block when TOC
+    # was requested. Auto-generated server-side from the page's
+    # headings; navigable + auto-updates.
+    if include_toc:
+        children = [build_notion_toc_block()] + children
 
     # 3. Optional session attachments -- upload each, append file blocks
     #    under an Attachments heading at the bottom of the page so the
