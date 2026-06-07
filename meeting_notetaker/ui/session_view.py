@@ -2542,6 +2542,11 @@ class SessionView(QWidget):
         # time, which the defaultStyleSheet alone can't override;
         # the walk has to happen after setHtml.
         doc.force_anchor_styling()
+        # Stash the body markdown on the doc so the Export PDF
+        # handler can pass it to the pypdf post-processor for
+        # bookmarks + link annotations (#94). Read-only attribute;
+        # no mutation after _build_print_document returns.
+        doc._mn_body_markdown = body_for_print  # noqa: SLF001
         return doc, tab_label
 
     def _on_print(self) -> None:
@@ -2700,6 +2705,19 @@ class SessionView(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Export PDF", f"Could not write PDF: {exc}")
             return
+        # #94: post-process the rendered PDF so the in-page TOC
+        # entries are clickable + the heading hierarchy shows in the
+        # viewer's sidebar. Non-fatal -- if pypdf can't read the
+        # PDF we wrote, the original stays on disk untouched.
+        if self._export_toc or self._export_heading_numbering:
+            body_md = getattr(doc, "_mn_body_markdown", "") or ""
+            if body_md:
+                from ..utils.pdf_post_process import add_pdf_navigation  # noqa: PLC0415
+                add_pdf_navigation(
+                    target,
+                    body_md,
+                    toc_max_depth=self._export_toc_max_depth,
+                )
         self.window().statusBar().showMessage(
             f"Exported PDF to {target.name}", 5000
         )

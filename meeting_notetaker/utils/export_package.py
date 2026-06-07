@@ -479,6 +479,15 @@ def render_session_pdf(
     printer.setDocName(f"{session_title} -- {tab_label}")
     doc.clamp_images_to_printer(printer)
     doc.print(printer)
+    # #94: post-process the rendered PDF to add bookmarks (sidebar
+    # navigation) + link annotations on the in-page TOC entries.
+    # Qt's QTextDocument print path doesn't emit either; pypdf does.
+    # Non-fatal -- a failed pass leaves the original Qt PDF on disk.
+    if include_toc or number_headings:
+        from .pdf_post_process import add_pdf_navigation  # noqa: PLC0415
+        add_pdf_navigation(
+            dst, body, toc_max_depth=toc_max_depth,
+        )
     return dst
 
 
