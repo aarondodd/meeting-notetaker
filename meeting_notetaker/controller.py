@@ -1034,10 +1034,18 @@ class SessionController(QObject):
         proc_state.batch_thread = None
         session = proc_state.session
         store = TranscriptStore(session.id)
-        if segments:
-            store.write_segments(segments)
-            self.store.update_session(session.id, has_transcript=True)
-            self.transcript_replaced.emit(session.id, segments)
+        # Flip has_transcript=True even when the batch returned no
+        # segments (#87). "Batch ran, found nothing" is a legitimate
+        # terminal state -- common for mic-only voice-note / walkthrough
+        # sessions where the mic captured ambient quiet narration that
+        # Whisper found nothing in. Without this, the session stays
+        # in_progress-looking in the UI forever, blocking synthesis
+        # even when the user has notes to drive it. The Transcript tab
+        # surfaces the empty state as "No speech detected..." (see
+        # SessionView).
+        store.write_segments(segments)
+        self.store.update_session(session.id, has_transcript=True)
+        self.transcript_replaced.emit(session.id, segments)
         # Capture the latest on-disk transcript for the refinement input.
         # Use the batch segments when present, else fall back to whatever
         # the live workers wrote at Stop.

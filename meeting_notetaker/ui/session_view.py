@@ -829,6 +829,7 @@ class SessionView(QWidget):
         self._raw_transcript_text = transcript
         self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
         self._refresh_transcript_timestamps()
+        self._refresh_transcript_placeholder(session)
         sdir = session_dir(session.id)
         self._notes_view.set_session_dir(sdir)
         self._set_notes_text(notes)
@@ -875,6 +876,7 @@ class SessionView(QWidget):
         if self._session is None:
             return
         self._session.state = state
+        self._refresh_transcript_placeholder(self._session)
         has_live_transcript = (
             self._session.has_transcript
             or bool(self._transcript_view.toPlainText().strip())
@@ -1250,6 +1252,38 @@ class SessionView(QWidget):
         # catches the lead-in (Aaron's "~10s before that line").
         target = max(0, int(start_ms) - _TRANSCRIPT_SEEK_LEAD_MS)
         self.transcript_seek_ms_requested.emit(self._session.id, target)
+
+    def _refresh_transcript_placeholder(self, session) -> None:
+        """Set the Transcript tab's placeholder copy based on session state.
+
+        Three audiences (#87):
+
+          * Fresh session, no recording yet -- guide them to Start /
+            Import.
+          * Recording in progress -- "Live transcript appears here as
+            speech is captured." (Or: "Capture-only mode is on..." when
+            applicable; we keep the message simple.)
+          * Recording finished but no segments returned -- "No speech
+            detected. Use the My Notes tab; the Generate Synthesis
+            Prompt button works from notes alone." This is the
+            mic-only / quiet-narration / walkthrough case.
+        """
+        state = session.state
+        if state in (STATE_COMPLETE, STATE_ERROR) and session.has_transcript:
+            self._transcript_view.setPlaceholderText(
+                "No speech detected in this recording.\n\n"
+                "Add notes in the My Notes tab; Generate Synthesis Prompt "
+                "drafts from notes alone when the transcript is empty."
+            )
+        elif state == STATE_NEW:
+            self._transcript_view.setPlaceholderText(
+                "No transcript yet. Start a recording or use "
+                "File > Import Transcript to bring one in."
+            )
+        else:
+            self._transcript_view.setPlaceholderText(
+                "Transcript appears here once the recording finishes."
+            )
 
     def _refresh_transcript_timestamps(self) -> None:
         """Rebuild the timestamp index from the transcript view text.
@@ -2173,14 +2207,21 @@ class SessionView(QWidget):
         self._transcript_empty_row.setVisible(
             has_session and not has_transcript and not is_recording
         )
-        # Generate/paste are available as soon as a transcript exists. The
-        # batch-refinement pass after Stop runs in the background and is
-        # explicitly NOT a gate on synthesis -- the live transcript is good
-        # enough to act on, and any later regenerate will pick up the
-        # refined version automatically.
-        can_synthesize = has_session and has_transcript and not is_recording
+        # Generate/paste are available as soon as the user has SOMETHING for
+        # the LLM to chew on. That's a transcript OR notes -- a mic-only
+        # voice-note / walkthrough session whose audio came out silent
+        # still wants to synthesize from notes alone. The prompt
+        # template already handles a missing transcript section
+        # gracefully.
+        # The batch-refinement pass after Stop runs in the background
+        # and is explicitly NOT a gate on synthesis -- the live
+        # transcript is good enough to act on, and any later regenerate
+        # picks up the refined version automatically.
+        can_synthesize = (
+            has_session and (has_transcript or has_notes) and not is_recording
+        )
         self._generate_btn.setEnabled(can_synthesize)
-        self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
+        self._paste_btn.setEnabled(can_synthesize)
         # Send button: gated by FOUR conditions. All must be true.
         #
         #   1. There's a transcript to synthesize (can_synthesize).
