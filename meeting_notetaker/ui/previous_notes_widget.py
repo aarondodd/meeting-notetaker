@@ -133,16 +133,14 @@ class PreviousNotesWidget(QWidget):
         apply_fonts as part of the cross-surface font refresh."""
         self._preview.setFont(preview_font)
 
-    def set_heading_numbering(
-        self, enabled: bool, *, skip_h1: bool = False,
-    ) -> None:
+    def set_heading_numbering(self, enabled: bool) -> None:
         """Toggle preview heading numbering (#92) on the inner
         preview. Re-rendering the currently-displayed archive (if
         any) is handled by the caller's setMarkdown on the next
         archive selection -- which is the common path in this
         read-only viewer."""
         try:
-            self._preview.set_heading_numbering(enabled, skip_h1=skip_h1)
+            self._preview.set_heading_numbering(enabled)
         except AttributeError:
             pass
 

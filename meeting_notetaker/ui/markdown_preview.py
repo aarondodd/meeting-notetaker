@@ -71,15 +71,9 @@ class MarkdownPreview(QTextBrowser):
         # default; SessionView pushes the config value at
         # construction + on Settings save.
         self._number_headings_enabled: bool = False
-        self._number_headings_skip_h1: bool = False
 
-    def set_heading_numbering(
-        self, enabled: bool, *, skip_h1: bool = False,
-    ) -> None:
+    def set_heading_numbering(self, enabled: bool) -> None:
         """Toggle heading auto-numbering for the preview (#92).
-
-        `skip_h1=True` means H1 stays unnumbered (treated as the
-        page title) and H2 becomes the top-level slot.
 
         Idempotent. Doesn't re-render existing content -- the toggle
         applies on the next setMarkdown call. SessionView re-pushes
@@ -87,7 +81,6 @@ class MarkdownPreview(QTextBrowser):
         rendering without reopening the session.
         """
         self._number_headings_enabled = bool(enabled)
-        self._number_headings_skip_h1 = bool(skip_h1)
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,9 +88,7 @@ class MarkdownPreview(QTextBrowser):
     def setMarkdown(self, text: str) -> None:  # type: ignore[override]
         if self._number_headings_enabled:
             from ..utils.markdown_outline import number_headings  # noqa: PLC0415
-            text = number_headings(
-                text, skip_h1=self._number_headings_skip_h1,
-            )
+            text = number_headings(text)
         super().setMarkdown(text)
         self._clamp_images_to_viewport()
 

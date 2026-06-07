@@ -258,71 +258,6 @@ def test_apply_outline_toc_link_matches_numbered_anchor_slug():
 
 # ---- combined regression ------------------------------------------------
 
-# ---- skip_h1 (numbering) ------------------------------------------------
-
-def test_number_headings_skip_h1_leaves_h1_alone():
-    """With skip_h1, H1 stays unnumbered and the H2 below becomes
-    the top-level counter slot."""
-    src = "# Doc Title\n## Goals\n## Non-Goals\n"
-    out = number_headings(src, skip_h1=True)
-    assert "# Doc Title" in out
-    assert "## 1 Goals" in out
-    assert "## 2 Non-Goals" in out
-
-
-def test_number_headings_skip_h1_h2_becomes_top_level():
-    """H2 with skip_h1 = top-level counter; H3 becomes "N.M"."""
-    src = "## Goals\n### Phase 1\n### Phase 2\n## Non-Goals\n"
-    out = number_headings(src, skip_h1=True)
-    assert "## 1 Goals" in out
-    assert "### 1.1 Phase 1" in out
-    assert "### 1.2 Phase 2" in out
-    assert "## 2 Non-Goals" in out
-
-
-def test_number_headings_skip_h1_continues_across_multiple_h1():
-    """Multiple H1s with skip_h1: deeper-level counters keep
-    continuing (H1 boundaries are decorative, not section
-    separators). Users who want per-section restart shouldn't
-    skip H1."""
-    src = "# Section A\n## Foo\n# Section B\n## Bar\n"
-    out = number_headings(src, skip_h1=True)
-    assert "# Section A" in out
-    assert "# Section B" in out
-    assert "## 1 Foo" in out
-    # Bar continues at 2, not back to 1 -- decorative H1s.
-    assert "## 2 Bar" in out
-
-
-# ---- skip_h1 (TOC) -------------------------------------------------------
-
-def test_generate_toc_skip_h1_omits_h1():
-    src = "# Title\n## Goals\n### Phase 1\n"
-    out = generate_toc(src, skip_h1=True)
-    assert "[Title]" not in out
-    assert "[Goals]" in out
-    assert "[Phase 1]" in out
-
-
-def test_generate_toc_skip_h1_indent_starts_at_h2():
-    """With skip_h1, the H2 entry has no indent (it's the top level
-    of the visible outline). H3 has one level of indent."""
-    src = "# Title\n## Goals\n### Phase\n"
-    out = generate_toc(src, skip_h1=True)
-    assert "- [Goals]" in out  # no leading whitespace
-    assert "  - [Phase]" in out  # one level of indent
-
-
-def test_generate_toc_max_depth_with_skip_h1():
-    """max_depth applies to the post-skip level so max_depth=2 with
-    skip_h1 means H2 + H3."""
-    src = "# Title\n## A\n### B\n#### C\n"
-    out = generate_toc(src, max_depth=2, skip_h1=True)
-    assert "[A]" in out
-    assert "[B]" in out
-    assert "[C]" not in out
-
-
 # ---- max_depth -----------------------------------------------------------
 
 def test_generate_toc_max_depth_one_includes_only_top_level():
@@ -345,20 +280,7 @@ def test_generate_toc_max_depth_zero_returns_empty():
     assert out == ""
 
 
-# ---- apply_outline forwards both new kwargs -----------------------------
-
-def test_apply_outline_skip_h1_routes_through_to_both_transforms():
-    src = "# Title\n## Goals\n## Non-Goals\n"
-    out = apply_outline(src, number=True, toc=True, skip_h1=True)
-    # H1 untouched.
-    assert "# Title" in out
-    # Numbered H2 entries.
-    assert "## 1 Goals" in out
-    # TOC entry for Goals exists.
-    assert "[1 Goals]" in out
-    # No TOC entry for the title.
-    assert "[Title]" not in out
-
+# ---- apply_outline forwards the new max_depth kwarg ---------------------
 
 def test_apply_outline_max_depth_threads_through():
     src = "# A\n## B\n### C\n"

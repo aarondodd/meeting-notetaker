@@ -1049,26 +1049,6 @@ class SettingsDialog(QDialog):
         )
         export_form.addRow(self._heading_numbering)
 
-        # Sub-option: skip H1 (treat as title).
-        self._heading_numbering_skip_h1 = QCheckBox(
-            "    Skip H1 (treat as document title)", self,
-        )
-        self._heading_numbering_skip_h1.setChecked(
-            getattr(config.synthesis, "heading_numbering_skip_h1", False),
-        )
-        self._heading_numbering_skip_h1.setToolTip(
-            "When on, H1 headings stay unnumbered and H2 becomes the "
-            "top-level number ('1', '1.1', etc.). Useful when the "
-            "document convention reserves H1 for the page title."
-        )
-        self._heading_numbering_skip_h1.setEnabled(
-            self._heading_numbering.isChecked()
-        )
-        self._heading_numbering.toggled.connect(
-            self._heading_numbering_skip_h1.setEnabled,
-        )
-        export_form.addRow(self._heading_numbering_skip_h1)
-
         self._toc_in_exports = QCheckBox(
             "Generate table of contents in exports", self,
         )
@@ -1323,9 +1303,6 @@ class SettingsDialog(QDialog):
         for field, cb in self._appendix_section_checkboxes.items():
             setattr(self._config.synthesis, field, cb.isChecked())
         self._config.synthesis.heading_numbering = self._heading_numbering.isChecked()
-        self._config.synthesis.heading_numbering_skip_h1 = (
-            self._heading_numbering_skip_h1.isChecked()
-        )
         self._config.synthesis.toc_in_exports = self._toc_in_exports.isChecked()
         self._config.synthesis.toc_max_depth = int(self._toc_max_depth.value())
         self._config.backup.folder = self._backup_folder_edit.text().strip()

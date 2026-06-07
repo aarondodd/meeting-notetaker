@@ -149,7 +149,6 @@ def export_to_notion(
     progress: Optional[Callable[[str], None]] = None,
     number_headings: bool = False,
     include_toc: bool = False,
-    skip_h1: bool = False,
     toc_max_depth: int = 3,
 ) -> ExportResult:
     """Convert + upload + create. Returns ExportResult with the new
@@ -172,7 +171,7 @@ def export_to_notion(
         from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
         markdown_body = apply_outline(
             markdown_body, number=number_headings, toc=include_toc,
-            skip_h1=skip_h1, max_depth=toc_max_depth,
+            max_depth=toc_max_depth,
         )
 
     # 1. Scan for local image refs, upload each, build a url->file_upload_id map.
@@ -294,7 +293,6 @@ def export_to_confluence(
     progress: Optional[Callable[[str], None]] = None,
     number_headings: bool = False,
     include_toc: bool = False,
-    skip_h1: bool = False,
     toc_max_depth: int = 3,
 ) -> ExportResult:
     """Two-pass when images OR attachments are present:
@@ -320,7 +318,7 @@ def export_to_confluence(
         from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
         markdown_body = apply_outline(
             markdown_body, number=number_headings, toc=include_toc,
-            skip_h1=skip_h1, max_depth=toc_max_depth,
+            max_depth=toc_max_depth,
         )
 
     refs = collect_image_refs(markdown_body)

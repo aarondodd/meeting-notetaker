@@ -45,7 +45,6 @@ class NotionExportWorker(_ExportWorkerBase):
         attachments: Optional[list[ExportAttachment]] = None,
         number_headings: bool = False,
         include_toc: bool = False,
-        skip_h1: bool = False,
         toc_max_depth: int = 3,
     ) -> None:
         super().__init__()
@@ -57,7 +56,6 @@ class NotionExportWorker(_ExportWorkerBase):
         self._attachments = attachments or []
         self._number_headings = number_headings
         self._include_toc = include_toc
-        self._skip_h1 = skip_h1
         self._toc_max_depth = toc_max_depth
 
     def run(self) -> None:
@@ -72,7 +70,6 @@ class NotionExportWorker(_ExportWorkerBase):
                 progress=self._emit_progress,
                 number_headings=self._number_headings,
                 include_toc=self._include_toc,
-                skip_h1=self._skip_h1,
                 toc_max_depth=self._toc_max_depth,
             )
         except Exception as exc:
@@ -94,7 +91,6 @@ class ConfluenceExportWorker(_ExportWorkerBase):
         attachments: Optional[list[ExportAttachment]] = None,
         number_headings: bool = False,
         include_toc: bool = False,
-        skip_h1: bool = False,
         toc_max_depth: int = 3,
     ) -> None:
         super().__init__()
@@ -107,7 +103,6 @@ class ConfluenceExportWorker(_ExportWorkerBase):
         self._attachments = attachments or []
         self._number_headings = number_headings
         self._include_toc = include_toc
-        self._skip_h1 = skip_h1
         self._toc_max_depth = toc_max_depth
 
     def run(self) -> None:
@@ -123,7 +118,6 @@ class ConfluenceExportWorker(_ExportWorkerBase):
                 progress=self._emit_progress,
                 number_headings=self._number_headings,
                 include_toc=self._include_toc,
-                skip_h1=self._skip_h1,
                 toc_max_depth=self._toc_max_depth,
             )
         except Exception as exc:

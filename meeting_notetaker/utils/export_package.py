@@ -404,7 +404,6 @@ def render_session_pdf(
     appendix_data=None,
     number_headings: bool = False,
     include_toc: bool = False,
-    skip_h1: bool = False,
     toc_max_depth: int = 3,
 ) -> Path:
     """Render a session-tab markdown body to a PDF on the MAIN
@@ -457,7 +456,7 @@ def render_session_pdf(
         from .markdown_outline import apply_outline  # noqa: PLC0415
         body = apply_outline(
             body, number=number_headings, toc=include_toc,
-            skip_h1=skip_h1, max_depth=toc_max_depth,
+            max_depth=toc_max_depth,
         )
 
     printable = build_print_markdown(

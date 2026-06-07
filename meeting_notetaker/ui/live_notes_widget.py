@@ -155,9 +155,7 @@ class LiveNotesWidget(QWidget):
 
     # ---- public API --------------------------------------------------------
 
-    def set_heading_numbering(
-        self, enabled: bool, *, skip_h1: bool = False,
-    ) -> None:
+    def set_heading_numbering(self, enabled: bool) -> None:
         """Toggle the preview's heading-numbering transform (#92).
 
         Forwards to the wrapped PreviewWithToc and schedules a
@@ -165,7 +163,7 @@ class LiveNotesWidget(QWidget):
         rather than waiting for the next edit / session-switch.
         """
         try:
-            self._preview.set_heading_numbering(enabled, skip_h1=skip_h1)
+            self._preview.set_heading_numbering(enabled)
         except AttributeError:
             pass
         self._schedule_preview_refresh()
