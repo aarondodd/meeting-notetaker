@@ -2518,9 +2518,9 @@ class SessionView(QWidget):
                 toc=self._export_toc,
                 max_depth=self._export_toc_max_depth,
             )
-            # #94: inject named anchors for the PDF so TOC links navigate.
-            from ..utils.markdown_outline import inject_pdf_anchors  # noqa: PLC0415
-            body_for_print = inject_pdf_anchors(body_for_print)
+            # #94: PDF anchor injection happens inside
+            # markdown_to_print_html (the setHtml path); no separate
+            # inject_pdf_anchors call needed here.
 
         printable = build_print_markdown(
             session_title=self._session.title,
@@ -2531,13 +2531,16 @@ class SessionView(QWidget):
 
         sdir = session_dir(self._session.id)
         doc = PrintTextDocument(sdir, parent=self)
-        doc.setMarkdown(printable)
-        # Force every Markdown anchor to render black + underline.
-        # Qt's Markdown parser writes cyan into the character format
-        # at parse time, which the defaultStyleSheet alone can't
-        # override; the walk has to happen after setMarkdown (#78
-        # followup -- the v0.7.6 stylesheet-only fix didn't take
-        # effect in the rendered PDF).
+        # #94: render via setHtml + mistune so the TOC's internal
+        # links carry into the PDF as clickable named-destination
+        # anchors. The setMarkdown path drops internal links
+        # silently.
+        from ..utils.print_html import markdown_to_print_html  # noqa: PLC0415
+        doc.setHtml(markdown_to_print_html(printable))
+        # Force every anchor to render black + underline. Qt's
+        # parser writes cyan into the character format at parse
+        # time, which the defaultStyleSheet alone can't override;
+        # the walk has to happen after setHtml.
         doc.force_anchor_styling()
         return doc, tab_label
 
