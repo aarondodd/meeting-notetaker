@@ -402,6 +402,8 @@ def render_session_pdf(
     session_date,
     session_contacts: Optional[list] = None,
     appendix_data=None,
+    number_headings: bool = False,
+    include_toc: bool = False,
 ) -> Path:
     """Render a session-tab markdown body to a PDF on the MAIN
     THREAD.
@@ -442,6 +444,18 @@ def render_session_pdf(
     if appendix_data is not None:
         from .appendix_transform import inject_appendix  # noqa: PLC0415
         body = inject_appendix(body, appendix_data)
+
+    # #92: heading numbering + TOC injection. Applies AFTER attendee-
+    # table swap + appendix injection so the auto-generated TOC sees
+    # the final body shape and the numbering picks up the appendix
+    # headings. Slugs in the TOC links match the Qt setMarkdown
+    # convention so click-to-navigate works wherever the PDF viewer
+    # respects internal markdown anchors.
+    if number_headings or include_toc:
+        from .markdown_outline import apply_outline  # noqa: PLC0415
+        body = apply_outline(
+            body, number=number_headings, toc=include_toc,
+        )
 
     printable = build_print_markdown(
         session_title=session_title,

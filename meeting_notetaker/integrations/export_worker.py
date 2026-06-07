@@ -43,6 +43,8 @@ class NotionExportWorker(_ExportWorkerBase):
         markdown_body: str,
         session_dir: Path,
         attachments: Optional[list[ExportAttachment]] = None,
+        number_headings: bool = False,
+        include_toc: bool = False,
     ) -> None:
         super().__init__()
         self._client = client
@@ -51,6 +53,8 @@ class NotionExportWorker(_ExportWorkerBase):
         self._markdown_body = markdown_body
         self._session_dir = session_dir
         self._attachments = attachments or []
+        self._number_headings = number_headings
+        self._include_toc = include_toc
 
     def run(self) -> None:
         try:
@@ -62,6 +66,8 @@ class NotionExportWorker(_ExportWorkerBase):
                 session_dir=self._session_dir,
                 attachments=self._attachments,
                 progress=self._emit_progress,
+                number_headings=self._number_headings,
+                include_toc=self._include_toc,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -80,6 +86,8 @@ class ConfluenceExportWorker(_ExportWorkerBase):
         markdown_body: str,
         session_dir: Path,
         attachments: Optional[list[ExportAttachment]] = None,
+        number_headings: bool = False,
+        include_toc: bool = False,
     ) -> None:
         super().__init__()
         self._client = client
@@ -89,6 +97,8 @@ class ConfluenceExportWorker(_ExportWorkerBase):
         self._markdown_body = markdown_body
         self._session_dir = session_dir
         self._attachments = attachments or []
+        self._number_headings = number_headings
+        self._include_toc = include_toc
 
     def run(self) -> None:
         try:
@@ -101,6 +111,8 @@ class ConfluenceExportWorker(_ExportWorkerBase):
                 session_dir=self._session_dir,
                 attachments=self._attachments,
                 progress=self._emit_progress,
+                number_headings=self._number_headings,
+                include_toc=self._include_toc,
             )
         except Exception as exc:
             self.failed.emit(str(exc))

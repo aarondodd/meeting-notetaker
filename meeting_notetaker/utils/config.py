@@ -290,6 +290,19 @@ class SynthesisConfig:
     appendix_export_referenced_attachments: bool = True
     appendix_export_session_attachments: bool = True
     appendix_export_links: bool = True
+    # Outline transforms (#92). When enabled, applied at render time
+    # to the synthesis body before it reaches Preview / PDF / Notion /
+    # Confluence. Off by default so existing exports stay byte-for-
+    # byte identical until the user opts in.
+    #   - heading_numbering: prefix every heading with a dotted-
+    #     decimal counter ("1.2.3 Heading"). Applies in Preview AND
+    #     every export.
+    #   - toc_in_exports: prepend an auto-generated table of contents
+    #     under a "## Contents" heading. Exports only (PDF, Notion,
+    #     Confluence) -- the Preview already has a sidebar TOC via
+    #     PreviewWithToc, so an inline TOC would duplicate.
+    heading_numbering: bool = False
+    toc_in_exports: bool = False
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

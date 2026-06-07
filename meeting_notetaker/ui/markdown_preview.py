@@ -66,11 +66,29 @@ class MarkdownPreview(QTextBrowser):
         # setHtml call -- Qt applies the sheet at render time and
         # caches results, so order matters.
         self.document().setDefaultStyleSheet(_PREVIEW_STYLESHEET)
+        # Heading numbering (#92). When True, the source body is
+        # passed through number_headings before setMarkdown. Off by
+        # default; SessionView pushes the config value at
+        # construction + on Settings save.
+        self._number_headings_enabled: bool = False
+
+    def set_heading_numbering(self, enabled: bool) -> None:
+        """Toggle heading auto-numbering for the preview (#92).
+
+        Idempotent. Doesn't re-render existing content -- the toggle
+        applies on the next setMarkdown call. SessionView re-pushes
+        the body when the setting changes so users see the new
+        rendering without reopening the session.
+        """
+        self._number_headings_enabled = bool(enabled)
 
     # ------------------------------------------------------------------
     # Public API
 
     def setMarkdown(self, text: str) -> None:  # type: ignore[override]
+        if self._number_headings_enabled:
+            from ..utils.markdown_outline import number_headings  # noqa: PLC0415
+            text = number_headings(text)
         super().setMarkdown(text)
         self._clamp_images_to_viewport()
 

@@ -147,6 +147,8 @@ def export_to_notion(
     session_dir: Path,
     attachments: Optional[list[ExportAttachment]] = None,
     progress: Optional[Callable[[str], None]] = None,
+    number_headings: bool = False,
+    include_toc: bool = False,
 ) -> ExportResult:
     """Convert + upload + create. Returns ExportResult with the new
     page's URL for the caller to surface (toast + open-in-browser).
@@ -160,6 +162,15 @@ def export_to_notion(
     def report(msg: str) -> None:
         if progress:
             progress(msg)
+
+    # #92: heading numbering + TOC. Applied BEFORE the image-ref
+    # collection + block conversion so the headings the user sees in
+    # Notion match what they'd see in the in-app preview and in PDF.
+    if number_headings or include_toc:
+        from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
+        markdown_body = apply_outline(
+            markdown_body, number=number_headings, toc=include_toc,
+        )
 
     # 1. Scan for local image refs, upload each, build a url->file_upload_id map.
     local_uploads: dict[str, str] = {}
@@ -278,6 +289,8 @@ def export_to_confluence(
     session_dir: Path,
     attachments: Optional[list[ExportAttachment]] = None,
     progress: Optional[Callable[[str], None]] = None,
+    number_headings: bool = False,
+    include_toc: bool = False,
 ) -> ExportResult:
     """Two-pass when images OR attachments are present:
       1. Create a placeholder page so we have a page_id.
@@ -294,6 +307,15 @@ def export_to_confluence(
     def report(msg: str) -> None:
         if progress:
             progress(msg)
+
+    # #92: heading numbering + TOC. Applied BEFORE the storage XML
+    # conversion so Confluence sees the final body shape and the
+    # generated TOC links match the heading anchors.
+    if number_headings or include_toc:
+        from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
+        markdown_body = apply_outline(
+            markdown_body, number=number_headings, toc=include_toc,
+        )
 
     refs = collect_image_refs(markdown_body)
     local_refs = [(u, a) for u, a in refs if is_local_image_ref(u)]

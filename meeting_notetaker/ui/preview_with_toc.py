@@ -72,12 +72,44 @@ class PreviewWithToc(QWidget):
         # Remember the most recent body so the TOC can be rebuilt
         # later (e.g. if the user resizes / focuses).
         self._current_body: str = ""
+        # Heading numbering toggle (#92). When True, both the body
+        # passed to setMarkdown AND the sidebar TOC reflect the
+        # numbering, so they stay consistent.
+        self._number_headings_enabled: bool = False
+
+    def set_heading_numbering(self, enabled: bool) -> None:
+        """Toggle heading auto-numbering for the wrapped preview (#92).
+
+        The transform applies at this level so both the rendered
+        body and the sidebar TOC see the same numbered headings.
+        Forwards to the inner MarkdownPreview as well so any direct
+        setMarkdown call into the inner widget stays consistent.
+        """
+        self._number_headings_enabled = bool(enabled)
+        self._preview.set_heading_numbering(enabled)
 
     # ---- MarkdownPreview-shaped public API ----
     def setMarkdown(self, text: str) -> None:  # noqa: N802 (Qt convention)
         self._current_body = text or ""
-        self._preview.setMarkdown(self._current_body)
-        self._rebuild_toc(self._current_body)
+        if self._number_headings_enabled:
+            from ..utils.markdown_outline import number_headings  # noqa: PLC0415
+            rendered = number_headings(self._current_body)
+        else:
+            rendered = self._current_body
+        # Inner MarkdownPreview also has the toggle wired; passing
+        # the already-numbered body in is harmless because
+        # number_headings is idempotent against numbered input only
+        # when nothing else has changed -- the inner preview's
+        # toggle is the deciding factor for whether a second pass
+        # runs. Disable the inner toggle while we hand off the
+        # already-transformed body to avoid the double-prefix risk.
+        previous_inner = self._preview._number_headings_enabled  # noqa: SLF001
+        self._preview._number_headings_enabled = False  # noqa: SLF001
+        try:
+            self._preview.setMarkdown(rendered)
+        finally:
+            self._preview._number_headings_enabled = previous_inner  # noqa: SLF001
+        self._rebuild_toc(rendered)
 
     def setHtml(self, text: str) -> None:  # noqa: N802
         self._current_body = ""

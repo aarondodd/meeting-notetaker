@@ -1028,6 +1028,42 @@ class SettingsDialog(QDialog):
             export_form.addRow(cb)
             self._appendix_section_checkboxes[field_name] = cb
 
+        # Document outline transforms (#92).
+        outline_blurb = QLabel(
+            "<b>Document outline</b>", self,
+        )
+        outline_blurb.setTextFormat(Qt.TextFormat.RichText)
+        export_form.addRow(outline_blurb)
+
+        self._heading_numbering = QCheckBox(
+            "Auto-number headings in preview and exports", self,
+        )
+        self._heading_numbering.setChecked(
+            getattr(config.synthesis, "heading_numbering", False),
+        )
+        self._heading_numbering.setToolTip(
+            "Prepends dotted-decimal numbers to every heading: "
+            "first H1 becomes '1 Heading', nested H2 becomes '1.1 "
+            "Sub-heading', etc. Applies at render and export time; "
+            "the on-disk notes.md file is unchanged."
+        )
+        export_form.addRow(self._heading_numbering)
+
+        self._toc_in_exports = QCheckBox(
+            "Generate table of contents in exports", self,
+        )
+        self._toc_in_exports.setChecked(
+            getattr(config.synthesis, "toc_in_exports", False),
+        )
+        self._toc_in_exports.setToolTip(
+            "Adds an auto-generated '## Contents' section at the top "
+            "of every export (PDF / Notion / Confluence). The Preview "
+            "already has a sidebar table of contents, so no inline "
+            "TOC is added there. PDF TOC entries link to anchors -- "
+            "click-to-navigate depends on the PDF viewer."
+        )
+        export_form.addRow(self._toc_in_exports)
+
         self._add_section("Export", export_group)
 
         # Backups group (#67) ---------------------------------------------
@@ -1247,6 +1283,8 @@ class SettingsDialog(QDialog):
         )
         for field, cb in self._appendix_section_checkboxes.items():
             setattr(self._config.synthesis, field, cb.isChecked())
+        self._config.synthesis.heading_numbering = self._heading_numbering.isChecked()
+        self._config.synthesis.toc_in_exports = self._toc_in_exports.isChecked()
         self._config.backup.folder = self._backup_folder_edit.text().strip()
         if self._backup_sched_on_close.isChecked():
             self._config.backup.schedule = "on_close"

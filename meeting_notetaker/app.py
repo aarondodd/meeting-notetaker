@@ -423,6 +423,24 @@ class MainApp(QObject):
             )
         except AttributeError:
             pass
+        # Push heading-numbering preference (#92). Same try/except
+        # pattern so older SessionView shapes degrade cleanly.
+        try:
+            self.window.session_view.set_heading_numbering(
+                self.config.synthesis.heading_numbering
+            )
+        except AttributeError:
+            pass
+        # Push the export-side outline preferences (#92) so the per-
+        # tab Export PDF / Print path picks up numbering + TOC
+        # automatically.
+        try:
+            self.window.session_view.set_export_outline_options(
+                number_headings=self.config.synthesis.heading_numbering,
+                include_toc=self.config.synthesis.toc_in_exports,
+            )
+        except AttributeError:
+            pass
         # Popout window mirrors the same fonts when open.
         popout = getattr(self, "_notes_popout", None)
         if popout is not None:
@@ -4030,6 +4048,14 @@ class MainApp(QObject):
         notes_pdf_path = None
         synthesis_pdf_path = None
         try:
+            # #92: pull the user's outline preferences once so both PDFs
+            # carry the same numbering + TOC choices.
+            outline_number = getattr(
+                self.config.synthesis, "heading_numbering", False,
+            )
+            outline_toc = getattr(
+                self.config.synthesis, "toc_in_exports", False,
+            )
             if notes_md.strip():
                 notes_pdf_path = pdf_temp_dir / "my-notes.pdf"
                 render_session_pdf(
@@ -4041,6 +4067,8 @@ class MainApp(QObject):
                     session_date=session_when,
                     session_contacts=session_contacts_for_pdf,
                     appendix_data=appendix_data,
+                    number_headings=outline_number,
+                    include_toc=outline_toc,
                 )
             if synthesis_md.strip():
                 synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
@@ -4053,6 +4081,8 @@ class MainApp(QObject):
                     session_date=session_when,
                     session_contacts=session_contacts_for_pdf,
                     appendix_data=appendix_data,
+                    number_headings=outline_number,
+                    include_toc=outline_toc,
                 )
         except Exception:
             log.exception("PDF pre-render failed for %s", session_id)

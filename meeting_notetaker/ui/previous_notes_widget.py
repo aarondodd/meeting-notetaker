@@ -133,6 +133,17 @@ class PreviousNotesWidget(QWidget):
         apply_fonts as part of the cross-surface font refresh."""
         self._preview.setFont(preview_font)
 
+    def set_heading_numbering(self, enabled: bool) -> None:
+        """Toggle preview heading numbering (#92) on the inner
+        preview. Re-rendering the currently-displayed archive (if
+        any) is handled by the caller's setMarkdown on the next
+        archive selection -- which is the common path in this
+        read-only viewer."""
+        try:
+            self._preview.set_heading_numbering(enabled)
+        except AttributeError:
+            pass
+
     def select_archive_by_name(self, archive_name: str) -> bool:
         """Pick the list row whose Path basename matches `archive_name`.
 

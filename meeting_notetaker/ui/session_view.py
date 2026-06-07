@@ -220,6 +220,10 @@ class SessionView(QWidget):
         # "every populated section on". MainApp.set_appendix_export_defaults
         # plumbs the saved config into this field.
         self._appendix_export_defaults = None
+        # #92 outline transforms. MainApp pushes the config values via
+        # set_export_outline_options on startup + Settings save.
+        self._export_heading_numbering: bool = False
+        self._export_toc: bool = False
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -1616,6 +1620,34 @@ class SessionView(QWidget):
         except AttributeError:
             pass
 
+    def set_export_outline_options(
+        self, *, number_headings: bool, include_toc: bool,
+    ) -> None:
+        """Push the export outline preferences (#92) into the session
+        view. Used by the per-tab Export PDF / Print path -- the body
+        is transformed before render so PDFs match the configured
+        preferences. Idempotent."""
+        self._export_heading_numbering = bool(number_headings)
+        self._export_toc = bool(include_toc)
+
+    def set_heading_numbering(self, enabled: bool) -> None:
+        """Toggle preview heading numbering (#92) on every preview-bearing
+        widget. SessionView routes to My Notes, Synthesis, Previous
+        Notes -- so the user sees consistent numbering across tabs.
+        The widgets re-render themselves so the change shows
+        immediately without a session switch."""
+        for widget in (self._live_notes_editor, self._notes_view):
+            try:
+                widget.set_heading_numbering(enabled)
+            except AttributeError:
+                continue
+        # Previous Notes preview is a separate widget; forward through
+        # if it implements the toggle.
+        try:
+            self._previous_view.set_heading_numbering(enabled)
+        except AttributeError:
+            pass
+
     def set_user_name(self, name: str) -> None:
         """Update the display label for the user's mic and refresh the transcript view."""
         new_name = (name or "").strip()
@@ -2448,6 +2480,17 @@ class SessionView(QWidget):
         body_for_print = inject_appendix(
             body_for_print, apply_inclusion(appendix_data, inclusion),
         )
+
+        # #92: heading numbering + TOC. Applied AFTER the appendix
+        # injection so the auto-TOC catches the appendix section
+        # headings and the numbering covers the whole document.
+        if self._export_heading_numbering or self._export_toc:
+            from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
+            body_for_print = apply_outline(
+                body_for_print,
+                number=self._export_heading_numbering,
+                toc=self._export_toc,
+            )
 
         printable = build_print_markdown(
             session_title=self._session.title,

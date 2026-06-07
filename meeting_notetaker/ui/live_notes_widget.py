@@ -155,6 +155,19 @@ class LiveNotesWidget(QWidget):
 
     # ---- public API --------------------------------------------------------
 
+    def set_heading_numbering(self, enabled: bool) -> None:
+        """Toggle the preview's heading-numbering transform (#92).
+
+        Forwards to the wrapped PreviewWithToc and schedules a
+        preview re-render so the new numbering shows immediately
+        rather than waiting for the next edit / session-switch.
+        """
+        try:
+            self._preview.set_heading_numbering(enabled)
+        except AttributeError:
+            pass
+        self._schedule_preview_refresh()
+
     def set_rich_source_view(self, enabled: bool) -> None:
         """Attach or detach the markdown source highlighter (#91).
 
