@@ -710,6 +710,21 @@ class SettingsDialog(QDialog):
         preview_form.addRow("Size:", self._preview_font_size)
         fonts_layout.addWidget(preview_group)
 
+        # Markdown rich source view (#91). Sits under Fonts because it
+        # changes how the editor renders, parallel to the font picker.
+        self._markdown_rich_editor = QCheckBox(
+            "Style markdown source in the editor (#91)", fonts_group,
+        )
+        self._markdown_rich_editor.setChecked(config.ui.markdown_rich_editor)
+        self._markdown_rich_editor.setToolTip(
+            "Render markdown structure cues in the My Notes editor: "
+            "headings sized + bold, bold/italic shown through, code "
+            "monospace, links underlined. The markdown syntax stays "
+            "visible and editable. Turn off for a plain monospace "
+            "editor."
+        )
+        fonts_layout.addWidget(self._markdown_rich_editor)
+
         self._add_section("Fonts", fonts_group)
 
         # Synthesis (combined Automation + Prompt Templates) ---------
@@ -1204,6 +1219,7 @@ class SettingsDialog(QDialog):
             self._preview_font_picker.currentData() or ""
         )
         self._config.ui.preview_font_size = int(self._preview_font_size.value())
+        self._config.ui.markdown_rich_editor = self._markdown_rich_editor.isChecked()
         self._config.synthesis.automation_enabled = self._auto_enabled.isChecked()
         self._config.synthesis.llm_target = (
             self._auto_target.currentData() or "claude"

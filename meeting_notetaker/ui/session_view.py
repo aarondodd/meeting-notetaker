@@ -1606,6 +1606,16 @@ class SessionView(QWidget):
             # skip -- preview reverts to the QApplication default.
             pass
 
+    def set_rich_source_view(self, enabled: bool) -> None:
+        """Toggle the styled markdown source view (#91) on every editor
+        that hosts one. Currently just the My Notes editor; the
+        Synthesis editor stays plain because synthesized notes are
+        usually printed / exported rather than scanned in-editor."""
+        try:
+            self._live_notes_editor.set_rich_source_view(enabled)
+        except AttributeError:
+            pass
+
     def set_user_name(self, name: str) -> None:
         """Update the display label for the user's mic and refresh the transcript view."""
         new_name = (name or "").strip()

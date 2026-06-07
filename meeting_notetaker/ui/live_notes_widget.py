@@ -41,6 +41,7 @@ from ..utils.images import (
     save_qimage,
 )
 from .markdown_preview import MarkdownPreview
+from .markdown_source_highlighter import MarkdownSourceHighlighter
 from .preview_with_toc import PreviewWithToc
 
 
@@ -127,6 +128,11 @@ class LiveNotesWidget(QWidget):
         self._editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self._editor.textChanged.connect(self.textChanged.emit)
         self._editor.image_pasted.connect(self._on_image_pasted)
+        # Styled markdown source view (#91). Created on demand via
+        # set_rich_source_view(True) -- SessionView decides based on
+        # the user's config.ui.markdown_rich_editor preference. When
+        # off the editor stays as plain monospace.
+        self._highlighter: Optional[MarkdownSourceHighlighter] = None
 
         # v0.7.0 tweak #7: My Notes + Synthesis preview gains a
         # clickable table-of-contents sidebar on the right. The
@@ -149,6 +155,35 @@ class LiveNotesWidget(QWidget):
 
     # ---- public API --------------------------------------------------------
 
+    def set_rich_source_view(self, enabled: bool) -> None:
+        """Attach or detach the markdown source highlighter (#91).
+
+        When enabled, headings render larger, bold/italic show through,
+        code is monospace + tinted, etc. -- the markdown syntax stays
+        visible and editable. When disabled, the editor reverts to a
+        plain monospace face.
+
+        Idempotent. Safe to call repeatedly with the same value.
+        """
+        if enabled:
+            if self._highlighter is None:
+                self._highlighter = MarkdownSourceHighlighter(
+                    self._editor.document(),
+                    base_font=self._editor.font(),
+                    palette=self._editor.palette(),
+                )
+            else:
+                self._highlighter.reload_styling(
+                    base_font=self._editor.font(),
+                    palette=self._editor.palette(),
+                )
+        else:
+            if self._highlighter is not None:
+                # QSyntaxHighlighter clears formats on the document when
+                # its document is set to None.
+                self._highlighter.setDocument(None)
+                self._highlighter = None
+
     def apply_fonts(self, editor_font, preview_font) -> None:
         """Push the resolved editor + preview fonts onto the inner
         widgets. Called by SessionView at construction (initial seed
@@ -161,6 +196,14 @@ class LiveNotesWidget(QWidget):
         for body text; headings and code blocks still pick up their
         intrinsic styling via the Markdown render path."""
         self._editor.setFont(editor_font)
+        # Rich source highlighter (#91): rebuild against the new base
+        # font so heading-size multipliers track the user's chosen
+        # editor font.
+        if self._highlighter is not None:
+            self._highlighter.reload_styling(
+                base_font=editor_font,
+                palette=self._editor.palette(),
+            )
         # PreviewWithToc exposes the inner MarkdownPreview via
         # .preview() so we can push the font without breaking the
         # composite's encapsulation.

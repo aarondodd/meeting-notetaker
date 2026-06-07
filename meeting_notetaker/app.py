@@ -414,6 +414,15 @@ class MainApp(QObject):
             self.window.session_view.apply_fonts(editor_font, preview_font)
         except AttributeError:
             log.exception("SessionView.apply_fonts not available; skipping font push")
+        # Push the rich-source-view preference too (#91). Hidden behind a
+        # try/except so a SessionView that predates the wiring degrades
+        # cleanly.
+        try:
+            self.window.session_view.set_rich_source_view(
+                self.config.ui.markdown_rich_editor
+            )
+        except AttributeError:
+            pass
         # Popout window mirrors the same fonts when open.
         popout = getattr(self, "_notes_popout", None)
         if popout is not None:

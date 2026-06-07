@@ -183,6 +183,13 @@ class UiConfig:
     # preserves the screenshare-friendly setup.
     notes_popout_geometry: str = ""
     notes_popout_always_on_top: bool = False
+    # Styled markdown source highlighting in the My Notes editor (#91).
+    # When True, the editor decorates the source with heading sizes,
+    # bold/italic/code styling, dimmed markers, etc. When False the
+    # editor reverts to plain monospace. Defaults True because the
+    # styling is conservative + based on palette colors so it adapts
+    # to light + dark themes without forcing one look.
+    markdown_rich_editor: bool = True
 
 
 @dataclass
