@@ -108,32 +108,43 @@ def test_paste_matches_generate_gate(qt_app):
         ), f"Generate/Paste parity broke for has_transcript={ht}, has_notes={hn}"
 
 
-def test_edit_send_sidekick_matches_generate_gate(qt_app):
-    """#90: the Edit & Send / Edit & Copy Prompt sidekick shares the
-    same enable gate as Generate -- the dialog renders the same
-    prompt so it must obey the same is-there-something-to-synthesize
-    rule."""
+def test_edit_dropdown_action_matches_generate_gate(qt_app):
+    """#90 split-button: the Edit-prompt dropdown menu action shares
+    the same enable gate as the Generate button itself."""
     for ht, hn in ((True, False), (False, True), (True, True), (False, False)):
         view = _state_view(qt_app, has_transcript=ht, has_notes=hn)
         assert (
-            view._edit_send_btn.isEnabled()  # noqa: SLF001
+            view._generate_edit_action.isEnabled()  # noqa: SLF001
             == view._generate_btn.isEnabled()  # noqa: SLF001
-        ), f"Sidekick/Generate parity broke for has_transcript={ht}, has_notes={hn}"
+        ), f"Generate dropdown parity broke for has_transcript={ht}, has_notes={hn}"
 
 
-def test_edit_send_sidekick_label_tracks_automation(qt_app, isolated_data_dir):
-    """#90: label changes based on automation mode so the user knows
-    what the dialog's primary button will do."""
+def test_send_dropdown_action_matches_send_gate(qt_app):
+    """The Send button's dropdown action obeys the same can_synthesize
+    rule even though Send itself has additional automation gates --
+    the edit-prompt path runs through the same render + dispatch so
+    it only needs content to exist."""
+    for ht, hn in ((True, False), (False, True), (True, True), (False, False)):
+        view = _state_view(qt_app, has_transcript=ht, has_notes=hn)
+        can_synth = view._generate_btn.isEnabled()  # noqa: SLF001
+        assert view._send_edit_action.isEnabled() == can_synth, (  # noqa: SLF001
+            f"Send dropdown parity broke for has_transcript={ht}, has_notes={hn}"
+        )
+
+
+def test_edit_dropdown_action_labels(qt_app, isolated_data_dir):
+    """#90: each button's dropdown surfaces an action whose label
+    matches the action it modifies. Stable across automation toggle."""
     from meeting_notetaker.ui.session_view import SessionView
     view = SessionView()
-    # Default state -- automation off.
-    assert "Copy Prompt" in view._edit_send_btn.text()  # noqa: SLF001
-    # Enable automation.
+    assert "Edit prompt before generating" in view._generate_edit_action.text()  # noqa: SLF001
+    assert "Edit prompt before sending" in view._send_edit_action.text()  # noqa: SLF001
+    # Stable through automation toggle.
     view.set_automation_enabled(True, "claude")
-    assert "Send" in view._edit_send_btn.text()  # noqa: SLF001
-    # Toggle back off.
+    assert "Edit prompt before generating" in view._generate_edit_action.text()  # noqa: SLF001
+    assert "Edit prompt before sending" in view._send_edit_action.text()  # noqa: SLF001
     view.set_automation_enabled(False)
-    assert "Copy Prompt" in view._edit_send_btn.text()  # noqa: SLF001
+    assert "Edit prompt before generating" in view._generate_edit_action.text()  # noqa: SLF001
 
 
 # ---- recording lock -----------------------------------------------------

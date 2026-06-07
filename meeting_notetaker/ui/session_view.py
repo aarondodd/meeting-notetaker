@@ -318,8 +318,27 @@ class SessionView(QWidget):
         # ellipsis but the dropdown shows the full text.
         self._prompt_template_picker.setMaximumWidth(200)
         synthesis.addWidget(self._prompt_template_picker)
-        self._generate_btn = QPushButton("Generate Synthesis Prompt", self)
+        # Split-button: main click runs the standard Generate /
+        # Send action; the dropdown arrow exposes the "Edit prompt
+        # before sending" path (#90). One button instead of a
+        # sidekick keeps the row tight and matches the platform
+        # convention (Save / Save As..., etc.). Same enable gate as
+        # the standard click.
+        self._generate_btn = QToolButton(self)
+        self._generate_btn.setText("Generate Synthesis Prompt")
+        self._generate_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly,
+        )
+        self._generate_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup,
+        )
         self._generate_btn.clicked.connect(self._on_generate_prompt)
+        self._generate_menu = QMenu(self._generate_btn)
+        self._generate_edit_action = self._generate_menu.addAction(
+            "Edit prompt before generating...",
+        )
+        self._generate_edit_action.triggered.connect(self._on_edit_and_send)
+        self._generate_btn.setMenu(self._generate_menu)
         synthesis.addWidget(self._generate_btn)
         self._paste_btn = QPushButton("Paste Response Back...", self)
         self._paste_btn.clicked.connect(self._on_paste_notes)
@@ -330,28 +349,31 @@ class SessionView(QWidget):
         # whenever Settings is closed. Copy button stays visible
         # regardless of the toggle (Aaron's call -- the manual copy
         # path is still useful when the extension isn't reachable).
-        self._send_btn = QPushButton("Send to Claude.ai", self)
+        # Same split-button shape as Generate: main click sends, the
+        # dropdown arrow exposes the edit-before-send path.
+        self._send_btn = QToolButton(self)
+        self._send_btn.setText("Send to Claude.ai")
+        self._send_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly,
+        )
+        self._send_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup,
+        )
         self._send_btn.setToolTip(
             "Send the synthesis prompt to the configured web LLM via "
             "the Meeting Notetaker browser extension. The response "
-            "lands in the Synthesis tab automatically."
+            "lands in the Synthesis tab automatically. Use the "
+            "dropdown to edit the rendered prompt before sending."
         )
         self._send_btn.clicked.connect(self._on_send_to_llm)
+        self._send_menu = QMenu(self._send_btn)
+        self._send_edit_action = self._send_menu.addAction(
+            "Edit prompt before sending...",
+        )
+        self._send_edit_action.triggered.connect(self._on_edit_and_send)
+        self._send_btn.setMenu(self._send_menu)
         self._send_btn.setVisible(False)
         synthesis.addWidget(self._send_btn)
-        # Sidekick: "Edit & Send..." / "Edit & Copy Prompt..." (#90).
-        # Opens the SessionPromptEditDialog with the rendered prompt,
-        # then dispatches the edited body through the same downstream
-        # path (automation bridge or clipboard) the standard
-        # Send/Generate button uses. Label changes with automation
-        # mode; same enable gate as Send/Generate.
-        self._edit_send_btn = QPushButton("Edit & Copy Prompt...", self)
-        self._edit_send_btn.setToolTip(
-            "Open an editor with the rendered prompt for this session; "
-            "edit it, then send or copy."
-        )
-        self._edit_send_btn.clicked.connect(self._on_edit_and_send)
-        synthesis.addWidget(self._edit_send_btn)
         self._copy_btn = QPushButton("Copy", self)
         self._copy_btn.setToolTip(
             "Copy the active tab's contents to the clipboard. The button "
@@ -1818,9 +1840,9 @@ class SessionView(QWidget):
             )
 
     def _on_edit_and_send(self) -> None:
-        """Sidekick to Send / Generate (#90): MainApp renders the
-        prompt, opens the SessionPromptEditDialog, and dispatches
-        the edited body through whichever downstream path
+        """Dropdown menu item next to Send / Generate (#90): MainApp
+        renders the prompt, opens the SessionPromptEditDialog, and
+        dispatches the edited body through whichever downstream path
         (automation bridge or clipboard) the current mode requires.
         We just emit -- the work happens in app.py."""
         if self._session is not None:
@@ -1987,12 +2009,6 @@ class SessionView(QWidget):
         self._generate_btn.setVisible(not enabled)
         self._paste_btn.setVisible(not enabled)
         self._send_btn.setVisible(enabled)
-        # Sidekick label follows the mode (#90). "Edit & Send..." in
-        # automation; "Edit & Copy Prompt..." in manual.
-        if enabled:
-            self._edit_send_btn.setText("Edit && Send...")
-        else:
-            self._edit_send_btn.setText("Edit && Copy Prompt...")
         # Label reflects the configured target.
         if enabled:
             try:
@@ -2305,8 +2321,12 @@ class SessionView(QWidget):
         )
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(can_synthesize)
-        # Sidekick button (#90) shares the same gate as Generate/Send.
-        self._edit_send_btn.setEnabled(can_synthesize)
+        # Dropdown menu actions (#90) share the same gate. The button-
+        # level enabled state already grays the dropdown arrow, but
+        # disabling the QAction is explicit insurance against the
+        # arrow being clickable when nothing's available.
+        self._generate_edit_action.setEnabled(can_synthesize)
+        self._send_edit_action.setEnabled(can_synthesize)
         # Send button: gated by FOUR conditions. All must be true.
         #
         #   1. There's a transcript to synthesize (can_synthesize).
