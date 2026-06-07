@@ -713,7 +713,7 @@ class SettingsDialog(QDialog):
         # Markdown rich source view (#91). Sits under Fonts because it
         # changes how the editor renders, parallel to the font picker.
         self._markdown_rich_editor = QCheckBox(
-            "Style markdown source in the editor (#91)", fonts_group,
+            "Style markdown source in the editor", fonts_group,
         )
         self._markdown_rich_editor.setChecked(config.ui.markdown_rich_editor)
         self._markdown_rich_editor.setToolTip(
