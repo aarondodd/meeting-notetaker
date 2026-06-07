@@ -6,6 +6,7 @@ from meeting_notetaker.utils.appendix_transform import (
     build_appendix_markdown,
     collect_from_markdown,
     inject_appendix,
+    strip_all_appendices,
 )
 from meeting_notetaker.utils.attendee_appendix import AttendeeAppendixEntry
 from meeting_notetaker.utils.attendee_context import AttendeeContextEntry
@@ -217,3 +218,163 @@ def test_collect_from_markdown_picks_up_links_from_live_notes():
     urls = {link.url for link in out.links}
     assert "https://a.example" in urls
     assert "https://b.example" in urls
+
+
+# ---- #93 strip_all_appendices + inject_appendix user-Appendix merge ----
+
+def test_strip_all_appendices_removes_raw_h2_sections():
+    """The strip helper drops every raw "(auto-extracted)" H2 block.
+
+    Idempotent on a clean body."""
+    raw = """# Notes
+
+User content stays.
+
+## Attendee Details (auto-extracted)
+```json
+[]
+```
+
+## Suggested Topics (auto-extracted)
+```json
+[]
+```
+"""
+    out = strip_all_appendices(raw)
+    assert "Attendee Details (auto-extracted)" not in out
+    assert "Suggested Topics (auto-extracted)" not in out
+    assert "User content stays." in out
+    # Idempotent on already-clean input.
+    assert strip_all_appendices(out) == out
+
+
+def test_strip_all_appendices_no_op_when_clean():
+    """A body with no raw appendix blocks passes through unchanged."""
+    clean = "# Notes\n\nNothing to strip here.\n"
+    assert strip_all_appendices(clean) == clean
+
+
+def test_inject_appendix_creates_h1_when_no_user_appendix():
+    """Baseline #93 behavior: no user `# Appendix` -> auto-extracted
+    section appended as a fresh H1 at the end."""
+    src = "# Notes\n\nbody text\n"
+    out = inject_appendix(src, _DATA_FULL)
+    assert "# Appendix (auto-extracted)" in out
+    # Auto-extracted H1 sits after the user content.
+    assert out.index("# Notes") < out.index("# Appendix (auto-extracted)")
+
+
+def test_inject_appendix_merges_under_user_appendix_at_eof():
+    """When the user wrote `# Appendix` at the end, the formatted
+    H2 sub-sections are merged into its body. No separate
+    "# Appendix (auto-extracted)" heading appears.
+
+    Note: the rendered H2 sub-sections drop the "(auto-extracted)"
+    suffix from their headings (the suffix is only on the raw H2
+    blocks the LLM emits; the formatted versions read cleaner).
+    The H1 wrapper carries the suffix when it's auto-injected; the
+    user-written "# Appendix" stays as-is.
+    """
+    src = "# Notes\n\nbody\n\n# Appendix\n\nUser's own appendix content.\n"
+    out = inject_appendix(src, _DATA_FULL)
+    # User's heading preserved.
+    assert "# Appendix\n" in out
+    assert "User's own appendix content." in out
+    # H2 sub-sections appear after the user's body.
+    assert "## Attendee Details" in out
+    # No separate auto-extracted H1 heading.
+    assert "# Appendix (auto-extracted)" not in out
+
+
+def test_inject_appendix_merges_under_user_appendix_mid_document():
+    """User's `# Appendix` sits between other H1 sections -- the
+    auto-extracted sub-sections merge before the next H1 boundary."""
+    src = (
+        "# Notes\n\nbody\n\n"
+        "# Appendix\n\nUser's own appendix content.\n\n"
+        "# Open Questions\n\nfollow-up items\n"
+    )
+    out = inject_appendix(src, _DATA_FULL)
+    # All three user H1 headings preserved.
+    assert "# Notes" in out
+    assert "# Appendix\n" in out
+    assert "# Open Questions" in out
+    # Sub-sections appended INSIDE the user's Appendix section,
+    # before the Open Questions H1 boundary.
+    appendix_idx = out.index("# Appendix\n")
+    attendee_idx = out.index("## Attendee Details")
+    open_q_idx = out.index("# Open Questions")
+    assert appendix_idx < attendee_idx < open_q_idx
+    # No separate auto-extracted H1 heading.
+    assert "# Appendix (auto-extracted)" not in out
+
+
+def test_inject_appendix_case_insensitive_user_appendix_match():
+    """User-written `# appendix` (lowercase) also triggers the merge."""
+    src = "# Notes\n\n# appendix\n\nuser body\n"
+    out = inject_appendix(src, _DATA_FULL)
+    assert "# Appendix (auto-extracted)" not in out
+    assert "## Attendee Details" in out
+
+
+def test_inject_appendix_appendix_auto_extracted_not_user_marker():
+    """A pre-existing `# Appendix (auto-extracted)` heading is NOT
+    treated as a user marker; it gets stripped by the per-section
+    strippers and the fresh auto-extracted H1 is appended at end."""
+    src = (
+        "# Notes\n\nbody\n\n"
+        "# Appendix (auto-extracted)\n\n"
+        "## Attendee Details (auto-extracted)\n```json\n[]\n```\n"
+    )
+    out = inject_appendix(src, _DATA_FULL)
+    # The stale H1 may or may not survive depending on the
+    # per-section strippers; the canonical heading appears as the
+    # injected one at the end.
+    assert "# Appendix (auto-extracted)" in out
+    # And new content from _DATA_FULL is present.
+    assert "Bob" in out
+
+
+def test_inject_appendix_no_op_when_no_data_and_no_user_appendix():
+    """Empty data + no user appendix = stripped body, nothing appended."""
+    empty = AppendixData(
+        attendee_context=[], attendee_details=[], topics=[],
+        referenced_attachments=[], session_attachments=[], links=[],
+    )
+    src = "# Notes\n\nbody only\n"
+    out = inject_appendix(src, empty)
+    assert "# Appendix" not in out
+    assert "body only" in out
+
+
+def test_strip_all_appendices_idempotent_supports_cleanup_on_open():
+    """The cleanup-on-open hook calls strip_all_appendices and
+    rewrites only when the result differs. Pin idempotency so the
+    second open doesn't rewrite an already-clean file."""
+    legacy = """# Notes
+
+User content stays.
+
+## Attendee Details (auto-extracted)
+```json
+[]
+```
+"""
+    once = strip_all_appendices(legacy)
+    twice = strip_all_appendices(once)
+    assert once == twice
+    assert "Attendee Details (auto-extracted)" not in once
+
+
+def test_inject_appendix_no_op_with_data_but_no_subsections_with_user_appendix():
+    """Edge case: user wrote `# Appendix` but data is empty. The
+    user's section stays untouched; nothing is injected."""
+    empty = AppendixData(
+        attendee_context=[], attendee_details=[], topics=[],
+        referenced_attachments=[], session_attachments=[], links=[],
+    )
+    src = "# Notes\n\nbody\n\n# Appendix\n\nUser content.\n"
+    out = inject_appendix(src, empty)
+    assert "# Appendix\n" in out
+    assert "User content." in out
+    assert "(auto-extracted)" not in out

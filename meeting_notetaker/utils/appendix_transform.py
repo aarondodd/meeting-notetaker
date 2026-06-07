@@ -8,6 +8,23 @@ appends a single ``# Appendix (auto-extracted)`` Markdown section
 Markdown tables. Source buffer remains untouched -- this is a
 render-time transform only.
 
+# Module overview
+
+Two related operations:
+
+  * ``strip_all_appendices(text)`` -- removes the raw H2
+    "(auto-extracted)" JSON blocks the LLM emits. Used at paste-back
+    time and at session open as the cleanup-on-open pass (#93).
+
+  * ``inject_appendix(source, data)`` -- strips the raw blocks (same
+    helpers as above) and appends the formatted appendix. When the
+    source has a user-written ``# Appendix`` heading, the formatted
+    sub-sections are merged into that section's body rather than a
+    new ``# Appendix (auto-extracted)`` heading appearing as a peer.
+
+The H2 "(auto-extracted)" suffix on each sub-section heading is
+preserved so the user always sees which content is machine-generated.
+
 Sub-sections (in order):
 1. Attendee Context (#63)
 2. Attendee Details (#51)
@@ -98,6 +115,97 @@ def build_appendix_markdown(data: AppendixData) -> str:
     Qt's setMarkdown renders cleanly + that survive the PDF print
     path without storage-XML gymnastics.
     """
+    sections = _build_appendix_subsections(data)
+    if not sections:
+        return ""
+    body = "\n\n".join(sections)
+    return f"{_APPENDIX_HEADING}\n\n{body}\n"
+
+
+def strip_all_appendices(markdown: str) -> str:
+    """Remove every raw LLM-appendix H2 section from `markdown`.
+
+    Runs the four section-specific strippers in sequence:
+      * attendee_context.strip_appendix
+      * attendee_appendix.strip_appendix (attendee details)
+      * topic_appendix.strip_appendix
+      * invite_mentions.strip_appendix
+
+    Free function so worker threads + the session-content loader can
+    scrub notes.md without depending on MainApp. Idempotent: a body
+    with no raw blocks passes through unchanged.
+    """
+    from .attendee_appendix import strip_appendix  # noqa: PLC0415
+    from .attendee_context import (  # noqa: PLC0415
+        strip_appendix as strip_attendee_context,
+    )
+    from .invite_mentions import (  # noqa: PLC0415
+        strip_appendix as strip_invite_mentions,
+    )
+    from .topic_appendix import (  # noqa: PLC0415
+        strip_appendix as strip_topic_appendix,
+    )
+    markdown = strip_appendix(markdown)
+    markdown = strip_topic_appendix(markdown)
+    markdown = strip_attendee_context(markdown)
+    markdown = strip_invite_mentions(markdown)
+    return markdown
+
+
+def inject_appendix(
+    source: str,
+    data: AppendixData,
+) -> str:
+    """Render the appendix transform over ``source`` markdown.
+
+    1. Removes the raw JSON appendix sections (attendee details,
+       attendee context, topics, referenced attachments).
+    2. Builds the formatted appendix sub-sections from ``data``.
+    3. If the source contains a user-written ``# Appendix`` heading
+       (without the ``(auto-extracted)`` suffix), the formatted
+       sub-sections are merged into that section's body. The
+       user's own appendix content is preserved above the merged
+       auto-extracted sub-sections.
+    4. Otherwise the formatted sub-sections are appended as a
+       fresh ``# Appendix (auto-extracted)`` H1 at the end.
+
+    When ``data`` produces no rendered output (every source empty),
+    the raw blocks are still stripped + nothing is appended.
+    """
+    stripped = source or ""
+    stripped = attendee_context.strip_appendix(stripped)
+    stripped = attendee_appendix.strip_appendix(stripped)
+    stripped = topic_appendix.strip_appendix(stripped)
+    stripped = invite_mentions.strip_appendix(stripped)
+    subsections = _build_appendix_subsections(data)
+    if not subsections:
+        return stripped
+    user_section_end = _find_user_appendix_section_end(stripped)
+    if user_section_end is not None:
+        # Merge sub-sections into the user's # Appendix section
+        # rather than create a separate H1. We splice at the end
+        # of the user's section, preserving everything they wrote
+        # above.
+        before = stripped[:user_section_end].rstrip()
+        after = stripped[user_section_end:]
+        merged_body = "\n\n".join(subsections)
+        return f"{before}\n\n{merged_body}\n{after}"
+    # No user-written # Appendix -- append a fresh auto-extracted H1.
+    body = "\n\n".join(subsections)
+    rendered = f"{_APPENDIX_HEADING}\n\n{body}\n"
+    if not stripped.endswith("\n"):
+        stripped = stripped + "\n"
+    return stripped.rstrip() + "\n\n" + rendered
+
+
+def _build_appendix_subsections(data: AppendixData) -> list[str]:
+    """Return the rendered H2 sub-section strings in canonical order.
+
+    Empty data sources are omitted -- the appendix should never
+    surface empty tables. Used by both build_appendix_markdown
+    (which wraps with the H1 heading) and inject_appendix's
+    user-Appendix merge path (which skips the H1 wrapper).
+    """
     sections: list[str] = []
     if data.attendee_context:
         sections.append(_render_attendee_context(data.attendee_context))
@@ -111,42 +219,43 @@ def build_appendix_markdown(data: AppendixData) -> str:
         sections.append(_render_session_attachments(data.session_attachments))
     if data.links:
         sections.append(_render_links(data.links))
-    if not sections:
-        return ""
-    body = "\n\n".join(sections)
-    return f"{_APPENDIX_HEADING}\n\n{body}\n"
+    return sections
 
 
-def inject_appendix(
-    source: str,
-    data: AppendixData,
-) -> str:
-    """Render the appendix transform over ``source`` markdown.
+# Regex matching `# Appendix` at line start. We accept any case +
+# trailing whitespace, but require an exact match to "Appendix"
+# (rejecting "Appendix (auto-extracted)" which has its own canonical
+# heading and isn't a user-written marker).
+_USER_APPENDIX_HEADING_RE = __import__("re").compile(
+    r"^# Appendix\s*$", __import__("re").IGNORECASE | __import__("re").MULTILINE,
+)
 
-    1. Removes the raw JSON appendix sections (attendee details,
-       attendee context, topics, referenced attachments).
-    2. Appends the rendered ``## Appendix (auto-extracted)`` section
-       built from ``data``.
 
-    A user-written ``## Appendix`` section earlier in the document
-    is preserved -- the rendered section uses a distinct
-    ``## Appendix (auto-extracted)`` heading so the two don't
-    collide.
+def _find_user_appendix_section_end(text: str) -> Optional[int]:
+    """Return the character index where the user's # Appendix
+    section ends (i.e. the start of the next # H1 boundary, or the
+    end of the text). Returns None when no user-written # Appendix
+    is present.
 
-    When ``data`` produces no rendered output (every source empty),
-    the raw blocks are still stripped + nothing is appended.
+    "User-written # Appendix" means an H1 line whose text is exactly
+    "Appendix" (case-insensitive). The auto-injected
+    "# Appendix (auto-extracted)" heading is NOT treated as a user
+    marker -- it gets stripped + re-injected fresh on the next pass.
     """
-    stripped = source or ""
-    stripped = attendee_context.strip_appendix(stripped)
-    stripped = attendee_appendix.strip_appendix(stripped)
-    stripped = topic_appendix.strip_appendix(stripped)
-    stripped = invite_mentions.strip_appendix(stripped)
-    rendered = build_appendix_markdown(data)
-    if not rendered:
-        return stripped
-    if not stripped.endswith("\n"):
-        stripped = stripped + "\n"
-    return stripped.rstrip() + "\n\n" + rendered
+    import re
+    match = _USER_APPENDIX_HEADING_RE.search(text)
+    if match is None:
+        return None
+    # Find the next H1 boundary after the matched line.
+    # Walk forward from after the matched heading; an H1 is any line
+    # starting with "# " (single hash, space) that isn't itself an
+    # auto-extracted variant of Appendix.
+    next_h1 = re.search(r"^# (?!Appendix\b)", text[match.end():], re.MULTILINE)
+    if next_h1 is None:
+        # User's appendix runs to EOF; the section ends at the
+        # very end of text.
+        return len(text)
+    return match.end() + next_h1.start()
 
 
 # ---------------------------------------------------------------------

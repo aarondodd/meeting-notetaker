@@ -726,29 +726,17 @@ class MainApp(QObject):
         """Run every LLM-appendix strip helper in sequence.
 
         Shared by the paste-back path (`_apply_synthesis_result`)
-        and the edit-dialog path (`_on_appendix_edit_requested`)
-        so the strip toggle behaves consistently regardless of
-        which surface produced the new notes.md. All four
-        appendices ride one Settings toggle -- if the user wants
-        notes.md clean, they want them all gone. The sidecar
-        persistence is the caller's responsibility (runs BEFORE
-        the strip so data survives).
+        and the edit-dialog path (`_on_appendix_edit_requested`).
+        Always-on as of #93 -- the raw H2 "(auto-extracted)" sections
+        no longer persist to notes.md; the sidecar is the canonical
+        source for render + export.
+
+        Thin wrapper around the free function so callers that already
+        hold a MainApp reference don't need to import the utils
+        module. Worker threads use the free function directly.
         """
-        from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
-        from .utils.attendee_context import (  # noqa: PLC0415
-            strip_appendix as strip_attendee_context,
-        )
-        from .utils.invite_mentions import (  # noqa: PLC0415
-            strip_appendix as strip_invite_mentions,
-        )
-        from .utils.topic_appendix import (  # noqa: PLC0415
-            strip_appendix as strip_topic_appendix,
-        )
-        markdown = strip_appendix(markdown)
-        markdown = strip_topic_appendix(markdown)
-        markdown = strip_attendee_context(markdown)
-        markdown = strip_invite_mentions(markdown)
-        return markdown
+        from .utils.appendix_transform import strip_all_appendices  # noqa: PLC0415
+        return strip_all_appendices(markdown)
 
     def _apply_synthesis_result(
         self,
@@ -785,8 +773,8 @@ class MainApp(QObject):
         # data is independent of the save path's success.
         self._apply_attendee_details_appendix(session_id, markdown)
         # Persist the four LLM appendices to the sidecar BEFORE the
-        # optional strip pass so the data is preserved regardless of
-        # the strip toggle (#64 sidecar followup).
+        # strip pass so the data is preserved regardless (#64 sidecar
+        # followup).
         try:
             from .utils.appendix_store import AppendixStore  # noqa: PLC0415
             AppendixStore(session_id).save_from_notes(markdown)
@@ -794,8 +782,12 @@ class MainApp(QObject):
             log.exception(
                 "appendix sidecar write failed: %s", session_id,
             )
-        if self.config.synthesis.strip_attendee_appendix:
-            markdown = self._strip_all_appendices(markdown)
+        # #93: appendix is system-managed data. Raw H2 "(auto-extracted)"
+        # JSON blocks no longer persist to notes.md; the sidecar is the
+        # canonical source for render + export. The strip toggle was
+        # removed from Settings; the config field stays as a deprecated
+        # no-op for back-compat with old config files.
+        markdown = self._strip_all_appendices(markdown)
         tstore = TranscriptStore(session_id)
         archive_path = tstore.save_notes(
             markdown, archive_existing=archive_existing,
@@ -2389,7 +2381,8 @@ class MainApp(QObject):
         # round-trip back into the sidecar via the next
         # _flush_notes. Skipped when the synthesis on disk is
         # already empty -- no JSON blocks to overwrite. When the
-        # strip_attendee_appendix Settings toggle is ON, apply the
+        # Strip the raw H2 "(auto-extracted)" sections (#93) so the
+        # updated notes.md stays clean. Apply the
         # strip pass so the dialog edits don't restore the JSON
         # the user told the app to hide (#73 finding #2).
         try:
@@ -2402,8 +2395,8 @@ class MainApp(QObject):
                 topics=edited_topics,
                 referenced_attachments=edited_referenced,
             )
-            if self.config.synthesis.strip_attendee_appendix:
-                updated_notes = self._strip_all_appendices(updated_notes)
+            # #93: strip is unconditional now; the sidecar is canonical.
+            updated_notes = self._strip_all_appendices(updated_notes)
             if updated_notes != current_notes:
                 tstore.save_notes(updated_notes, archive_existing=False)
                 # Keep the search index in sync so the edit is
@@ -6269,11 +6262,28 @@ class _SessionContentLoader(QThread):
     def run(self) -> None:
         from .models.transcript import TranscriptStore
         from .utils import prompts as prompts_mod
+        from .utils.appendix_transform import strip_all_appendices
         try:
             store = TranscriptStore(self._session_id)
             transcript = store.read_transcript()
             live_notes = store.read_live_notes()
             notes = store.read_notes()
+            # #93: scrub raw H2 "(auto-extracted)" sections from
+            # notes.md if a legacy session still carries them. The
+            # sidecar already holds the parsed data; rewriting the
+            # cleaned body once at open keeps the editor view aligned
+            # with the new always-strip behavior. Idempotent -- a
+            # clean file passes through with no rewrite.
+            cleaned = strip_all_appendices(notes)
+            if cleaned != notes:
+                try:
+                    store.save_notes(cleaned, archive_existing=False)
+                    notes = cleaned
+                except OSError:
+                    log.exception(
+                        "appendix cleanup-on-open save failed: %s",
+                        self._session_id,
+                    )
             previous_notes_paths = store.list_previous_notes()
             template_names = [t.name for t in prompts_mod.list_templates()]
             selected_template = store.read_prompt_template_name()

@@ -245,11 +245,11 @@ class SynthesisConfig:
     # rich fields. User opts in via Settings > Synthesis Prompts
     # when they want LLM backfill from in-meeting mentions.
     auto_extract_attendee_details: bool = False
-    # When True, the "## Attendee Details (auto-extracted)" appendix
-    # is removed from the saved notes.md after parsing. Default OFF
-    # so the user can see what the LLM extracted (transparency); flip
-    # ON if the appendix is cluttering shared synthesis exports.
-    strip_attendee_appendix: bool = False
+    # #93: deprecated as of v0.7.9. The raw "(auto-extracted)" H2
+    # sections are always stripped from notes.md now; the sidecar is
+    # the canonical source for render + export. The field stays so
+    # old config files load cleanly, but its value is ignored.
+    strip_attendee_appendix: bool = True
     # Default prompt-template filename used by sessions that don't
     # have a per-session override. Empty string falls back to
     # "default.md" (the bundled generic template). Settings >
