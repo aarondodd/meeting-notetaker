@@ -975,20 +975,188 @@ class MainApp(QObject):
                 self.config.synthesis.auto_extract_attendee_details
             ),
         )
+        self._dispatch_rendered_synthesis(
+            session_id=session_id,
+            target_key=target_key,
+            target=target,
+            rendered_body=rendered,
+        )
 
+    def _resolve_session_prompt_template(
+        self,
+        session_id: str,
+    ):
+        """Pick the prompt template for `session_id` using the standard
+        three-tier fallback (session override -> Settings default ->
+        bundled default). Returns the PromptTemplate or None when no
+        templates are installed. Shared between the standard send path
+        and the #90 edit-and-send path."""
+        store = TranscriptStore(session_id)
+        templates = prompts_mod.list_templates()
+        if not templates:
+            return None
+
+        def _find(name: str):
+            return next((t for t in templates if t.name == name), None)
+
+        chosen = None
+        chosen_name = store.read_prompt_template_name()
+        if chosen_name:
+            chosen = _find(chosen_name)
+        if chosen is None and self.config.synthesis.default_template_name:
+            chosen = _find(self.config.synthesis.default_template_name)
+        if chosen is None:
+            chosen = _find("default") or templates[0]
+        return chosen
+
+    def _on_edit_and_send(self, session_id: str) -> None:
+        """Sidekick to Send / Generate (#90).
+
+        Renders the synthesis prompt for the session, opens the
+        SessionPromptEditDialog with the rendered body, and on Accept
+        dispatches the edited body through the same automation bridge
+        or clipboard path the standard Send/Generate uses.
+
+        Refuses with a user-readable message if the session has no
+        transcript yet AND no notes (mirrors the SessionView enable
+        gate from #87 -- the user shouldn't have been able to click
+        the button in that state, but a defensive check costs nothing).
+        """
+        from .ui.session_prompt_dialog import SessionPromptEditDialog  # noqa: PLC0415
+
+        session = self.store.get_session(session_id)
+        if session is None:
+            return
+        store = TranscriptStore(session_id)
+        transcript = store.read_transcript()
+        self.window.session_view.flush_pending_live_notes()
+        live_notes = store.read_live_notes()
+        if not transcript.strip() and not live_notes.strip():
+            QMessageBox.information(
+                self.window, "Edit & Send",
+                "This session has no transcript or notes yet -- there's "
+                "nothing to send.",
+            )
+            return
+        try:
+            when = datetime.fromisoformat(
+                session.created_at.replace("Z", "+00:00")
+            ).astimezone()
+        except ValueError:
+            when = datetime.now().astimezone()
+        chosen = self._resolve_session_prompt_template(session_id)
+        if chosen is None:
+            QMessageBox.warning(
+                self.window, "Edit & Send",
+                "No prompt templates found in the prompts folder.",
+            )
+            return
+        rendered = prompts_mod.render(
+            chosen,
+            session_title=session.title,
+            session_date=when,
+            transcript=transcript,
+            live_notes=live_notes,
+            user_name=self.config.ui.user_name,
+            include_system_prompts=(
+                self.config.synthesis.auto_extract_attendee_details
+            ),
+        )
+        dialog = SessionPromptEditDialog(
+            rendered_prompt=rendered,
+            session_title=session.title,
+            template_name=chosen.name,
+            automation_enabled=self.config.synthesis.automation_enabled,
+            parent=self.window,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        result = dialog.result_payload
+        if result is None:
+            return
+        if result.action == "send":
+            self._dispatch_edited_synthesis(session_id, result.edited_body)
+        else:
+            self._copy_edited_prompt_to_clipboard(result.edited_body)
+
+    def _dispatch_edited_synthesis(
+        self, session_id: str, edited_body: str,
+    ) -> None:
+        """Send the edited prompt through the automation bridge using
+        the configured LLM target. Performs the same Chrome-launch +
+        connection preflight as _on_send_to_llm so the edit flow
+        survives cold-start Chrome state without duplicating logic."""
+        target_key = self.config.synthesis.llm_target or "claude"
+        if self._synth_state == SynthesisConnectionState.NOT_RUNNING:
+            if not self._launch_chrome_and_wait_for_connection(session_id):
+                return
+        elif self._synth_state == SynthesisConnectionState.RUNNING_DISCONNECTED:
+            QMessageBox.warning(
+                self.window, "Synthesis Automation",
+                "Chrome is running but the extension hasn't connected "
+                "back to the app. Try Reconnect from the extension popup.",
+            )
+            return
+        elif not self._bridge_ready_state:
+            QMessageBox.warning(
+                self.window, "Synthesis Automation",
+                "Lost connection to the extension. Try again in a moment.",
+            )
+            return
+        try:
+            target = get_target(target_key)
+        except ValueError:
+            QMessageBox.warning(
+                self.window, "Synthesis Automation",
+                f"Unknown LLM target {target_key!r}.",
+            )
+            return
+        if not target.implemented:
+            QMessageBox.information(
+                self.window, "Synthesis Automation",
+                f"{target.label} automation isn't implemented in this build.",
+            )
+            return
+        self._dispatch_rendered_synthesis(
+            session_id=session_id,
+            target_key=target_key,
+            target=target,
+            rendered_body=edited_body,
+        )
+
+    def _copy_edited_prompt_to_clipboard(self, edited_body: str) -> None:
+        """Manual mode counterpart to _dispatch_edited_synthesis.
+        Copies the edited body to the clipboard so the user can paste
+        it into their LLM chat manually."""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(edited_body)
+        self.window.status(
+            "Edited prompt copied to clipboard. Paste it into your LLM, "
+            "then use Paste Response Back to bring the synthesis in.",
+            timeout_ms=8000,
+        )
+
+    def _dispatch_rendered_synthesis(
+        self,
+        *,
+        session_id: str,
+        target_key: str,
+        target,
+        rendered_body: str,
+    ) -> None:
+        """Bridge-send + in-progress banner, given an already-rendered
+        prompt body. Shared between the standard Send to LLM path and
+        the #90 Edit & Send path so the edited body and the auto-
+        rendered body go through identical downstream plumbing."""
         request_id = secrets.token_hex(8)
         self._inflight_syntheses[request_id] = session_id
-        # Build the URL the extension should land on. For Claude this
-        # honors the optional claude_project_id setting -- when set,
-        # syntheses accumulate in that project rather than the user's
-        # default chat list.
         chat_url = ""
         if target_key == "claude":
             chat_url = self.config.synthesis.claude_chat_url()
         msg = automation_messages.SynthesizeRequest(
             request_id=request_id,
             target=target_key,
-            prompt=rendered,
+            prompt=rendered_body,
             new_chat=True,
             chat_url=chat_url,
         )
@@ -1003,11 +1171,6 @@ class MainApp(QObject):
                 "extension popup, or fall back to manual Generate / Paste.",
             )
             return
-        # Make sure the banner persists across session-switches: if the
-        # user clicks Send, navigates to a different session, and then
-        # comes back, the banner should still be up. SessionView keys
-        # by session id; the call here registers the in-progress state
-        # for the originating session.
         self.window.session_view.set_synthesis_in_progress(
             session_id, True, status_text=f"Sent to {target.label}, waiting for response..."
         )
@@ -1261,6 +1424,8 @@ class MainApp(QObject):
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
         sv.send_to_llm_clicked.connect(self._on_send_to_llm)
+        # Edit & Send / Edit & Copy Prompt (#90).
+        sv.edit_and_send_clicked.connect(self._on_edit_and_send)
         # Issue #80: empty-state import button on the Transcript tab.
         sv.import_transcript_clicked.connect(self._on_import_transcript)
         sv.copy_tab_clicked.connect(self._on_copy_tab)

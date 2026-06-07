@@ -108,6 +108,34 @@ def test_paste_matches_generate_gate(qt_app):
         ), f"Generate/Paste parity broke for has_transcript={ht}, has_notes={hn}"
 
 
+def test_edit_send_sidekick_matches_generate_gate(qt_app):
+    """#90: the Edit & Send / Edit & Copy Prompt sidekick shares the
+    same enable gate as Generate -- the dialog renders the same
+    prompt so it must obey the same is-there-something-to-synthesize
+    rule."""
+    for ht, hn in ((True, False), (False, True), (True, True), (False, False)):
+        view = _state_view(qt_app, has_transcript=ht, has_notes=hn)
+        assert (
+            view._edit_send_btn.isEnabled()  # noqa: SLF001
+            == view._generate_btn.isEnabled()  # noqa: SLF001
+        ), f"Sidekick/Generate parity broke for has_transcript={ht}, has_notes={hn}"
+
+
+def test_edit_send_sidekick_label_tracks_automation(qt_app, isolated_data_dir):
+    """#90: label changes based on automation mode so the user knows
+    what the dialog's primary button will do."""
+    from meeting_notetaker.ui.session_view import SessionView
+    view = SessionView()
+    # Default state -- automation off.
+    assert "Copy Prompt" in view._edit_send_btn.text()  # noqa: SLF001
+    # Enable automation.
+    view.set_automation_enabled(True, "claude")
+    assert "Send" in view._edit_send_btn.text()  # noqa: SLF001
+    # Toggle back off.
+    view.set_automation_enabled(False)
+    assert "Copy Prompt" in view._edit_send_btn.text()  # noqa: SLF001
+
+
 # ---- recording lock -----------------------------------------------------
 
 def test_generate_disabled_during_recording(qt_app):

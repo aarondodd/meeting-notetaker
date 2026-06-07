@@ -81,6 +81,13 @@ class SessionView(QWidget):
     # when the user has the feature enabled in Settings. Carries the
     # session id and the LLM target key ("claude" / "copilot").
     send_to_llm_clicked = pyqtSignal(str, str)      # session_id, target
+    # Issue #90: sidekick button that opens the SessionPromptEditDialog
+    # with the rendered prompt for one-shot editing before dispatch.
+    # Same enable gate as the Send/Generate pair; MainApp does the
+    # render + dialog + downstream routing in one handler. Carries the
+    # session id; the target (claude / copilot) is resolved by MainApp
+    # from the automation toggle the same way send_to_llm_clicked does.
+    edit_and_send_clicked = pyqtSignal(str)         # session_id
     # Issue #80: empty-state affordance on the Transcript tab. MainApp
     # opens the ImportTranscriptDialog and writes the result to
     # raw.transcript.md. Carries the session id for symmetry with the
@@ -327,6 +334,19 @@ class SessionView(QWidget):
         self._send_btn.clicked.connect(self._on_send_to_llm)
         self._send_btn.setVisible(False)
         synthesis.addWidget(self._send_btn)
+        # Sidekick: "Edit & Send..." / "Edit & Copy Prompt..." (#90).
+        # Opens the SessionPromptEditDialog with the rendered prompt,
+        # then dispatches the edited body through the same downstream
+        # path (automation bridge or clipboard) the standard
+        # Send/Generate button uses. Label changes with automation
+        # mode; same enable gate as Send/Generate.
+        self._edit_send_btn = QPushButton("Edit & Copy Prompt...", self)
+        self._edit_send_btn.setToolTip(
+            "Open an editor with the rendered prompt for this session; "
+            "edit it, then send or copy."
+        )
+        self._edit_send_btn.clicked.connect(self._on_edit_and_send)
+        synthesis.addWidget(self._edit_send_btn)
         self._copy_btn = QPushButton("Copy", self)
         self._copy_btn.setToolTip(
             "Copy the active tab's contents to the clipboard. The button "
@@ -1749,6 +1769,15 @@ class SessionView(QWidget):
                 self._session.id, self._automation_target
             )
 
+    def _on_edit_and_send(self) -> None:
+        """Sidekick to Send / Generate (#90): MainApp renders the
+        prompt, opens the SessionPromptEditDialog, and dispatches
+        the edited body through whichever downstream path
+        (automation bridge or clipboard) the current mode requires.
+        We just emit -- the work happens in app.py."""
+        if self._session is not None:
+            self.edit_and_send_clicked.emit(self._session.id)
+
     def _on_import_transcript_clicked(self) -> None:
         """Fire the per-session import signal so MainApp opens the
         ImportTranscriptDialog scoped to this session."""
@@ -1910,6 +1939,12 @@ class SessionView(QWidget):
         self._generate_btn.setVisible(not enabled)
         self._paste_btn.setVisible(not enabled)
         self._send_btn.setVisible(enabled)
+        # Sidekick label follows the mode (#90). "Edit & Send..." in
+        # automation; "Edit & Copy Prompt..." in manual.
+        if enabled:
+            self._edit_send_btn.setText("Edit && Send...")
+        else:
+            self._edit_send_btn.setText("Edit && Copy Prompt...")
         # Label reflects the configured target.
         if enabled:
             try:
@@ -2222,6 +2257,8 @@ class SessionView(QWidget):
         )
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(can_synthesize)
+        # Sidekick button (#90) shares the same gate as Generate/Send.
+        self._edit_send_btn.setEnabled(can_synthesize)
         # Send button: gated by FOUR conditions. All must be true.
         #
         #   1. There's a transcript to synthesize (can_synthesize).
