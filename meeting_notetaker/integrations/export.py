@@ -32,8 +32,9 @@ from urllib.parse import urlparse
 import mistune
 
 from .confluence_api import ConfluenceClient
-from .confluence_storage import markdown_to_storage
+from .confluence_storage import build_toc_macro, markdown_to_storage
 from .notion_api import NotionClient
+from .notion_blocks import build_toc_block as build_notion_toc_block
 from .notion_blocks import markdown_to_blocks
 
 
@@ -147,6 +148,9 @@ def export_to_notion(
     session_dir: Path,
     attachments: Optional[list[ExportAttachment]] = None,
     progress: Optional[Callable[[str], None]] = None,
+    number_headings: bool = False,
+    include_toc: bool = False,
+    toc_max_depth: int = 3,
 ) -> ExportResult:
     """Convert + upload + create. Returns ExportResult with the new
     page's URL for the caller to surface (toast + open-in-browser).
@@ -160,6 +164,19 @@ def export_to_notion(
     def report(msg: str) -> None:
         if progress:
             progress(msg)
+
+    # #92 + #94: apply heading numbering before the block conversion
+    # so the numbered headings flow through to Notion. The TOC is
+    # NOT injected as a markdown list -- Notion has a native
+    # `table_of_contents` block that auto-generates a clickable
+    # nested list of headings server-side. Strictly better fit
+    # than a markdown list (which Notion renders as static text).
+    # Numbering still happens; only the markdown TOC list is skipped.
+    if number_headings:
+        from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
+        markdown_body = apply_outline(
+            markdown_body, number=True, toc=False,
+        )
 
     # 1. Scan for local image refs, upload each, build a url->file_upload_id map.
     local_uploads: dict[str, str] = {}
@@ -198,6 +215,11 @@ def export_to_notion(
     # 2. Convert + create.
     report("Converting Markdown to Notion blocks...")
     children = markdown_to_blocks(markdown_body, image_resolver=image_resolver)
+    # #94: prepend Notion's native table_of_contents block when TOC
+    # was requested. Auto-generated server-side from the page's
+    # headings; navigable + auto-updates.
+    if include_toc:
+        children = [build_notion_toc_block()] + children
 
     # 3. Optional session attachments -- upload each, append file blocks
     #    under an Attachments heading at the bottom of the page so the
@@ -278,6 +300,9 @@ def export_to_confluence(
     session_dir: Path,
     attachments: Optional[list[ExportAttachment]] = None,
     progress: Optional[Callable[[str], None]] = None,
+    number_headings: bool = False,
+    include_toc: bool = False,
+    toc_max_depth: int = 3,
 ) -> ExportResult:
     """Two-pass when images OR attachments are present:
       1. Create a placeholder page so we have a page_id.
@@ -295,6 +320,19 @@ def export_to_confluence(
         if progress:
             progress(msg)
 
+    # #92 + #94: heading numbering applies before the storage XML
+    # conversion so the numbered headings flow through. The TOC is
+    # NOT injected as a markdown list -- Confluence has a native
+    # `<ac:structured-macro ac:name="toc">` macro that auto-generates
+    # a clickable nested list server-side; we prepend it to the
+    # storage XML after conversion. Numbering still happens; only
+    # the markdown list injection is skipped for Confluence.
+    if number_headings:
+        from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
+        markdown_body = apply_outline(
+            markdown_body, number=True, toc=False,
+        )
+
     refs = collect_image_refs(markdown_body)
     local_refs = [(u, a) for u, a in refs if is_local_image_ref(u)]
     has_attachments = bool(attachments)
@@ -303,6 +341,12 @@ def export_to_confluence(
     if not local_refs and not has_attachments:
         report("Converting Markdown to Confluence storage XML...")
         storage_xml = markdown_to_storage(markdown_body)
+        # #94: native TOC macro instead of a markdown list. Confluence
+        # auto-generates a clickable nested TOC from the page's
+        # headings server-side. Better fit than the markdown list,
+        # which renders as non-clickable bullets.
+        if include_toc:
+            storage_xml = build_toc_macro(max_level=toc_max_depth) + storage_xml
         report("Creating page in Confluence...")
         page = client.create_page(
             parent_id=parent_id, space_id=space_id, title=title,
@@ -378,6 +422,10 @@ def export_to_confluence(
     storage_xml = markdown_to_storage(markdown_body, image_resolver=image_resolver)
     if uploaded_attachments:
         storage_xml += _build_confluence_attachments_section(uploaded_attachments)
+    # #94: prepend the native TOC macro after image + attachment
+    # injection so the TOC appears above the body content.
+    if include_toc:
+        storage_xml = build_toc_macro(max_level=toc_max_depth) + storage_xml
 
     report("Updating page body in Confluence...")
     client.update_page(page_id=page_id, title=title, storage_xml=storage_xml)

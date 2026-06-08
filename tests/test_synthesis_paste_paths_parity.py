@@ -121,12 +121,11 @@ def test_shared_pipeline_enriches_existing_contact_fields(app_with_session):
     assert bob.company == "Bobco"
 
 
-def test_shared_pipeline_respects_strip_toggle(app_with_session):
-    """strip_attendee_appendix ON removes every raw JSON block from
-    the saved notes.md, but the sidecar persists (written before
-    the strip pass), so the Appendix tray stays populated."""
+def test_shared_pipeline_strips_raw_blocks_unconditionally(app_with_session):
+    """#93: appendix is system-managed data. Raw JSON blocks always
+    strip from notes.md on paste-back; the sidecar is the canonical
+    source for the Edit Appendix UI + render/export."""
     ma, sid = app_with_session
-    ma.config.synthesis.strip_attendee_appendix = True
     ma._apply_synthesis_result(sid, _SYNTHESIS_BODY, archive_existing=False)  # noqa: SLF001
     from meeting_notetaker.models.transcript import TranscriptStore
     saved = TranscriptStore(sid).read_notes()
@@ -139,22 +138,10 @@ def test_shared_pipeline_respects_strip_toggle(app_with_session):
         assert f"{tag} (auto-extracted)" not in saved, (
             f"{tag} should have been stripped"
         )
-    # Sidecar still has the data.
+    # Sidecar still has the data (written BEFORE the strip pass).
     from meeting_notetaker.utils.appendix_store import AppendixStore
     ctx, det, topics, ref = AppendixStore(sid).load_as_dataclasses()
     assert ctx and det and topics and ref
-
-
-def test_shared_pipeline_default_keeps_raw_blocks_in_notes(app_with_session):
-    """Default strip flag is OFF -- raw JSON stays in notes.md so
-    the editor surface shows what the LLM produced."""
-    ma, sid = app_with_session
-    assert ma.config.synthesis.strip_attendee_appendix is False
-    ma._apply_synthesis_result(sid, _SYNTHESIS_BODY, archive_existing=False)  # noqa: SLF001
-    from meeting_notetaker.models.transcript import TranscriptStore
-    saved = TranscriptStore(sid).read_notes()
-    assert "Attendee Context (auto-extracted)" in saved
-    assert "Referenced Attachments (auto-extracted)" in saved
 
 
 def test_shared_pipeline_normalizes_loose_list_serialization(app_with_session):
@@ -217,11 +204,12 @@ def test_chrome_and_manual_flow_produce_identical_state(app_with_session):
 # ---- Edit-dialog + strip-toggle parity (#73 finding #2 + #8) ----
 
 
-def test_edit_dialog_strip_off_writes_json_blocks_back(app_with_session):
-    """When strip toggle is OFF (default), the dialog flow's
-    regenerate_notes_json restores fresh JSON blocks to notes.md
-    so the next debounced _flush_notes doesn't stomp the dialog's
-    edits."""
+def test_edit_dialog_regenerate_writes_json_blocks_back(app_with_session):
+    """`regenerate_notes_json` (the utility called from the edit
+    dialog) restores fresh JSON blocks to notes.md so a later strip
+    pass has something to strip + the sidecar contains the edited
+    payload. The integrated flow then strips unconditionally per
+    #93; this test is scoped to the utility behavior."""
     from meeting_notetaker.models.transcript import TranscriptStore
     from meeting_notetaker.utils.appendix_store import (
         AppendixStore,
@@ -234,15 +222,14 @@ def test_edit_dialog_strip_off_writes_json_blocks_back(app_with_session):
     from meeting_notetaker.utils.invite_mentions import InviteMentionEntry
 
     ma, sid = app_with_session
-    ma.config.synthesis.strip_attendee_appendix = False
-    # Seed sidecar + notes.md via the paste-back path.
+    # Seed sidecar via the paste-back path (notes.md ends up clean).
     ma._apply_synthesis_result(sid, _SYNTHESIS_BODY, archive_existing=False)  # noqa: SLF001
     # Simulate the dialog editing Bob's observation.
     edited_ctx = [AttendeeContextEntry(name="Bob", observation="REVISED")]
     edited_det = [AttendeeAppendixEntry(name="Bob", title="CEO", company="Bobco")]
     edited_topics = ["Q3 hiring"]
     edited_ref = [InviteMentionEntry(name="deck", context="slide 4")]
-    # Manually run the regenerate step (the dialog's side effect).
+    # Manually run the regenerate utility step.
     current = TranscriptStore(sid).read_notes()
     updated = regenerate_notes_json(
         current,
@@ -251,10 +238,11 @@ def test_edit_dialog_strip_off_writes_json_blocks_back(app_with_session):
         topics=edited_topics,
         referenced_attachments=edited_ref,
     )
-    # Strip toggle OFF -> notes.md keeps JSON blocks with new data.
+    # The utility puts JSON blocks back into the body (the integrated
+    # path then strips them post-utility per #93; this is utility-level).
     assert "Attendee Context (auto-extracted)" in updated
     assert "REVISED" in updated
-    # Also confirm sidecar would round-trip via save.
+    # Sidecar persistence is independent.
     AppendixStore(sid).save(
         attendee_context=edited_ctx,
         attendee_details=edited_det,
@@ -265,10 +253,10 @@ def test_edit_dialog_strip_off_writes_json_blocks_back(app_with_session):
     assert ctx[0].observation == "REVISED"
 
 
-def test_edit_dialog_strip_on_keeps_notes_clean(app_with_session):
-    """When strip toggle is ON, the dialog flow must NOT restore
-    the JSON blocks to notes.md -- the user explicitly chose to
-    hide them. Sidecar still gets the edit (#73 finding #2)."""
+def test_edit_dialog_integrated_flow_keeps_notes_clean(app_with_session):
+    """Integrated dialog edit flow strips the regenerated JSON
+    blocks (per #93) so the on-disk notes.md stays clean.
+    Sidecar still gets the edit (#73 finding #2)."""
     from meeting_notetaker.models.transcript import TranscriptStore
     from meeting_notetaker.utils.appendix_store import (
         AppendixStore,
@@ -281,12 +269,11 @@ def test_edit_dialog_strip_on_keeps_notes_clean(app_with_session):
     from meeting_notetaker.utils.invite_mentions import InviteMentionEntry
 
     ma, sid = app_with_session
-    ma.config.synthesis.strip_attendee_appendix = True
-    # Seed via paste-back (strip toggle ON so notes.md is clean).
+    # Seed via paste-back (always strips per #93).
     ma._apply_synthesis_result(sid, _SYNTHESIS_BODY, archive_existing=False)  # noqa: SLF001
     saved_after_paste = TranscriptStore(sid).read_notes()
     assert "Attendee Context (auto-extracted)" not in saved_after_paste
-    # Simulate dialog edit + the new post-#73 strip pass.
+    # Simulate dialog edit + the integrated regenerate + strip pass.
     edited_ctx = [AttendeeContextEntry(name="Bob", observation="REVISED")]
     edited_det = [AttendeeAppendixEntry(name="Bob", title="CEO", company="Bobco")]
     edited_topics = ["Q3 hiring"]
@@ -298,11 +285,10 @@ def test_edit_dialog_strip_on_keeps_notes_clean(app_with_session):
         topics=edited_topics,
         referenced_attachments=edited_ref,
     )
-    # The new behavior: strip pass runs after regenerate so the
+    # #93: strip pass runs unconditionally after regenerate, so the
     # JSON blocks regenerate_notes_json just added get removed.
-    if ma.config.synthesis.strip_attendee_appendix:
-        updated = ma._strip_all_appendices(updated)  # noqa: SLF001
-    # notes.md stays clean; the user's strip preference is honored.
+    updated = ma._strip_all_appendices(updated)  # noqa: SLF001
+    # notes.md stays clean.
     for tag in (
         "Attendee Context",
         "Attendee Details",

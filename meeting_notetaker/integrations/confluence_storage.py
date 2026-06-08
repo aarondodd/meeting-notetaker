@@ -47,6 +47,27 @@ def markdown_to_storage(
     return converter.render_blocks(ast)
 
 
+def build_toc_macro(*, max_level: int = 3) -> str:
+    """Return Confluence's native auto-TOC macro (#94).
+
+    The macro renders server-side as a nested clickable list of the
+    page's headings -- works correctly regardless of how the body
+    was generated, and stays in sync if the user edits the page.
+    Used in place of the markdown ``## Contents`` list we use for
+    PDF / Notion, since Confluence's native macro is a strictly
+    better fit for the platform.
+
+    ``max_level`` clamps to 1-6 to match Confluence's macro
+    parameter contract.
+    """
+    level = max(1, min(6, int(max_level)))
+    return (
+        '<ac:structured-macro ac:name="toc">'
+        f'<ac:parameter ac:name="maxLevel">{level}</ac:parameter>'
+        '</ac:structured-macro>'
+    )
+
+
 class _Converter:
     def __init__(
         self,

@@ -406,6 +406,10 @@ class SessionController(QObject):
         self._active_recording_session: Optional[Session] = None
         self._mic_recorder = None
         self._loopback_recorder = None
+        # Hot-plug watcher for multi-endpoint mode (#85.6). Owns a
+        # QTimer-driven poll over the WASAPI output endpoint set;
+        # debounces flapping connectors before extending capture.
+        self._endpoint_watcher = None
         self._chunk_buffer: Optional[ChunkBuffer] = None
         self._workers: list[LiveTranscriptionWorker] = []
         self._t_start_wall: Optional[float] = None
@@ -555,30 +559,84 @@ class SessionController(QObject):
             self._mic_recorder.start()
 
             # Loopback recorder (Windows only; fail soft if unavailable).
+            # When multi_endpoint_capture is on (default), the
+            # MultiEndpointLoopbackRecorder orchestrator captures every
+            # WASAPI output endpoint to a sidecar WAV and mixes at
+            # Stop. Issue #84: this is the primary defense against the
+            # "Teams routed to a different endpoint than the one we
+            # bound to" failure mode. Single-endpoint mode stays
+            # available as a fallback for users hitting WASAPI quirks.
             from .audio.loopback_recorder import LoopbackRecorder, LoopbackUnavailable
-            if LoopbackRecorder.is_available():
+            from .audio.multi_loopback import MultiEndpointLoopbackRecorder
+            multi = self.config.audio.multi_endpoint_capture
+            if MultiEndpointLoopbackRecorder.is_available() and multi:
+                self._loopback_recorder = MultiEndpointLoopbackRecorder(
+                    self._chunk_buffer,
+                    self._sys_wav,
+                    source_name=SYS,
+                )
+            elif LoopbackRecorder.is_available():
                 self._loopback_recorder = LoopbackRecorder(
                     self._chunk_buffer,
                     self._sys_wav,
                     source_name=SYS,
                     device_name=self.config.audio.loopback_device_name,
                 )
+            else:
+                self._loopback_recorder = None
+                self.status.emit("PyAudioWPatch not installed; recording mic only.")
+
+            # Endpoint hot-plug watcher (#85.6). Only meaningful in
+            # multi-endpoint mode -- when a USB headset / monitor
+            # appears mid-call we extend capture to include it. Single-
+            # endpoint mode treats hot-plug as a no-op.
+            self._endpoint_watcher = None
+            if (
+                isinstance(self._loopback_recorder, MultiEndpointLoopbackRecorder)
+                and self._loopback_recorder is not None
+            ):
+                try:
+                    from .audio.endpoint_watcher import EndpointWatcher
+                except ImportError:
+                    EndpointWatcher = None
+                if EndpointWatcher is not None:
+                    self._endpoint_watcher = EndpointWatcher(parent=self)
+                    self._endpoint_watcher.endpoints_changed.connect(
+                        self._on_endpoints_changed
+                    )
+
+            if self._loopback_recorder is not None:
                 self._loopback_recorder.error.connect(self.error.emit)
-                # Same shape as the mic path. Tag with session id so
-                # the app can correlate the warning to a specific
-                # recording when surfacing it.
+                # Tag warnings with session id so the app correlates
+                # the warning to a specific recording.
                 lb_session_id = session.id
                 self._loopback_recorder.capture_warning.connect(
                     lambda msg, sid=lb_session_id: self.capture_warning.emit(sid, msg)
                 )
+                # Mid-recording silence detector (#84). The handler
+                # cross-references with audio_session_monitor so the
+                # banner can name the meeting app rendering audio
+                # elsewhere (the diagnostic the user needs to act on).
+                self._loopback_recorder.silence_detected.connect(
+                    lambda sid=lb_session_id: self._on_loopback_silence_detected(sid)
+                )
+                self._loopback_recorder.silence_cleared.connect(
+                    lambda sid=lb_session_id: self._on_loopback_silence_cleared(sid)
+                )
                 try:
                     self._loopback_recorder.start()
+                    if self._endpoint_watcher is not None:
+                        self._endpoint_watcher.start()
                 except LoopbackUnavailable as exc:
                     log.warning("loopback unavailable: %s", exc)
                     self._loopback_recorder = None
+                    if self._endpoint_watcher is not None:
+                        try:
+                            self._endpoint_watcher.stop()
+                        except Exception:
+                            log.exception("endpoint watcher stop after loopback fail")
+                        self._endpoint_watcher = None
                     self.status.emit("System-audio loopback unavailable; recording mic only.")
-            else:
-                self.status.emit("PyAudioWPatch not installed; recording mic only.")
 
             self._t_start_wall = time.monotonic()
             self._active_elapsed_accumulated_sec = 0.0
@@ -721,6 +779,117 @@ class SessionController(QObject):
         if store.remove_last_for(name):
             self.speaker_tags_changed.emit(session.id, store.counts())
 
+    # ---- imported audio entry (#88) ------------------------------------
+
+    def start_processing_imported_session(
+        self,
+        session: Session,
+        *,
+        mic_wav: Optional[Path] = None,
+        sys_wav: Optional[Path] = None,
+        run_diarization: bool = True,
+    ) -> None:
+        """Pump a session's already-on-disk audio through the standard
+        batch transcription + (optional) speaker refinement pipeline.
+
+        Used by the audio-import dialog (#88) after it has decoded the
+        user's source file (any format PyAV accepts) into the canonical
+        16 kHz mono int16 WAV at the right slot in the session folder.
+
+        Exactly one of `mic_wav` / `sys_wav` should be set per the
+        import dialog's speaker-treatment dropdown:
+
+          - 'Single combined recording'       -> sys_wav (diarization on)
+          - 'My own voice only'               -> mic_wav (diarization off)
+          - 'Other people's voices'           -> sys_wav (diarization on,
+                                                  no user-voiceprint match)
+
+        Mirrors the post-Stop processing path: construct a
+        _ProcessingState, plan the phases, fire the batch thread, and
+        let the existing _on_batch_done / _finalize_session sequence
+        commit the transcript. From the user's perspective the session
+        looks identical to a live recording that just finished, except
+        the audio came from a file rather than the microphone.
+
+        Refuses to run when a live recording is active or when this
+        session is already being processed.
+        """
+        if self._active_recording_session is not None:
+            self.error.emit(
+                "Stop the active recording before importing audio."
+            )
+            return
+        if session.id in self._processing_sessions:
+            self.error.emit(
+                "This session is already being processed; wait for it "
+                "to finish before importing more audio."
+            )
+            return
+        if mic_wav is None and sys_wav is None:
+            self.error.emit(
+                "Import audio: neither mic nor system track was provided."
+            )
+            return
+
+        hotwords = self._collect_hotwords(session)
+        proc_state = _ProcessingState(
+            session=session,
+            mic_wav=mic_wav,
+            sys_wav=sys_wav,
+            live_segments=[],
+            speaker_tags=[],
+        )
+        self._processing_sessions[session.id] = proc_state
+        skip_batch = self.config.transcription.skip_batch_refinement
+        will_run_refinement = bool(
+            run_diarization
+            and self.config.speakers.enabled
+            and sys_wav is not None
+            and sys_wav.exists()
+        )
+        self._phase_plans[session.id] = self._build_phase_plan(
+            will_run_batch=not skip_batch,
+            will_run_refinement=will_run_refinement,
+        )
+
+        # Imported sessions don't have an Outlook-style ended_at; set it
+        # to now so the session list shows them as completed.
+        self.store.update_session(
+            session.id,
+            ended_at=utc_now_iso(),
+        )
+
+        if skip_batch:
+            self._finalize_session(session.id, batch_segments=None)
+            return
+
+        self.store.update_session(session.id, state=STATE_PROCESSING)
+        session.state = STATE_PROCESSING
+        self.state_changed.emit(session.id, STATE_PROCESSING)
+        self._emit_unified_progress(session.id, "batch", 0)
+
+        beam_size = 1 if self.config.transcription.fast_batch else 5
+        batch_thread = _BatchTranscribeThread(
+            proc_state.mic_wav,
+            proc_state.sys_wav,
+            self.config.transcription.model_size,
+            vad_filter=self.config.audio.vad_enabled,
+            vad_min_silence_ms=self.config.audio.vad_min_silence_ms,
+            beam_size=beam_size,
+            hotwords=hotwords,
+            cpu_threads=self.config.transcription.resolved_cpu_threads(),
+            num_workers=self.config.transcription.num_workers,
+        )
+        batch_thread.progress.connect(self.status.emit)
+        sid = session.id
+        batch_thread.progress_pct.connect(
+            lambda pct, _sid=sid: self._emit_unified_progress(_sid, "batch", pct)
+        )
+        batch_thread.done.connect(lambda segs, _sid=sid: self._on_batch_done(_sid, segs))
+        batch_thread.failed.connect(lambda msg, _sid=sid: self._on_batch_failed(_sid, msg))
+        proc_state.batch_thread = batch_thread
+        batch_thread.start()
+
     def stop_session(self) -> None:
         if self._active_recording_session is None:
             return
@@ -737,6 +906,12 @@ class SessionController(QObject):
                 self._loopback_recorder.stop()
         except Exception:
             log.exception("loopback stop failed")
+        try:
+            if self._endpoint_watcher is not None:
+                self._endpoint_watcher.stop()
+                self._endpoint_watcher = None
+        except Exception:
+            log.exception("endpoint watcher stop failed")
 
         # Stop live workers (drains remaining ChunkBuffer).
         for worker in self._workers:
@@ -970,10 +1145,18 @@ class SessionController(QObject):
         proc_state.batch_thread = None
         session = proc_state.session
         store = TranscriptStore(session.id)
-        if segments:
-            store.write_segments(segments)
-            self.store.update_session(session.id, has_transcript=True)
-            self.transcript_replaced.emit(session.id, segments)
+        # Flip has_transcript=True even when the batch returned no
+        # segments (#87). "Batch ran, found nothing" is a legitimate
+        # terminal state -- common for mic-only voice-note / walkthrough
+        # sessions where the mic captured ambient quiet narration that
+        # Whisper found nothing in. Without this, the session stays
+        # in_progress-looking in the UI forever, blocking synthesis
+        # even when the user has notes to drive it. The Transcript tab
+        # surfaces the empty state as "No speech detected..." (see
+        # SessionView).
+        store.write_segments(segments)
+        self.store.update_session(session.id, has_transcript=True)
+        self.transcript_replaced.emit(session.id, segments)
         # Capture the latest on-disk transcript for the refinement input.
         # Use the batch segments when present, else fall back to whatever
         # the live workers wrote at Stop.
@@ -1165,6 +1348,81 @@ class SessionController(QObject):
         self._sys_wav = None
         if error:
             self._live_segments = []
+
+    # ---- mid-recording silence detection (#84) --------------------------
+
+    def _on_loopback_silence_detected(self, session_id: str) -> None:
+        """The loopback's rolling-window RMS dropped below floor for the
+        full window. Compose a user-facing message that names a meeting
+        app currently rendering audio elsewhere, if one is active --
+        that is the diagnostic the user needs to know which knob to
+        change (Teams output device, Windows default, recorder
+        endpoint). Falls back to a generic copy when no cross-reference
+        signal is available."""
+        try:
+            from .integrations import audio_session_monitor
+            sessions = audio_session_monitor.enumerate_active_sessions()
+        except Exception:
+            log.exception("audio_session_monitor lookup failed during silence event")
+            sessions = []
+        # Filter to known meeting apps; the rest aren't load-bearing
+        # for the user-facing diagnosis (a YouTube tab playing music
+        # elsewhere is noise, not signal).
+        try:
+            from .integrations.audio_session_monitor import (
+                DEFAULT_APP_ALLOWLIST,
+                display_name_for,
+            )
+            allow = {a.lower() for a in DEFAULT_APP_ALLOWLIST}
+            meeting_apps = sorted({
+                display_name_for(s.process_name)
+                for s in sessions
+                if s.process_name.lower() in allow
+            })
+        except Exception:
+            meeting_apps = []
+        if meeting_apps:
+            apps_label = ", ".join(meeting_apps)
+            msg = (
+                f"System audio appears silent for the past 30 seconds, but "
+                f"{apps_label} is rendering audio. The recorder may be "
+                f"bound to a different output device. Check your meeting "
+                f"app's output device in its audio settings."
+            )
+        else:
+            msg = (
+                "System audio appears silent for the past 30 seconds. If "
+                "you expect audio to be playing, check the output device "
+                "in your meeting app's audio settings."
+            )
+        log.info("loopback silence_detected for %s: %s", session_id, msg)
+        self.capture_warning.emit(session_id, msg)
+
+    # ---- hot-plug endpoint changes (#85.6) ------------------------------
+
+    def _on_endpoints_changed(self, change) -> None:
+        """Forward an endpoint-set change to the multi-endpoint
+        orchestrator. Only the `added` set drives action -- a removed
+        endpoint stays in the capture set so its tail silence is
+        captured + padded at finalize (the sub-recorder will detect
+        the device gone via stalled callbacks and warn through the
+        existing capture_warning path)."""
+        from .audio.multi_loopback import MultiEndpointLoopbackRecorder
+        if not isinstance(self._loopback_recorder, MultiEndpointLoopbackRecorder):
+            return
+        for name in change.added:
+            ok = self._loopback_recorder.extend_to_endpoint(name)
+            log.info(
+                "controller: hot-plug extend_to_endpoint(%r) -> %s",
+                name, ok,
+            )
+
+    def _on_loopback_silence_cleared(self, session_id: str) -> None:
+        """The loopback callback started receiving above-floor audio
+        again. Used today for log diagnostics; SessionView's banner
+        is one-shot (the user can dismiss the warning manually) so we
+        don't auto-clear from here."""
+        log.info("loopback silence_cleared for %s", session_id)
 
     # ---- live segment routing ---------------------------------------------
 

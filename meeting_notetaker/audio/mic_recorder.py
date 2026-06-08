@@ -547,14 +547,23 @@ def _pick_input_device(pa, saved_name: str = "") -> tuple[Optional[int], dict]:
     """Choose an input device. Returns (device_index_or_None, device_info).
 
     If `saved_name` is set and matches an available device (exact, then
-    case-insensitive substring), use it. Otherwise fall back to:
-    PyAudio's `get_default_input_device_info()` (often unreliable on
-    Windows -- raises 'No Default Input Device Available' even when working
-    input devices exist), then enumerate and prefer the first WASAPI input,
-    then any input, then a helpful error.
+    case-insensitive substring), use it -- but only after a probe via
+    `probe_input_device` confirms the device is currently openable. A
+    stale name match can resolve to a device that survives in PortAudio's
+    enumeration after a Windows topology change (sleep/wake, USB replug)
+    but no longer accepts streams; the probe rejects it so the caller
+    falls through to the default rather than locking onto a ghost.
+
+    Otherwise fall back to: PyAudio's `get_default_input_device_info()`
+    (often unreliable on Windows -- raises 'No Default Input Device
+    Available' even when working input devices exist), then enumerate
+    and prefer the first WASAPI input, then any input, then a helpful
+    error.
     """
     import pyaudio
     import sys
+
+    from .devices import probe_input_device
 
     if saved_name:
         target = saved_name.strip()
@@ -570,18 +579,31 @@ def _pick_input_device(pa, saved_name: str = "") -> tuple[Optional[int], dict]:
                 continue
             name = str(d.get("name", ""))
             if name == target:
-                log.info("picked saved input device #%d: %s", i, name)
-                return i, d
+                if probe_input_device(pa, d):
+                    log.info("picked saved input device #%d: %s", i, name)
+                    return i, d
+                log.warning(
+                    "exact-match input device #%d %r failed probe; falling through",
+                    i, name,
+                )
+                break
             if substring_match is None and target_lower and target_lower in name.lower():
                 substring_match = (i, d)
         if substring_match is not None:
             idx, d = substring_match
-            log.info(
-                "picked input device #%d: %s (substring match for saved %r)",
+            if probe_input_device(pa, d):
+                log.info(
+                    "picked input device #%d: %s (substring match for saved %r)",
+                    idx, d.get("name", "?"), saved_name,
+                )
+                return idx, d
+            log.warning(
+                "substring-match input device #%d %r failed probe (saved %r is stale); "
+                "falling back to default",
                 idx, d.get("name", "?"), saved_name,
             )
-            return idx, d
-        log.warning("saved input device %r not found; falling back to default", saved_name)
+        else:
+            log.warning("saved input device %r not found; falling back to default", saved_name)
 
     try:
         info = pa.get_default_input_device_info()

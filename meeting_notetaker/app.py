@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from .automation import messages as automation_messages
 from .automation.bridge import Bridge, HandshakeState
@@ -99,6 +99,7 @@ from .utils.paths import (
     calendar_state_path,
     log_path,
     rotate_log_on_launch,
+    session_audio_dir,
 )
 from .utils.single_instance import acquire as acquire_lock, release as release_lock
 from .utils.vocabulary import seed_vocabulary_file
@@ -413,6 +414,40 @@ class MainApp(QObject):
             self.window.session_view.apply_fonts(editor_font, preview_font)
         except AttributeError:
             log.exception("SessionView.apply_fonts not available; skipping font push")
+        # Push the rich-source-view preference too (#91). Hidden behind a
+        # try/except so a SessionView that predates the wiring degrades
+        # cleanly.
+        try:
+            self.window.session_view.set_rich_source_view(
+                self.config.ui.markdown_rich_editor
+            )
+        except AttributeError:
+            pass
+        # Push heading-numbering preference (#92). Same try/except
+        # pattern so older SessionView shapes degrade cleanly.
+        toc_max_depth = int(
+            getattr(self.config.synthesis, "toc_max_depth", 3) or 3,
+        )
+        try:
+            self.window.session_view.set_heading_numbering(
+                self.config.synthesis.heading_numbering,
+            )
+        except AttributeError:
+            pass
+        # Push the export-side outline preferences (#92) so the per-
+        # tab Export PDF / Print path picks up numbering + TOC
+        # automatically.
+        try:
+            self.window.session_view.set_export_outline_options(
+                number_headings=self.config.synthesis.heading_numbering,
+                include_toc=self.config.synthesis.toc_in_exports,
+                toc_max_depth=toc_max_depth,
+                use_word_for_pdf=getattr(
+                    self.config.synthesis, "use_word_for_pdf", False,
+                ),
+            )
+        except AttributeError:
+            pass
         # Popout window mirrors the same fonts when open.
         popout = getattr(self, "_notes_popout", None)
         if popout is not None:
@@ -694,29 +729,17 @@ class MainApp(QObject):
         """Run every LLM-appendix strip helper in sequence.
 
         Shared by the paste-back path (`_apply_synthesis_result`)
-        and the edit-dialog path (`_on_appendix_edit_requested`)
-        so the strip toggle behaves consistently regardless of
-        which surface produced the new notes.md. All four
-        appendices ride one Settings toggle -- if the user wants
-        notes.md clean, they want them all gone. The sidecar
-        persistence is the caller's responsibility (runs BEFORE
-        the strip so data survives).
+        and the edit-dialog path (`_on_appendix_edit_requested`).
+        Always-on as of #93 -- the raw H2 "(auto-extracted)" sections
+        no longer persist to notes.md; the sidecar is the canonical
+        source for render + export.
+
+        Thin wrapper around the free function so callers that already
+        hold a MainApp reference don't need to import the utils
+        module. Worker threads use the free function directly.
         """
-        from .utils.attendee_appendix import strip_appendix  # noqa: PLC0415
-        from .utils.attendee_context import (  # noqa: PLC0415
-            strip_appendix as strip_attendee_context,
-        )
-        from .utils.invite_mentions import (  # noqa: PLC0415
-            strip_appendix as strip_invite_mentions,
-        )
-        from .utils.topic_appendix import (  # noqa: PLC0415
-            strip_appendix as strip_topic_appendix,
-        )
-        markdown = strip_appendix(markdown)
-        markdown = strip_topic_appendix(markdown)
-        markdown = strip_attendee_context(markdown)
-        markdown = strip_invite_mentions(markdown)
-        return markdown
+        from .utils.appendix_transform import strip_all_appendices  # noqa: PLC0415
+        return strip_all_appendices(markdown)
 
     def _apply_synthesis_result(
         self,
@@ -753,8 +776,8 @@ class MainApp(QObject):
         # data is independent of the save path's success.
         self._apply_attendee_details_appendix(session_id, markdown)
         # Persist the four LLM appendices to the sidecar BEFORE the
-        # optional strip pass so the data is preserved regardless of
-        # the strip toggle (#64 sidecar followup).
+        # strip pass so the data is preserved regardless (#64 sidecar
+        # followup).
         try:
             from .utils.appendix_store import AppendixStore  # noqa: PLC0415
             AppendixStore(session_id).save_from_notes(markdown)
@@ -762,8 +785,12 @@ class MainApp(QObject):
             log.exception(
                 "appendix sidecar write failed: %s", session_id,
             )
-        if self.config.synthesis.strip_attendee_appendix:
-            markdown = self._strip_all_appendices(markdown)
+        # #93: appendix is system-managed data. Raw H2 "(auto-extracted)"
+        # JSON blocks no longer persist to notes.md; the sidecar is the
+        # canonical source for render + export. The strip toggle was
+        # removed from Settings; the config field stays as a deprecated
+        # no-op for back-compat with old config files.
+        markdown = self._strip_all_appendices(markdown)
         tstore = TranscriptStore(session_id)
         archive_path = tstore.save_notes(
             markdown, archive_existing=archive_existing,
@@ -974,20 +1001,188 @@ class MainApp(QObject):
                 self.config.synthesis.auto_extract_attendee_details
             ),
         )
+        self._dispatch_rendered_synthesis(
+            session_id=session_id,
+            target_key=target_key,
+            target=target,
+            rendered_body=rendered,
+        )
 
+    def _resolve_session_prompt_template(
+        self,
+        session_id: str,
+    ):
+        """Pick the prompt template for `session_id` using the standard
+        three-tier fallback (session override -> Settings default ->
+        bundled default). Returns the PromptTemplate or None when no
+        templates are installed. Shared between the standard send path
+        and the #90 edit-and-send path."""
+        store = TranscriptStore(session_id)
+        templates = prompts_mod.list_templates()
+        if not templates:
+            return None
+
+        def _find(name: str):
+            return next((t for t in templates if t.name == name), None)
+
+        chosen = None
+        chosen_name = store.read_prompt_template_name()
+        if chosen_name:
+            chosen = _find(chosen_name)
+        if chosen is None and self.config.synthesis.default_template_name:
+            chosen = _find(self.config.synthesis.default_template_name)
+        if chosen is None:
+            chosen = _find("default") or templates[0]
+        return chosen
+
+    def _on_edit_and_send(self, session_id: str) -> None:
+        """Sidekick to Send / Generate (#90).
+
+        Renders the synthesis prompt for the session, opens the
+        SessionPromptEditDialog with the rendered body, and on Accept
+        dispatches the edited body through the same automation bridge
+        or clipboard path the standard Send/Generate uses.
+
+        Refuses with a user-readable message if the session has no
+        transcript yet AND no notes (mirrors the SessionView enable
+        gate from #87 -- the user shouldn't have been able to click
+        the button in that state, but a defensive check costs nothing).
+        """
+        from .ui.session_prompt_dialog import SessionPromptEditDialog  # noqa: PLC0415
+
+        session = self.store.get_session(session_id)
+        if session is None:
+            return
+        store = TranscriptStore(session_id)
+        transcript = store.read_transcript()
+        self.window.session_view.flush_pending_live_notes()
+        live_notes = store.read_live_notes()
+        if not transcript.strip() and not live_notes.strip():
+            QMessageBox.information(
+                self.window, "Edit & Send",
+                "This session has no transcript or notes yet -- there's "
+                "nothing to send.",
+            )
+            return
+        try:
+            when = datetime.fromisoformat(
+                session.created_at.replace("Z", "+00:00")
+            ).astimezone()
+        except ValueError:
+            when = datetime.now().astimezone()
+        chosen = self._resolve_session_prompt_template(session_id)
+        if chosen is None:
+            QMessageBox.warning(
+                self.window, "Edit & Send",
+                "No prompt templates found in the prompts folder.",
+            )
+            return
+        rendered = prompts_mod.render(
+            chosen,
+            session_title=session.title,
+            session_date=when,
+            transcript=transcript,
+            live_notes=live_notes,
+            user_name=self.config.ui.user_name,
+            include_system_prompts=(
+                self.config.synthesis.auto_extract_attendee_details
+            ),
+        )
+        dialog = SessionPromptEditDialog(
+            rendered_prompt=rendered,
+            session_title=session.title,
+            template_name=chosen.name,
+            automation_enabled=self.config.synthesis.automation_enabled,
+            parent=self.window,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        result = dialog.result_payload
+        if result is None:
+            return
+        if result.action == "send":
+            self._dispatch_edited_synthesis(session_id, result.edited_body)
+        else:
+            self._copy_edited_prompt_to_clipboard(result.edited_body)
+
+    def _dispatch_edited_synthesis(
+        self, session_id: str, edited_body: str,
+    ) -> None:
+        """Send the edited prompt through the automation bridge using
+        the configured LLM target. Performs the same Chrome-launch +
+        connection preflight as _on_send_to_llm so the edit flow
+        survives cold-start Chrome state without duplicating logic."""
+        target_key = self.config.synthesis.llm_target or "claude"
+        if self._synth_state == SynthesisConnectionState.NOT_RUNNING:
+            if not self._launch_chrome_and_wait_for_connection(session_id):
+                return
+        elif self._synth_state == SynthesisConnectionState.RUNNING_DISCONNECTED:
+            QMessageBox.warning(
+                self.window, "Synthesis Automation",
+                "Chrome is running but the extension hasn't connected "
+                "back to the app. Try Reconnect from the extension popup.",
+            )
+            return
+        elif not self._bridge_ready_state:
+            QMessageBox.warning(
+                self.window, "Synthesis Automation",
+                "Lost connection to the extension. Try again in a moment.",
+            )
+            return
+        try:
+            target = get_target(target_key)
+        except ValueError:
+            QMessageBox.warning(
+                self.window, "Synthesis Automation",
+                f"Unknown LLM target {target_key!r}.",
+            )
+            return
+        if not target.implemented:
+            QMessageBox.information(
+                self.window, "Synthesis Automation",
+                f"{target.label} automation isn't implemented in this build.",
+            )
+            return
+        self._dispatch_rendered_synthesis(
+            session_id=session_id,
+            target_key=target_key,
+            target=target,
+            rendered_body=edited_body,
+        )
+
+    def _copy_edited_prompt_to_clipboard(self, edited_body: str) -> None:
+        """Manual mode counterpart to _dispatch_edited_synthesis.
+        Copies the edited body to the clipboard so the user can paste
+        it into their LLM chat manually."""
+        clipboard = QApplication.clipboard()
+        clipboard.setText(edited_body)
+        self.window.status(
+            "Edited prompt copied to clipboard. Paste it into your LLM, "
+            "then use Paste Response Back to bring the synthesis in.",
+            timeout_ms=8000,
+        )
+
+    def _dispatch_rendered_synthesis(
+        self,
+        *,
+        session_id: str,
+        target_key: str,
+        target,
+        rendered_body: str,
+    ) -> None:
+        """Bridge-send + in-progress banner, given an already-rendered
+        prompt body. Shared between the standard Send to LLM path and
+        the #90 Edit & Send path so the edited body and the auto-
+        rendered body go through identical downstream plumbing."""
         request_id = secrets.token_hex(8)
         self._inflight_syntheses[request_id] = session_id
-        # Build the URL the extension should land on. For Claude this
-        # honors the optional claude_project_id setting -- when set,
-        # syntheses accumulate in that project rather than the user's
-        # default chat list.
         chat_url = ""
         if target_key == "claude":
             chat_url = self.config.synthesis.claude_chat_url()
         msg = automation_messages.SynthesizeRequest(
             request_id=request_id,
             target=target_key,
-            prompt=rendered,
+            prompt=rendered_body,
             new_chat=True,
             chat_url=chat_url,
         )
@@ -1002,11 +1197,6 @@ class MainApp(QObject):
                 "extension popup, or fall back to manual Generate / Paste.",
             )
             return
-        # Make sure the banner persists across session-switches: if the
-        # user clicks Send, navigates to a different session, and then
-        # comes back, the banner should still be up. SessionView keys
-        # by session id; the call here registers the in-progress state
-        # for the originating session.
         self.window.session_view.set_synthesis_in_progress(
             session_id, True, status_text=f"Sent to {target.label}, waiting for response..."
         )
@@ -1206,6 +1396,8 @@ class MainApp(QObject):
             self._on_manage_classification,
         )
         self.window.address_book_requested.connect(self._on_address_book)
+        # Tools > Edit Prompts... (#89) -- open the in-app prompt editor.
+        self.window.edit_prompts_requested.connect(self._on_edit_prompts)
         # File > Save to ... mirrors the SessionView's right-pane
         # Save to... button. Route both through the same handlers so
         # body resolution + worker spawn stay in one place (#79).
@@ -1222,6 +1414,12 @@ class MainApp(QObject):
         # handler the SessionView's empty-state Import button uses.
         self.window.import_transcript_requested.connect(
             self._on_file_menu_import_transcript,
+        )
+        # File > Import Audio Recording... (#88) -- decode an external
+        # audio file into the selected session and run the standard
+        # transcribe + speaker pipeline against it.
+        self.window.import_audio_requested.connect(
+            self._on_file_menu_import_audio,
         )
         # View menu (v0.7.7).
         self.window.pop_out_notes_preview_requested.connect(
@@ -1252,6 +1450,8 @@ class MainApp(QObject):
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
         sv.send_to_llm_clicked.connect(self._on_send_to_llm)
+        # Edit & Send / Edit & Copy Prompt (#90).
+        sv.edit_and_send_clicked.connect(self._on_edit_and_send)
         # Issue #80: empty-state import button on the Transcript tab.
         sv.import_transcript_clicked.connect(self._on_import_transcript)
         sv.copy_tab_clicked.connect(self._on_copy_tab)
@@ -2184,7 +2384,8 @@ class MainApp(QObject):
         # round-trip back into the sidecar via the next
         # _flush_notes. Skipped when the synthesis on disk is
         # already empty -- no JSON blocks to overwrite. When the
-        # strip_attendee_appendix Settings toggle is ON, apply the
+        # Strip the raw H2 "(auto-extracted)" sections (#93) so the
+        # updated notes.md stays clean. Apply the
         # strip pass so the dialog edits don't restore the JSON
         # the user told the app to hide (#73 finding #2).
         try:
@@ -2197,8 +2398,8 @@ class MainApp(QObject):
                 topics=edited_topics,
                 referenced_attachments=edited_referenced,
             )
-            if self.config.synthesis.strip_attendee_appendix:
-                updated_notes = self._strip_all_appendices(updated_notes)
+            # #93: strip is unconditional now; the sidecar is canonical.
+            updated_notes = self._strip_all_appendices(updated_notes)
             if updated_notes != current_notes:
                 tstore.save_notes(updated_notes, archive_existing=False)
                 # Keep the search index in sync so the edit is
@@ -2692,6 +2893,61 @@ class MainApp(QObject):
         except (TypeError, RuntimeError):
             pass
         self._notes_popout = None
+
+    def _on_file_menu_import_audio(self) -> None:
+        """File > Import Audio Recording... (#88)
+
+        Decode an external audio file into the selected session's
+        audio dir and trigger the standard transcribe + speaker
+        pipeline against it. Refuses if there's no session selected,
+        if the session already has audio (don't clobber a real
+        recording), or if a live recording is in flight."""
+        from .ui.import_audio_dialog import ImportAudioDialog  # noqa: PLC0415
+
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            QMessageBox.information(
+                self.window, "Import Audio Recording",
+                "Select a session in the list first, then choose "
+                "File > Import Audio Recording...",
+            )
+            return
+        session = sv._session  # noqa: SLF001
+        # Refuse to overwrite an existing recording. The user should
+        # create a new session if they want to import audio.
+        audio_dir = session_audio_dir(session.id)
+        existing = [
+            p for p in (audio_dir / "mic.wav", audio_dir / "sys.wav")
+            if p.exists() and p.stat().st_size > 44
+        ]
+        if existing:
+            QMessageBox.warning(
+                self.window, "Import Audio Recording",
+                "This session already has audio. Import to a new session "
+                "instead so the existing recording isn't overwritten.",
+            )
+            return
+        if self.controller.active_session is not None:
+            QMessageBox.warning(
+                self.window, "Import Audio Recording",
+                "Stop the active recording before importing audio.",
+            )
+            return
+        dlg = ImportAudioDialog(audio_dir, parent=self.window)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        result = dlg.result_payload
+        if result is None:
+            return
+        # Hand off to the controller. The pipeline marks the session
+        # as STATE_PROCESSING and runs the same downstream batch +
+        # speaker passes a live recording would.
+        self.controller.start_processing_imported_session(
+            session,
+            mic_wav=result.decoded_wav_path if result.slot == "mic" else None,
+            sys_wav=result.decoded_wav_path if result.slot == "sys" else None,
+            run_diarization=result.run_diarization,
+        )
 
     def _on_file_menu_import_transcript(self) -> None:
         """File > Import Transcript... -- forwards to the same handler
@@ -3792,6 +4048,17 @@ class MainApp(QObject):
         notes_pdf_path = None
         synthesis_pdf_path = None
         try:
+            # #92: pull the user's outline preferences once so both PDFs
+            # carry the same numbering + TOC choices.
+            outline_number = getattr(
+                self.config.synthesis, "heading_numbering", False,
+            )
+            outline_toc = getattr(
+                self.config.synthesis, "toc_in_exports", False,
+            )
+            outline_max_depth = int(getattr(
+                self.config.synthesis, "toc_max_depth", 3,
+            ) or 3)
             if notes_md.strip():
                 notes_pdf_path = pdf_temp_dir / "my-notes.pdf"
                 render_session_pdf(
@@ -3803,6 +4070,9 @@ class MainApp(QObject):
                     session_date=session_when,
                     session_contacts=session_contacts_for_pdf,
                     appendix_data=appendix_data,
+                    number_headings=outline_number,
+                    include_toc=outline_toc,
+                    toc_max_depth=outline_max_depth,
                 )
             if synthesis_md.strip():
                 synthesis_pdf_path = pdf_temp_dir / "synthesis.pdf"
@@ -3815,6 +4085,9 @@ class MainApp(QObject):
                     session_date=session_when,
                     session_contacts=session_contacts_for_pdf,
                     appendix_data=appendix_data,
+                    number_headings=outline_number,
+                    include_toc=outline_toc,
+                    toc_max_depth=outline_max_depth,
                 )
         except Exception:
             log.exception("PDF pre-render failed for %s", session_id)
@@ -4946,6 +5219,47 @@ class MainApp(QObject):
         if sv._session is not None:
             self._refresh_session_classification(sv._session.id)
 
+    def _on_edit_prompts(self) -> None:
+        """Tools > Edit Prompts... (#89)
+
+        Open the in-app prompt editor. On close, refresh the prompt
+        dropdowns in the SessionView so newly-created prompts show
+        up and deleted ones drop out without an app restart.
+        """
+        from .ui.prompt_editor_dialog import PromptEditorDialog  # noqa: PLC0415
+
+        dlg = PromptEditorDialog(parent=self.window)
+        dlg.exec()
+        self._refresh_prompt_pickers()
+
+    def _refresh_prompt_pickers(self) -> None:
+        """Push the current set of prompt templates back into the
+        SessionView's per-session prompt picker. Settings rebuilds its
+        own picker inside _open_prompt_editor."""
+        from .utils import prompts as prompts_mod  # noqa: PLC0415
+
+        try:
+            templates = prompts_mod.list_templates()
+        except Exception:
+            log.exception("Failed to refresh prompts after editor close")
+            return
+        sv = self.window.session_view
+        # Preserve the per-session override if the user has one set;
+        # picking it up via the session_view's current selection.
+        current_override = ""
+        try:
+            current_override = sv._prompt_template_picker.currentData() or ""  # noqa: SLF001
+        except Exception:
+            pass
+        settings_default = getattr(
+            self.config.synthesis, "default_prompt_template_name", "",
+        )
+        sv.set_prompt_templates(
+            [t.name for t in templates],
+            selected=current_override,
+            settings_default=settings_default,
+        )
+
     def _on_address_book(self) -> None:
         """File > Address Book. Manages Contacts (the master
         identity behind People + Speakers). On close, refresh
@@ -5244,7 +5558,7 @@ class MainApp(QObject):
             if running:
                 return SegmentState(
                     color="green",
-                    short_label="Cal",
+                    short_label="Calendar",
                     tooltip=(
                         f"Watching Outlook calendar; notifying within "
                         f"+- {self.config.calendar.window_minutes} min of "
@@ -5253,7 +5567,7 @@ class MainApp(QObject):
                 )
             return SegmentState(
                 color="yellow",
-                short_label="Cal",
+                short_label="Calendar",
                 tooltip=(
                     "Calendar watching is enabled but the monitor is not "
                     "running. Try toggling it off and on in Settings."
@@ -5261,7 +5575,7 @@ class MainApp(QObject):
             )
         return SegmentState(
             color="red",
-            short_label="Cal",
+            short_label="Calendar",
             tooltip=(
                 "Calendar watching is enabled, but Outlook (or pywin32) is "
                 "not reachable. Help > Diagnose Outlook... reports which "
@@ -5282,7 +5596,7 @@ class MainApp(QObject):
         state = self._synth_state
         return SegmentState(
             color=state.dot_color(),
-            short_label="Syn",
+            short_label="Synthesis",
             tooltip=state.status_tooltip(),
         )
 
@@ -5297,7 +5611,7 @@ class MainApp(QObject):
         if not audio_session_monitor.is_available():
             return SegmentState(
                 color="red",
-                short_label="Det",
+                short_label="Meeting Detect",
                 tooltip=(
                     "Ad-hoc meeting detection is enabled, but pycaw / "
                     "psutil are not importable. Install them in this "
@@ -5309,7 +5623,7 @@ class MainApp(QObject):
             allowlist_size = len(self.config.detection.app_allowlist)
             return SegmentState(
                 color="green",
-                short_label="Det",
+                short_label="Meeting Detect",
                 tooltip=(
                     f"Watching system audio for {allowlist_size} known "
                     f"meeting app(s); prompting after audio sustains "
@@ -5318,7 +5632,7 @@ class MainApp(QObject):
             )
         return SegmentState(
             color="yellow",
-            short_label="Det",
+            short_label="Meeting Detect",
             tooltip=(
                 "Ad-hoc meeting detection is enabled but the monitor is "
                 "not running. Try toggling it off and on in Settings."
@@ -5951,11 +6265,28 @@ class _SessionContentLoader(QThread):
     def run(self) -> None:
         from .models.transcript import TranscriptStore
         from .utils import prompts as prompts_mod
+        from .utils.appendix_transform import strip_all_appendices
         try:
             store = TranscriptStore(self._session_id)
             transcript = store.read_transcript()
             live_notes = store.read_live_notes()
             notes = store.read_notes()
+            # #93: scrub raw H2 "(auto-extracted)" sections from
+            # notes.md if a legacy session still carries them. The
+            # sidecar already holds the parsed data; rewriting the
+            # cleaned body once at open keeps the editor view aligned
+            # with the new always-strip behavior. Idempotent -- a
+            # clean file passes through with no rewrite.
+            cleaned = strip_all_appendices(notes)
+            if cleaned != notes:
+                try:
+                    store.save_notes(cleaned, archive_existing=False)
+                    notes = cleaned
+                except OSError:
+                    log.exception(
+                        "appendix cleanup-on-open save failed: %s",
+                        self._session_id,
+                    )
             previous_notes_paths = store.list_previous_notes()
             template_names = [t.name for t in prompts_mod.list_templates()]
             selected_template = store.read_prompt_template_name()

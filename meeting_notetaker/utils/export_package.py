@@ -402,6 +402,9 @@ def render_session_pdf(
     session_date,
     session_contacts: Optional[list] = None,
     appendix_data=None,
+    number_headings: bool = False,
+    include_toc: bool = False,
+    toc_max_depth: int = 3,
 ) -> Path:
     """Render a session-tab markdown body to a PDF on the MAIN
     THREAD.
@@ -443,6 +446,19 @@ def render_session_pdf(
         from .appendix_transform import inject_appendix  # noqa: PLC0415
         body = inject_appendix(body, appendix_data)
 
+    # #92: heading numbering + TOC injection. Applies AFTER attendee-
+    # table swap + appendix injection so the auto-generated TOC sees
+    # the final body shape and the numbering picks up the appendix
+    # headings. Slugs in the TOC links match the Qt setMarkdown
+    # convention so click-to-navigate works wherever the PDF viewer
+    # respects internal markdown anchors.
+    if number_headings or include_toc:
+        from .markdown_outline import apply_outline  # noqa: PLC0415
+        body = apply_outline(
+            body, number=number_headings, toc=include_toc,
+            max_depth=toc_max_depth,
+        )
+
     printable = build_print_markdown(
         session_title=session_title,
         tab_label=tab_label,
@@ -450,7 +466,12 @@ def render_session_pdf(
         body=body,
     )
     doc = PrintTextDocument(Path(base_dir))
-    doc.setMarkdown(printable)
+    # #94: render via setHtml + mistune so the TOC's [text](#slug)
+    # links carry into the PDF as clickable named-destination
+    # anchors. Qt's setMarkdown -> PDF path drops internal links;
+    # the setHtml path preserves them.
+    from .print_html import markdown_to_print_html  # noqa: PLC0415
+    doc.setHtml(markdown_to_print_html(printable))
 
     printer = QPrinter(QPrinter.PrinterMode.HighResolution)
     printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
@@ -458,6 +479,15 @@ def render_session_pdf(
     printer.setDocName(f"{session_title} -- {tab_label}")
     doc.clamp_images_to_printer(printer)
     doc.print(printer)
+    # #94: post-process the rendered PDF to add bookmarks (sidebar
+    # navigation) + link annotations on the in-page TOC entries.
+    # Qt's QTextDocument print path doesn't emit either; pypdf does.
+    # Non-fatal -- a failed pass leaves the original Qt PDF on disk.
+    if include_toc or number_headings:
+        from .pdf_post_process import add_pdf_navigation  # noqa: PLC0415
+        add_pdf_navigation(
+            dst, body, toc_max_depth=toc_max_depth,
+        )
     return dst
 
 

@@ -293,7 +293,7 @@ def _build_main_window(*, automation_enabled: bool = False) -> MainWindow:
         win.session_view.set_automation_enabled(True, "claude")
         base_indicators["syn"] = SegmentState(
             color="green",
-            short_label="Syn",
+            short_label="Synthesis",
             tooltip=(
                 "The Meeting Notetaker extension is connected. "
                 "Send is ready to use."

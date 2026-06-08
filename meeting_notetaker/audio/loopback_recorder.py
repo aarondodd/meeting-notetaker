@@ -25,6 +25,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .chunk_buffer import ChunkBuffer
 from .resample import to_mono_16k
+from .silence_tracker import SilenceTracker
 from .wav_align import compute_pad_frames, gap_frames_to_fill, pad_wav
 from .wav_writer import AsyncWavWriter
 
@@ -45,6 +46,13 @@ class LoopbackRecorder(QObject):
     # Distinct from mic capture stall in expected causes (WASAPI engine
     # idle vs USB driver) but same UX impact and same signal shape.
     capture_warning = pyqtSignal(str)
+    # Mid-recording state transitions for the rolling-window silence
+    # tracker (issue #84). The controller listens, cross-references
+    # with audio_session_monitor to enrich the user-facing message
+    # (e.g. "Teams is rendering audio but the recorder is silent"),
+    # and re-emits as capture_warning to SessionView's banner.
+    silence_detected = pyqtSignal()
+    silence_cleared = pyqtSignal()
 
     def __init__(
         self,
@@ -109,9 +117,24 @@ class LoopbackRecorder(QObject):
         # pattern). Tracks the last time we emitted a status line so
         # the callback can decide whether to log this cycle.
         self._last_diag_log_wallclock: Optional[float] = None
+        # Rolling-window silence detector for the mid-recording
+        # capture_warning path (issue #84). The tracker waits for a
+        # full window before reporting silent, so the first 30 s of a
+        # recording can't false-fire even with no audio. State flips
+        # are debounced: we emit silence_detected once on the silent
+        # transition and silence_cleared once on the recovery, no more.
+        self._silence_tracker = SilenceTracker()
+        self._silence_state: bool = False
+        self._last_silence_check_wallclock: Optional[float] = None
 
     # See MicRecorder._DIAG_LOG_INTERVAL_S.
     _DIAG_LOG_INTERVAL_S = 60.0
+
+    # Cadence for the silence-tracker check. Cheap (O(chunks in
+    # window)) so 1 s is plenty -- the user-visible latency between
+    # the recording going silent and the banner appearing is bounded
+    # by silence_window_sec + this cadence (~31 s with defaults).
+    _SILENCE_CHECK_INTERVAL_S = 1.0
 
     @staticmethod
     def is_available() -> bool:
@@ -128,7 +151,15 @@ class LoopbackRecorder(QObject):
         If `saved_name` is set, prefer the loopback whose name matches
         (exact, then case-insensitive substring). Otherwise return the
         loopback paired with the system default output.
+
+        Substring matches are probed via `probe_input_device` before
+        being returned. A stale endpoint that survives in PortAudio's
+        enumeration after a Windows topology change can pass the name
+        comparison but reject stream creation; the probe fails the
+        match and the lookup falls through to the default-output
+        loopback instead of locking onto a ghost device.
         """
+        from .devices import probe_input_device
         try:
             import pyaudiowpatch as pyaudio
         except ImportError:
@@ -142,19 +173,32 @@ class LoopbackRecorder(QObject):
                 for loopback in pa.get_loopback_device_info_generator():
                     name = str(loopback.get("name", ""))
                     if name == target:
-                        return loopback
+                        if probe_input_device(pa, loopback):
+                            return loopback
+                        log.warning(
+                            "exact-match loopback %r failed probe; falling through",
+                            name,
+                        )
+                        break
                     if substring_match is None and target_lower and target_lower in name.lower():
                         substring_match = loopback
                 if substring_match is not None:
-                    log.info(
-                        "picked loopback device (substring match for saved %r): %s",
-                        saved_name, substring_match.get("name", "?"),
+                    if probe_input_device(pa, substring_match):
+                        log.info(
+                            "picked loopback device (substring match for saved %r): %s",
+                            saved_name, substring_match.get("name", "?"),
+                        )
+                        return substring_match
+                    log.warning(
+                        "substring-match loopback %r failed probe (saved %r is stale); "
+                        "falling back to default-output loopback",
+                        substring_match.get("name", "?"), saved_name,
                     )
-                    return substring_match
-                log.warning(
-                    "saved loopback device %r not found; falling back to default-output loopback",
-                    saved_name,
-                )
+                else:
+                    log.warning(
+                        "saved loopback device %r not found; falling back to default-output loopback",
+                        saved_name,
+                    )
 
             wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
             default_speakers = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
@@ -318,9 +362,35 @@ class LoopbackRecorder(QObject):
             if self._writer is not None:
                 # Non-blocking enqueue -- writer thread drains to disk.
                 self._writer.write_frames(in_data)
+            # PCM array; needed for the silence tracker regardless of
+            # whether the live consumer (chunk_buffer) wants it.
+            pcm = np.frombuffer(in_data, dtype=np.int16)
+            # Silence tracker: feed the raw int16 (not the downsampled
+            # mono) so RMS reflects the actual rendered amplitude on
+            # the endpoint, not the post-resample numerics.
+            self._silence_tracker.write(pcm, now)
+            if self._last_silence_check_wallclock is None:
+                self._last_silence_check_wallclock = now
+            elif now - self._last_silence_check_wallclock >= self._SILENCE_CHECK_INTERVAL_S:
+                self._last_silence_check_wallclock = now
+                is_silent_now = self._silence_tracker.is_silent(now)
+                if is_silent_now and not self._silence_state:
+                    self._silence_state = True
+                    log.warning(
+                        "LoopbackRecorder silence detected after %.0fs "
+                        "(RMS %.1f dBFS)",
+                        self._silence_tracker.silence_window_sec,
+                        self._silence_tracker.current_rms_dbfs(),
+                    )
+                    # Emit from the callback thread; Qt marshalling
+                    # via auto-connect handles the cross-thread.
+                    self.silence_detected.emit()
+                elif not is_silent_now and self._silence_state:
+                    self._silence_state = False
+                    log.info("LoopbackRecorder silence cleared")
+                    self.silence_cleared.emit()
             # Skip chunk_buffer + downmix when no live consumer (issue #47).
             if self.chunk_buffer is not None:
-                pcm = np.frombuffer(in_data, dtype=np.int16)
                 mono16k = to_mono_16k(pcm, channels=self._channels, src_rate=self._native_rate)
                 self.chunk_buffer.write(self.source_name, mono16k)
         except Exception as exc:  # pragma: no cover - audio-callback safety net

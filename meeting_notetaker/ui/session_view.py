@@ -42,6 +42,7 @@ from ..models.transcript import (
 )
 from ..utils.export import (
     build_print_markdown,
+    default_export_document_title,
     default_export_filename,
     export_initial_save_path,
 )
@@ -81,6 +82,13 @@ class SessionView(QWidget):
     # when the user has the feature enabled in Settings. Carries the
     # session id and the LLM target key ("claude" / "copilot").
     send_to_llm_clicked = pyqtSignal(str, str)      # session_id, target
+    # Issue #90: sidekick button that opens the SessionPromptEditDialog
+    # with the rendered prompt for one-shot editing before dispatch.
+    # Same enable gate as the Send/Generate pair; MainApp does the
+    # render + dialog + downstream routing in one handler. Carries the
+    # session id; the target (claude / copilot) is resolved by MainApp
+    # from the automation toggle the same way send_to_llm_clicked does.
+    edit_and_send_clicked = pyqtSignal(str)         # session_id
     # Issue #80: empty-state affordance on the Transcript tab. MainApp
     # opens the ImportTranscriptDialog and writes the result to
     # raw.transcript.md. Carries the session id for symmetry with the
@@ -213,6 +221,15 @@ class SessionView(QWidget):
         # "every populated section on". MainApp.set_appendix_export_defaults
         # plumbs the saved config into this field.
         self._appendix_export_defaults = None
+        # #92 outline transforms. MainApp pushes the config values via
+        # set_export_outline_options on startup + Settings save.
+        self._export_heading_numbering: bool = False
+        self._export_toc: bool = False
+        self._export_toc_max_depth: int = 3
+        # #94: when True AND Word COM is available, "Save as PDF..."
+        # routes through Word for native TOC + bookmarks instead of
+        # Qt's PDF backend + pypdf post-process.
+        self._use_word_for_pdf: bool = False
         self._live_notes_save_timer = QTimer(self)
         self._live_notes_save_timer.setSingleShot(True)
         self._live_notes_save_timer.setInterval(800)
@@ -306,8 +323,27 @@ class SessionView(QWidget):
         # ellipsis but the dropdown shows the full text.
         self._prompt_template_picker.setMaximumWidth(200)
         synthesis.addWidget(self._prompt_template_picker)
-        self._generate_btn = QPushButton("Generate Synthesis Prompt", self)
+        # Split-button: main click runs the standard Generate /
+        # Send action; the dropdown arrow exposes the "Edit prompt
+        # before sending" path (#90). One button instead of a
+        # sidekick keeps the row tight and matches the platform
+        # convention (Save / Save As..., etc.). Same enable gate as
+        # the standard click.
+        self._generate_btn = QToolButton(self)
+        self._generate_btn.setText("Generate Synthesis Prompt")
+        self._generate_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly,
+        )
+        self._generate_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup,
+        )
         self._generate_btn.clicked.connect(self._on_generate_prompt)
+        self._generate_menu = QMenu(self._generate_btn)
+        self._generate_edit_action = self._generate_menu.addAction(
+            "Edit prompt before generating...",
+        )
+        self._generate_edit_action.triggered.connect(self._on_edit_and_send)
+        self._generate_btn.setMenu(self._generate_menu)
         synthesis.addWidget(self._generate_btn)
         self._paste_btn = QPushButton("Paste Response Back...", self)
         self._paste_btn.clicked.connect(self._on_paste_notes)
@@ -318,13 +354,29 @@ class SessionView(QWidget):
         # whenever Settings is closed. Copy button stays visible
         # regardless of the toggle (Aaron's call -- the manual copy
         # path is still useful when the extension isn't reachable).
-        self._send_btn = QPushButton("Send to Claude.ai", self)
+        # Same split-button shape as Generate: main click sends, the
+        # dropdown arrow exposes the edit-before-send path.
+        self._send_btn = QToolButton(self)
+        self._send_btn.setText("Send to Claude.ai")
+        self._send_btn.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly,
+        )
+        self._send_btn.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup,
+        )
         self._send_btn.setToolTip(
             "Send the synthesis prompt to the configured web LLM via "
             "the Meeting Notetaker browser extension. The response "
-            "lands in the Synthesis tab automatically."
+            "lands in the Synthesis tab automatically. Use the "
+            "dropdown to edit the rendered prompt before sending."
         )
         self._send_btn.clicked.connect(self._on_send_to_llm)
+        self._send_menu = QMenu(self._send_btn)
+        self._send_edit_action = self._send_menu.addAction(
+            "Edit prompt before sending...",
+        )
+        self._send_edit_action.triggered.connect(self._on_edit_and_send)
+        self._send_btn.setMenu(self._send_menu)
         self._send_btn.setVisible(False)
         synthesis.addWidget(self._send_btn)
         self._copy_btn = QPushButton("Copy", self)
@@ -373,6 +425,14 @@ class SessionView(QWidget):
         self._export_menu = QMenu(self._export_btn)
         self._export_pdf_action = self._export_menu.addAction("Save as PDF...")
         self._export_pdf_action.triggered.connect(self._on_export_pdf)
+        # #94: Save as Word (.docx). Inserts Word's native TOC field
+        # that auto-populates the first time the user opens the file
+        # in Word. Always visible -- the docx itself is cross-
+        # platform, only the optional TOC-population step needs Word.
+        self._export_word_action = self._export_menu.addAction(
+            "Save as Word..."
+        )
+        self._export_word_action.triggered.connect(self._on_export_word)
         # Notion + Confluence actions; visibility re-evaluated whenever
         # the session changes or settings are saved.
         self._export_notion_action = self._export_menu.addAction(
@@ -829,6 +889,7 @@ class SessionView(QWidget):
         self._raw_transcript_text = transcript
         self._transcript_view.setPlainText(rewrite_user_label(transcript, self._user_name))
         self._refresh_transcript_timestamps()
+        self._refresh_transcript_placeholder(session)
         sdir = session_dir(session.id)
         self._notes_view.set_session_dir(sdir)
         self._set_notes_text(notes)
@@ -875,6 +936,7 @@ class SessionView(QWidget):
         if self._session is None:
             return
         self._session.state = state
+        self._refresh_transcript_placeholder(self._session)
         has_live_transcript = (
             self._session.has_transcript
             or bool(self._transcript_view.toPlainText().strip())
@@ -1251,6 +1313,38 @@ class SessionView(QWidget):
         target = max(0, int(start_ms) - _TRANSCRIPT_SEEK_LEAD_MS)
         self.transcript_seek_ms_requested.emit(self._session.id, target)
 
+    def _refresh_transcript_placeholder(self, session) -> None:
+        """Set the Transcript tab's placeholder copy based on session state.
+
+        Three audiences (#87):
+
+          * Fresh session, no recording yet -- guide them to Start /
+            Import.
+          * Recording in progress -- "Live transcript appears here as
+            speech is captured." (Or: "Capture-only mode is on..." when
+            applicable; we keep the message simple.)
+          * Recording finished but no segments returned -- "No speech
+            detected. Use the My Notes tab; the Generate Synthesis
+            Prompt button works from notes alone." This is the
+            mic-only / quiet-narration / walkthrough case.
+        """
+        state = session.state
+        if state in (STATE_COMPLETE, STATE_ERROR) and session.has_transcript:
+            self._transcript_view.setPlaceholderText(
+                "No speech detected in this recording.\n\n"
+                "Add notes in the My Notes tab; Generate Synthesis Prompt "
+                "drafts from notes alone when the transcript is empty."
+            )
+        elif state == STATE_NEW:
+            self._transcript_view.setPlaceholderText(
+                "No transcript yet. Start a recording or use "
+                "File > Import Transcript to bring one in."
+            )
+        else:
+            self._transcript_view.setPlaceholderText(
+                "Transcript appears here once the recording finishes."
+            )
+
     def _refresh_transcript_timestamps(self) -> None:
         """Rebuild the timestamp index from the transcript view text.
 
@@ -1552,6 +1646,58 @@ class SessionView(QWidget):
             # skip -- preview reverts to the QApplication default.
             pass
 
+    def set_rich_source_view(self, enabled: bool) -> None:
+        """Toggle the styled markdown source view (#91) on every editor
+        that hosts one. Currently just the My Notes editor; the
+        Synthesis editor stays plain because synthesized notes are
+        usually printed / exported rather than scanned in-editor."""
+        try:
+            self._live_notes_editor.set_rich_source_view(enabled)
+        except AttributeError:
+            pass
+
+    def set_export_outline_options(
+        self,
+        *,
+        number_headings: bool,
+        include_toc: bool,
+        toc_max_depth: int = 3,
+        use_word_for_pdf: bool = False,
+    ) -> None:
+        """Push the export outline preferences (#92, #94) into the
+        session view. Used by the per-tab Export PDF / Print path --
+        the body is transformed before render so PDFs match the
+        configured preferences. Idempotent.
+
+        ``use_word_for_pdf`` -- #94 follow-up. When True AND Word COM
+        is available, "Save as PDF..." renders via Word's native TOC +
+        PDF export pipeline rather than Qt's PDF backend. When True
+        on a non-Windows host (or Windows without Word), the flag is
+        silently ignored; the Qt path stays the fallback.
+        """
+        self._export_heading_numbering = bool(number_headings)
+        self._export_toc = bool(include_toc)
+        self._export_toc_max_depth = max(1, min(6, int(toc_max_depth)))
+        self._use_word_for_pdf = bool(use_word_for_pdf)
+
+    def set_heading_numbering(self, enabled: bool) -> None:
+        """Toggle preview heading numbering (#92) on every preview-bearing
+        widget. SessionView routes to My Notes, Synthesis, Previous
+        Notes -- so the user sees consistent numbering across tabs.
+        The widgets re-render themselves so the change shows
+        immediately without a session switch."""
+        for widget in (self._live_notes_editor, self._notes_view):
+            try:
+                widget.set_heading_numbering(enabled)
+            except AttributeError:
+                continue
+        # Previous Notes preview is a separate widget; forward through
+        # if it implements the toggle.
+        try:
+            self._previous_view.set_heading_numbering(enabled)
+        except AttributeError:
+            pass
+
     def set_user_name(self, name: str) -> None:
         """Update the display label for the user's mic and refresh the transcript view."""
         new_name = (name or "").strip()
@@ -1714,6 +1860,15 @@ class SessionView(QWidget):
             self.send_to_llm_clicked.emit(
                 self._session.id, self._automation_target
             )
+
+    def _on_edit_and_send(self) -> None:
+        """Dropdown menu item next to Send / Generate (#90): MainApp
+        renders the prompt, opens the SessionPromptEditDialog, and
+        dispatches the edited body through whichever downstream path
+        (automation bridge or clipboard) the current mode requires.
+        We just emit -- the work happens in app.py."""
+        if self._session is not None:
+            self.edit_and_send_clicked.emit(self._session.id)
 
     def _on_import_transcript_clicked(self) -> None:
         """Fire the per-session import signal so MainApp opens the
@@ -2173,14 +2328,27 @@ class SessionView(QWidget):
         self._transcript_empty_row.setVisible(
             has_session and not has_transcript and not is_recording
         )
-        # Generate/paste are available as soon as a transcript exists. The
-        # batch-refinement pass after Stop runs in the background and is
-        # explicitly NOT a gate on synthesis -- the live transcript is good
-        # enough to act on, and any later regenerate will pick up the
-        # refined version automatically.
-        can_synthesize = has_session and has_transcript and not is_recording
+        # Generate/paste are available as soon as the user has SOMETHING for
+        # the LLM to chew on. That's a transcript OR notes -- a mic-only
+        # voice-note / walkthrough session whose audio came out silent
+        # still wants to synthesize from notes alone. The prompt
+        # template already handles a missing transcript section
+        # gracefully.
+        # The batch-refinement pass after Stop runs in the background
+        # and is explicitly NOT a gate on synthesis -- the live
+        # transcript is good enough to act on, and any later regenerate
+        # picks up the refined version automatically.
+        can_synthesize = (
+            has_session and (has_transcript or has_notes) and not is_recording
+        )
         self._generate_btn.setEnabled(can_synthesize)
-        self._paste_btn.setEnabled(has_session and (has_transcript or has_notes) and not is_recording)
+        self._paste_btn.setEnabled(can_synthesize)
+        # Dropdown menu actions (#90) share the same gate. The button-
+        # level enabled state already grays the dropdown arrow, but
+        # disabling the QAction is explicit insurance against the
+        # arrow being clickable when nothing's available.
+        self._generate_edit_action.setEnabled(can_synthesize)
+        self._send_edit_action.setEnabled(can_synthesize)
         # Send button: gated by FOUR conditions. All must be true.
         #
         #   1. There's a transcript to synthesize (can_synthesize).
@@ -2361,6 +2529,21 @@ class SessionView(QWidget):
             body_for_print, apply_inclusion(appendix_data, inclusion),
         )
 
+        # #92: heading numbering + TOC. Applied AFTER the appendix
+        # injection so the auto-TOC catches the appendix section
+        # headings and the numbering covers the whole document.
+        if self._export_heading_numbering or self._export_toc:
+            from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
+            body_for_print = apply_outline(
+                body_for_print,
+                number=self._export_heading_numbering,
+                toc=self._export_toc,
+                max_depth=self._export_toc_max_depth,
+            )
+            # #94: PDF anchor injection happens inside
+            # markdown_to_print_html (the setHtml path); no separate
+            # inject_pdf_anchors call needed here.
+
         printable = build_print_markdown(
             session_title=self._session.title,
             tab_label=tab_label,
@@ -2370,14 +2553,22 @@ class SessionView(QWidget):
 
         sdir = session_dir(self._session.id)
         doc = PrintTextDocument(sdir, parent=self)
-        doc.setMarkdown(printable)
-        # Force every Markdown anchor to render black + underline.
-        # Qt's Markdown parser writes cyan into the character format
-        # at parse time, which the defaultStyleSheet alone can't
-        # override; the walk has to happen after setMarkdown (#78
-        # followup -- the v0.7.6 stylesheet-only fix didn't take
-        # effect in the rendered PDF).
+        # #94: render via setHtml + mistune so the TOC's internal
+        # links carry into the PDF as clickable named-destination
+        # anchors. The setMarkdown path drops internal links
+        # silently.
+        from ..utils.print_html import markdown_to_print_html  # noqa: PLC0415
+        doc.setHtml(markdown_to_print_html(printable))
+        # Force every anchor to render black + underline. Qt's
+        # parser writes cyan into the character format at parse
+        # time, which the defaultStyleSheet alone can't override;
+        # the walk has to happen after setHtml.
         doc.force_anchor_styling()
+        # Stash the body markdown on the doc so the Export PDF
+        # handler can pass it to the pypdf post-processor for
+        # bookmarks + link annotations (#94). Read-only attribute;
+        # no mutation after _build_print_document returns.
+        doc._mn_body_markdown = body_for_print  # noqa: SLF001
         return doc, tab_label
 
     def _on_print(self) -> None:
@@ -2522,6 +2713,25 @@ class SessionView(QWidget):
         if target.suffix.lower() != ".pdf":
             target = target.with_suffix(".pdf")
 
+        # #94: when the user opted into "Use Word for PDF export" AND
+        # Word COM is available, render via Word -- the resulting PDF
+        # has Word's native sidebar bookmarks + clickable TOC entries
+        # without any post-processing. Otherwise fall back to Qt's
+        # PDF backend + pypdf post-process.
+        if self._use_word_for_pdf:
+            from ..utils.word_export import is_word_com_available  # noqa: PLC0415
+            if is_word_com_available():
+                body_md = getattr(doc, "_mn_body_markdown", "") or ""
+                if self._render_pdf_via_word(
+                    body_md=body_md, dst=target, tab_label=tab_label,
+                ):
+                    self.window().statusBar().showMessage(
+                        f"Exported PDF (via Word) to {target.name}", 5000,
+                    )
+                    return
+                # Word path failed -- fall through to Qt so the user
+                # still gets a PDF rather than a silent no-op.
+
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(str(target))
@@ -2536,9 +2746,135 @@ class SessionView(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Export PDF", f"Could not write PDF: {exc}")
             return
+        # #94: post-process the rendered PDF. Qt writes the exact
+        # destination per heading in /Names/Dests during print; the
+        # post-processor copies those entries inline onto each Link
+        # annotation so PDFium-based viewers (Chrome / Edge) actually
+        # navigate to the heading. Non-fatal -- failure leaves the
+        # raw Qt PDF on disk.
+        if self._export_toc or self._export_heading_numbering:
+            body_md = getattr(doc, "_mn_body_markdown", "") or ""
+            if body_md:
+                from ..utils.pdf_post_process import add_pdf_navigation  # noqa: PLC0415
+                add_pdf_navigation(
+                    target,
+                    body_md,
+                    toc_max_depth=self._export_toc_max_depth,
+                )
         self.window().statusBar().showMessage(
             f"Exported PDF to {target.name}", 5000
         )
+
+    def _on_export_word(self) -> None:
+        """Save the active tab as a Word (.docx) document.
+
+        Renders the markdown body via python-docx with a Word native
+        TOC field (when the TOC export setting is on) -- Word
+        populates the TOC the first time the file is opened. On
+        Windows with Word installed, we additionally invoke Word COM
+        to populate the TOC server-side so the file opens fully
+        rendered.
+        """
+        doc, tab_label = self._build_print_document(
+            appendix_defaults=self._appendix_export_defaults,
+        )
+        if doc is None or self._session is None:
+            return
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+        suggested_name = default_export_filename(
+            self._session.title, tab_label, ".docx"
+        )
+        suggested_path = export_initial_save_path(
+            self._export_default_folder,
+            session_dir(self._session.id),
+            suggested_name,
+        )
+        path_str, _filter = QFileDialog.getSaveFileName(
+            self,
+            f"Export {tab_label} as Word",
+            suggested_path,
+            "Word documents (*.docx)",
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        if target.suffix.lower() != ".docx":
+            target = target.with_suffix(".docx")
+
+        body_md = getattr(doc, "_mn_body_markdown", "") or ""
+        from ..utils.word_export import (  # noqa: PLC0415
+            export_to_docx,
+            is_word_com_available,
+            populate_toc_via_word,
+        )
+        # Word doc Title = same components as the filename
+        # (session title + tab label + date), unsanitized so the
+        # rendered title keeps any special characters.
+        doc_title = default_export_document_title(
+            self._session.title, tab_label,
+        )
+        stats = export_to_docx(
+            body_md,
+            target,
+            base_dir=session_dir(self._session.id),
+            title=doc_title,
+            include_toc=self._export_toc,
+            toc_max_depth=self._export_toc_max_depth,
+        )
+        if stats.error:
+            QMessageBox.warning(
+                self, "Export Word",
+                f"Could not write Word document: {stats.error}",
+            )
+            return
+        # Best-effort TOC population via Word COM -- skipped silently
+        # on non-Windows / no Word. Without this, Word shows the TOC
+        # placeholder until the user updates the field manually.
+        if self._export_toc and is_word_com_available():
+            populate_toc_via_word(target, save_in_place=True)
+        self.window().statusBar().showMessage(
+            f"Exported Word document to {target.name}", 5000,
+        )
+
+    def _render_pdf_via_word(
+        self, *, body_md: str, dst: Path, tab_label: str,
+    ) -> bool:
+        """Word-COM PDF render path (#94 follow-up).
+
+        Renders markdown -> .docx with a native TOC field, then drives
+        Word to populate the TOC and ExportAsFixedFormat -> PDF. Word
+        emits a PDF with native sidebar bookmarks and clickable TOC
+        hyperlinks via the CreateBookmarks=1 flag.
+
+        Returns True on success, False on any failure. The .docx
+        intermediate is written to a temp path next to the PDF and
+        cleaned up at the end so the user only sees the PDF.
+        """
+        if self._session is None or not body_md:
+            return False
+        from ..utils.word_export import (  # noqa: PLC0415
+            export_to_docx,
+            export_to_pdf_via_word,
+        )
+        import tempfile  # noqa: PLC0415
+
+        doc_title = default_export_document_title(
+            self._session.title, tab_label,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp_docx = Path(td) / f"{dst.stem}.docx"
+            stats = export_to_docx(
+                body_md,
+                tmp_docx,
+                base_dir=session_dir(self._session.id),
+                title=doc_title,
+                include_toc=self._export_toc,
+                toc_max_depth=self._export_toc_max_depth,
+            )
+            if stats.error:
+                return False
+            return export_to_pdf_via_word(tmp_docx, dst)
 
 
 _TIMESTAMP_RE = re.compile(r"^\[(\d+):(\d{2}):(\d{2})\]")

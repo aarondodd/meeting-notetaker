@@ -3,3 +3,9 @@ pytest>=7.0.0
 pytest-qt>=4.2.0
 pyinstaller>=6.0.0
 pre-commit>=3.0.0
+# Issue #94 acceptance test: pypdfium2 is Chrome/Edge's PDF engine
+# in Python form. The PDF post-process test renders a PDF via Qt,
+# applies the navigation patch, and verifies link annotations
+# resolve via PDFium -- so "passing test" maps to "user can click
+# the link in their browser PDF viewer."
+pypdfium2>=5.0

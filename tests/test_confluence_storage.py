@@ -207,3 +207,28 @@ def test_xml_attribute_escaping_in_links():
 def test_inline_code_with_lt_gt_escaped():
     out = markdown_to_storage("Inline `<tag>` here.")
     assert "<code>&lt;tag&gt;</code>" in out
+
+
+# ---- #94 native TOC macro -----------------------------------------------
+
+def test_build_toc_macro_default_max_level():
+    from meeting_notetaker.integrations.confluence_storage import build_toc_macro
+    out = build_toc_macro(max_level=3)
+    assert '<ac:structured-macro ac:name="toc">' in out
+    assert '<ac:parameter ac:name="maxLevel">3</ac:parameter>' in out
+    assert out.endswith("</ac:structured-macro>")
+
+
+def test_build_toc_macro_clamps_max_level_to_one_through_six():
+    from meeting_notetaker.integrations.confluence_storage import build_toc_macro
+    assert 'maxLevel">1<' in build_toc_macro(max_level=0)
+    assert 'maxLevel">1<' in build_toc_macro(max_level=-5)
+    assert 'maxLevel">6<' in build_toc_macro(max_level=10)
+    assert 'maxLevel">6<' in build_toc_macro(max_level=100)
+
+
+def test_build_toc_macro_respects_int_coercion():
+    """A string-typed max_level still works -- explicit cast inside
+    the helper guards against config values arriving as strings."""
+    from meeting_notetaker.integrations.confluence_storage import build_toc_macro
+    assert 'maxLevel">4<' in build_toc_macro(max_level="4")  # type: ignore[arg-type]

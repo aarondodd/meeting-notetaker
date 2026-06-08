@@ -247,9 +247,42 @@ class SettingsDialog(QDialog):
         else:
             self._loopback_picker.setToolTip(
                 "System audio capture (WASAPI loopback). (System default) picks "
-                "the loopback paired with the OS default output."
+                "the loopback paired with the OS default output. Ignored when "
+                "'Capture all audio outputs' is on -- that mode opens every "
+                "output endpoint and mixes at finalize."
             )
         audio_form.addRow("Loopback device:", self._loopback_picker)
+
+        # Multi-endpoint capture toggle (#85). Default ON. When on,
+        # the orchestrator opens one stream per WASAPI output endpoint
+        # and mixes sidecars at finalize so a meeting app routing to
+        # a non-default endpoint mid-call still gets captured. Users
+        # who hit WASAPI quirks on their hardware can flip off to
+        # fall back to the single-endpoint path.
+        self._multi_endpoint = QCheckBox("Capture all audio outputs (recommended)", self)
+        self._multi_endpoint.setChecked(config.audio.multi_endpoint_capture)
+        self._multi_endpoint.setToolTip(
+            "When on (default), the recorder opens every WASAPI output "
+            "endpoint -- laptop speakers, headphones, monitor speakers, "
+            "HDMI -- and mixes them into one sys.wav at stop. Protects "
+            "against Windows / meeting-app routing changes mid-call. "
+            "Sidecar WAVs are temporarily created during recording and "
+            "removed at stop. Flip off to fall back to single-endpoint "
+            "capture if you hit WASAPI errors on your hardware."
+        )
+        audio_form.addRow(self._multi_endpoint)
+        if not self._loopback_devices:
+            self._multi_endpoint.setEnabled(False)
+        # Caption beneath the toggle so the trade-off is visible
+        # without hovering the tooltip.
+        multi_caption = QLabel(
+            "<i>Captures every Windows output endpoint and mixes at stop "
+            "(default). Off: captures only the picked loopback device.</i>",
+            self,
+        )
+        multi_caption.setWordWrap(True)
+        multi_caption.setStyleSheet("color: palette(mid);")
+        audio_form.addRow(multi_caption)
 
         self._retain_default = QCheckBox(
             "Retain audio files after transcription (default for new sessions)", self
@@ -677,6 +710,21 @@ class SettingsDialog(QDialog):
         preview_form.addRow("Size:", self._preview_font_size)
         fonts_layout.addWidget(preview_group)
 
+        # Markdown rich source view (#91). Sits under Fonts because it
+        # changes how the editor renders, parallel to the font picker.
+        self._markdown_rich_editor = QCheckBox(
+            "Style markdown source in the editor", fonts_group,
+        )
+        self._markdown_rich_editor.setChecked(config.ui.markdown_rich_editor)
+        self._markdown_rich_editor.setToolTip(
+            "Render markdown structure cues in the My Notes editor: "
+            "headings sized + bold, bold/italic shown through, code "
+            "monospace, links underlined. The markdown syntax stays "
+            "visible and editable. Turn off for a plain monospace "
+            "editor."
+        )
+        fonts_layout.addWidget(self._markdown_rich_editor)
+
         self._add_section("Fonts", fonts_group)
 
         # Synthesis (combined Automation + Prompt Templates) ---------
@@ -827,6 +875,13 @@ class SettingsDialog(QDialog):
         prompts_layout.addWidget(self._extract_attendees)
 
         prompts_row = QHBoxLayout()
+        # Prompt editor (#89). Replaces the AppData-folder edit workflow
+        # with an in-app editor that archives every save so reverts are
+        # one click. Open Prompts Folder stays available as an escape
+        # hatch for power users / external editors.
+        self._edit_prompts_btn = QPushButton("Edit Prompts...", self)
+        self._edit_prompts_btn.clicked.connect(self._open_prompt_editor)
+        prompts_row.addWidget(self._edit_prompts_btn)
         self._open_prompts_btn = QPushButton("Open Prompts Folder", self)
         self._open_prompts_btn.clicked.connect(self._open_prompts_folder)
         prompts_row.addWidget(self._open_prompts_btn)
@@ -972,6 +1027,93 @@ class SettingsDialog(QDialog):
             cb.setEnabled(self._appendix_export_include.isChecked())
             export_form.addRow(cb)
             self._appendix_section_checkboxes[field_name] = cb
+
+        # Document outline transforms (#92).
+        outline_blurb = QLabel(
+            "<b>Document outline</b>", self,
+        )
+        outline_blurb.setTextFormat(Qt.TextFormat.RichText)
+        export_form.addRow(outline_blurb)
+
+        self._heading_numbering = QCheckBox(
+            "Auto-number headings in preview and exports", self,
+        )
+        self._heading_numbering.setChecked(
+            getattr(config.synthesis, "heading_numbering", False),
+        )
+        self._heading_numbering.setToolTip(
+            "Prepends dotted-decimal numbers to every heading: "
+            "first H1 becomes '1 Heading', nested H2 becomes '1.1 "
+            "Sub-heading', etc. Applies at render and export time; "
+            "the on-disk notes.md file is unchanged."
+        )
+        export_form.addRow(self._heading_numbering)
+
+        self._toc_in_exports = QCheckBox(
+            "Generate table of contents in exports", self,
+        )
+        self._toc_in_exports.setChecked(
+            getattr(config.synthesis, "toc_in_exports", False),
+        )
+        self._toc_in_exports.setToolTip(
+            "Adds an auto-generated '## Contents' section at the top "
+            "of every export (PDF / Notion / Confluence). The Preview "
+            "already has a sidebar table of contents, so no inline "
+            "TOC is added there. PDF TOC entries link to anchors -- "
+            "click-to-navigate depends on the PDF viewer."
+        )
+        export_form.addRow(self._toc_in_exports)
+
+        # Sub-option: TOC max depth.
+        toc_depth_row = QHBoxLayout()
+        toc_depth_row.addWidget(QLabel("    Max depth:", self))
+        self._toc_max_depth = QSpinBox(self)
+        self._toc_max_depth.setRange(1, 6)
+        self._toc_max_depth.setValue(
+            getattr(config.synthesis, "toc_max_depth", 3),
+        )
+        self._toc_max_depth.setToolTip(
+            "Heading levels to include in the TOC. 3 (H1-H3) is a "
+            "reasonable default; deeper exports include sub-sub-"
+            "sections at the cost of a longer TOC."
+        )
+        self._toc_max_depth.setEnabled(self._toc_in_exports.isChecked())
+        self._toc_in_exports.toggled.connect(self._toc_max_depth.setEnabled)
+        toc_depth_row.addWidget(self._toc_max_depth)
+        toc_depth_row.addStretch(1)
+        export_form.addRow(toc_depth_row)
+
+        # #94: route PDF export through Word when available so the
+        # PDF gets Word's native clickable TOC + sidebar bookmarks
+        # without any post-processing. Disabled if win32com isn't
+        # importable (non-Windows or Windows without pywin32) -- the
+        # cross-platform Qt + pypdf path stays the default fallback.
+        from ..utils.word_export import is_word_com_available  # noqa: PLC0415
+        word_com_ok = is_word_com_available()
+        self._use_word_for_pdf = QCheckBox(
+            "Use Word for PDF export (Windows only)", self,
+        )
+        self._use_word_for_pdf.setChecked(
+            getattr(config.synthesis, "use_word_for_pdf", False)
+            and word_com_ok,
+        )
+        self._use_word_for_pdf.setEnabled(word_com_ok)
+        if word_com_ok:
+            self._use_word_for_pdf.setToolTip(
+                "Render the PDF via Word's native PDF export instead "
+                "of Qt's PDF backend. Produces a PDF with Word's "
+                "native sidebar bookmarks and clickable table of "
+                "contents -- no post-processing needed. Requires "
+                "Word to be installed."
+            )
+        else:
+            self._use_word_for_pdf.setToolTip(
+                "Disabled because Word COM (pywin32 + installed "
+                "Word) is unavailable on this host. The Qt PDF path "
+                "still emits clickable TOC entries via the #94 post-"
+                "process."
+            )
+        export_form.addRow(self._use_word_for_pdf)
 
         self._add_section("Export", export_group)
 
@@ -1134,6 +1276,7 @@ class SettingsDialog(QDialog):
         self._config.audio.vad_min_silence_ms = self._vad_slider.value()
         self._config.audio.mic_device_name = self._mic_picker.currentData() or ""
         self._config.audio.loopback_device_name = self._loopback_picker.currentData() or ""
+        self._config.audio.multi_endpoint_capture = self._multi_endpoint.isChecked()
         self._config.calendar.watch_calendar = self._watch_calendar.isChecked()
         self._config.calendar.window_minutes = int(self._window_slider.value())
         self._config.speakers.enabled = self._speakers_enabled.isChecked()
@@ -1163,6 +1306,7 @@ class SettingsDialog(QDialog):
             self._preview_font_picker.currentData() or ""
         )
         self._config.ui.preview_font_size = int(self._preview_font_size.value())
+        self._config.ui.markdown_rich_editor = self._markdown_rich_editor.isChecked()
         self._config.synthesis.automation_enabled = self._auto_enabled.isChecked()
         self._config.synthesis.llm_target = (
             self._auto_target.currentData() or "claude"
@@ -1190,6 +1334,12 @@ class SettingsDialog(QDialog):
         )
         for field, cb in self._appendix_section_checkboxes.items():
             setattr(self._config.synthesis, field, cb.isChecked())
+        self._config.synthesis.heading_numbering = self._heading_numbering.isChecked()
+        self._config.synthesis.toc_in_exports = self._toc_in_exports.isChecked()
+        self._config.synthesis.toc_max_depth = int(self._toc_max_depth.value())
+        self._config.synthesis.use_word_for_pdf = (
+            self._use_word_for_pdf.isChecked()
+        )
         self._config.backup.folder = self._backup_folder_edit.text().strip()
         if self._backup_sched_on_close.isChecked():
             self._config.backup.schedule = "on_close"
@@ -1585,6 +1735,38 @@ class SettingsDialog(QDialog):
     def _open_prompts_folder(self) -> None:
         path = prompts_dir()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_prompt_editor(self) -> None:
+        """Open the in-app prompt editor (#89). On close, repopulate
+        the default-template dropdown so any new / deleted prompts
+        surface immediately without reopening Settings."""
+        from .prompt_editor_dialog import PromptEditorDialog  # noqa: PLC0415
+
+        dlg = PromptEditorDialog(parent=self)
+        dlg.exec()
+        # Repopulate the default-template picker so newly-created
+        # prompts show up and deleted ones drop out. Preserve the
+        # currently-selected default if it still exists.
+        current = self._default_template.currentData() if hasattr(
+            self, "_default_template"
+        ) else ""
+        self._default_template.blockSignals(True)
+        self._default_template.clear()
+        for tpl in _prompts_mod.list_templates():
+            self._default_template.addItem(tpl.display_name, tpl.name)
+        if current:
+            for i in range(self._default_template.count()):
+                if self._default_template.itemData(i) == current:
+                    self._default_template.setCurrentIndex(i)
+                    break
+        self._default_template.blockSignals(False)
+        # The parent is the MainWindow; MainApp's _on_edit_prompts
+        # owns the SessionView refresh when the editor is opened from
+        # the Tools menu. Settings opens the editor inline; we let the
+        # next New Session / session-switch tick refresh the in-meeting
+        # picker. A future enhancement could re-emit a signal here to
+        # force the refresh immediately; keeping the surface narrow
+        # for now.
 
     def _open_vocabulary_file(self) -> None:
         path = seed_vocabulary_file()

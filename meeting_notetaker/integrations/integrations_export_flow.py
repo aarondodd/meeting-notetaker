@@ -89,6 +89,15 @@ def run_notion_export(
         attachments=(
             session_attachments if selection.include_attachments else []
         ),
+        number_headings=getattr(
+            main_app.config.synthesis, "heading_numbering", False,
+        ),
+        include_toc=getattr(
+            main_app.config.synthesis, "toc_in_exports", False,
+        ),
+        toc_max_depth=int(getattr(
+            main_app.config.synthesis, "toc_max_depth", 3,
+        ) or 3),
     )
     del tab_label  # picker title carries the user's wording now
     _run_worker_with_progress(
@@ -150,6 +159,15 @@ def run_confluence_export(
         attachments=(
             session_attachments if selection.include_attachments else []
         ),
+        number_headings=getattr(
+            main_app.config.synthesis, "heading_numbering", False,
+        ),
+        include_toc=getattr(
+            main_app.config.synthesis, "toc_in_exports", False,
+        ),
+        toc_max_depth=int(getattr(
+            main_app.config.synthesis, "toc_max_depth", 3,
+        ) or 3),
     )
     del tab_label  # picker title carries the user's wording now
     _run_worker_with_progress(

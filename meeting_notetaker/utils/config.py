@@ -9,6 +9,7 @@ Schema (config.toml):
     vad_min_silence_ms = 500
     mic_device_name = ""               # empty -> system default; substring match
     loopback_device_name = ""          # empty -> system default; substring match (Windows-only)
+    multi_endpoint_capture = true      # capture every WASAPI output endpoint and mix at finalize (Windows-only)
 
     [transcription]
     model_size = "small.en"
@@ -80,6 +81,15 @@ class AudioConfig:
     vad_min_silence_ms: int = 500
     mic_device_name: str = ""
     loopback_device_name: str = ""
+    # Multi-endpoint loopback capture (#85). When True, the recorder
+    # opens one loopback stream per WASAPI output endpoint and mixes
+    # at finalize. Defaults ON because Aaron's #84 case is the
+    # canonical Windows multi-monitor failure mode (Teams routes to a
+    # different endpoint than the one the user expected) and the
+    # disk cost is held to near-single-endpoint by per-endpoint RMS
+    # gating. Users who hit WASAPI stale-handle quirks at start can
+    # toggle this off to fall back to single-endpoint mode.
+    multi_endpoint_capture: bool = True
 
 
 @dataclass
@@ -173,6 +183,13 @@ class UiConfig:
     # preserves the screenshare-friendly setup.
     notes_popout_geometry: str = ""
     notes_popout_always_on_top: bool = False
+    # Styled markdown source highlighting in the My Notes editor (#91).
+    # When True, the editor decorates the source with heading sizes,
+    # bold/italic/code styling, dimmed markers, etc. When False the
+    # editor reverts to plain monospace. Defaults True because the
+    # styling is conservative + based on palette colors so it adapts
+    # to light + dark themes without forcing one look.
+    markdown_rich_editor: bool = True
 
 
 @dataclass
@@ -228,11 +245,11 @@ class SynthesisConfig:
     # rich fields. User opts in via Settings > Synthesis Prompts
     # when they want LLM backfill from in-meeting mentions.
     auto_extract_attendee_details: bool = False
-    # When True, the "## Attendee Details (auto-extracted)" appendix
-    # is removed from the saved notes.md after parsing. Default OFF
-    # so the user can see what the LLM extracted (transparency); flip
-    # ON if the appendix is cluttering shared synthesis exports.
-    strip_attendee_appendix: bool = False
+    # #93: deprecated as of v0.7.9. The raw "(auto-extracted)" H2
+    # sections are always stripped from notes.md now; the sidecar is
+    # the canonical source for render + export. The field stays so
+    # old config files load cleanly, but its value is ignored.
+    strip_attendee_appendix: bool = True
     # Default prompt-template filename used by sessions that don't
     # have a per-session override. Empty string falls back to
     # "default.md" (the bundled generic template). Settings >
@@ -273,6 +290,30 @@ class SynthesisConfig:
     appendix_export_referenced_attachments: bool = True
     appendix_export_session_attachments: bool = True
     appendix_export_links: bool = True
+    # Outline transforms (#92). When enabled, applied at render time
+    # to the synthesis body before it reaches Preview / PDF / Notion /
+    # Confluence. Off by default so existing exports stay byte-for-
+    # byte identical until the user opts in.
+    #   - heading_numbering: prefix every heading with a dotted-
+    #     decimal counter ("1.2.3 Heading"). Applies in Preview AND
+    #     every export.
+    #   - toc_in_exports: prepend an auto-generated table of contents
+    #     under a "## Contents" heading. Exports only (PDF, Notion,
+    #     Confluence) -- the Preview already has a sidebar TOC via
+    #     PreviewWithToc, so an inline TOC would duplicate.
+    heading_numbering: bool = False
+    toc_in_exports: bool = False
+    # TOC depth ceiling. Default 3 (H1-H3, or H2-H4 when skip_h1).
+    # Constrained to 1-6 to match markdown's heading range.
+    toc_max_depth: int = 3
+    # #94: when True AND the host is Windows AND Word is installed,
+    # "Save as PDF..." renders to a temp .docx first, opens it in
+    # Word, populates the native TOC field, and exports to PDF via
+    # Word's ExportAsFixedFormat. The PDF gets Word's native sidebar
+    # bookmarks + clickable TOC entries with no post-processing. Off
+    # by default; Qt's native PDF path (with pypdf post-processing
+    # for clickable TOC entries) is the cross-platform fallback.
+    use_word_for_pdf: bool = False
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

@@ -38,6 +38,27 @@ _HEADING_TYPE = {
 }
 
 
+def build_toc_block() -> dict[str, Any]:
+    """Return Notion's native auto-TOC block (#94).
+
+    Notion renders the ``table_of_contents`` block as a clickable
+    nested list of the page's headings -- server-side, auto-updating,
+    and styled to match Notion's native UI. This is strictly better
+    than emitting our own markdown TOC bullet list, which Notion
+    renders as non-clickable text.
+
+    Notion's TOC block has no max_depth parameter -- it shows all
+    heading levels found on the page. Configure ``toc_max_depth`` on
+    the source-side numbering / outline transforms if you want to
+    suppress deeper headings before they reach Notion.
+    """
+    return {
+        "object": "block",
+        "type": "table_of_contents",
+        "table_of_contents": {},
+    }
+
+
 def markdown_to_blocks(
     markdown_text: str,
     *,
