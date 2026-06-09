@@ -1413,6 +1413,9 @@ class MainApp(QObject):
         self.window.save_to_obsidian_requested.connect(
             self._on_file_menu_save_to_obsidian,
         )
+        self.window.save_to_onenote_requested.connect(
+            self._on_file_menu_save_to_onenote,
+        )
         # File > Import Transcript... (#80) -- routes to the same
         # handler the SessionView's empty-state Import button uses.
         self.window.import_transcript_requested.connect(
@@ -1472,6 +1475,7 @@ class MainApp(QObject):
         sv.export_to_notion_requested.connect(self._on_export_to_notion)
         sv.export_to_confluence_requested.connect(self._on_export_to_confluence)
         sv.export_to_obsidian_requested.connect(self._on_export_to_obsidian)
+        sv.export_to_onenote_requested.connect(self._on_export_to_onenote)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
         # Click-to-tag attendee sidebar. The session-view passes its own
         # session_id; we forward to controller.tag_speaker which captures
@@ -2715,10 +2719,15 @@ class MainApp(QObject):
             self.config.obsidian.vault_root
             and self.config.obsidian.last_verified_at
         )
+        onenote_ready = bool(
+            self.config.onenote.enabled
+            and self.config.onenote.last_verified_at
+        )
         self.window.session_view.set_integration_targets(
             notion_enabled=notion_ready,
             confluence_enabled=confluence_ready,
             obsidian_enabled=obsidian_ready,
+            onenote_enabled=onenote_ready,
         )
 
     def _on_export_to_notion(
@@ -2751,6 +2760,18 @@ class MainApp(QObject):
         from .integrations.integrations_export_flow import run_obsidian_export  # noqa: PLC0415
 
         run_obsidian_export(
+            self,
+            session_id=session_id,
+            tab_label=tab_label,
+            body=body,
+        )
+
+    def _on_export_to_onenote(
+        self, session_id: str, tab_label: str, body: str,
+    ) -> None:
+        from .integrations.integrations_export_flow import run_onenote_export  # noqa: PLC0415
+
+        run_onenote_export(
             self,
             session_id=session_id,
             tab_label=tab_label,
@@ -2790,6 +2811,13 @@ class MainApp(QObject):
             return
         body, label = sv._active_tab_body_and_label()  # noqa: SLF001
         self._on_export_to_obsidian(sv._session.id, label, body)  # noqa: SLF001
+
+    def _on_file_menu_save_to_onenote(self) -> None:
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            return
+        body, label = sv._active_tab_body_and_label()  # noqa: SLF001
+        self._on_export_to_onenote(sv._session.id, label, body)  # noqa: SLF001
 
     def _on_open_fonts_settings(self) -> None:
         """View > Editor & Preview Fonts... opens Settings landed on

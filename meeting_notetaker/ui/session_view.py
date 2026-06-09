@@ -126,6 +126,7 @@ class SessionView(QWidget):
     export_to_notion_requested = pyqtSignal(str, str, str)
     export_to_confluence_requested = pyqtSignal(str, str, str)
     export_to_obsidian_requested = pyqtSignal(str, str, str)
+    export_to_onenote_requested = pyqtSignal(str, str, str)
     # Click-to-tag for in-meeting speaker anchoring. The sidebar emits
     # (session_id, name) per click; the controller persists a SpeakerTag
     # and the post-meeting refiner uses tags to constrain the clusterer.
@@ -448,10 +449,15 @@ class SessionView(QWidget):
             "Save to Obsidian..."
         )
         self._export_obsidian_action.triggered.connect(self._on_export_obsidian)
+        self._export_onenote_action = self._export_menu.addAction(
+            "Save to OneNote..."
+        )
+        self._export_onenote_action.triggered.connect(self._on_export_onenote)
         # Hidden by default; MainApp toggles via set_integration_targets().
         self._export_notion_action.setVisible(False)
         self._export_confluence_action.setVisible(False)
         self._export_obsidian_action.setVisible(False)
+        self._export_onenote_action.setVisible(False)
         self._export_btn.setMenu(self._export_menu)
         synthesis.addWidget(self._export_btn)
         # Legacy alias so older test references to _export_pdf_btn don't
@@ -2598,14 +2604,16 @@ class SessionView(QWidget):
     def set_integration_targets(
         self, *, notion_enabled: bool, confluence_enabled: bool,
         obsidian_enabled: bool = False,
+        onenote_enabled: bool = False,
     ) -> None:
         """MainApp calls this whenever Settings is saved or on startup
-        so the Export menu surfaces Notion / Confluence / Obsidian only
-        when the relevant integration's verify stamp is present (#79
-        / #96)."""
+        so the Export menu surfaces Notion / Confluence / Obsidian /
+        OneNote only when the relevant integration's verify stamp is
+        present (#79 / #96 / #100)."""
         self._export_notion_action.setVisible(notion_enabled)
         self._export_confluence_action.setVisible(confluence_enabled)
         self._export_obsidian_action.setVisible(obsidian_enabled)
+        self._export_onenote_action.setVisible(onenote_enabled)
 
     def _active_tab_body_and_label(self) -> tuple[str, str]:
         """Return (markdown_body, tab_label) for the currently viewed
@@ -2691,6 +2699,12 @@ class SessionView(QWidget):
             return
         body, label = self._active_tab_body_and_label()
         self.export_to_obsidian_requested.emit(self._session.id, label, body)
+
+    def _on_export_onenote(self) -> None:
+        if self._session is None:
+            return
+        body, label = self._active_tab_body_and_label()
+        self.export_to_onenote_requested.emit(self._session.id, label, body)
 
     def _on_export_pdf(self) -> None:
         """Save the active tab as a PDF via Qt's native PDF backend.

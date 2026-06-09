@@ -133,6 +133,72 @@ class NotionPickerBrowser:
         )
 
 
+class OneNotePickerBrowser:
+    """Adapts OneNoteClient to the picker's browse interface (#100).
+
+    Hierarchy:
+
+      * notebooks -- expandable, NOT selectable (pages can't live
+        directly under a notebook).
+      * section groups -- expandable, NOT selectable.
+      * sections -- leaf, selectable; the new page will land here.
+
+    The dialog gates OK on ``node.kind`` (sections only); see
+    ``_on_selection_changed``.
+    """
+
+    def __init__(self, client) -> None:
+        self._client = client
+        self._notebooks = []
+        self._lookup: dict[str, object] = {}
+
+    def browse_root(self) -> list[PickerNode]:
+        self._notebooks = self._client.list_notebooks()
+        out: list[PickerNode] = []
+        for nb in self._notebooks:
+            self._lookup[nb.id] = nb
+            out.append(PickerNode(
+                id=nb.id, title=nb.name,
+                has_children=bool(nb.sections or nb.section_groups),
+                kind="notebook",
+            ))
+        return out
+
+    def browse_children(self, node: PickerNode) -> list[PickerNode]:
+        parent = self._lookup.get(node.id)
+        if parent is None:
+            return []
+        sections = getattr(parent, "sections", []) or []
+        groups = getattr(parent, "section_groups", []) or []
+        out: list[PickerNode] = []
+        for g in groups:
+            self._lookup[g.id] = g
+            out.append(PickerNode(
+                id=g.id, title=g.name,
+                has_children=bool(g.sections or g.section_groups),
+                kind="section_group",
+            ))
+        for s in sections:
+            self._lookup[s.id] = s
+            out.append(PickerNode(
+                id=s.id, title=s.name,
+                has_children=False,
+                kind="section",
+            ))
+        return out
+
+    def create_folder(
+        self, parent: Optional[PickerNode], name: str,
+    ) -> PickerNode:
+        """Not supported in v1. Surface a clear error so the user
+        knows to create the section in OneNote itself."""
+        raise NotImplementedError(
+            "Creating new OneNote sections from the picker isn't "
+            "supported yet. Add the section in OneNote, then re-open "
+            "this dialog."
+        )
+
+
 class ConfluencePickerBrowser:
     """Adapts ConfluenceClient to the picker's browse interface."""
 
@@ -457,8 +523,13 @@ class IntegrationsPickerDialog(QDialog):
     def _on_selection_changed(self) -> None:
         node = self._current_node()
         has_pickable = node is not None
-        # Spaces aren't valid destinations -- only pages can be parents.
-        if node is not None and node.kind == "space":
+        # Some kinds are expandable but not selectable as a parent:
+        #   * Confluence spaces -- only pages can be parents.
+        #   * OneNote notebooks + section groups -- pages can only
+        #     live under sections (#100).
+        if node is not None and node.kind in (
+            "space", "notebook", "section_group",
+        ):
             has_pickable = False
         self._ok_btn.setEnabled(has_pickable)
         self._star_btn.setEnabled(has_pickable)

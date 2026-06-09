@@ -155,6 +155,7 @@ class MainWindow(QMainWindow):
     save_to_notion_requested = pyqtSignal()
     save_to_confluence_requested = pyqtSignal()
     save_to_obsidian_requested = pyqtSignal()
+    save_to_onenote_requested = pyqtSignal()
     # Issue #80: File > Import transcript... -- pulls a transcript from
     # an external source into the selected session (no recording needed).
     # MainApp opens the dialog, writes raw.transcript.md on accept, and
@@ -273,6 +274,11 @@ class MainWindow(QMainWindow):
             self.save_to_obsidian_requested.emit,
         )
         save_menu.addAction(self._action_save_obsidian)
+        self._action_save_onenote = QAction("Save to OneNote...", self)
+        self._action_save_onenote.triggered.connect(
+            self.save_to_onenote_requested.emit,
+        )
+        save_menu.addAction(self._action_save_onenote)
         self._file_save_menu = save_menu
         # Delete submenu: recording-only vs the whole session, matching
         # the right-click split so users don't fat-finger the wrong one.
@@ -384,6 +390,7 @@ class MainWindow(QMainWindow):
             self._action_save_notion,
             self._action_save_confluence,
             self._action_save_obsidian,
+            self._action_save_onenote,
             self._action_pop_out_notes,
         ):
             action.setEnabled(False)
@@ -874,6 +881,7 @@ class MainWindow(QMainWindow):
         self._action_save_notion.setEnabled(single is not None)
         self._action_save_confluence.setEnabled(single is not None)
         self._action_save_obsidian.setEnabled(single is not None)
+        self._action_save_onenote.setEnabled(single is not None)
         self._file_save_menu.setEnabled(single is not None)
 
     # ---- File-menu emit helpers ----------------------------------------

@@ -36,6 +36,12 @@ from .confluence_storage import build_toc_macro, markdown_to_storage
 from .notion_api import NotionClient
 from .notion_blocks import build_toc_block as build_notion_toc_block
 from .notion_blocks import markdown_to_blocks
+from .onenote_com import OneNoteClient, OneNoteError
+from .onenote_xml import (
+    OneNoteAttachedFile,
+    OneNoteImageRef,
+    build_page_xml,
+)
 
 
 # ---- attachment payload ----------------------------------------------------
@@ -458,6 +464,121 @@ def _build_confluence_attachments_section(
             "</p></li>"
         )
     return "<h2>Attachments</h2><ul>" + "".join(items) + "</ul>"
+
+
+# ---- OneNote export -------------------------------------------------------
+
+
+def export_to_onenote(
+    *,
+    client: OneNoteClient,
+    section_id: str,
+    title: str,
+    markdown_body: str,
+    session_dir: Path,
+    attachments: Optional[list[ExportAttachment]] = None,
+    progress: Optional[Callable[[str], None]] = None,
+    number_headings: bool = False,
+    open_after_save: bool = True,
+) -> ExportResult:
+    """Render the markdown body to OneNote XML + push it to a freshly-
+    created page under ``section_id`` via the desktop COM client.
+
+    No TOC: OneNote has no native TOC primitive (issue #100). Heading
+    numbering still applies; ``include_toc`` would have no useful
+    target here so the param is omitted.
+    """
+    attachments = attachments or []
+
+    def report(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    if number_headings:
+        from ..utils.markdown_outline import apply_outline  # noqa: PLC0415
+        markdown_body = apply_outline(
+            markdown_body, number=True, toc=False,
+        )
+
+    # 1. Build an image resolver that returns the file bytes for any
+    #    local image; remote images stay in the XML as a hyperlink.
+    def image_resolver(url: str, alt: str) -> Optional[OneNoteImageRef]:
+        if not is_local_image_ref(url):
+            return None
+        path = resolve_local_image_path(url, base_dir=session_dir)
+        if path is None:
+            return None
+        fmt = _guess_image_format(path)
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        return OneNoteImageRef(url=url, alt=alt, data=data, format=fmt)
+
+    # 2. Resolve session attachments to disk paths the XML can embed.
+    attached_files: list[OneNoteAttachedFile] = []
+    for att in attachments:
+        if not att.path.is_file():
+            continue
+        attached_files.append(OneNoteAttachedFile(
+            path=att.path,
+            label=att.label(),
+        ))
+
+    # 3. Create the empty page first so we have an id for the XML.
+    report("Creating page in OneNote...")
+    page_id = client.create_page(section_id=section_id)
+
+    # 4. Generate the XML body + push it.
+    report("Rendering page content...")
+    page_xml, stats = build_page_xml(
+        page_id=page_id, title=title,
+        markdown_body=markdown_body,
+        image_resolver=image_resolver,
+        attached_files=attached_files,
+    )
+
+    report("Saving content to OneNote...")
+    try:
+        client.update_page_content(page_xml=page_xml)
+    except OneNoteError as exc:
+        raise OneNoteError(
+            f"OneNote rejected the page content for section "
+            f"{section_id!r}. The page was created but is empty. "
+            f"Underlying error: {exc}",
+        ) from exc
+
+    # 5. Best-effort link + post-save navigation.
+    page_url = client.get_page_url(page_id=page_id) or ""
+    if open_after_save:
+        report("Opening in OneNote...")
+        client.navigate_to(page_id=page_id)
+
+    return ExportResult(
+        target="onenote",
+        page_id=page_id,
+        page_url=page_url,
+        title=title,
+        message=(
+            f"Saved to OneNote: {stats.paragraphs} paragraph(s), "
+            f"{stats.headings} heading(s)"
+            + (f", {stats.images_embedded} image(s)" if stats.images_embedded else "")
+            + (f", {stats.tables} table(s)" if stats.tables else "")
+            + (f", {stats.attached_files} attachment(s)" if stats.attached_files else "")
+            + "."
+        ),
+    )
+
+
+def _guess_image_format(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in (".jpg", ".jpeg"):
+        return "jpeg"
+    if suffix == ".gif":
+        return "gif"
+    if suffix == ".bmp":
+        return "bmp"
+    return "png"
 
 
 # ---- xml escaping helpers (mirrors confluence_storage but tiny) -----------

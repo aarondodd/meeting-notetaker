@@ -1063,6 +1063,14 @@ a printer or write it to one of three destinations:
   syncs it however the user already has it set up (iCloud,
   Syncthing, Obsidian Sync, etc.). See
   [Saving notes to Obsidian](#saving-notes-to-obsidian) below.
+- **Save to OneNote...** -- creates a new page in the desktop
+  OneNote (Microsoft 365 / OneNote 2016+) via its COM interface.
+  No token, no Graph API, no admin coordination -- whichever
+  notebook the desktop OneNote has open is where the page lands.
+  Visible only when OneNote is enabled + verified under Settings
+  > Integrations. The deprecated "OneNote for Windows 10" UWP app
+  is NOT supported -- only the desktop OneNote exposes COM. See
+  [Saving notes to OneNote](#saving-notes-to-onenote) below.
 
 The File menu mirrors the same Save to submenu so you can drive
 the flow without leaving the menu bar. See
@@ -1208,6 +1216,64 @@ the destination can't fetch (Notion's page-attachment URLs,
 `cid:`, `file://`) render as visible
 `*❌ (image: foo.png could not be pasted) ❌*` placeholders rather
 than broken icons.
+
+## Saving notes to OneNote
+
+**Save to OneNote** creates a new page in the desktop OneNote
+(Microsoft 365 build, formerly OneNote 2016) under a section you
+pick. No token, no Graph API -- the integration dispatches
+against the OneNote desktop client's COM interface
+(`OneNote.Application`). The page lands in whichever notebook the
+client has open, signed in as whichever account the user is using.
+
+**One-time setup.** Settings > Integrations > OneNote: tick the
+**Enable Save to OneNote** checkbox + click **Verify connection**.
+The status line reports how many notebooks the client has loaded;
+that's the smoke check that COM is reachable.
+
+**Not supported: OneNote for Windows 10.** The deprecated UWP
+"OneNote for Windows 10" app does NOT expose COM. If Verify
+returns a `CoCreateInstance failed` style error, install the
+desktop OneNote (microsoft.com/microsoft-365/onenote) and try
+again.
+
+**Per-save picker.** Same shape as Save to Notion / Confluence:
+favorites + recents + a tree-view browser. The tree shows
+notebooks -> (section groups) -> sections; only **sections** are
+valid parents (OneNote pages can only live inside sections).
+Picking a notebook or a section group leaves the OK button
+disabled until you drill down to a section. Per-save knobs:
+
+  * Editable page title -- defaults to `YYYY-MM-DD HH:MM - <session title>`.
+  * Include attachments -- copies session files into the page as
+    `InsertedFile` blocks (Settings > Integrations > OneNote has a
+    "Include session attachments by default on save" toggle so
+    you don't have to tick the checkbox every save).
+  * Open after save -- launches `NavigateTo(pageId)` so the new
+    page surfaces in your OneNote window.
+
+**Page formatting.** Headings use OneNote's native quickStyle 1-6
+(matches markdown H1-H6). Bold / italic / strikethrough / code
+spans / links survive as inline HTML spans inside the `one:T`
+text. Markdown tables become native `one:Table` rows with the
+header row bolded. Fenced code blocks render as a single-cell
+table with a pale-grey background + Consolas font -- the closest
+visual match to a fence since OneNote's schema has no native
+code primitive.
+
+**Images.** Local images in the synthesis body embed inline as
+`one:Image` with the bytes carried as base64. PNG / JPEG / GIF /
+BMP work natively; other formats fall through to a missing-image
+placeholder. Remote (http / https) image URLs aren't downloaded
+-- they render as a clickable link to the source so the page
+stays small.
+
+**No table of contents.** OneNote has no native TOC primitive (no
+`one:TableOfContents` element in the 2013 schema). We
+deliberately don't emit a markdown-style TOC into the body
+either -- OneNote's outline view doesn't render the bullet
+links clickably and the duplication adds visual noise. The
+`number_headings` Settings toggle still applies.
 
 ## Saving notes to Obsidian
 
@@ -1360,6 +1426,9 @@ of these are also editable directly in `config.toml`.
 | Notion integration token | (empty) | Internal Integration Token from notion.so/my-integrations. Enables Save to Notion when Verify succeeds. |
 | Confluence base URL | (empty) | Tenant root (Cloud: `https://your-org.atlassian.net/wiki`). |
 | Confluence email + API token | (empty) | Email + token from id.atlassian.com. Enables Save to Confluence when Verify succeeds. |
+| OneNote enabled | off | Tick + click Verify to enable Save to OneNote. Requires the desktop OneNote (Microsoft 365 / 2016+). The UWP "OneNote for Windows 10" app does NOT expose COM and is unsupported. |
+| OneNote open after save | on | Calls NavigateTo(pageId) after writing the page so the new content surfaces in your OneNote window. |
+| OneNote include attachments by default | off | Pre-check the "Include attachments" box in the save dialog. |
 | Obsidian vault path | (empty) | Absolute path to an Obsidian vault directory. Enables Save to Obsidian when Verify vault succeeds. |
 | Obsidian note location | `By series + date` | Template that picks the subfolder + filename. `By series + date` (default) = `Meetings/{series}/{YYYY}-{MM}-{DD} - {title}` (chronological order inside each series folder); `Year / Month` = `Meetings/{YYYY}/{MM}` (filename = session title); `By series` = `Meetings/{series}` (filename = session title); `Flat` = `Meetings/` (filename = session title); `Custom...` exposes a free-form template with `{YYYY}` / `{MM}` / `{DD}` / `{title}` / `{series}` / `{session_id}` placeholders -- if the template's last segment contains `{title}`, it becomes the filename pattern and everything before is the subdir. |
 | Obsidian YAML frontmatter | on | Write a YAML frontmatter block at the top of each saved note. Carries title / date / attendees / series / tags / `source_session_id`. |

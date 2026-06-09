@@ -1386,6 +1386,20 @@ class SettingsDialog(QDialog):
             self._config.confluence.email = new_cf_email
             self._config.confluence.api_token = new_cf_token
             self._config.confluence.last_verified_at = ""
+        # Issue #100 -- OneNote. The enabled flag is the user's
+        # opt-in; clearing it also clears last_verified_at so a
+        # re-enable forces a fresh Verify.
+        new_onenote_enabled = self._onenote_enabled.isChecked()
+        if new_onenote_enabled != self._config.onenote.enabled:
+            self._config.onenote.enabled = new_onenote_enabled
+            if not new_onenote_enabled:
+                self._config.onenote.last_verified_at = ""
+        self._config.onenote.open_after_save = (
+            self._onenote_open_after.isChecked()
+        )
+        self._config.onenote.default_include_attachments = (
+            self._onenote_default_attach.isChecked()
+        )
         # Issue #96 -- Obsidian. Vault path changes clear last_verified_at
         # the same way the Notion/Confluence credential edits do.
         new_vault_root = self._obsidian_vault_edit.text().strip()
@@ -1535,6 +1549,50 @@ class SettingsDialog(QDialog):
         confluence_form.addRow(confluence_verify_row)
         self._refresh_confluence_status_label()
         layout.addWidget(confluence_group)
+
+        # ---- OneNote (#100) -----------------------------------------------
+        onenote_group = QGroupBox("OneNote", self)
+        onenote_form = QFormLayout(onenote_group)
+
+        onenote_note = QLabel(
+            "Saves a new page to the desktop OneNote (Microsoft 365 / "
+            "OneNote 2016+) via its COM interface. No token needed. "
+            "The deprecated 'OneNote for Windows 10' UWP app is "
+            "unsupported -- only the desktop OneNote exposes COM.",
+            self,
+        )
+        onenote_note.setWordWrap(True)
+        onenote_form.addRow(onenote_note)
+
+        self._onenote_enabled = QCheckBox("Enable Save to OneNote", self)
+        self._onenote_enabled.setChecked(config.onenote.enabled)
+        onenote_form.addRow("", self._onenote_enabled)
+
+        onenote_verify_row = QHBoxLayout()
+        self._onenote_verify_btn = QPushButton("Verify connection", self)
+        self._onenote_verify_btn.clicked.connect(self._on_verify_onenote)
+        onenote_verify_row.addWidget(self._onenote_verify_btn)
+        self._onenote_status_label = QLabel(self)
+        self._onenote_status_label.setWordWrap(True)
+        onenote_verify_row.addWidget(self._onenote_status_label, 1)
+        onenote_form.addRow(onenote_verify_row)
+
+        self._onenote_open_after = QCheckBox(
+            "Open the page in OneNote after save",
+        )
+        self._onenote_open_after.setChecked(config.onenote.open_after_save)
+        onenote_form.addRow("", self._onenote_open_after)
+
+        self._onenote_default_attach = QCheckBox(
+            "Include session attachments by default on save",
+        )
+        self._onenote_default_attach.setChecked(
+            config.onenote.default_include_attachments,
+        )
+        onenote_form.addRow("", self._onenote_default_attach)
+
+        self._refresh_onenote_status_label()
+        layout.addWidget(onenote_group)
 
         # ---- Obsidian (#96) -----------------------------------------------
         obsidian_group = QGroupBox("Obsidian", self)
@@ -1757,6 +1815,50 @@ class SettingsDialog(QDialog):
         self._config.confluence.api_token = token
         self._config.confluence.last_verified_at = when
         self._confluence_status_label.setText(f"Connected as {name} (verified {when}).")
+
+    # ---- OneNote (#100) ----------------------------------------------
+
+    def _on_verify_onenote(self) -> None:
+        from datetime import datetime as _dt  # noqa: PLC0415
+        from ..integrations.onenote_com import (  # noqa: PLC0415
+            OneNoteUnavailable,
+            verify as verify_onenote,
+        )
+
+        self._onenote_status_label.setText("Verifying...")
+        self._onenote_verify_btn.setEnabled(False)
+        try:
+            info = verify_onenote()
+        except OneNoteUnavailable as exc:
+            self._onenote_status_label.setText(
+                "Failed: " + str(exc)
+            )
+            return
+        except Exception as exc:
+            self._onenote_status_label.setText(f"Failed: {exc}")
+            return
+        finally:
+            self._onenote_verify_btn.setEnabled(True)
+        when = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
+        self._config.onenote.last_verified_at = when
+        self._config.onenote.enabled = True
+        self._onenote_enabled.setChecked(True)
+        nb = info.get("notebooks", 0)
+        self._onenote_status_label.setText(
+            f"Connected: {nb} notebook(s) loaded (verified {when})."
+        )
+
+    def _refresh_onenote_status_label(self) -> None:
+        when = self._config.onenote.last_verified_at
+        if not self._config.onenote.enabled:
+            self._onenote_status_label.setText("Disabled.")
+            return
+        if when:
+            self._onenote_status_label.setText(f"Connected (verified {when}).")
+        else:
+            self._onenote_status_label.setText(
+                "Click Verify to confirm + enable Save to OneNote."
+            )
 
     # ---- Obsidian (#96) ----------------------------------------------
 

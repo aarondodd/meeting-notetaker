@@ -51,5 +51,5 @@ the document's structure.
 | Target | Native TOC? | Notes |
 |---|---|---|
 | Google Docs | `documents.batchUpdate -> Doc TOC` | TOC support via API exists -- use it. |
-| Microsoft OneNote | No native TOC primitive | Fall back to markdown TOC. |
+| Microsoft OneNote | No native TOC primitive (no `one:TableOfContents` block in the 2013 schema) | Implemented (#100). We deliberately do NOT emit a TOC -- OneNote's outline view doesn't render markdown TOC lists clickably and the duplication adds visual noise without navigation value. Heading numbering still applies. |
 | Obsidian (vault save) | Obsidian's built-in outline view + the Outline community plugin | Implemented (#96). Obsidian renders an outline in the right sidebar from the document's headings; we explicitly do NOT emit a markdown TOC into the body because it would duplicate the outline view. The export still respects `number_headings`, just not `toc_in_exports`. |

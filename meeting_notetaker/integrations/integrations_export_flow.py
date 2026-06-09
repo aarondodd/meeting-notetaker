@@ -36,6 +36,7 @@ from .export_worker import (
     ConfluenceExportWorker,
     NotionExportWorker,
     ObsidianExportWorker,
+    OneNoteExportWorker,
 )
 from .notion_api import NotionClient
 from .obsidian_export import (
@@ -51,10 +52,12 @@ from .obsidian_vault import (
     vault_is_valid,
     vault_name_for_path,
 )
+from .onenote_com import OneNoteClient, OneNoteUnavailable
 from ..ui.integrations_picker_dialog import (
     ConfluencePickerBrowser,
     IntegrationsPickerDialog,
     NotionPickerBrowser,
+    OneNotePickerBrowser,
 )
 from ..ui.obsidian_picker_dialog import ObsidianSavePicker
 
@@ -196,6 +199,78 @@ def run_confluence_export(
         progress_title="Exporting to Confluence",
         cancel_label="Cancel",
         target="confluence",
+        selection_id=selection.id,
+        selection_title=selection.title,
+        selection_extra=selection.extra,
+    )
+
+
+def run_onenote_export(
+    main_app: "MainApp", *, session_id: str, tab_label: str, body: str,
+) -> None:
+    cfg = main_app.config.onenote
+    if not (cfg.enabled and cfg.last_verified_at):
+        QMessageBox.information(
+            main_app.window, "Save to OneNote",
+            "Enable OneNote + click Verify in Settings -> Integrations first.",
+        )
+        return
+    try:
+        client = OneNoteClient()
+    except OneNoteUnavailable as exc:
+        QMessageBox.warning(
+            main_app.window, "Save to OneNote",
+            f"OneNote is not reachable via COM:\n\n{exc}",
+        )
+        return
+    browser = OneNotePickerBrowser(client)
+    session_attachments = _load_session_attachments(session_id)
+    dlg = IntegrationsPickerDialog(
+        title="Save to OneNote",
+        browser=browser,
+        favorites=cfg.favorites,
+        recents=cfg.recents,
+        default_page_title=_default_page_title(main_app, session_id),
+        series_name=_session_series_name(main_app, session_id),
+        attachment_count=len(session_attachments),
+        parent=main_app.window,
+    )
+    if dlg.exec() != dlg.DialogCode.Accepted:
+        return
+    selection = dlg.selection()
+    if selection is None:
+        return
+    main_app.config.onenote.favorites = dlg.updated_favorites()
+
+    # Picker pre-checks for `default_include_attachments`; the dialog
+    # doesn't (yet) take a default-checked parameter, so we honor the
+    # config setting at this layer: if the user opted in once, pass
+    # the attachments even when they didn't tick the box.
+    include_attachments = (
+        selection.include_attachments
+        or cfg.default_include_attachments
+    )
+
+    worker = OneNoteExportWorker(
+        client=client,
+        section_id=selection.id,
+        title=selection.page_title,
+        markdown_body=body,
+        session_dir=session_dir(session_id),
+        attachments=(
+            session_attachments if include_attachments else []
+        ),
+        number_headings=getattr(
+            main_app.config.synthesis, "heading_numbering", False,
+        ),
+        open_after_save=cfg.open_after_save,
+    )
+    del tab_label
+    _run_worker_with_progress(
+        main_app, worker,
+        progress_title="Saving to OneNote",
+        cancel_label="Cancel",
+        target="onenote",
         selection_id=selection.id,
         selection_title=selection.title,
         selection_extra=selection.extra,
@@ -514,6 +589,8 @@ def _on_worker_succeeded(
         cfg_section = main_app.config.notion
     elif target == "confluence":
         cfg_section = main_app.config.confluence
+    elif target == "onenote":
+        cfg_section = main_app.config.onenote
     else:
         cfg_section = main_app.config.obsidian
     cfg_section.recents = _push_recent(
@@ -532,6 +609,14 @@ def _on_worker_succeeded(
         # Linux / LSOpen on macOS) which dispatches to the installed
         # Obsidian client.
         if selection_extra.get("open_after_save") and result.page_url:
+            QDesktopServices.openUrl(QUrl(result.page_url))
+    elif target == "onenote":
+        # The COM client already called NavigateTo when
+        # open_after_save was set, so the OneNote window is on the
+        # right page. If a clickable onenote:// hyperlink is
+        # available we still openUrl it -- harmless redundancy that
+        # gives the user a clickable reference in the toast.
+        if result.page_url:
             QDesktopServices.openUrl(QUrl(result.page_url))
     elif result.page_url:
         # Open the new page in the user's default browser. Aaron's
@@ -553,6 +638,7 @@ def _on_worker_failed(
         "notion": "Notion",
         "confluence": "Confluence",
         "obsidian": "Obsidian",
+        "onenote": "OneNote",
     }.get(target, target.title())
     QMessageBox.warning(
         main_app.window, f"Save to {pretty}",

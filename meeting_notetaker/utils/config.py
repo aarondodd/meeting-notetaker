@@ -408,6 +408,29 @@ class ConfluenceConfig:
 
 
 @dataclass
+class OneNoteConfig:
+    """Save to OneNote via the desktop client's COM interface (#100).
+
+    No token + no Graph API: the integration dispatches against
+    ``OneNote.Application`` (the desktop / Microsoft 365 build of
+    OneNote). The UWP "OneNote for Windows 10" variant does NOT
+    expose COM and is unsupported -- Settings calls this out
+    explicitly so a UWP-only user knows why Verify fails.
+
+    ``last_verified_at`` stamps the most recent successful Dispatch
+    ping; cleared whenever the user toggles the enable switch off.
+    Favorites + recents mirror the Notion / Confluence shape so the
+    shared picker can render them without per-target wiring.
+    """
+    enabled: bool = False
+    last_verified_at: str = ""
+    favorites: list[dict] = field(default_factory=list)
+    recents: list[dict] = field(default_factory=list)
+    open_after_save: bool = True
+    default_include_attachments: bool = False
+
+
+@dataclass
 class ObsidianConfig:
     """Obsidian vault bridge (issue #96).
 
@@ -461,6 +484,7 @@ class Config:
     notion: NotionConfig = field(default_factory=NotionConfig)
     confluence: ConfluenceConfig = field(default_factory=ConfluenceConfig)
     obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
+    onenote: OneNoteConfig = field(default_factory=OneNoteConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -500,6 +524,9 @@ class Config:
             ),
             obsidian=ObsidianConfig(
                 **_filter_fields(ObsidianConfig, data.get("obsidian", {}))
+            ),
+            onenote=OneNoteConfig(
+                **_filter_fields(OneNoteConfig, data.get("onenote", {}))
             ),
         )
 
@@ -668,6 +695,7 @@ class Config:
             ("notion", self.notion),
             ("confluence", self.confluence),
             ("obsidian", self.obsidian),
+            ("onenote", self.onenote),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():

@@ -21,6 +21,7 @@ from .export import (
     ExportResult,
     export_to_confluence,
     export_to_notion,
+    export_to_onenote,
 )
 from .obsidian_export import (
     ObsidianPublishOptions,
@@ -76,6 +77,52 @@ class NotionExportWorker(_ExportWorkerBase):
                 number_headings=self._number_headings,
                 include_toc=self._include_toc,
                 toc_max_depth=self._toc_max_depth,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit(result)
+
+
+class OneNoteExportWorker(_ExportWorkerBase):
+    """Issue #100. COM dispatch is in-process + fast but page-content
+    push still benefits from running off the UI thread so the
+    progress dialog stays responsive."""
+
+    def __init__(
+        self,
+        *,
+        client,
+        section_id: str,
+        title: str,
+        markdown_body: str,
+        session_dir: Path,
+        attachments: Optional[list[ExportAttachment]] = None,
+        number_headings: bool = False,
+        open_after_save: bool = True,
+    ) -> None:
+        super().__init__()
+        self._client = client
+        self._section_id = section_id
+        self._title = title
+        self._markdown_body = markdown_body
+        self._session_dir = session_dir
+        self._attachments = attachments or []
+        self._number_headings = number_headings
+        self._open_after_save = open_after_save
+
+    def run(self) -> None:
+        try:
+            result = export_to_onenote(
+                client=self._client,
+                section_id=self._section_id,
+                title=self._title,
+                markdown_body=self._markdown_body,
+                session_dir=self._session_dir,
+                attachments=self._attachments,
+                progress=self._emit_progress,
+                number_headings=self._number_headings,
+                open_after_save=self._open_after_save,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
