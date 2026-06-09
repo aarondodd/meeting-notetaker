@@ -52,4 +52,4 @@ the document's structure.
 |---|---|---|
 | Google Docs | `documents.batchUpdate -> Doc TOC` | TOC support via API exists -- use it. |
 | Microsoft OneNote | No native TOC primitive | Fall back to markdown TOC. |
-| Obsidian (vault save) | `[[wikilinks]]` + Outliner plugin | Vault doesn't have a native TOC; markdown TOC works because Obsidian's renderer respects `[text](#slug)` anchors. |
+| Obsidian (vault save) | Obsidian's built-in outline view + the Outline community plugin | Implemented (#96). Obsidian renders an outline in the right sidebar from the document's headings; we explicitly do NOT emit a markdown TOC into the body because it would duplicate the outline view. The export still respects `number_headings`, just not `toc_in_exports`. |

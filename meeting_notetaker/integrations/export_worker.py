@@ -22,6 +22,11 @@ from .export import (
     export_to_confluence,
     export_to_notion,
 )
+from .obsidian_export import (
+    ObsidianPublishOptions,
+    ObsidianSessionInfo,
+    export_to_obsidian,
+)
 
 
 class _ExportWorkerBase(QThread):
@@ -71,6 +76,49 @@ class NotionExportWorker(_ExportWorkerBase):
                 number_headings=self._number_headings,
                 include_toc=self._include_toc,
                 toc_max_depth=self._toc_max_depth,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit(result)
+
+
+class ObsidianExportWorker(_ExportWorkerBase):
+    """Issue #96. Filesystem write runs fast but the worker exists
+    for consistency with the other export paths + so the progress
+    dialog has a signal to subscribe to."""
+
+    def __init__(
+        self,
+        *,
+        session: ObsidianSessionInfo,
+        body: str,
+        options: ObsidianPublishOptions,
+        session_dir: Path,
+        attachments: Optional[list[ExportAttachment]] = None,
+        location_template_name: str = "year_month",
+        location_template_custom: str = "",
+    ) -> None:
+        super().__init__()
+        self._session = session
+        self._body = body
+        self._options = options
+        self._session_dir = session_dir
+        self._attachments = attachments or []
+        self._location_template_name = location_template_name
+        self._location_template_custom = location_template_custom
+
+    def run(self) -> None:
+        try:
+            result = export_to_obsidian(
+                session=self._session,
+                body=self._body,
+                options=self._options,
+                session_dir=self._session_dir,
+                attachments=self._attachments,
+                progress=self._emit_progress,
+                location_template_name=self._location_template_name,
+                location_template_custom=self._location_template_custom,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
