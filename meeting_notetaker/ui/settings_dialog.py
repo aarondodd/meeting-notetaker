@@ -1753,7 +1753,11 @@ class SettingsDialog(QDialog):
             self, "Choose Obsidian vault", start,
         )
         if chosen:
-            self._obsidian_vault_edit.setText(chosen)
+            # Normalize separators (Qt returns forward slashes on
+            # Windows) so the canonical form matches what Path stores
+            # at Verify time and Accept doesn't see a spurious diff
+            # that wipes last_verified_at.
+            self._obsidian_vault_edit.setText(str(Path(chosen)))
             self._config.obsidian.last_verified_at = ""
             self._refresh_obsidian_status_label()
 
@@ -1778,7 +1782,15 @@ class SettingsDialog(QDialog):
         vault_name = vault_name_for_path(vault_root)
         registered = is_vault_registered(vault_root)
         when = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
-        self._config.obsidian.vault_root = str(vault_root)
+        canonical = str(vault_root)
+        # Sync the line edit to the canonical form so the next pass
+        # through _on_accept's "did the user edit the field?" check
+        # compares apples to apples. Without this, raw user input
+        # like "~/Vaults/X" or a path with forward slashes survives
+        # in the widget while the resolved form lands in _config,
+        # the compare fails, and last_verified_at gets wiped.
+        self._obsidian_vault_edit.setText(canonical)
+        self._config.obsidian.vault_root = canonical
         self._config.obsidian.vault_name = vault_name
         self._config.obsidian.last_verified_at = when
         if registered:
