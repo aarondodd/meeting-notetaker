@@ -1055,6 +1055,14 @@ a printer or write it to one of three destinations:
 - **Save to Confluence...** -- creates a new Confluence page under
   a parent you pick. Visible only when Confluence is configured +
   verified.
+- **Save to Obsidian...** -- writes a markdown file (with YAML
+  frontmatter linking attendees + series) into a configured
+  Obsidian vault. Visible only when an Obsidian vault path is
+  configured + verified under Settings > Integrations. No remote
+  service involved -- the note lands on local disk and Obsidian
+  syncs it however the user already has it set up (iCloud,
+  Syncthing, Obsidian Sync, etc.). See
+  [Saving notes to Obsidian](#saving-notes-to-obsidian) below.
 
 The File menu mirrors the same Save to submenu so you can drive
 the flow without leaving the menu bar. See
@@ -1201,6 +1209,67 @@ the destination can't fetch (Notion's page-attachment URLs,
 `*❌ (image: foo.png could not be pasted) ❌*` placeholders rather
 than broken icons.
 
+## Saving notes to Obsidian
+
+**Save to Obsidian** writes the finalized synthesis into a folder
+of an Obsidian vault you control. The vault is just a directory of
+plaintext markdown on disk -- no API, no token, no third-party
+plugin. Whatever sync the user already has on the vault
+(iCloud / OneDrive / Syncthing / Obsidian Sync) propagates the note
+to their other machines without us doing anything.
+
+**One-time setup.** Settings > Integrations > Obsidian: point the
+vault path at your vault directory + click **Verify vault**. The
+status line reports whether Obsidian itself has the vault
+registered (which it needs for the "open in Obsidian" URI to work
+-- if the vault is not yet registered, open it once in Obsidian
+and re-verify).
+
+**Per-save dialog.** The picker offers:
+
+  * **Subfolder** -- defaults to the location template the user
+    picked in Settings (`Meetings/{YYYY}/{MM}` by default; "By
+    series", "Flat", or a custom template are also available);
+    editable per-save with a folder browser.
+  * **Filename** -- defaults to the sanitized session title (with
+    characters Obsidian forbids -- `[ ] # ^ | : * ? " < > | / \`
+    -- stripped automatically); editable.
+  * **Include attachments** -- copies the session's tracked
+    attachments into the vault alongside the note, and links them
+    in an `## Attachments` tail.
+  * **Append a backlink to today's daily note** -- adds a single
+    `- [[path/to/note|title]] -- 30 min` line to the user's daily
+    note (reads the user's Daily Notes core-plugin or Periodic
+    Notes config to find the right file). Off by default.
+  * **Open in Obsidian after save** -- launches
+    `obsidian://open?vault=<name>&file=<path>` after writing.
+
+**YAML frontmatter.** Every saved note opens with a frontmatter
+block carrying the session's date, time, duration, attendees,
+series, tags, and `source_session_id`. The session ID is the
+bridge back: re-saving the same session detects the existing note
+by `source_session_id` and offers **Overwrite / Save as new /
+Cancel** so the user doesn't accidentally produce duplicates.
+
+**Wikilinks.** Attendee names and the series land in frontmatter
+as `[[Alice]]` / `[[Weekly Sync]]` so they form graph nodes in
+Obsidian; the body text is untouched (no auto-wikification of
+arbitrary names inside paragraphs). Toggles in Settings let the
+user turn either off.
+
+**Images.** Local images in the body copy into
+`Meetings/_assets/<session-id>/` under the vault, and the
+markdown links in the note rewrite to point at the copied files.
+Hash-based dedup means re-saves don't double-copy an unchanged
+image.
+
+**No table of contents.** Obsidian has a built-in outline view in
+the right sidebar, and the Outline community plugin gives the
+same thing inline. We deliberately don't emit a markdown TOC into
+the body -- it would duplicate what Obsidian shows for free.
+Heading numbering (the `number_headings` Settings toggle) still
+applies to Obsidian saves.
+
 ## Speaker identification
 
 After each recording, the app tries to label the *system audio*
@@ -1291,6 +1360,13 @@ of these are also editable directly in `config.toml`.
 | Notion integration token | (empty) | Internal Integration Token from notion.so/my-integrations. Enables Save to Notion when Verify succeeds. |
 | Confluence base URL | (empty) | Tenant root (Cloud: `https://your-org.atlassian.net/wiki`). |
 | Confluence email + API token | (empty) | Email + token from id.atlassian.com. Enables Save to Confluence when Verify succeeds. |
+| Obsidian vault path | (empty) | Absolute path to an Obsidian vault directory. Enables Save to Obsidian when Verify vault succeeds. |
+| Obsidian note location | `Year / Month` | Template that picks the subfolder a new note lands in. `Year / Month` = `Meetings/{YYYY}/{MM}`; `By series` = `Meetings/{series}`; `Flat` = `Meetings/`; `Custom...` exposes a free-form template with `{YYYY}` / `{MM}` / `{DD}` / `{title}` / `{series}` / `{session_id}` placeholders. |
+| Obsidian YAML frontmatter | on | Write a YAML frontmatter block at the top of each saved note. Carries title / date / attendees / series / tags / `source_session_id`. |
+| Obsidian wikilinks (attendees + series) | on | Render attendee names and the series in frontmatter as `[[wikilinks]]` so they form graph nodes. |
+| Obsidian classification in frontmatter | off | Add the session's classification value to frontmatter. |
+| Obsidian daily-note backlink | off | After saving, append a backlink to today's daily note (reads the user's Daily Notes or Periodic Notes config to find it). |
+| Obsidian open after save | on | Launch `obsidian://open?vault=...&file=...` after the note lands. |
 
 ## Backups (v0.7.5+)
 

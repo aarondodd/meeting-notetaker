@@ -8,6 +8,7 @@ automatically, so there is no theme picker.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -41,7 +42,11 @@ from ..automation import installer
 from ..automation.targets import ALL_TARGETS, get_target
 from ..diarization import user_voiceprint
 from ..diarization.store import open_speaker_store
-from ..utils.config import Config, VALID_MODEL_SIZES
+from ..utils.config import (
+    Config,
+    VALID_MODEL_SIZES,
+    VALID_OBSIDIAN_LOCATION_TEMPLATES,
+)
 from ..utils.paths import prompts_dir, vocabulary_path
 from ..utils.vocabulary import seed_vocabulary_file
 from .automation_install_dialog import AutomationInstallDialog
@@ -1381,6 +1386,38 @@ class SettingsDialog(QDialog):
             self._config.confluence.email = new_cf_email
             self._config.confluence.api_token = new_cf_token
             self._config.confluence.last_verified_at = ""
+        # Issue #96 -- Obsidian. Vault path changes clear last_verified_at
+        # the same way the Notion/Confluence credential edits do.
+        new_vault_root = self._obsidian_vault_edit.text().strip()
+        if new_vault_root != self._config.obsidian.vault_root:
+            self._config.obsidian.vault_root = new_vault_root
+            self._config.obsidian.last_verified_at = ""
+            self._config.obsidian.vault_name = ""
+        self._config.obsidian.location_template_name = (
+            self._obsidian_location_picker.currentData()
+            or "year_month"
+        )
+        self._config.obsidian.location_template_custom = (
+            self._obsidian_custom_template.text().strip()
+        )
+        self._config.obsidian.write_frontmatter = (
+            self._obsidian_write_fm.isChecked()
+        )
+        self._config.obsidian.wikilink_attendees = (
+            self._obsidian_wikilink_att.isChecked()
+        )
+        self._config.obsidian.wikilink_series = (
+            self._obsidian_wikilink_series.isChecked()
+        )
+        self._config.obsidian.include_classification = (
+            self._obsidian_include_class.isChecked()
+        )
+        self._config.obsidian.daily_note_backlink = (
+            self._obsidian_daily_backlink.isChecked()
+        )
+        self._config.obsidian.open_after_save = (
+            self._obsidian_open_after.isChecked()
+        )
         # Remember which section the user was on so reopening Settings
         # lands them right back. Stored in ui.settings_active_section.
         self._config.ui.settings_active_section = self._active_section_label()
@@ -1496,6 +1533,108 @@ class SettingsDialog(QDialog):
         self._refresh_confluence_status_label()
         layout.addWidget(confluence_group)
 
+        # ---- Obsidian (#96) -----------------------------------------------
+        obsidian_group = QGroupBox("Obsidian", self)
+        obsidian_form = QFormLayout(obsidian_group)
+
+        vault_row = QHBoxLayout()
+        self._obsidian_vault_edit = QLineEdit(self)
+        self._obsidian_vault_edit.setText(config.obsidian.vault_root)
+        self._obsidian_vault_edit.setPlaceholderText(
+            "Path to your Obsidian vault folder"
+        )
+        vault_row.addWidget(self._obsidian_vault_edit, 1)
+        obsidian_browse_btn = QPushButton("Browse...", self)
+        obsidian_browse_btn.clicked.connect(self._on_browse_obsidian_vault)
+        vault_row.addWidget(obsidian_browse_btn)
+        obsidian_form.addRow("Vault path:", vault_row)
+
+        obsidian_verify_row = QHBoxLayout()
+        self._obsidian_verify_btn = QPushButton("Verify vault", self)
+        self._obsidian_verify_btn.clicked.connect(self._on_verify_obsidian)
+        obsidian_verify_row.addWidget(self._obsidian_verify_btn)
+        self._obsidian_status_label = QLabel(self)
+        self._obsidian_status_label.setWordWrap(True)
+        obsidian_verify_row.addWidget(self._obsidian_status_label, 1)
+        obsidian_form.addRow(obsidian_verify_row)
+
+        self._obsidian_location_picker = QComboBox(self)
+        for name, label in (
+            ("year_month", "Year / Month -- Meetings/{YYYY}/{MM}"),
+            ("by_series", "By series -- Meetings/{series}"),
+            ("flat", "Flat -- Meetings/"),
+            ("custom", "Custom..."),
+        ):
+            self._obsidian_location_picker.addItem(label, name)
+        current_idx = [
+            i for i in range(self._obsidian_location_picker.count())
+            if self._obsidian_location_picker.itemData(i)
+            == config.obsidian.location_template_name
+        ]
+        if current_idx:
+            self._obsidian_location_picker.setCurrentIndex(current_idx[0])
+        obsidian_form.addRow("Note location:", self._obsidian_location_picker)
+
+        self._obsidian_custom_template = QLineEdit(self)
+        self._obsidian_custom_template.setText(
+            config.obsidian.location_template_custom,
+        )
+        self._obsidian_custom_template.setPlaceholderText(
+            "e.g. Meetings/{series}/{YYYY-MM-DD} - {title}"
+        )
+        obsidian_form.addRow("Custom template:", self._obsidian_custom_template)
+        self._obsidian_location_picker.currentIndexChanged.connect(
+            self._refresh_obsidian_custom_enabled
+        )
+        self._refresh_obsidian_custom_enabled()
+
+        self._obsidian_write_fm = QCheckBox(
+            "Write YAML frontmatter (date, attendees, series, tags)"
+        )
+        self._obsidian_write_fm.setChecked(config.obsidian.write_frontmatter)
+        obsidian_form.addRow("", self._obsidian_write_fm)
+
+        self._obsidian_wikilink_att = QCheckBox(
+            "Use [[wikilinks]] for attendee names in frontmatter"
+        )
+        self._obsidian_wikilink_att.setChecked(
+            config.obsidian.wikilink_attendees,
+        )
+        obsidian_form.addRow("", self._obsidian_wikilink_att)
+
+        self._obsidian_wikilink_series = QCheckBox(
+            "Use [[wikilink]] for the series in frontmatter"
+        )
+        self._obsidian_wikilink_series.setChecked(
+            config.obsidian.wikilink_series,
+        )
+        obsidian_form.addRow("", self._obsidian_wikilink_series)
+
+        self._obsidian_include_class = QCheckBox(
+            "Include classification in frontmatter"
+        )
+        self._obsidian_include_class.setChecked(
+            config.obsidian.include_classification,
+        )
+        obsidian_form.addRow("", self._obsidian_include_class)
+
+        self._obsidian_daily_backlink = QCheckBox(
+            "Append a backlink to today's daily note on save"
+        )
+        self._obsidian_daily_backlink.setChecked(
+            config.obsidian.daily_note_backlink,
+        )
+        obsidian_form.addRow("", self._obsidian_daily_backlink)
+
+        self._obsidian_open_after = QCheckBox(
+            "Open the note in Obsidian after save"
+        )
+        self._obsidian_open_after.setChecked(config.obsidian.open_after_save)
+        obsidian_form.addRow("", self._obsidian_open_after)
+
+        self._refresh_obsidian_status_label()
+        layout.addWidget(obsidian_group)
+
         layout.addStretch(1)
         return page
 
@@ -1603,6 +1742,72 @@ class SettingsDialog(QDialog):
         self._config.confluence.api_token = token
         self._config.confluence.last_verified_at = when
         self._confluence_status_label.setText(f"Connected as {name} (verified {when}).")
+
+    # ---- Obsidian (#96) ----------------------------------------------
+
+    def _on_browse_obsidian_vault(self) -> None:
+        start = self._obsidian_vault_edit.text().strip() or str(
+            Path.home()
+        )
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Choose Obsidian vault", start,
+        )
+        if chosen:
+            self._obsidian_vault_edit.setText(chosen)
+            self._config.obsidian.last_verified_at = ""
+            self._refresh_obsidian_status_label()
+
+    def _on_verify_obsidian(self) -> None:
+        from ..integrations.obsidian_vault import (  # noqa: PLC0415
+            is_vault_registered,
+            vault_is_valid,
+            vault_name_for_path,
+        )
+        from datetime import datetime as _dt  # noqa: PLC0415
+
+        raw = self._obsidian_vault_edit.text().strip()
+        if not raw:
+            self._obsidian_status_label.setText("Enter a vault path first.")
+            return
+        vault_root = Path(raw).expanduser()
+        if not vault_is_valid(vault_root):
+            self._obsidian_status_label.setText(
+                "Folder is not readable / writable, or does not exist."
+            )
+            return
+        vault_name = vault_name_for_path(vault_root)
+        registered = is_vault_registered(vault_root)
+        when = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
+        self._config.obsidian.vault_root = str(vault_root)
+        self._config.obsidian.vault_name = vault_name
+        self._config.obsidian.last_verified_at = when
+        if registered:
+            self._obsidian_status_label.setText(
+                f"Vault '{vault_name}' verified (registered with Obsidian)."
+            )
+        else:
+            self._obsidian_status_label.setText(
+                f"Vault folder OK -- not yet registered with Obsidian. "
+                f"Open it once in Obsidian to enable the 'open after save' URI."
+            )
+
+    def _refresh_obsidian_status_label(self) -> None:
+        if not self._obsidian_vault_edit.text().strip():
+            self._obsidian_status_label.setText("Not configured.")
+            return
+        when = self._config.obsidian.last_verified_at
+        if when:
+            self._obsidian_status_label.setText(
+                f"Vault verified ({when})."
+            )
+        else:
+            self._obsidian_status_label.setText(
+                "Vault path entered. Click Verify vault to confirm + enable save."
+            )
+
+    def _refresh_obsidian_custom_enabled(self) -> None:
+        is_custom = self._obsidian_location_picker.currentData() == "custom"
+        self._obsidian_custom_template.setEnabled(is_custom)
 
     def inject_backup_now_handler(self, handler) -> None:
         """Caller (MainApp) wires the manual-backup action here so the

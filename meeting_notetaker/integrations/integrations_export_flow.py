@@ -19,6 +19,7 @@ MainApp's massive class body.
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QUrl
@@ -26,16 +27,35 @@ from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import QMessageBox, QProgressDialog
 
 from ..models.attachments import AttachmentsStore
+from ..models.transcript import TranscriptStore
+from ..utils.live_notes import parse_attendees
 from ..utils.paths import session_dir
 from .confluence_api import ConfluenceClient
 from .export import ExportAttachment
-from .export_worker import ConfluenceExportWorker, NotionExportWorker
+from .export_worker import (
+    ConfluenceExportWorker,
+    NotionExportWorker,
+    ObsidianExportWorker,
+)
 from .notion_api import NotionClient
+from .obsidian_export import (
+    ObsidianSessionInfo,
+    find_republish_candidate,
+    resolve_location_template,
+    sanitize_obsidian_path_segment,
+    sanitize_obsidian_stem,
+)
+from .obsidian_vault import (
+    is_vault_registered,
+    vault_is_valid,
+    vault_name_for_path,
+)
 from ..ui.integrations_picker_dialog import (
     ConfluencePickerBrowser,
     IntegrationsPickerDialog,
     NotionPickerBrowser,
 )
+from ..ui.obsidian_picker_dialog import ObsidianSavePicker
 
 
 if TYPE_CHECKING:  # pragma: no cover -- type-check only
@@ -181,6 +201,173 @@ def run_confluence_export(
     )
 
 
+def run_obsidian_export(
+    main_app: "MainApp", *, session_id: str, tab_label: str, body: str,
+) -> None:
+    cfg = main_app.config.obsidian
+    vault_root = Path(cfg.vault_root) if cfg.vault_root else None
+    if vault_root is None or not vault_is_valid(vault_root):
+        QMessageBox.information(
+            main_app.window, "Save to Obsidian",
+            "Set the Obsidian vault path in Settings -> Integrations first.",
+        )
+        return
+    info = _obsidian_session_info(main_app, session_id)
+    session_attachments = _load_session_attachments(session_id)
+    when = info.started_at
+    default_subdir = resolve_location_template(
+        template_name=cfg.location_template_name,
+        template_custom=cfg.location_template_custom,
+        session=info,
+        when=when,
+    )
+    default_stem = sanitize_obsidian_stem(
+        info.title, fallback=session_id,
+    )
+
+    dlg = ObsidianSavePicker(
+        vault_root=vault_root,
+        vault_name=cfg.vault_name or vault_name_for_path(vault_root),
+        default_subdir=default_subdir,
+        default_filename_stem=default_stem,
+        attachment_count=len(session_attachments),
+        session=info,
+        write_frontmatter=cfg.write_frontmatter,
+        wikilink_attendees=cfg.wikilink_attendees,
+        wikilink_series=cfg.wikilink_series,
+        include_classification=cfg.include_classification,
+        daily_note_backlink=cfg.daily_note_backlink,
+        open_after_save=cfg.open_after_save,
+        parent=main_app.window,
+    )
+    if dlg.exec() != dlg.DialogCode.Accepted:
+        return
+    options = dlg.result_options()
+    options.vault_name = cfg.vault_name or vault_name_for_path(vault_root)
+
+    # Re-publish detection. Scan the vault for any md whose
+    # source_session_id matches; surface Overwrite / Save as new
+    # / Cancel before kicking off the worker.
+    candidate = find_republish_candidate(
+        search_root=vault_root, session_id=session_id,
+    )
+    if candidate is not None:
+        choice = _ask_republish_choice(
+            main_app, candidate.existing_path.relative_to(vault_root),
+        )
+        if choice == "cancel":
+            return
+        options.on_conflict = choice
+        if choice == "overwrite":
+            options.target_subdir = str(
+                candidate.existing_path.parent.relative_to(vault_root),
+            ).replace("\\", "/")
+            options.filename_stem = candidate.existing_path.stem
+
+    sanitized_subdir = sanitize_obsidian_path_segment(
+        options.target_subdir, fallback="Meetings",
+    ) if options.target_subdir else ""
+    options.target_subdir = sanitized_subdir
+
+    worker = ObsidianExportWorker(
+        session=info,
+        body=body,
+        options=options,
+        session_dir=session_dir(session_id),
+        attachments=(
+            session_attachments if options.include_attachments else []
+        ),
+        location_template_name=cfg.location_template_name,
+        location_template_custom=cfg.location_template_custom,
+    )
+    del tab_label
+    _run_worker_with_progress(
+        main_app, worker,
+        progress_title="Saving to Obsidian",
+        cancel_label="Cancel",
+        target="obsidian",
+        selection_id=session_id,
+        selection_title=options.filename_stem,
+        selection_extra={
+            "vault_name": options.vault_name,
+            "vault_root": str(vault_root),
+            "open_after_save": options.open_after_save,
+        },
+    )
+
+
+def _ask_republish_choice(
+    main_app: "MainApp", existing_rel: Path,
+) -> str:
+    box = QMessageBox(main_app.window)
+    box.setWindowTitle("Save to Obsidian")
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setText(
+        f"This session has already been saved to:\n\n  {existing_rel}\n\n"
+        "What would you like to do?"
+    )
+    overwrite = box.addButton("Overwrite", QMessageBox.ButtonRole.AcceptRole)
+    save_new = box.addButton("Save as new", QMessageBox.ButtonRole.AcceptRole)
+    cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(overwrite)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is overwrite:
+        return "overwrite"
+    if clicked is save_new:
+        return "save_as_new"
+    del cancel
+    return "cancel"
+
+
+def _obsidian_session_info(
+    main_app: "MainApp", session_id: str,
+) -> ObsidianSessionInfo:
+    session = main_app.store.get_session(session_id)
+    title = (session.title if session else session_id) or session_id
+    started_at = None
+    duration_minutes = None
+    if session and session.created_at:
+        try:
+            started_at = datetime.fromisoformat(
+                session.created_at.replace("Z", "+00:00")
+            ).astimezone()
+        except ValueError:
+            started_at = None
+    if session and session.duration_seconds:
+        duration_minutes = max(1, session.duration_seconds // 60)
+    attendees: list[str] = []
+    try:
+        live_body = TranscriptStore(session_id).read_live_notes()
+        attendees = parse_attendees(live_body)
+    except Exception:
+        attendees = []
+    series_name = ""
+    classification_name = ""
+    topic_names: list[str] = []
+    store = getattr(main_app, "classification", None)
+    if store is not None:
+        try:
+            classification = store.classification_for_session(session_id)
+            if classification.series:
+                series_name = classification.series.name or ""
+            topic_names = [
+                t.topic.name for t in classification.topics if t.topic.name
+            ]
+        except Exception:
+            pass
+    return ObsidianSessionInfo(
+        session_id=session_id,
+        title=title,
+        started_at=started_at,
+        duration_minutes=duration_minutes,
+        attendees=attendees,
+        series=series_name,
+        tags=topic_names,
+        classification=classification_name,
+    )
+
+
 # ---- helpers --------------------------------------------------------------
 
 
@@ -315,10 +502,12 @@ def _on_worker_succeeded(
 ) -> None:
     progress.close()
     # Update recents (most recent first, dedup by id, trim).
-    cfg_section = (
-        main_app.config.notion if target == "notion"
-        else main_app.config.confluence
-    )
+    if target == "notion":
+        cfg_section = main_app.config.notion
+    elif target == "confluence":
+        cfg_section = main_app.config.confluence
+    else:
+        cfg_section = main_app.config.obsidian
     cfg_section.recents = _push_recent(
         cfg_section.recents, selection_id, selection_title, selection_extra,
     )
@@ -329,10 +518,19 @@ def _on_worker_succeeded(
         # Persistence is best-effort here; the export itself succeeded.
         pass
 
-    # Open the new page in the user's default browser. Aaron's
-    # requirement: trigger the user's default browser to open the
-    # page exported.
-    if result.page_url:
+    if target == "obsidian":
+        if selection_extra.get("open_after_save") and result.page_url:
+            uri = _build_obsidian_open_uri(
+                vault_name=str(selection_extra.get("vault_name") or ""),
+                vault_root=str(selection_extra.get("vault_root") or ""),
+                file_url=result.page_url,
+            )
+            if uri:
+                QDesktopServices.openUrl(QUrl(uri))
+    elif result.page_url:
+        # Open the new page in the user's default browser. Aaron's
+        # requirement: trigger the user's default browser to open the
+        # page exported.
         QDesktopServices.openUrl(QUrl(result.page_url))
 
     # Status-bar toast. The result.message text already calls out the
@@ -345,12 +543,49 @@ def _on_worker_failed(
     main_app: "MainApp", target: str, err: str, progress: QProgressDialog,
 ) -> None:
     progress.close()
-    pretty = "Notion" if target == "notion" else "Confluence"
+    pretty = {
+        "notion": "Notion",
+        "confluence": "Confluence",
+        "obsidian": "Obsidian",
+    }.get(target, target.title())
     QMessageBox.warning(
-        main_app.window, f"Export to {pretty}",
-        f"The export failed:\n\n{err}",
+        main_app.window, f"Save to {pretty}",
+        f"The save failed:\n\n{err}",
     )
     _drop_worker(main_app, target)
+
+
+def _build_obsidian_open_uri(
+    *,
+    vault_name: str,
+    vault_root: str,
+    file_url: str,
+) -> str:
+    """Build an ``obsidian://open?vault=...&file=...`` URI.
+
+    Prefers vault name (Obsidian's URI scheme accepts either name or
+    path). Falls back to converting the file:// URL into a
+    vault-relative path when the vault name is empty.
+    """
+    from urllib.parse import quote, urlparse  # noqa: PLC0415
+    parsed = urlparse(file_url)
+    if parsed.scheme != "file":
+        return ""
+    try:
+        file_path = Path(parsed.path)
+        rel = file_path.relative_to(Path(vault_root)) if vault_root else file_path
+    except (ValueError, OSError):
+        return ""
+    rel_no_ext = str(rel)
+    if rel_no_ext.lower().endswith(".md"):
+        rel_no_ext = rel_no_ext[:-3]
+    rel_no_ext = rel_no_ext.replace("\\", "/")
+    if vault_name:
+        return (
+            f"obsidian://open?vault={quote(vault_name)}"
+            f"&file={quote(rel_no_ext)}"
+        )
+    return f"obsidian://open?path={quote(str(file_path))}"
 
 
 def _drop_worker(main_app: "MainApp", target: str) -> None:

@@ -66,6 +66,9 @@ VALID_LLM_TARGETS = ("claude", "copilot")
 VALID_RETAIN_FORMATS = ("opus", "flac", "wav")
 VALID_SESSION_LIST_SORTS = ("date_desc", "date_asc", "title_asc", "title_desc")
 VALID_BACKUP_SCHEDULES = ("manual", "on_close", "when_idle")
+VALID_OBSIDIAN_LOCATION_TEMPLATES = (
+    "year_month", "by_series", "flat", "custom",
+)
 
 
 @dataclass
@@ -405,6 +408,38 @@ class ConfluenceConfig:
 
 
 @dataclass
+class ObsidianConfig:
+    """Obsidian vault bridge (issue #96).
+
+    Filesystem-based publish to a configured Obsidian vault. No API,
+    no token -- we write markdown directly into the vault folder.
+    ``vault_root`` is the absolute path to the vault. ``vault_name``
+    is what Obsidian itself calls the vault (used by ``obsidian://``
+    URIs); auto-detected from the OS-level obsidian.json when
+    available, falls back to the vault folder's basename.
+    """
+    vault_root: str = ""
+    vault_name: str = ""
+    last_verified_at: str = ""
+    # Named layout the picker dropdown selects. "custom" uses
+    # `location_template_custom` instead. Placeholders: {YYYY},
+    # {MM}, {DD}, {title}, {series}, {session_id}.
+    location_template_name: str = "year_month"
+    location_template_custom: str = ""
+    write_frontmatter: bool = True
+    wikilink_attendees: bool = True
+    wikilink_series: bool = True
+    include_classification: bool = False
+    open_after_save: bool = True
+    daily_note_backlink: bool = False
+    # Pre-rendered list of files we've published, keyed by
+    # session_id, with vault-relative path + iso timestamp. Used by
+    # the picker to surface the "previously saved here" hint without
+    # walking the vault.
+    recents: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
@@ -416,6 +451,7 @@ class Config:
     backup: BackupConfig = field(default_factory=BackupConfig)
     notion: NotionConfig = field(default_factory=NotionConfig)
     confluence: ConfluenceConfig = field(default_factory=ConfluenceConfig)
+    obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -452,6 +488,9 @@ class Config:
             ),
             confluence=ConfluenceConfig(
                 **_filter_fields(ConfluenceConfig, data.get("confluence", {}))
+            ),
+            obsidian=ObsidianConfig(
+                **_filter_fields(ObsidianConfig, data.get("obsidian", {}))
             ),
         )
 
@@ -572,6 +611,20 @@ class Config:
                     "confluence.base_url must start with https:// or http:// "
                     f"(got {self.confluence.base_url!r})"
                 )
+        if self.obsidian.location_template_name not in VALID_OBSIDIAN_LOCATION_TEMPLATES:
+            errors.append(
+                f"obsidian.location_template_name "
+                f"{self.obsidian.location_template_name!r} must be one of "
+                f"{VALID_OBSIDIAN_LOCATION_TEMPLATES}"
+            )
+        if (
+            self.obsidian.location_template_name == "custom"
+            and not self.obsidian.location_template_custom.strip()
+        ):
+            errors.append(
+                "obsidian.location_template_custom must be set when "
+                "location_template_name is 'custom'"
+            )
         if self.synthesis.claude_project_id:
             # Optional field; if set, must look like a UUID
             # (8-4-4-4-12 hex). Loose match -- Claude uses UUID-v7
@@ -605,6 +658,7 @@ class Config:
             ("backup", self.backup),
             ("notion", self.notion),
             ("confluence", self.confluence),
+            ("obsidian", self.obsidian),
         ):
             lines.append(f"[{section}]")
             for key, value in asdict(obj).items():

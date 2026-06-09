@@ -1410,6 +1410,9 @@ class MainApp(QObject):
         self.window.save_to_confluence_requested.connect(
             self._on_file_menu_save_to_confluence,
         )
+        self.window.save_to_obsidian_requested.connect(
+            self._on_file_menu_save_to_obsidian,
+        )
         # File > Import Transcript... (#80) -- routes to the same
         # handler the SessionView's empty-state Import button uses.
         self.window.import_transcript_requested.connect(
@@ -1468,6 +1471,7 @@ class MainApp(QObject):
         # SessionView stays unaware of the integrations module.
         sv.export_to_notion_requested.connect(self._on_export_to_notion)
         sv.export_to_confluence_requested.connect(self._on_export_to_confluence)
+        sv.export_to_obsidian_requested.connect(self._on_export_to_obsidian)
         sv.retain_audio_toggled.connect(self.controller.set_retain_audio)
         # Click-to-tag attendee sidebar. The session-view passes its own
         # session_id; we forward to controller.tag_speaker which captures
@@ -2707,9 +2711,14 @@ class MainApp(QObject):
             and self.config.confluence.api_token
             and self.config.confluence.last_verified_at
         )
+        obsidian_ready = bool(
+            self.config.obsidian.vault_root
+            and self.config.obsidian.last_verified_at
+        )
         self.window.session_view.set_integration_targets(
             notion_enabled=notion_ready,
             confluence_enabled=confluence_ready,
+            obsidian_enabled=obsidian_ready,
         )
 
     def _on_export_to_notion(
@@ -2730,6 +2739,18 @@ class MainApp(QObject):
         from .integrations.integrations_export_flow import run_confluence_export  # noqa: PLC0415
 
         run_confluence_export(
+            self,
+            session_id=session_id,
+            tab_label=tab_label,
+            body=body,
+        )
+
+    def _on_export_to_obsidian(
+        self, session_id: str, tab_label: str, body: str,
+    ) -> None:
+        from .integrations.integrations_export_flow import run_obsidian_export  # noqa: PLC0415
+
+        run_obsidian_export(
             self,
             session_id=session_id,
             tab_label=tab_label,
@@ -2762,6 +2783,13 @@ class MainApp(QObject):
             return
         body, label = sv._active_tab_body_and_label()  # noqa: SLF001
         self._on_export_to_confluence(sv._session.id, label, body)  # noqa: SLF001
+
+    def _on_file_menu_save_to_obsidian(self) -> None:
+        sv = self.window.session_view
+        if sv._session is None:  # noqa: SLF001
+            return
+        body, label = sv._active_tab_body_and_label()  # noqa: SLF001
+        self._on_export_to_obsidian(sv._session.id, label, body)  # noqa: SLF001
 
     def _on_open_fonts_settings(self) -> None:
         """View > Editor & Preview Fonts... opens Settings landed on
