@@ -150,25 +150,34 @@ def truncate_filename_stem(stem: str) -> str:
 # ---- location template ---------------------------------------------------
 
 
-def resolve_location_template(
+_NAMED_LAYOUTS: dict[str, tuple[str, str]] = {
+    "year_month":      ("Meetings/{YYYY}/{MM}",  "{title}"),
+    "by_series":       ("Meetings/{series}",      "{title}"),
+    "by_series_dated": ("Meetings/{series}",      "{YYYY}-{MM}-{DD} - {title}"),
+    "flat":            ("Meetings",               "{title}"),
+}
+
+
+def resolve_location_layout(
     *,
     template_name: str,
     template_custom: str,
     session: ObsidianSessionInfo,
     when: Optional[datetime] = None,
-) -> str:
-    """Return the vault-relative subdirectory the note should land in.
+) -> tuple[str, str]:
+    """Return the (subdir, filename_stem) pair for a template.
 
-    Named templates:
-      * ``year_month`` -- ``Meetings/{YYYY}/{MM}``.
-      * ``by_series`` -- ``Meetings/{series}`` (falls back to
-        ``Meetings/Untitled`` when no series is set).
-      * ``flat`` -- ``Meetings``.
-      * ``custom`` -- the user's literal ``template_custom`` with
-        ``{YYYY}``, ``{MM}``, ``{DD}``, ``{title}``, ``{series}``,
-        ``{session_id}`` placeholders substituted.
+    Named templates each pin both halves explicitly (see
+    ``_NAMED_LAYOUTS``). For ``custom``: split the user's literal
+    template at the last ``/`` if the final segment carries
+    ``{title}`` -- it's then treated as the filename pattern, the
+    rest as the subdir. A custom template with no ``{title}`` in
+    the last segment is treated entirely as a subdir and the
+    filename defaults to ``{title}``.
 
-    Empty / unknown name falls back to ``year_month``.
+    Placeholders in both halves: ``{YYYY}``, ``{MM}``, ``{DD}``,
+    ``{title}``, ``{series}``, ``{session_id}``. Empty / unknown
+    template_name falls back to ``year_month``.
     """
     moment = when or session.started_at or datetime.now().astimezone()
     placeholders = {
@@ -180,24 +189,75 @@ def resolve_location_template(
         "session_id": session.session_id,
     }
     if template_name == "custom":
-        layout = template_custom or "Meetings/{YYYY}/{MM}"
-    elif template_name == "by_series":
-        layout = "Meetings/{series}"
-    elif template_name == "flat":
-        layout = "Meetings"
+        layout = (template_custom or "Meetings/{YYYY}/{MM}").replace("\\", "/")
+        parts = layout.split("/")
+        if parts and "{title}" in parts[-1]:
+            subdir_template = "/".join(parts[:-1]) or "Meetings"
+            filename_template = parts[-1]
+        else:
+            subdir_template = layout
+            filename_template = "{title}"
     else:
-        layout = "Meetings/{YYYY}/{MM}"
-    return _fill_placeholders(layout, placeholders)
+        subdir_template, filename_template = _NAMED_LAYOUTS.get(
+            template_name, _NAMED_LAYOUTS["year_month"],
+        )
+    subdir = _fill_placeholders(subdir_template, placeholders)
+    filename = _fill_placeholders_inline(filename_template, placeholders)
+    return subdir, filename
+
+
+def resolve_location_template(
+    *,
+    template_name: str,
+    template_custom: str,
+    session: ObsidianSessionInfo,
+    when: Optional[datetime] = None,
+) -> str:
+    """Subdir-only convenience wrapper. The picker pre-populates the
+    filename field separately via ``resolve_filename_template``."""
+    subdir, _filename = resolve_location_layout(
+        template_name=template_name,
+        template_custom=template_custom,
+        session=session,
+        when=when,
+    )
+    return subdir
+
+
+def resolve_filename_template(
+    *,
+    template_name: str,
+    template_custom: str,
+    session: ObsidianSessionInfo,
+    when: Optional[datetime] = None,
+) -> str:
+    """Filename-stem convenience wrapper. The picker uses this to
+    pre-populate the filename field; the user can override."""
+    _subdir, filename = resolve_location_layout(
+        template_name=template_name,
+        template_custom=template_custom,
+        session=session,
+        when=when,
+    )
+    return filename
 
 
 def _fill_placeholders(layout: str, placeholders: dict) -> str:
-    out = layout
-    for key, value in placeholders.items():
-        out = out.replace("{" + key + "}", value)
+    out = _fill_placeholders_inline(layout, placeholders)
     # Strip empty segments produced by an unset placeholder so we
     # don't write a path with a doubled "/" or a trailing slash.
     parts = [p for p in out.replace("\\", "/").split("/") if p]
     return "/".join(parts)
+
+
+def _fill_placeholders_inline(layout: str, placeholders: dict) -> str:
+    """Substitute placeholders without splitting on path separators
+    -- used for filename stems where ``/`` would be a sanitization
+    target, not a real boundary."""
+    out = layout
+    for key, value in placeholders.items():
+        out = out.replace("{" + key + "}", value)
+    return out
 
 
 # ---- frontmatter ---------------------------------------------------------

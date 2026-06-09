@@ -1562,6 +1562,10 @@ class SettingsDialog(QDialog):
         for name, label in (
             ("year_month", "Year / Month -- Meetings/{YYYY}/{MM}"),
             ("by_series", "By series -- Meetings/{series}"),
+            (
+                "by_series_dated",
+                "By series + date -- Meetings/{series}/{YYYY}-{MM}-{DD} - {title}",
+            ),
             ("flat", "Flat -- Meetings/"),
             ("custom", "Custom..."),
         ):
@@ -1580,7 +1584,7 @@ class SettingsDialog(QDialog):
             config.obsidian.location_template_custom,
         )
         self._obsidian_custom_template.setPlaceholderText(
-            "e.g. Meetings/{series}/{YYYY-MM-DD} - {title}"
+            "e.g. Meetings/{series}/{YYYY}-{MM}-{DD} - {title}"
         )
         obsidian_form.addRow("Custom template:", self._obsidian_custom_template)
         self._obsidian_location_picker.currentIndexChanged.connect(

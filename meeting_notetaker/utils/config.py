@@ -67,7 +67,7 @@ VALID_RETAIN_FORMATS = ("opus", "flac", "wav")
 VALID_SESSION_LIST_SORTS = ("date_desc", "date_asc", "title_asc", "title_desc")
 VALID_BACKUP_SCHEDULES = ("manual", "on_close", "when_idle")
 VALID_OBSIDIAN_LOCATION_TEMPLATES = (
-    "year_month", "by_series", "flat", "custom",
+    "year_month", "by_series", "by_series_dated", "flat", "custom",
 )
 
 

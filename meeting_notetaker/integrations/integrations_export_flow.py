@@ -41,6 +41,7 @@ from .notion_api import NotionClient
 from .obsidian_export import (
     ObsidianSessionInfo,
     find_republish_candidate,
+    resolve_filename_template,
     resolve_location_template,
     sanitize_obsidian_path_segment,
     sanitize_obsidian_stem,
@@ -222,7 +223,13 @@ def run_obsidian_export(
         when=when,
     )
     default_stem = sanitize_obsidian_stem(
-        info.title, fallback=session_id,
+        resolve_filename_template(
+            template_name=cfg.location_template_name,
+            template_custom=cfg.location_template_custom,
+            session=info,
+            when=when,
+        ),
+        fallback=session_id,
     )
 
     dlg = ObsidianSavePicker(

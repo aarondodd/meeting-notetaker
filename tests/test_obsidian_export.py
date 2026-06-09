@@ -21,7 +21,9 @@ from meeting_notetaker.integrations.obsidian_export import (
     export_to_obsidian,
     find_republish_candidate,
     read_existing_frontmatter,
+    resolve_filename_template,
     resolve_local_image_path,
+    resolve_location_layout,
     resolve_location_template,
     rewrite_image_refs,
     sanitize_obsidian_path_segment,
@@ -118,13 +120,15 @@ def test_location_template_flat():
     ) == "Meetings"
 
 
-def test_location_template_custom():
+def test_location_template_custom_with_title_in_last_segment_splits():
+    """The subdir-only wrapper returns just the subdir half. The {title}
+    in the last segment routes into the filename pattern, not the path."""
     out = resolve_location_template(
         template_name="custom",
         template_custom="Notes/{YYYY}-{MM}/{title}",
         session=_info(title="Q3 Plan"),
     )
-    assert out == "Notes/2026-06/Q3 Plan"
+    assert out == "Notes/2026-06"
 
 
 def test_location_template_custom_with_session_id():
@@ -142,6 +146,52 @@ def test_location_template_unknown_falls_back_to_year_month():
         session=_info(),
     )
     assert out == "Meetings/2026/06"
+
+
+def test_location_template_by_series_dated_subdir_and_filename():
+    """The named 'by_series + date' preset groups by series in the
+    subdir + chronologically orders within via the filename."""
+    subdir, filename = resolve_location_layout(
+        template_name="by_series_dated", template_custom="",
+        session=_info(title="Standup", series="Daily"),
+    )
+    assert subdir == "Meetings/Daily"
+    assert filename == "2026-06-09 - Standup"
+
+
+def test_resolve_filename_template_named_templates_use_title():
+    """Subdir-only named templates leave the filename as the bare title."""
+    for name in ("year_month", "by_series", "flat"):
+        out = resolve_filename_template(
+            template_name=name, template_custom="",
+            session=_info(title="Sample"),
+        )
+        assert out == "Sample", name
+
+
+def test_resolve_filename_template_custom_splits_on_title_in_last_segment():
+    """A custom template whose last path segment carries {title} is
+    split: everything before is subdir, the {title}-bearing segment
+    becomes the filename pattern."""
+    subdir, filename = resolve_location_layout(
+        template_name="custom",
+        template_custom="Notes/{series}/{YYYY}-{MM}-{DD} - {title}",
+        session=_info(title="Sync", series="Weekly"),
+    )
+    assert subdir == "Notes/Weekly"
+    assert filename == "2026-06-09 - Sync"
+
+
+def test_resolve_filename_template_custom_subdir_only_keeps_title_default():
+    """No {title} in the last segment -> whole template is the subdir,
+    filename defaults to the session title."""
+    subdir, filename = resolve_location_layout(
+        template_name="custom",
+        template_custom="Notes/{YYYY}/{series}",
+        session=_info(title="Sync", series="Weekly"),
+    )
+    assert subdir == "Notes/2026/Weekly"
+    assert filename == "Sync"
 
 
 # ---- frontmatter --------------------------------------------------------
