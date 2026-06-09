@@ -423,8 +423,12 @@ class ObsidianConfig:
     last_verified_at: str = ""
     # Named layout the picker dropdown selects. "custom" uses
     # `location_template_custom` instead. Placeholders: {YYYY},
-    # {MM}, {DD}, {title}, {series}, {session_id}.
-    location_template_name: str = "year_month"
+    # {MM}, {DD}, {title}, {series}, {session_id}. Default is
+    # `by_series_dated` per Aaron's 2026-06-09 ask: most users
+    # group meetings by series in their vault and want chronological
+    # filenames inside each series folder; this is also the only
+    # named preset whose filename is sortable on its own.
+    location_template_name: str = "by_series_dated"
     location_template_custom: str = ""
     write_frontmatter: bool = True
     wikilink_attendees: bool = True
