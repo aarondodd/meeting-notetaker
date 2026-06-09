@@ -63,6 +63,7 @@ class ObsidianSavePicker(QDialog):
         include_classification: bool,
         daily_note_backlink: bool,
         open_after_save: bool,
+        default_include_attachments: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -100,7 +101,9 @@ class ObsidianSavePicker(QDialog):
             f"Include {attachment_count} attachment(s)"
             if attachment_count else "Include attachments"
         )
-        self._attach_chk.setChecked(False)
+        self._attach_chk.setChecked(
+            default_include_attachments and attachment_count > 0,
+        )
         self._attach_chk.setEnabled(attachment_count > 0)
         form.addRow("", self._attach_chk)
 

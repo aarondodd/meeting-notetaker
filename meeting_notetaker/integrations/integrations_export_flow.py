@@ -245,6 +245,7 @@ def run_obsidian_export(
         include_classification=cfg.include_classification,
         daily_note_backlink=cfg.daily_note_backlink,
         open_after_save=cfg.open_after_save,
+        default_include_attachments=cfg.default_include_attachments,
         parent=main_app.window,
     )
     if dlg.exec() != dlg.DialogCode.Accepted:
@@ -526,14 +527,12 @@ def _on_worker_succeeded(
         pass
 
     if target == "obsidian":
+        # page_url is the obsidian:// URI; QDesktopServices delegates
+        # to the OS handler (ShellExecute on Windows / xdg-open on
+        # Linux / LSOpen on macOS) which dispatches to the installed
+        # Obsidian client.
         if selection_extra.get("open_after_save") and result.page_url:
-            uri = _build_obsidian_open_uri(
-                vault_name=str(selection_extra.get("vault_name") or ""),
-                vault_root=str(selection_extra.get("vault_root") or ""),
-                file_url=result.page_url,
-            )
-            if uri:
-                QDesktopServices.openUrl(QUrl(uri))
+            QDesktopServices.openUrl(QUrl(result.page_url))
     elif result.page_url:
         # Open the new page in the user's default browser. Aaron's
         # requirement: trigger the user's default browser to open the
@@ -562,37 +561,6 @@ def _on_worker_failed(
     _drop_worker(main_app, target)
 
 
-def _build_obsidian_open_uri(
-    *,
-    vault_name: str,
-    vault_root: str,
-    file_url: str,
-) -> str:
-    """Build an ``obsidian://open?vault=...&file=...`` URI.
-
-    Prefers vault name (Obsidian's URI scheme accepts either name or
-    path). Falls back to converting the file:// URL into a
-    vault-relative path when the vault name is empty.
-    """
-    from urllib.parse import quote, urlparse  # noqa: PLC0415
-    parsed = urlparse(file_url)
-    if parsed.scheme != "file":
-        return ""
-    try:
-        file_path = Path(parsed.path)
-        rel = file_path.relative_to(Path(vault_root)) if vault_root else file_path
-    except (ValueError, OSError):
-        return ""
-    rel_no_ext = str(rel)
-    if rel_no_ext.lower().endswith(".md"):
-        rel_no_ext = rel_no_ext[:-3]
-    rel_no_ext = rel_no_ext.replace("\\", "/")
-    if vault_name:
-        return (
-            f"obsidian://open?vault={quote(vault_name)}"
-            f"&file={quote(rel_no_ext)}"
-        )
-    return f"obsidian://open?path={quote(str(file_path))}"
 
 
 def _drop_worker(main_app: "MainApp", target: str) -> None:

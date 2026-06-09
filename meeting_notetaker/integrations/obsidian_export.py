@@ -665,11 +665,15 @@ def export_to_obsidian(
                 report(f"Skipped daily-note backlink: {exc}")
 
     rel = _posix_relpath(target_path, vault_root)
-    file_url = target_path.resolve().as_uri()
+    open_uri = build_obsidian_open_uri(
+        vault_name=options.vault_name,
+        vault_root=vault_root,
+        note_path=target_path,
+    )
     return ExportResult(
         target="obsidian",
         page_id=session.session_id,
-        page_url=file_url,
+        page_url=open_uri,
         title=session.title or stem,
         message=(
             f"Saved to Obsidian vault as {rel}."
@@ -677,6 +681,35 @@ def export_to_obsidian(
             else f"Updated note in Obsidian vault at {rel}."
         ),
     )
+
+
+def build_obsidian_open_uri(
+    *,
+    vault_name: str,
+    vault_root: Path,
+    note_path: Path,
+) -> str:
+    """Build the ``obsidian://open?...`` URI for a newly-written note.
+
+    Prefers the vault-name + vault-relative-path form (the canonical
+    Obsidian URI). Falls back to the absolute ``?path=...`` form when
+    the caller didn't supply a vault name -- e.g. a vault that
+    Obsidian has never opened.
+
+    No file:// round-tripping: takes ``Path`` objects throughout so
+    Windows path-with-drive-letter doesn't get mangled through
+    urlparse's "/C:/..." shape.
+    """
+    from urllib.parse import quote  # noqa: PLC0415
+    if vault_name:
+        rel = _posix_relpath(note_path, vault_root)
+        if rel.lower().endswith(".md"):
+            rel = rel[:-3]
+        return (
+            f"obsidian://open?vault={quote(vault_name)}"
+            f"&file={quote(rel)}"
+        )
+    return f"obsidian://open?path={quote(str(note_path))}"
 
 
 # ---- attachments tail ----------------------------------------------------

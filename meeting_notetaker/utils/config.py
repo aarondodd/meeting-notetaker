@@ -432,6 +432,11 @@ class ObsidianConfig:
     include_classification: bool = False
     open_after_save: bool = True
     daily_note_backlink: bool = False
+    # Default state for the per-save "Include attachments" checkbox.
+    # Aaron's 2026-06-09 ask: he wants attachments always; clicking
+    # each save is friction. Off by default so the integration's
+    # behavior on first launch is unchanged.
+    default_include_attachments: bool = False
     # Pre-rendered list of files we've published, keyed by
     # session_id, with vault-relative path + iso timestamp. Used by
     # the picker to surface the "previously saved here" hint without

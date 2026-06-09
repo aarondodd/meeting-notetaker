@@ -16,6 +16,7 @@ from meeting_notetaker.integrations.obsidian_export import (
     ObsidianPublishOptions,
     ObsidianSessionInfo,
     build_frontmatter,
+    build_obsidian_open_uri,
     collect_local_image_refs,
     copy_image_dedupe,
     export_to_obsidian,
@@ -484,7 +485,10 @@ def test_export_writes_note_with_frontmatter_and_relative_image(tmp_path):
     assert img.is_file()
     assert "../../_assets/abc/foo.png" in text
     assert res.target == "obsidian"
-    assert res.page_url.startswith("file://")
+    # page_url is the obsidian:// URI -- the caller passes it
+    # straight to QDesktopServices.openUrl, which dispatches to the
+    # installed Obsidian client. No file:// round-trip.
+    assert res.page_url.startswith("obsidian://open?")
 
 
 def test_export_counter_suffix_on_existing_file(tmp_path):
@@ -505,8 +509,9 @@ def test_export_counter_suffix_on_existing_file(tmp_path):
     )
     assert (vault / "Notes" / "t.md").is_file()
     assert (vault / "Notes" / "t-2.md").is_file()
-    assert "t.md" in res1.page_url
-    assert "t-2.md" in res2.page_url
+    # The obsidian:// URI carries the vault-relative path with no .md.
+    assert "file=Notes/t" in res1.page_url
+    assert "file=Notes/t-2" in res2.page_url
 
 
 def test_export_overwrite_uses_target_path(tmp_path):
@@ -529,7 +534,7 @@ def test_export_overwrite_uses_target_path(tmp_path):
     note = vault / "Notes" / "t.md"
     assert "second body" in note.read_text()
     assert "first" not in note.read_text()
-    assert "Notes/t.md" in res.page_url
+    assert "file=Notes/t" in res.page_url
 
 
 def test_export_does_not_emit_table_of_contents(tmp_path):
@@ -553,6 +558,83 @@ def test_export_does_not_emit_table_of_contents(tmp_path):
     text = note.read_text()
     assert "## Contents" not in text
     assert "- [Section A](#" not in text
+
+
+def test_build_obsidian_open_uri_vault_name_form(tmp_path):
+    """The vault-name URI carries the vault-relative path with no .md
+    extension. Earlier shape round-tripped through file:// + urlparse
+    which mangled Windows drive-letter paths."""
+    vault = tmp_path / "MyVault"
+    vault.mkdir()
+    note = vault / "Meetings" / "2026" / "06" / "Note.md"
+    note.parent.mkdir(parents=True)
+    note.touch()
+    uri = build_obsidian_open_uri(
+        vault_name="MyVault", vault_root=vault, note_path=note,
+    )
+    assert uri == (
+        "obsidian://open?vault=MyVault"
+        "&file=Meetings/2026/06/Note"
+    )
+
+
+def test_build_obsidian_open_uri_falls_back_to_path_form(tmp_path):
+    """When the vault name is empty, the absolute-path fallback fires."""
+    vault = tmp_path / "MyVault"
+    vault.mkdir()
+    note = vault / "n.md"
+    note.touch()
+    uri = build_obsidian_open_uri(
+        vault_name="", vault_root=vault, note_path=note,
+    )
+    assert uri.startswith("obsidian://open?path=")
+    assert "n.md" in uri
+
+
+def test_build_obsidian_open_uri_quotes_special_chars(tmp_path):
+    """Vault names + paths with spaces get url-encoded."""
+    vault = tmp_path / "My Vault"
+    vault.mkdir()
+    note = vault / "Meetings" / "Q3 Plan.md"
+    note.parent.mkdir(parents=True)
+    note.touch()
+    uri = build_obsidian_open_uri(
+        vault_name="My Vault", vault_root=vault, note_path=note,
+    )
+    assert "vault=My%20Vault" in uri
+    assert "Meetings/Q3%20Plan" in uri
+
+
+def test_export_obsidian_uri_uses_vault_name_when_set(tmp_path):
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    sess_dir = tmp_path / "session"
+    sess_dir.mkdir()
+    info = ObsidianSessionInfo(session_id="abc", title="t")
+    opts = ObsidianPublishOptions(
+        vault_root=vault, vault_name="Vault",
+        target_subdir="Notes", filename_stem="t",
+    )
+    res = export_to_obsidian(
+        session=info, body="body", options=opts, session_dir=sess_dir,
+    )
+    assert res.page_url == "obsidian://open?vault=Vault&file=Notes/t"
+
+
+def test_export_obsidian_uri_falls_back_to_path_when_no_vault_name(tmp_path):
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    sess_dir = tmp_path / "session"
+    sess_dir.mkdir()
+    info = ObsidianSessionInfo(session_id="abc", title="t")
+    opts = ObsidianPublishOptions(
+        vault_root=vault, vault_name="",
+        target_subdir="Notes", filename_stem="t",
+    )
+    res = export_to_obsidian(
+        session=info, body="body", options=opts, session_dir=sess_dir,
+    )
+    assert res.page_url.startswith("obsidian://open?path=")
 
 
 def test_export_daily_note_backlink(tmp_path):

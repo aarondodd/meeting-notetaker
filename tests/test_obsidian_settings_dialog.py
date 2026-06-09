@@ -155,3 +155,17 @@ def test_location_template_round_trip(qt_app, tmp_path):
         assert cfg.obsidian.location_template_name == "by_series"
     finally:
         dlg.deleteLater()
+
+
+def test_default_include_attachments_round_trip(qt_app):
+    """Toggling the new 'include attachments by default' checkbox
+    persists across accept so the per-save picker picks it up."""
+    cfg = Config()
+    assert cfg.obsidian.default_include_attachments is False
+    dlg = SettingsDialog(cfg)
+    try:
+        dlg._obsidian_default_attach.setChecked(True)  # noqa: SLF001
+        dlg._on_accept()  # noqa: SLF001
+        assert cfg.obsidian.default_include_attachments is True
+    finally:
+        dlg.deleteLater()

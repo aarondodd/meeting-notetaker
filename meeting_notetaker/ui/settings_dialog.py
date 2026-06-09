@@ -1412,6 +1412,9 @@ class SettingsDialog(QDialog):
         self._config.obsidian.include_classification = (
             self._obsidian_include_class.isChecked()
         )
+        self._config.obsidian.default_include_attachments = (
+            self._obsidian_default_attach.isChecked()
+        )
         self._config.obsidian.daily_note_backlink = (
             self._obsidian_daily_backlink.isChecked()
         )
@@ -1621,6 +1624,14 @@ class SettingsDialog(QDialog):
             config.obsidian.include_classification,
         )
         obsidian_form.addRow("", self._obsidian_include_class)
+
+        self._obsidian_default_attach = QCheckBox(
+            "Include session attachments by default on save"
+        )
+        self._obsidian_default_attach.setChecked(
+            config.obsidian.default_include_attachments,
+        )
+        obsidian_form.addRow("", self._obsidian_default_attach)
 
         self._obsidian_daily_backlink = QCheckBox(
             "Append a backlink to today's daily note on save"

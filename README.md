@@ -1365,6 +1365,7 @@ of these are also editable directly in `config.toml`.
 | Obsidian YAML frontmatter | on | Write a YAML frontmatter block at the top of each saved note. Carries title / date / attendees / series / tags / `source_session_id`. |
 | Obsidian wikilinks (attendees + series) | on | Render attendee names and the series in frontmatter as `[[wikilinks]]` so they form graph nodes. |
 | Obsidian classification in frontmatter | off | Add the session's classification value to frontmatter. |
+| Obsidian include attachments by default | off | Pre-check the "Include attachments" box in the save dialog. Saves a click for users who want every save to bring the attachments with it. |
 | Obsidian daily-note backlink | off | After saving, append a backlink to today's daily note (reads the user's Daily Notes or Periodic Notes config to find it). |
 | Obsidian open after save | on | Launch `obsidian://open?vault=...&file=...` after the note lands. |
 
