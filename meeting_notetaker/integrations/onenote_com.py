@@ -414,6 +414,118 @@ def diagnose_onenote_com() -> str:
     except Exception as exc:  # noqa: BLE001
         out.append(f"  EnsureModule failed: {type(exc).__name__}: {exc}")
         return "\n".join(out)
+    # Phase 3b: registry checks that the universal marshaler needs.
+    # TYPE_E_LIBNOTREGISTERED at call time is almost always one of:
+    #   * HKCR\Interface\{IID}\TypeLib missing or wrong LIBID
+    #   * HKCR\Interface\{IID}\ProxyStubClsid32 missing
+    #   * The pointed-at typelib not registered for the current
+    #     bitness (32-bit vs 64-bit)
+    out.append("--- interface marshaling registrations ---")
+    try:
+        import winreg  # noqa: PLC0415
+        # Pull the IApplication IID out of the gen_py dump above so
+        # this still works if OneNote ships a different IID.
+        target_iids = [
+            "{452AC71A-B655-4967-A208-A4CC39DD7949}",  # IApplication
+        ]
+        for iid in target_iids:
+            out.append(f"  Interface {iid}:")
+            for sub in ("TypeLib", "ProxyStubClsid32"):
+                try:
+                    with winreg.OpenKey(
+                        winreg.HKEY_CLASSES_ROOT,
+                        fr"Interface\{iid}\{sub}",
+                    ) as k:
+                        val = winreg.QueryValueEx(k, "")[0]
+                    out.append(f"    {sub} = {val}")
+                    if sub == "TypeLib":
+                        try:
+                            with winreg.OpenKey(
+                                winreg.HKEY_CLASSES_ROOT,
+                                fr"Interface\{iid}\TypeLib",
+                            ) as k:
+                                ver = winreg.QueryValueEx(k, "Version")[0]
+                            out.append(f"    Version = {ver}")
+                        except OSError as exc:
+                            out.append(f"    Version: MISSING ({exc})")
+                except OSError as exc:
+                    out.append(f"    {sub}: MISSING ({exc})")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  interface check failed: {exc}")
+
+    # Phase 3c: OneNote server bitness vs Python bitness. Mismatch
+    # is the canonical cause for missing 64-bit Interface registrations.
+    out.append("--- OneNote server bitness ---")
+    try:
+        import winreg  # noqa: PLC0415
+        # The CoClass CLSID (Application2) we resolved above.
+        clsid = "{DC67E480-C3CB-49F8-8232-60B0C2056C8E}"
+        for ls_key in ("LocalServer32", "LocalServer"):
+            try:
+                with winreg.OpenKey(
+                    winreg.HKEY_CLASSES_ROOT,
+                    fr"CLSID\{clsid}\{ls_key}",
+                ) as k:
+                    val = winreg.QueryValueEx(k, "")[0]
+                out.append(f"  {ls_key} = {val}")
+                # Look for the exe and dump architecture by reading PE header
+                import re  # noqa: PLC0415
+                m = re.match(r'"?([^"]+\.exe)', val, re.IGNORECASE)
+                exe_path = m.group(1) if m else val.split(" ")[0]
+                out.append(f"  exe path: {exe_path}")
+                try:
+                    with open(exe_path, "rb") as f:
+                        f.seek(0x3C)
+                        pe_offset = int.from_bytes(f.read(4), "little")
+                        f.seek(pe_offset + 4)
+                        machine = int.from_bytes(f.read(2), "little")
+                    # 0x014c = x86 32-bit, 0x8664 = x64 64-bit
+                    arch = {0x014c: "32-bit", 0x8664: "64-bit"}.get(
+                        machine, f"unknown(0x{machine:04x})",
+                    )
+                    out.append(f"  exe arch: {arch}")
+                except OSError as exc:
+                    out.append(f"  exe read failed: {exc}")
+            except OSError:
+                continue
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  server-bitness check failed: {exc}")
+
+    # Phase 3d: typelib registered file paths for both bitnesses.
+    # Universal marshaler picks via the current process's bitness;
+    # if only 32-bit is registered, 64-bit Python's marshaler trips.
+    out.append("--- typelib registered files (per bitness) ---")
+    try:
+        import winreg  # noqa: PLC0415
+        libid = "{0EA692EE-BB50-4E3C-AEF0-356D91732725}"
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CLASSES_ROOT, fr"TypeLib\{libid}",
+            ) as lib_key:
+                ver_idx = 0
+                while True:
+                    try:
+                        ver_name = winreg.EnumKey(lib_key, ver_idx)
+                    except OSError:
+                        break
+                    ver_idx += 1
+                    if "." not in ver_name:
+                        continue
+                    out.append(f"  v{ver_name}:")
+                    for arch_sub in ("win32", "win64"):
+                        try:
+                            with winreg.OpenKey(
+                                lib_key, fr"{ver_name}\0\{arch_sub}",
+                            ) as ak:
+                                val = winreg.QueryValueEx(ak, "")[0]
+                            out.append(f"    {arch_sub}: {val}")
+                        except OSError:
+                            out.append(f"    {arch_sub}: not registered")
+        except OSError as exc:
+            out.append(f"  typelib registry missing: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  typelib path check failed: {exc}")
+
     # Phase 4: exercise every CoClass candidate so we can see which
     # one survives the live GetHierarchy call (the marshaling step
     # that broke for Application2 with TYPE_E_LIBNOTREGISTERED).
