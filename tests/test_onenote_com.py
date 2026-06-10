@@ -27,7 +27,7 @@ class _FakeApp:
         self.calls.append(("GetHierarchy", start, scope))
         return self._hierarchy
 
-    def CreateNewPage(self, section_id, _placeholder, _style):  # noqa: N802
+    def CreateNewPage(self, section_id, _style):  # noqa: N802
         self.calls.append(("CreateNewPage", section_id))
         return self._create
 

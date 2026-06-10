@@ -54,6 +54,11 @@ tomli>=2.0.0; python_version < '3.11'
 truststore>=0.9.0; sys_platform == 'win32'
 # Outlook calendar integration via COM. Windows-only; provides win32com.client.
 pywin32>=306; sys_platform == 'win32'
+# OneNote fallback dispatch (#100): some Click-to-Run Microsoft 365 installs
+# refuse pywin32's gen_py + InvokeTypes path with TYPE_E_LIBNOTREGISTERED at
+# the marshaling layer. comtypes uses VTable invocation for dual interfaces
+# and sometimes works on those installs.
+comtypes>=1.4.0; sys_platform == 'win32'
 # Ad-hoc meeting auto-detect: enumerate Windows audio sessions per process
 # via IAudioSessionManager2 (no audio capture). pycaw wraps the COM calls;
 # psutil resolves process IDs to executable names. Windows-only.

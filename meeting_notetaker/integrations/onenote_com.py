@@ -213,28 +213,68 @@ def _dispatch_via_registry(progid: str) -> object:
         log.debug("OneNote CoClass %s passed smoke test", attr_name)
         return instance
 
+    # pywin32's typed InvokeTypes path failed. Try comtypes as a
+    # fallback: comtypes uses VTable invocation for dual interfaces
+    # (no IDispatch::Invoke -> universal-marshaler dance), which
+    # sometimes works on Click-to-Run installs where pywin32's
+    # path fails with TYPE_E_LIBNOTREGISTERED.
+    comtypes_inst = _dispatch_via_comtypes(progid)
+    if comtypes_inst is not None:
+        try:
+            comtypes_inst.GetHierarchy("", 4)
+            log.info("OneNote dispatched via comtypes fallback")
+            return comtypes_inst
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            if "-2147319779" in err or "Library not registered" in err:
+                saw_libnotregistered = True
+            errors.append(f"comtypes GetHierarchy: {exc}")
+
     if saw_libnotregistered:
         raise OneNoteUnavailable(
             "OneNote is installed but its COM registration is "
-            "incomplete on this machine. The Windows COM marshaling "
-            "layer returned 'Library not registered' "
-            "(TYPE_E_LIBNOTREGISTERED) for every entry point we "
-            "tried -- a known Microsoft 365 Click-to-Run side "
-            "effect. The fix is Microsoft's built-in repair tool:\n\n"
+            "incomplete on this machine. Both pywin32 and comtypes "
+            "got 'Library not registered' (TYPE_E_LIBNOTREGISTERED) "
+            "from the Windows COM marshaling layer for every entry "
+            "point we tried. The Microsoft-blessed fix is Quick "
+            "Repair, which needs admin:\n\n"
             "  1. Close all Office apps (Outlook, Word, OneNote).\n"
             "  2. Settings > Apps > Installed apps > Microsoft 365.\n"
-            "  3. Modify > Quick Repair > Repair.\n"
+            "  3. Modify > Quick Repair > Repair (admin required).\n"
             "  4. Restart Meeting Notetaker + click Verify again.\n\n"
-            "If Quick Repair doesn't help, run Online Repair from "
-            "the same dialog (slower, more thorough). In the "
-            "meantime Save to Notion / Confluence / Obsidian / PDF / "
-            "Word all work without OneNote."
+            "If you can't run Quick Repair (corporate machine, no "
+            "admin), Save to Notion / Confluence / Obsidian / PDF / "
+            "Word all work without OneNote and don't need any "
+            "system-level repair."
         )
 
     raise OneNoteUnavailable(
-        "Every OneNote CoClass candidate failed. Errors: "
+        "Every OneNote dispatch candidate failed. Errors: "
         + " | ".join(errors)
     )
+
+
+def _dispatch_via_comtypes(progid: str) -> Optional[object]:
+    """Try CreateObject via comtypes. Returns None if comtypes is
+    unavailable or CreateObject itself fails; the caller decides
+    whether to surface that or fall back to the pywin32 errors.
+
+    comtypes generates COM wrappers on demand from the running
+    object's typelib + uses VTable invocation for dual interfaces,
+    a different code path than pywin32's gen_py + typelib-validated
+    InvokeTypes. Some Click-to-Run installs fail at one but not the
+    other.
+    """
+    try:
+        import comtypes.client  # type: ignore[import-untyped]  # noqa: PLC0415
+    except ImportError as exc:
+        log.debug("comtypes not installed; skipping fallback: %s", exc)
+        return None
+    try:
+        return comtypes.client.CreateObject(progid)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("comtypes CreateObject(%s) failed: %s", progid, exc)
+        return None
 
 
 def _read_progid_clsid(progid: str) -> str:
@@ -548,7 +588,42 @@ def diagnose_onenote_com() -> str:
     except Exception as exc:  # noqa: BLE001
         out.append(f"  typelib path check failed: {exc}")
 
-    # Phase 4: exercise every CoClass candidate so we can see which
+    # Phase 4: comtypes fallback. Different Python COM library that
+    # uses VTable invocation for dual interfaces -- sometimes works
+    # where pywin32 doesn't.
+    out.append("--- comtypes fallback ---")
+    try:
+        import comtypes.client  # noqa: PLC0415
+        out.append(f"  comtypes: {comtypes.client.__file__}")
+        try:
+            ct_inst = comtypes.client.CreateObject("OneNote.Application")
+            out.append(
+                f"  CreateObject ok; type={type(ct_inst).__name__}"
+            )
+            out.append(
+                f"  has GetHierarchy: {hasattr(ct_inst, 'GetHierarchy')}"
+            )
+            if hasattr(ct_inst, "GetHierarchy"):
+                try:
+                    xml = ct_inst.GetHierarchy("", 4)
+                    out.append(
+                        f"  GetHierarchy ok; returned "
+                        f"{len(xml or '')} chars"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    out.append(
+                        f"  GetHierarchy raised: {type(exc).__name__}: {exc}"
+                    )
+        except Exception as exc:  # noqa: BLE001
+            out.append(
+                f"  CreateObject failed: {type(exc).__name__}: {exc}"
+            )
+    except ImportError:
+        out.append("  comtypes is not installed")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  comtypes import failed: {exc}")
+
+    # Phase 5: exercise every CoClass candidate so we can see which
     # one survives the live GetHierarchy call (the marshaling step
     # that broke for Application2 with TYPE_E_LIBNOTREGISTERED).
     out.append("--- per-CoClass smoke test ---")
@@ -647,19 +722,23 @@ class OneNoteClient:
     # ---- page ops -------------------------------------------------------
 
     def create_page(self, *, section_id: str) -> str:
-        """Create a new empty page under ``section_id`` + return its id."""
+        """Create a new empty page under ``section_id`` + return its id.
+
+        The OneNote IDL signature is
+        ``CreateNewPage(BSTR section_id, BSTR* page_id_out,
+        NewPageStyle style)``. pywin32 + comtypes wrappers both
+        elide the ``[out]`` parameter from the Python signature and
+        return it as the function value, so we pass two args:
+        ``(section_id, style)``.
+        """
         try:
-            new_id = self._app.CreateNewPage(section_id, "", 0)
+            new_id = self._app.CreateNewPage(section_id, 0)
         except Exception as exc:  # noqa: BLE001
             raise OneNoteError(
                 f"CreateNewPage failed for section {section_id!r}: {exc}",
             ) from exc
-        # CreateNewPage returns the new page id as the out parameter.
-        # pywin32 marshals the out into the call's return value when
-        # the BSTR is the only out; some signatures return ("", id).
-        # Handle both shapes.
-        if isinstance(new_id, tuple) and len(new_id) >= 2:
-            return str(new_id[1])
+        if isinstance(new_id, tuple) and new_id:
+            return str(new_id[-1])
         return str(new_id or "")
 
     def update_page_content(self, *, page_xml: str) -> None:
