@@ -93,9 +93,28 @@ _DispatchFn = Callable[[str], object]
 
 
 def _default_dispatch(progid: str) -> object:
-    """Real win32com Dispatch. Wrapped so tests can inject a fake."""
+    """Real win32com Dispatch with type-library binding.
+
+    Bare ``Dispatch`` uses late binding (IDispatch::Invoke). The
+    OneNote desktop client hides ``GetHierarchy`` / ``CreateNewPage``
+    / ``UpdatePageContent`` from the IDispatch surface on most
+    Click-to-Run installs -- the COM object exists but the methods
+    are only reachable through the type library. The symptom is an
+    ``AttributeError: OneNote.Application.GetHierarchy`` at the first
+    call (which is what Verify hits). ``gencache.EnsureDispatch``
+    fixes this by generating a typed wrapper from the typelib at
+    Dispatch time.
+
+    Falls back to plain ``Dispatch`` if the gen_py cache directory is
+    read-only (rare; some sandboxed environments). The fallback lets
+    the wrapper still work on any future install whose IDispatch
+    surface is complete.
+    """
     import win32com.client  # type: ignore[import-untyped]  # noqa: PLC0415
-    return win32com.client.Dispatch(progid)
+    try:
+        return win32com.client.gencache.EnsureDispatch(progid)
+    except Exception:  # noqa: BLE001 -- broad on purpose: gen_py may fail many ways
+        return win32com.client.Dispatch(progid)
 
 
 def verify(*, dispatch: Optional[_DispatchFn] = None) -> dict:
