@@ -95,26 +95,129 @@ _DispatchFn = Callable[[str], object]
 def _default_dispatch(progid: str) -> object:
     """Real win32com Dispatch with type-library binding.
 
-    Bare ``Dispatch`` uses late binding (IDispatch::Invoke). The
-    OneNote desktop client hides ``GetHierarchy`` / ``CreateNewPage``
-    / ``UpdatePageContent`` from the IDispatch surface on most
-    Click-to-Run installs -- the COM object exists but the methods
-    are only reachable through the type library. The symptom is an
-    ``AttributeError: OneNote.Application.GetHierarchy`` at the first
-    call (which is what Verify hits). ``gencache.EnsureDispatch``
-    fixes this by generating a typed wrapper from the typelib at
-    Dispatch time.
+    The OneNote desktop client hides ``GetHierarchy`` /
+    ``CreateNewPage`` / ``UpdatePageContent`` from the IDispatch
+    surface on Click-to-Run Microsoft 365 installs -- the COM
+    object exists but the methods are only reachable through the
+    type library. ``gencache.EnsureDispatch`` generates a typed
+    wrapper from the typelib at Dispatch time.
 
-    Falls back to plain ``Dispatch`` if the gen_py cache directory is
-    read-only (rare; some sandboxed environments). The fallback lets
-    the wrapper still work on any future install whose IDispatch
-    surface is complete.
+    If EnsureDispatch is going to fail (read-only gen_py cache;
+    typelib registration issue; bitness mismatch) we want to know
+    WHY, not silently fall back into the same symptom. The error
+    bubbles with the EnsureDispatch failure attached so the Verify
+    path can surface it instead of returning a misleading generic
+    AttributeError on the next method call.
     """
     import win32com.client  # type: ignore[import-untyped]  # noqa: PLC0415
     try:
-        return win32com.client.gencache.EnsureDispatch(progid)
-    except Exception:  # noqa: BLE001 -- broad on purpose: gen_py may fail many ways
-        return win32com.client.Dispatch(progid)
+        client = win32com.client.gencache.EnsureDispatch(progid)
+    except Exception as ensure_err:  # noqa: BLE001
+        # Fall back to plain Dispatch, but if that result lacks
+        # GetHierarchy we surface the EnsureDispatch error so the
+        # caller knows the type-library bind failed.
+        try:
+            client = win32com.client.Dispatch(progid)
+        except Exception as fallback_err:  # noqa: BLE001
+            raise OneNoteUnavailable(
+                f"Could not Dispatch '{progid}'. "
+                f"EnsureDispatch error: {ensure_err}. "
+                f"Dispatch fallback error: {fallback_err}."
+            ) from fallback_err
+        if not hasattr(client, "GetHierarchy"):
+            raise OneNoteUnavailable(
+                "Late-bound OneNote dispatch is missing the "
+                "GetHierarchy method (typelib binding failed). "
+                f"EnsureDispatch underlying error: {ensure_err}. "
+                "Run diagnose_onenote_com() for the full picture."
+            ) from ensure_err
+        return client
+    # EnsureDispatch returned a typed wrapper. Guard against the rare
+    # case where the wrapper is generated but the method is still
+    # missing -- e.g. a partially-registered typelib.
+    if not hasattr(client, "GetHierarchy"):
+        raise OneNoteUnavailable(
+            "Typed OneNote wrapper is missing GetHierarchy. "
+            "The type library appears registered but incomplete. "
+            "Run diagnose_onenote_com() for the full picture."
+        )
+    return client
+
+
+def diagnose_onenote_com() -> str:
+    """Multi-line diagnostic report covering every COM path we try.
+
+    Surfaced via the Settings dialog's Verify error fallback so the
+    operator gets a complete picture (pywin32 version, gen_py cache
+    path, EnsureDispatch error, plain Dispatch error, method
+    visibility on the dispatched object, GetHierarchy invocation).
+    """
+    out: list[str] = []
+    try:
+        import sys  # noqa: PLC0415
+        out.append(
+            f"Python: {'.'.join(map(str, sys.version_info[:3]))}, "
+            f"{'64' if sys.maxsize > 2**32 else '32'}-bit"
+        )
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"Python info: {exc}")
+    try:
+        import win32com.client  # noqa: PLC0415
+        out.append(f"pywin32 win32com.client: {win32com.client.__file__}")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"pywin32 import failed: {exc}")
+        return "\n".join(out)
+    try:
+        from win32com.client import gencache  # noqa: PLC0415
+        out.append(f"gen_py cache path: {gencache.GetGeneratePath()}")
+        try:
+            import os  # noqa: PLC0415
+            cache_path = gencache.GetGeneratePath()
+            out.append(f"  cache writable: {os.access(cache_path, os.W_OK)}")
+        except Exception as exc:  # noqa: BLE001
+            out.append(f"  cache writability check failed: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"gen_py: {exc}")
+
+    # Phase 1: EnsureDispatch
+    out.append("--- EnsureDispatch('OneNote.Application') ---")
+    try:
+        client = win32com.client.gencache.EnsureDispatch("OneNote.Application")
+        out.append(f"  ok; type={type(client).__name__}")
+        out.append(f"  has GetHierarchy: {hasattr(client, 'GetHierarchy')}")
+        if hasattr(client, "GetHierarchy"):
+            try:
+                xml = client.GetHierarchy("", 4)
+                out.append(
+                    f"  GetHierarchy ok; returned {len(xml or '')} chars"
+                )
+            except Exception as exc:  # noqa: BLE001
+                out.append(
+                    f"  GetHierarchy raised: {type(exc).__name__}: {exc}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  failed: {type(exc).__name__}: {exc}")
+
+    # Phase 2: plain Dispatch
+    out.append("--- Dispatch('OneNote.Application') ---")
+    try:
+        client = win32com.client.Dispatch("OneNote.Application")
+        out.append(f"  ok; type={type(client).__name__}")
+        out.append(f"  has GetHierarchy: {hasattr(client, 'GetHierarchy')}")
+        if hasattr(client, "GetHierarchy"):
+            try:
+                xml = client.GetHierarchy("", 4)
+                out.append(
+                    f"  GetHierarchy ok; returned {len(xml or '')} chars"
+                )
+            except Exception as exc:  # noqa: BLE001
+                out.append(
+                    f"  GetHierarchy raised: {type(exc).__name__}: {exc}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  failed: {type(exc).__name__}: {exc}")
+
+    return "\n".join(out)
 
 
 def verify(*, dispatch: Optional[_DispatchFn] = None) -> dict:

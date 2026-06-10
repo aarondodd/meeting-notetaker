@@ -1820,8 +1820,10 @@ class SettingsDialog(QDialog):
 
     def _on_verify_onenote(self) -> None:
         from datetime import datetime as _dt  # noqa: PLC0415
+        from PyQt6.QtWidgets import QMessageBox  # noqa: PLC0415
         from ..integrations.onenote_com import (  # noqa: PLC0415
             OneNoteUnavailable,
+            diagnose_onenote_com,
             verify as verify_onenote,
         )
 
@@ -1829,13 +1831,21 @@ class SettingsDialog(QDialog):
         self._onenote_verify_btn.setEnabled(False)
         try:
             info = verify_onenote()
-        except OneNoteUnavailable as exc:
-            self._onenote_status_label.setText(
-                "Failed: " + str(exc)
-            )
-            return
-        except Exception as exc:
-            self._onenote_status_label.setText(f"Failed: {exc}")
+        except (OneNoteUnavailable, Exception) as exc:
+            self._onenote_status_label.setText("Failed (see details).")
+            # Surface the full diagnostic in a separate dialog so the
+            # operator can copy + paste it into a bug report. Status
+            # label is too short for the multi-line breakdown.
+            box = QMessageBox(self)
+            box.setWindowTitle("OneNote verify failed")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(f"Verify failed:\n\n{exc}")
+            try:
+                diag = diagnose_onenote_com()
+            except Exception as diag_err:  # noqa: BLE001
+                diag = f"(diagnostic failed: {diag_err})"
+            box.setDetailedText(diag)
+            box.exec()
             return
         finally:
             self._onenote_verify_btn.setEnabled(True)
