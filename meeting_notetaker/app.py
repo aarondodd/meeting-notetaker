@@ -1449,7 +1449,7 @@ class MainApp(QObject):
 
         sv = self.window.session_view
         sv.start_clicked.connect(self._on_start_clicked)
-        sv.stop_clicked.connect(lambda _sid: self.controller.stop_session())
+        sv.stop_clicked.connect(self._on_stop_clicked)
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
         sv.send_to_llm_clicked.connect(self._on_send_to_llm)
@@ -2082,6 +2082,27 @@ class MainApp(QObject):
             log.exception("failed to align created_at to meeting start time")
             return
         self.store.update_session(session_id, created_at=iso)
+
+    def _on_stop_clicked(self, session_id: str) -> None:
+        """Tear down screen capture BEFORE the controller's blocking
+        stop_session work begins (#102 bug 2).
+
+        SessionController.stop_session blocks the UI thread for up to
+        ~5s per live transcription worker as they drain their queues.
+        If auto-capture is armed, a QTimer fire could be queued in the
+        event loop during that block and run as soon as it returns --
+        adding the auto-capture's 50ms overlay-hide sleep + mss BitBlt
+        on top of the drain wait, compounding the "Not Responding"
+        impression.
+
+        Stopping the auto-capture timer + hiding the overlay before
+        the controller call cancels any queued tick + lets the
+        overlay's window destruction overlap with the drain wait.
+        """
+        if session_id:
+            self._stop_auto_capture(session_id)
+            self._hide_armed_region_overlay()
+        self.controller.stop_session()
 
     def _on_start_clicked(self, session_id: str) -> None:
         session = self.store.get_session(session_id)
