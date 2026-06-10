@@ -1654,13 +1654,14 @@ class SessionView(QWidget):
 
     def set_rich_source_view(self, enabled: bool) -> None:
         """Toggle the styled markdown source view (#91) on every editor
-        that hosts one. Currently just the My Notes editor; the
-        Synthesis editor stays plain because synthesized notes are
-        usually printed / exported rather than scanned in-editor."""
-        try:
-            self._live_notes_editor.set_rich_source_view(enabled)
-        except AttributeError:
-            pass
+        that hosts one. Applies to both My Notes and Synthesis -- the
+        Synthesis tab is just as edit-heavy as My Notes once the user
+        starts cleaning up the LLM's draft (#102 bug 1)."""
+        for editor in (self._live_notes_editor, self._notes_view):
+            try:
+                editor.set_rich_source_view(enabled)
+            except AttributeError:
+                pass
 
     def set_export_outline_options(
         self,
