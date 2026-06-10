@@ -159,31 +159,59 @@ def _dispatch_via_registry(progid: str) -> object:
         ) from exc
 
     target_iid = pythoncom.MakeIID(coclass_clsid)
+    # Order candidates: the CLSID matching our ProgID first
+    # (natural pick), then every other CoClass class that exposes
+    # GetHierarchy. OneNote ships two Application CoClasses
+    # (Application + Application2); on some installs the marshaling
+    # for one fails with TYPE_E_LIBNOTREGISTERED on the first method
+    # call while the other works. The fallback iteration covers it.
+    primary: list[tuple[str, type]] = []
+    others: list[tuple[str, type]] = []
     for attr_name in dir(mod):
         cls = getattr(mod, attr_name, None)
         if not isinstance(cls, type):
             continue
-        if getattr(cls, "CLSID", None) != target_iid:
+        if getattr(cls, "CLSID", None) is None:
             continue
+        if cls.CLSID == target_iid:
+            primary.append((attr_name, cls))
+        else:
+            others.append((attr_name, cls))
+    candidates = primary + others
+
+    if not candidates:
+        raise OneNoteUnavailable(
+            f"Generated module for typelib {typelib_libid} has no "
+            f"class for CLSID {coclass_clsid}. The typelib "
+            f"registration may be corrupt; reinstall the desktop "
+            f"OneNote.",
+        )
+
+    errors: list[str] = []
+    for attr_name, cls in candidates:
         try:
             instance = cls()
         except Exception as exc:  # noqa: BLE001
-            raise OneNoteUnavailable(
-                f"CoCreateInstance({coclass_clsid}) via {attr_name} "
-                f"failed: {exc}",
-            ) from exc
+            errors.append(f"{attr_name} construct: {exc}")
+            continue
         if not hasattr(instance, "GetHierarchy"):
-            raise OneNoteUnavailable(
-                f"Typed wrapper {attr_name} has no GetHierarchy. "
-                f"The OneNote type library is registered but missing "
-                f"the IApplication interface.",
-            )
+            errors.append(f"{attr_name} has no GetHierarchy")
+            continue
+        # Live smoke test. The cost is one COM round-trip that
+        # returns the same XML list_notebooks() returns later; if
+        # the marshaling is going to fail, it fails here with a
+        # specific candidate name so we can move on.
+        try:
+            instance.GetHierarchy("", 4)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{attr_name} GetHierarchy call: {exc}")
+            continue
+        log.debug("OneNote CoClass %s passed smoke test", attr_name)
         return instance
 
     raise OneNoteUnavailable(
-        f"Generated module for typelib {typelib_libid} has no class "
-        f"for CLSID {coclass_clsid}. The typelib registration may be "
-        f"corrupt; reinstall the desktop OneNote.",
+        "Every OneNote CoClass candidate failed. Errors: "
+        + " | ".join(errors)
     )
 
 
@@ -386,25 +414,31 @@ def diagnose_onenote_com() -> str:
     except Exception as exc:  # noqa: BLE001
         out.append(f"  EnsureModule failed: {type(exc).__name__}: {exc}")
         return "\n".join(out)
+    # Phase 4: exercise every CoClass candidate so we can see which
+    # one survives the live GetHierarchy call (the marshaling step
+    # that broke for Application2 with TYPE_E_LIBNOTREGISTERED).
+    out.append("--- per-CoClass smoke test ---")
     try:
-        client = _dispatch_via_registry("OneNote.Application")
-        out.append(f"  registry-walk dispatch ok; type={type(client).__name__}")
-        out.append(f"  has GetHierarchy: {hasattr(client, 'GetHierarchy')}")
-        if hasattr(client, "GetHierarchy"):
+        import pythoncom  # noqa: PLC0415
+        for n, c in names_with_clsid:
+            cls = getattr(mod, n)
             try:
-                xml = client.GetHierarchy("", 4)
+                inst = cls()
+            except Exception as exc:  # noqa: BLE001
+                out.append(f"  {n}: construct failed: {exc}")
+                continue
+            if not hasattr(inst, "GetHierarchy"):
+                out.append(f"  {n}: no GetHierarchy method")
+                continue
+            try:
+                xml = inst.GetHierarchy("", 4)
                 out.append(
-                    f"  GetHierarchy ok; returned {len(xml or '')} chars"
+                    f"  {n}: ok; returned {len(xml or '')} chars"
                 )
             except Exception as exc:  # noqa: BLE001
-                out.append(
-                    f"  GetHierarchy raised: {type(exc).__name__}: {exc}"
-                )
+                out.append(f"  {n}: GetHierarchy raised: {exc}")
     except Exception as exc:  # noqa: BLE001
-        out.append(
-            f"  registry-walk dispatch failed: "
-            f"{type(exc).__name__}: {exc}"
-        )
+        out.append(f"  per-CoClass smoke test failed: {exc}")
 
     return "\n".join(out)
 
