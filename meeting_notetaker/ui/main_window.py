@@ -440,8 +440,16 @@ class MainWindow(QMainWindow):
         self._main_splitter = splitter
         layout.addWidget(splitter)
 
-        # Left pane: session list + buttons
+        # Left pane: session list + buttons.
+        # Minimum width guards against the recording-time splitter
+        # collapse Aaron reported (#102 bug 3): when SessionView's
+        # right-hand content grows (live transcript width, attendee
+        # sidebar, status segments), Qt redistributes the splitter
+        # and the left pane can shrink to a sliver that's hard to
+        # drag back. 240px keeps the date + the first words of the
+        # title visible regardless of what the right pane does.
         left = QWidget(splitter)
+        left.setMinimumWidth(240)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
         header_row = QHBoxLayout()
