@@ -93,137 +93,194 @@ _DispatchFn = Callable[[str], object]
 
 
 def _default_dispatch(progid: str) -> object:
-    """Real win32com Dispatch with type-library binding.
+    """Build a typed OneNote.Application wrapper via the registry.
 
-    Standard ``gencache.EnsureDispatch`` calls ``GetTypeInfo()`` on
-    the dispatched instance to find the typelib. The OneNote desktop
-    client refuses ``GetTypeInfo()`` ("This COM object can not
-    automate the makepy process"), so EnsureDispatch can't generate
-    the typed wrapper that way -- and plain Dispatch can't reach
-    ``GetHierarchy`` either because OneNote hides every method from
-    the IDispatch surface.
+    Standard ``gencache.EnsureDispatch`` fails because pywin32 needs
+    ``GetTypeInfo()`` on the running OneNote instance to find the
+    typelib + the IID of the wrapped interface. OneNote refuses
+    ``GetTypeInfo()``. Plain ``Dispatch`` returns ``CDispatch`` and
+    every method call raises ``AttributeError(progid + "." + name)``
+    because OneNote also hides those methods from the IDispatch
+    surface.
 
-    The OneNote typelib *is* registered in HKCR\\TypeLib even when
-    GetTypeInfo refuses to expose it. ``_force_generate_typed_wrapper``
-    scans the registry for the OneNote typelib + runs makepy against
-    it manually, so a subsequent Dispatch picks up the now-generated
-    wrapper. Idempotent: makepy is a no-op if the cache already has
-    the wrapper.
+    The workaround does not touch the live instance at all:
+
+      1. ProgID -> CoClass CLSID via ``HKCR\\<ProgID>\\CLSID``.
+      2. CoClass CLSID -> TypeLib LIBID + version via
+         ``HKCR\\CLSID\\{...}\\TypeLib`` and ``\\Version``.
+      3. ``gencache.EnsureModule(LIBID, lcid, major, minor)`` runs
+         makepy against the registered typelib + drops a typed
+         wrapper module into gen_py.
+      4. Find the gen_py CoClass class whose ``CLSID`` matches our
+         CoClass CLSID + instantiate it. The CoClass base class
+         calls ``CoCreateInstance(CLSID)`` internally, which attaches
+         to the running OneNote process and wraps the resulting
+         IDispatch in the typed interface class -- no GetTypeInfo
+         on the live object required.
+
+    Try EnsureDispatch first so installs whose typelib binding
+    works the normal way (most non-OneNote COM servers) take the
+    fast path.
     """
     import win32com.client  # type: ignore[import-untyped]  # noqa: PLC0415
+
     try:
         client = win32com.client.gencache.EnsureDispatch(progid)
-    except TypeError as ensure_err:
-        # The classic "can not automate the makepy process" path.
-        # OneNote hides typeinfo on the running instance; bypass via
-        # the registry-resident typelib.
-        if "makepy" not in str(ensure_err):
-            raise OneNoteUnavailable(
-                f"EnsureDispatch failed: {ensure_err}",
-            ) from ensure_err
-        try:
-            _force_generate_typed_wrapper()
-        except OneNoteUnavailable:
-            raise
-        except Exception as gen_err:  # noqa: BLE001
-            raise OneNoteUnavailable(
-                "Could not generate a typed wrapper for OneNote. "
-                f"EnsureDispatch: {ensure_err}. "
-                f"Manual typelib build: {gen_err}."
-            ) from gen_err
-        # Wrapper is now in gen_py; re-Dispatch picks it up.
-        client = win32com.client.Dispatch(progid)
-    except Exception as ensure_err:  # noqa: BLE001
-        try:
-            client = win32com.client.Dispatch(progid)
-        except Exception as fallback_err:  # noqa: BLE001
-            raise OneNoteUnavailable(
-                f"Could not Dispatch '{progid}'. "
-                f"EnsureDispatch: {ensure_err}. "
-                f"Dispatch: {fallback_err}."
-            ) from fallback_err
-    if not hasattr(client, "GetHierarchy"):
-        raise OneNoteUnavailable(
-            "OneNote was reachable via COM but the typed wrapper is "
-            "missing GetHierarchy. Run diagnose_onenote_com() for "
-            "the full picture."
-        )
-    return client
+        if hasattr(client, "GetHierarchy"):
+            return client
+    except TypeError:
+        pass  # GetTypeInfo refused; use the registry path below.
+    except Exception as exc:  # noqa: BLE001
+        # Other Dispatch failure (CLSID missing entirely, COM error,
+        # etc.) -- the registry path will hit the same wall and give
+        # a clearer error.
+        log.debug("EnsureDispatch raised %s; trying registry path", exc)
+
+    return _dispatch_via_registry(progid)
 
 
-def _force_generate_typed_wrapper() -> None:
-    """Find the OneNote type library by registry scan + makepy it.
-
-    Walks ``HKEY_CLASSES_ROOT\\TypeLib`` looking for a registered
-    typelib whose human-readable name carries "OneNote". For each
-    candidate we call ``gencache.EnsureModule`` which, when the
-    cache is empty, runs makepy with that LIBID + major.minor; when
-    the cache already has the wrapper, returns immediately.
-    """
+def _dispatch_via_registry(progid: str) -> object:
+    """Bypass GetTypeInfo entirely: walk the registry to build a
+    typed CoClass wrapper. Raises ``OneNoteUnavailable`` with a
+    specific message at the first failing step."""
     import winreg  # noqa: PLC0415
+
+    import pythoncom  # type: ignore[import-untyped]  # noqa: PLC0415
     from win32com.client import gencache  # noqa: PLC0415
 
-    candidates = list(_iter_registered_onenote_typelibs())
-    if not candidates:
+    coclass_clsid = _read_progid_clsid(progid)
+    typelib_libid, major, minor = _read_coclass_typelib(coclass_clsid)
+    try:
+        mod = gencache.EnsureModule(typelib_libid, 0, major, minor)
+    except Exception as exc:  # noqa: BLE001
         raise OneNoteUnavailable(
-            "No registered OneNote type library found in HKCR\\TypeLib. "
-            "Reinstall the desktop OneNote and retry."
-        )
-    last_err: Optional[Exception] = None
-    for libid, major, minor, name in candidates:
-        try:
-            gencache.EnsureModule(libid, 0, major, minor)
-            return
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
+            f"makepy could not build a wrapper for the OneNote "
+            f"type library {typelib_libid} v{major}.{minor}: {exc}",
+        ) from exc
+
+    target_iid = pythoncom.MakeIID(coclass_clsid)
+    for attr_name in dir(mod):
+        cls = getattr(mod, attr_name, None)
+        if not isinstance(cls, type):
             continue
+        if getattr(cls, "CLSID", None) != target_iid:
+            continue
+        try:
+            instance = cls()
+        except Exception as exc:  # noqa: BLE001
+            raise OneNoteUnavailable(
+                f"CoCreateInstance({coclass_clsid}) via {attr_name} "
+                f"failed: {exc}",
+            ) from exc
+        if not hasattr(instance, "GetHierarchy"):
+            raise OneNoteUnavailable(
+                f"Typed wrapper {attr_name} has no GetHierarchy. "
+                f"The OneNote type library is registered but missing "
+                f"the IApplication interface.",
+            )
+        return instance
+
     raise OneNoteUnavailable(
-        "Found OneNote type library entries but every makepy "
-        f"build failed. Last error: {last_err}"
+        f"Generated module for typelib {typelib_libid} has no class "
+        f"for CLSID {coclass_clsid}. The typelib registration may be "
+        f"corrupt; reinstall the desktop OneNote.",
     )
 
 
-def _iter_registered_onenote_typelibs():
-    """Yield ``(libid, major, minor, name)`` for every registry entry
-    whose typelib name carries "OneNote"."""
+def _read_progid_clsid(progid: str) -> str:
+    """``HKCR\\<ProgID>\\CLSID`` -> ``"{XXXXXXXX-...}"``."""
+    import winreg  # noqa: PLC0415
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CLASSES_ROOT, fr"{progid}\CLSID",
+        ) as key:
+            value = winreg.QueryValueEx(key, "")[0]
+    except OSError as exc:
+        raise OneNoteUnavailable(
+            f"Registry path HKCR\\{progid}\\CLSID is missing. "
+            f"The desktop OneNote may not be installed, or its "
+            f"COM registration is broken. ({exc})",
+        ) from exc
+    if not value:
+        raise OneNoteUnavailable(
+            f"HKCR\\{progid}\\CLSID has an empty value.",
+        )
+    return value if value.startswith("{") else "{" + value + "}"
+
+
+def _read_coclass_typelib(coclass_clsid: str) -> tuple[str, int, int]:
+    """``HKCR\\CLSID\\{...}\\TypeLib`` + ``\\Version``.
+
+    Returns ``(libid_string, major, minor)``.
+
+    Version strings under ``HKCR\\CLSID\\...\\Version`` are decimal
+    (e.g. ``"1.1"``) -- distinct from the per-version subkey names
+    under ``HKCR\\TypeLib\\{LIBID}`` which are hex.
+    """
     import winreg  # noqa: PLC0415
 
-    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "TypeLib") as typelib_root:
-        idx_lib = 0
-        while True:
-            try:
-                libid = winreg.EnumKey(typelib_root, idx_lib)
-            except OSError:
-                break
-            idx_lib += 1
-            try:
-                with winreg.OpenKey(typelib_root, libid) as lib_key:
-                    idx_ver = 0
-                    while True:
-                        try:
-                            version = winreg.EnumKey(lib_key, idx_ver)
-                        except OSError:
-                            break
-                        idx_ver += 1
-                        try:
-                            with winreg.OpenKey(lib_key, version) as ver_key:
-                                try:
-                                    name = winreg.QueryValueEx(ver_key, "")[0]
-                                except OSError:
-                                    name = ""
-                                if "OneNote" not in (name or ""):
-                                    continue
-                                try:
-                                    major_str, minor_str = version.split(".", 1)
-                                    major = int(major_str, 16)
-                                    minor = int(minor_str, 16)
-                                except ValueError:
-                                    continue
-                                yield (libid, major, minor, name)
-                        except OSError:
-                            continue
-            except OSError:
-                continue
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CLASSES_ROOT, fr"CLSID\{coclass_clsid}\TypeLib",
+        ) as key:
+            libid = winreg.QueryValueEx(key, "")[0]
+    except OSError as exc:
+        raise OneNoteUnavailable(
+            f"OneNote CoClass {coclass_clsid} has no registered "
+            f"TypeLib. ({exc})",
+        ) from exc
+
+    version_str = ""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CLASSES_ROOT, fr"CLSID\{coclass_clsid}\Version",
+        ) as key:
+            version_str = winreg.QueryValueEx(key, "")[0]
+    except OSError:
+        version_str = ""
+
+    if version_str:
+        try:
+            major_s, _, minor_s = version_str.partition(".")
+            return libid, int(major_s), int(minor_s or "0")
+        except ValueError:
+            pass
+
+    # Version subkey is absent or unparseable: fall back to the
+    # highest-versioned entry under HKCR\TypeLib\{LIBID}. Subkey
+    # names there are HEX (typelib's wMajorVerNum / wMinorVerNum
+    # rendered as hex digits).
+    best: Optional[tuple[int, int]] = None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CLASSES_ROOT, fr"TypeLib\{libid}",
+        ) as lib_key:
+            idx = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(lib_key, idx)
+                except OSError:
+                    break
+                idx += 1
+                if "." not in sub:
+                    continue
+                ma_s, _, mi_s = sub.partition(".")
+                try:
+                    ma, mi = int(ma_s, 16), int(mi_s, 16)
+                except ValueError:
+                    continue
+                if best is None or (ma, mi) > best:
+                    best = (ma, mi)
+    except OSError as exc:
+        raise OneNoteUnavailable(
+            f"No registered versions for typelib {libid}. ({exc})",
+        ) from exc
+
+    if best is None:
+        raise OneNoteUnavailable(
+            f"Typelib {libid} has no parseable version subkeys.",
+        )
+    return libid, best[0], best[1]
 
 
 def diagnose_onenote_com() -> str:
@@ -298,6 +355,56 @@ def diagnose_onenote_com() -> str:
                 )
     except Exception as exc:  # noqa: BLE001
         out.append(f"  failed: {type(exc).__name__}: {exc}")
+
+    # Phase 3: the registry-walk workaround we actually use.
+    out.append("--- registry-walk path ---")
+    try:
+        clsid = _read_progid_clsid("OneNote.Application")
+        out.append(f"  ProgID -> CLSID: {clsid}")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  ProgID -> CLSID failed: {type(exc).__name__}: {exc}")
+        return "\n".join(out)
+    try:
+        libid, major, minor = _read_coclass_typelib(clsid)
+        out.append(f"  CLSID -> TypeLib: {libid} v{major}.{minor}")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  CLSID -> TypeLib failed: {type(exc).__name__}: {exc}")
+        return "\n".join(out)
+    try:
+        from win32com.client import gencache  # noqa: PLC0415
+        mod = gencache.EnsureModule(libid, 0, major, minor)
+        out.append(f"  EnsureModule ok; module={mod.__name__}")
+        names_with_clsid = [
+            (n, getattr(mod, n).CLSID)
+            for n in dir(mod)
+            if isinstance(getattr(mod, n, None), type)
+            and getattr(getattr(mod, n), "CLSID", None) is not None
+        ]
+        out.append(f"  CoClass candidates: {len(names_with_clsid)}")
+        for n, c in names_with_clsid[:6]:
+            out.append(f"    {n}: {c}")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"  EnsureModule failed: {type(exc).__name__}: {exc}")
+        return "\n".join(out)
+    try:
+        client = _dispatch_via_registry("OneNote.Application")
+        out.append(f"  registry-walk dispatch ok; type={type(client).__name__}")
+        out.append(f"  has GetHierarchy: {hasattr(client, 'GetHierarchy')}")
+        if hasattr(client, "GetHierarchy"):
+            try:
+                xml = client.GetHierarchy("", 4)
+                out.append(
+                    f"  GetHierarchy ok; returned {len(xml or '')} chars"
+                )
+            except Exception as exc:  # noqa: BLE001
+                out.append(
+                    f"  GetHierarchy raised: {type(exc).__name__}: {exc}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        out.append(
+            f"  registry-walk dispatch failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
     return "\n".join(out)
 
