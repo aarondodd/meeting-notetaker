@@ -1558,7 +1558,12 @@ class SettingsDialog(QDialog):
             "Saves a new page to the desktop OneNote (Microsoft 365 / "
             "OneNote 2016+) via its COM interface. No token needed. "
             "The deprecated 'OneNote for Windows 10' UWP app is "
-            "unsupported -- only the desktop OneNote exposes COM.",
+            "unsupported -- only the desktop OneNote exposes COM. "
+            "Some Microsoft 365 Click-to-Run installs ship with an "
+            "incomplete COM registration -- if Verify reports "
+            "'Library not registered', run Microsoft 365 Quick "
+            "Repair (Settings > Apps > Microsoft 365 > Modify > "
+            "Quick Repair) and try again.",
             self,
         )
         onenote_note.setWordWrap(True)

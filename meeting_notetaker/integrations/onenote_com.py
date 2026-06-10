@@ -150,12 +150,6 @@ def _dispatch_via_registry(progid: str) -> object:
 
     coclass_clsid = _read_progid_clsid(progid)
     typelib_libid, major, minor = _read_coclass_typelib(coclass_clsid)
-    # Ensure the typelib has a per-user win64 registration even when
-    # the installer only wrote win32. Idempotent + no admin needed.
-    # Without this, 64-bit Python's universal marshaler fails to
-    # find the typelib at the first cross-process method call with
-    # TYPE_E_LIBNOTREGISTERED.
-    _ensure_user_typelib_registration(typelib_libid, major, minor)
     try:
         mod = gencache.EnsureModule(typelib_libid, 0, major, minor)
     except Exception as exc:  # noqa: BLE001
@@ -194,6 +188,7 @@ def _dispatch_via_registry(progid: str) -> object:
         )
 
     errors: list[str] = []
+    saw_libnotregistered = False
     for attr_name, cls in candidates:
         try:
             instance = cls()
@@ -210,78 +205,36 @@ def _dispatch_via_registry(progid: str) -> object:
         try:
             instance.GetHierarchy("", 4)
         except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            if "-2147319779" in err or "Library not registered" in err:
+                saw_libnotregistered = True
             errors.append(f"{attr_name} GetHierarchy call: {exc}")
             continue
         log.debug("OneNote CoClass %s passed smoke test", attr_name)
         return instance
 
+    if saw_libnotregistered:
+        raise OneNoteUnavailable(
+            "OneNote is installed but its COM registration is "
+            "incomplete on this machine. The Windows COM marshaling "
+            "layer returned 'Library not registered' "
+            "(TYPE_E_LIBNOTREGISTERED) for every entry point we "
+            "tried -- a known Microsoft 365 Click-to-Run side "
+            "effect. The fix is Microsoft's built-in repair tool:\n\n"
+            "  1. Close all Office apps (Outlook, Word, OneNote).\n"
+            "  2. Settings > Apps > Installed apps > Microsoft 365.\n"
+            "  3. Modify > Quick Repair > Repair.\n"
+            "  4. Restart Meeting Notetaker + click Verify again.\n\n"
+            "If Quick Repair doesn't help, run Online Repair from "
+            "the same dialog (slower, more thorough). In the "
+            "meantime Save to Notion / Confluence / Obsidian / PDF / "
+            "Word all work without OneNote."
+        )
+
     raise OneNoteUnavailable(
         "Every OneNote CoClass candidate failed. Errors: "
         + " | ".join(errors)
     )
-
-
-def _ensure_user_typelib_registration(
-    libid: str, major: int, minor: int,
-) -> None:
-    """Mirror an HKLM win32 typelib registration to HKCU win64.
-
-    OneNote's Click-to-Run install on 64-bit Windows writes only the
-    win32 path under ``HKCR\\TypeLib\\{LIBID}\\<ver>\\0\\win32`` even
-    though OneNote.exe is 64-bit. When a 64-bit Python process
-    marshals across the OneNote process boundary, the universal
-    marshaler queries ``\\win64`` and finds nothing, returning
-    ``TYPE_E_LIBNOTREGISTERED`` (HRESULT 0x8002801D).
-
-    Per-user write to ``HKCU\\Software\\Classes\\TypeLib\\...\\0\\win64``
-    fixes this for the current user without admin. Reads the path
-    out of the system-level win32 registration so we mirror the
-    installer's canonical value, including the embedded-resource
-    suffix (e.g. ``...\\ONENOTE.EXE\\3``).
-
-    Idempotent: if win64 is already registered (HKLM or a prior HKCU
-    write) we re-write the same value. No effect on machines whose
-    typelib is correctly registered for win64 at the system level.
-    """
-    import winreg  # noqa: PLC0415
-
-    version_key = f"{major}.{minor}"
-    win32_path = ""
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CLASSES_ROOT,
-            fr"TypeLib\{libid}\{version_key}\0\win32",
-        ) as key:
-            win32_path = winreg.QueryValueEx(key, "")[0]
-    except OSError as exc:
-        # No win32 registration to mirror -- this machine's install
-        # is too broken for our shim to help. Surface a clear note
-        # so the user knows Office Quick Repair is the next move.
-        log.debug(
-            "OneNote typelib win32 registration missing (%s); cannot "
-            "mirror to win64", exc,
-        )
-        return
-    if not win32_path:
-        return
-    target_key = (
-        fr"Software\Classes\TypeLib\{libid}\{version_key}\0\win64"
-    )
-    try:
-        with winreg.CreateKey(
-            winreg.HKEY_CURRENT_USER, target_key,
-        ) as key:
-            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, win32_path)
-        log.debug(
-            "Wrote per-user typelib win64 registration: %s -> %s",
-            target_key, win32_path,
-        )
-    except OSError as exc:
-        log.warning(
-            "Could not write per-user typelib win64 registration "
-            "(%s); OneNote calls may still fail with "
-            "TYPE_E_LIBNOTREGISTERED.", exc,
-        )
 
 
 def _read_progid_clsid(progid: str) -> str:
