@@ -675,7 +675,17 @@ def _walk_files(root: Path) -> Iterable[Path]:
 # is done on POSIX-form relative paths so Windows + Linux behave the
 # same in tests.
 _EXCLUDE_TOP_LEVEL = {
-    "models", "automation", "instance.lock",
+    "models",
+    "automation",
+    "instance.lock",
+    # #102 bug 5: the updater downloads installer .exe payloads into
+    # %APPDATA%\MeetingNotetaker\updates\ for Inno Setup to silently
+    # install from. Those files are transient -- once a release has
+    # installed, the .exe is dead weight -- and don't belong in user-
+    # data backups. updater.prune_updates_cache trims the dir on
+    # startup; this defensive add keeps the dir's contents out of
+    # any future snapshot path even if _TOP_LEVEL_DIRS grows.
+    "updates",
 }
 _EXCLUDE_SUFFIXES = ("-wal", "-shm")
 _EXCLUDE_NAME_PREFIXES = (

@@ -381,6 +381,15 @@ class MainApp(QObject):
         # after show() so the network call never blocks the first paint.
         QTimer.singleShot(2000, self._auto_check_for_updates)
 
+        # Prune stale installer .exe payloads the updater has
+        # accumulated in %APPDATA%\MeetingNotetaker\updates (#102 bug 5).
+        # Each upgrade leaves a fat .exe behind; without sweeping, the
+        # cache grows by one installer per release. Keep the most
+        # recent one in case the user wants to re-run / inspect it;
+        # delete everything older. Deferred 3s so disk I/O doesn't
+        # extend the first-paint critical path.
+        QTimer.singleShot(3000, self._prune_updates_cache)
+
         # Startup stale-scan for the search index. Deferred so it
         # doesn't extend the first-paint critical path; once done,
         # the periodic catch-up timer takes over.
@@ -5971,6 +5980,21 @@ class MainApp(QObject):
         )
 
     # ---- update checks ----------------------------------------------------
+
+    def _prune_updates_cache(self) -> None:
+        """Sweep stale installer .exe files out of the updates cache
+        on startup (#102 bug 5). Best-effort: a failure to delete a
+        single file is logged + skipped, never propagated."""
+        try:
+            from .utils.updater import prune_updates_cache  # noqa: PLC0415
+            deleted = prune_updates_cache()
+            if deleted:
+                log.info(
+                    "Pruned %d stale installer(s) from updates cache",
+                    len(deleted),
+                )
+        except Exception:
+            log.exception("Could not prune updates cache")
 
     def _auto_check_for_updates(self) -> None:
         """Silent weekly check on startup (issue #34).

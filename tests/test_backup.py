@@ -356,6 +356,10 @@ def test_exclude_filters_out_logs_and_models(tmp_path):
         root / "sessions.db-shm",
         root / ".pre-restore.X.123" / "stale.txt",
         root / ".restore-tmp.456" / "anything",
+        # #102 bug 5: updater download cache must stay out of backups
+        # so a 60+ MB installer per release doesn't bloat the archive.
+        root / "updates" / "meeting-notetaker-setup-0.7.10.exe",
+        root / "updates" / "meeting-notetaker-setup-0.7.11.exe",
     ):
         assert _excluded(p, root) is True, f"should exclude {p}"
 
