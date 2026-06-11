@@ -81,9 +81,13 @@ class ScreencapSidebar(QWidget):
         self._help.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(self._help)
 
-        # Fixed width keeps the sidebar from sliding the editor pane
-        # around when armed/disarmed.
-        self.setFixedWidth(160)
+        # Min + max instead of setFixedWidth so the right column can
+        # squeeze under splitter pressure when it becomes visible on
+        # Start Recording (#102 bug 3, Aaron's 2026-06-11 follow-up).
+        # At full width the sidebar still gets 160; the buttons stack
+        # cleanly down to ~100.
+        self.setMinimumWidth(100)
+        self.setMaximumWidth(160)
         self.set_armed(False)
 
     def set_armed(self, armed: bool) -> None:

@@ -126,6 +126,13 @@ class SessionView(QWidget):
     export_to_notion_requested = pyqtSignal(str, str, str)
     export_to_confluence_requested = pyqtSignal(str, str, str)
     export_to_obsidian_requested = pyqtSignal(str, str, str)
+    # Emitted just before _right_column.setVisible(...) toggles, with
+    # the upcoming visibility as the payload (#102 bug 3 follow-up).
+    # MainWindow uses it to checkpoint the main splitter sizes BEFORE
+    # the toggle triggers a layout redistribute, then restores them on
+    # the next event-loop tick so the user's preferred split survives
+    # Start Recording.
+    right_column_will_toggle = pyqtSignal(bool)
     # Click-to-tag for in-meeting speaker anchoring. The sidebar emits
     # (session_id, name) per click; the controller persists a SpeakerTag
     # and the post-meeting refiner uses tags to constrain the clusterer.
@@ -1064,6 +1071,16 @@ class SessionView(QWidget):
             return
         self.tag_speaker_clicked.emit(self._session.id, name)
 
+    def _toggle_right_column(self, visible: bool) -> None:
+        """Fire ``right_column_will_toggle`` BEFORE the visibility
+        change so MainWindow can checkpoint the splitter sizes, then
+        flip visibility. Idempotent / cheap when state matches.
+        """
+        if self._right_column.isVisible() == visible:
+            return
+        self.right_column_will_toggle.emit(visible)
+        self._right_column.setVisible(visible)
+
     def _on_attendee_remove_last_clicked(self, name: str) -> None:
         if self._session is None:
             return
@@ -1079,7 +1096,7 @@ class SessionView(QWidget):
         if self._session is None or self._session.state not in (
             STATE_RECORDING, STATE_PAUSED,
         ):
-            self._right_column.setVisible(False)
+            self._toggle_right_column(False)
             return
         current = self._tabs.currentWidget()
         # Comparison uses the page wrappers since v0.7.2 #51 Phase 3
@@ -1087,7 +1104,7 @@ class SessionView(QWidget):
         on_transcript_or_notes = current in (
             self._transcript_view, self._live_notes_page,
         )
-        self._right_column.setVisible(on_transcript_or_notes)
+        self._toggle_right_column(on_transcript_or_notes)
         # The screencap sidebar belongs to My Notes only; hide it on
         # the Transcript tab even though the column is shown for the
         # attendee tag controls.
