@@ -294,7 +294,12 @@ def fetch_calendar_range(
         return []
 
 
-def fetch_meeting_by_entry_id(entry_id: str) -> Optional[MeetingInfo]:
+def fetch_meeting_by_entry_id(
+    entry_id: str,
+    *,
+    instance_start: Optional[datetime] = None,
+    instance_end: Optional[datetime] = None,
+) -> Optional[MeetingInfo]:
     """Re-fetch a single calendar item with full detail (Recipients,
     Body, Attachments) by its EntryID.
 
@@ -303,6 +308,18 @@ def fetch_meeting_by_entry_id(entry_id: str) -> Optional[MeetingInfo]:
     the caller resolves the selected entry_id back to a full
     MeetingInfo via this call -- cheap because it touches exactly
     one item.
+
+    Recurring-series caveat: Outlook's ``Namespace.GetItemFromID``
+    returns the recurring **master**, not the occurrence the user
+    picked, even when the EntryID came from a Restrict +
+    IncludeRecurrences iteration that yielded the instance. To get
+    the correct date/time on the resulting session, callers pass the
+    instance's ``Start`` / ``End`` (captured by ``_item_to_info_light``
+    during the picker's initial fetch) through ``instance_start`` /
+    ``instance_end``. When provided, those values override the
+    master's Start / End on the returned MeetingInfo so the
+    downstream ``_align_created_at_to_meeting`` lines up with the
+    occurrence the user actually clicked.
     """
     if not entry_id or not is_available():
         return None
@@ -318,10 +335,35 @@ def fetch_meeting_by_entry_id(entry_id: str) -> Optional[MeetingInfo]:
     try:
         ns = outlook.GetNamespace("MAPI")
         item = ns.GetItemFromID(entry_id)
-        return _item_to_info(item)
+        info = _item_to_info(item)
     except Exception:
         log.exception("could not resolve calendar item by EntryID")
         return None
+    return _apply_instance_times(
+        info, start=instance_start, end=instance_end,
+    )
+
+
+def _apply_instance_times(
+    info: MeetingInfo,
+    *,
+    start: Optional[datetime],
+    end: Optional[datetime],
+) -> MeetingInfo:
+    """Override ``start_time`` / ``end_time`` on ``info`` with caller-
+    supplied instance values when provided. Pure function; the
+    recurring-master patching logic for
+    ``fetch_meeting_by_entry_id`` lives here so it's unit-testable
+    without mocking COM dispatch.
+    """
+    if start is None and end is None:
+        return info
+    from dataclasses import replace  # noqa: PLC0415
+    return replace(
+        info,
+        start_time=start if start is not None else info.start_time,
+        end_time=end if end is not None else info.end_time,
+    )
 
 
 def fetch_imminent_meetings(window_minutes: int = 5) -> list[MeetingInfo]:

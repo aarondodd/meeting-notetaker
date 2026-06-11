@@ -685,3 +685,97 @@ def test_fetch_remaining_today_passes_light_through(monkeypatch):
     monkeypatch.setattr(outlook_calendar, "fetch_calendar_range", fake_range)
     fetch_remaining_today(now=datetime(2026, 6, 10, 9, 0), light=True)
     assert captured["light"] is True
+
+
+# ---- _apply_instance_times (#102 follow-up: recurring master/occurrence) -
+
+
+def test_apply_instance_times_passes_through_when_both_none():
+    base = MeetingInfo(
+        entry_id="x",
+        subject="Recurring",
+        start_time=datetime(2026, 1, 5, 9, 0),  # master start
+        end_time=datetime(2026, 1, 5, 10, 0),
+    )
+    out = outlook_calendar._apply_instance_times(
+        base, start=None, end=None,
+    )
+    # No override -> same dataclass identity (or at least same fields).
+    assert out.start_time == base.start_time
+    assert out.end_time == base.end_time
+
+
+def test_apply_instance_times_overrides_start_only():
+    base = MeetingInfo(
+        entry_id="x",
+        subject="Recurring",
+        start_time=datetime(2026, 1, 5, 9, 0),  # master
+        end_time=datetime(2026, 1, 5, 10, 0),
+    )
+    out = outlook_calendar._apply_instance_times(
+        base,
+        start=datetime(2026, 6, 11, 9, 0),  # today's occurrence
+        end=None,
+    )
+    assert out.start_time == datetime(2026, 6, 11, 9, 0)
+    assert out.end_time == base.end_time
+
+
+def test_apply_instance_times_overrides_both():
+    """The Aaron's-2026-06-11-bug shape: the master Start/End from
+    GetItemFromID must be replaced with the occurrence times the
+    light cache captured so the downstream session created_at lines
+    up with the picked day's instance, not the series's first
+    instance."""
+    master = MeetingInfo(
+        entry_id="x",
+        subject="Weekly sync",
+        start_time=datetime(2025, 1, 7, 9, 0),  # series start
+        end_time=datetime(2025, 1, 7, 9, 30),
+        attendees=[],
+        body="",
+        location="",
+        attachments=[],
+    )
+    occurrence_start = datetime(2026, 6, 11, 9, 0)
+    occurrence_end = datetime(2026, 6, 11, 9, 30)
+    out = outlook_calendar._apply_instance_times(
+        master,
+        start=occurrence_start,
+        end=occurrence_end,
+    )
+    assert out.start_time == occurrence_start
+    assert out.end_time == occurrence_end
+    # Non-time fields are unchanged.
+    assert out.subject == master.subject
+    assert out.entry_id == master.entry_id
+
+
+def test_apply_instance_times_preserves_master_when_partial_override():
+    """Defensive: caller passes only `end` (rare). Start keeps master,
+    end takes the override -- no field gets lost."""
+    base = MeetingInfo(
+        entry_id="x",
+        subject="x",
+        start_time=datetime(2025, 1, 7, 9, 0),
+        end_time=datetime(2025, 1, 7, 9, 30),
+    )
+    out = outlook_calendar._apply_instance_times(
+        base, start=None, end=datetime(2026, 6, 11, 9, 30),
+    )
+    assert out.start_time == base.start_time
+    assert out.end_time == datetime(2026, 6, 11, 9, 30)
+
+
+def test_fetch_meeting_by_entry_id_no_outlook_ignores_instance_times():
+    """Without Outlook on the host, the function returns None
+    regardless of whether instance_start/end are passed."""
+    from meeting_notetaker.integrations.outlook_calendar import (
+        fetch_meeting_by_entry_id,
+    )
+    assert fetch_meeting_by_entry_id("anything") is None
+    assert fetch_meeting_by_entry_id(
+        "anything",
+        instance_start=datetime(2026, 6, 11, 9, 0),
+        instance_end=datetime(2026, 6, 11, 9, 30),
+    ) is None

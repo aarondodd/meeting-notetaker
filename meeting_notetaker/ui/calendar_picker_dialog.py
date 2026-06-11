@@ -174,7 +174,20 @@ class CalendarPickerDialog(QDialog):
         cached = next(
             (m for m in self._meetings if m.entry_id == entry_id), None
         )
-        full = fetch_meeting_by_entry_id(entry_id) if entry_id else None
+        # Pass the cached instance times through so the full fetch
+        # doesn't accidentally swap the recurring master's Start /
+        # End back in for picked occurrences of a recurring series
+        # (Aaron's 2026-06-11 follow-up to #102 bug 4). Outlook's
+        # GetItemFromID returns the master appointment, not the
+        # occurrence, and that flow's downstream session created_at
+        # alignment would otherwise land on the first-ever instance.
+        instance_start = cached.start_time if cached else None
+        instance_end = cached.end_time if cached else None
+        full = fetch_meeting_by_entry_id(
+            entry_id,
+            instance_start=instance_start,
+            instance_end=instance_end,
+        ) if entry_id else None
         # Fall back to the light record if the full re-fetch failed --
         # the caller still gets subject + times which is better than
         # nothing, and the empty attendees/body just means no seeding.
