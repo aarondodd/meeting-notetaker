@@ -787,6 +787,23 @@ class MainApp(QObject):
                 self.config.save()
             except Exception:
                 log.exception("could not persist dismissed extension version")
+            # Land the user directly on the extensions page with our
+            # row highlighted so the reload icon is one click away.
+            # Best-effort: when Chrome can't be located we leave the
+            # text-only instructions standing -- they already explain
+            # the steps.
+            try:
+                opened = automation_installer.open_chrome_extensions_page()
+            except Exception:
+                log.exception("could not open chrome://extensions")
+                opened = False
+            if not opened:
+                self.window.status(
+                    "Couldn't open Chrome automatically. Open "
+                    "chrome://extensions yourself and click the "
+                    "reload icon on the Meeting Notetaker row.",
+                    timeout_ms=8000,
+                )
 
     def _dispatch_bridge_message(self, msg: dict) -> None:
         msg_type = msg.get("type", "")

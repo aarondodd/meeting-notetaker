@@ -23,7 +23,9 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
+from typing import Any, Optional
 from pathlib import Path
 
 from ..utils.paths import (
@@ -77,6 +79,113 @@ def installed_extension_version() -> str:
     except (OSError, ValueError):
         return ""
     return str(data.get("version") or "")
+
+
+def find_chrome_executable() -> Optional[Path]:
+    """Best-effort lookup of ``chrome.exe`` on Windows.
+
+    Tries (in order): the ``App Paths`` registry key Microsoft has
+    documented since IE4 + the StartMenu Internet pointer; then the
+    canonical install paths for system + per-user Chrome. Returns
+    None when none of them resolve to an existing file -- callers
+    fall through to displaying the chrome:// URL as text instead.
+
+    Non-Windows: returns None. The 'open chrome://extensions for me'
+    affordance is only documented as a Windows feature for now;
+    other platforms get the manual instructions.
+    """
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import winreg  # noqa: PLC0415  Windows-only stdlib
+    except ImportError:
+        return None
+
+    candidates: list[str] = []
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for sub in (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+            r"SOFTWARE\Clients\StartMenuInternet\Google Chrome\shell\open\command",
+        ):
+            try:
+                with winreg.OpenKey(hive, sub) as key:
+                    raw = winreg.QueryValueEx(key, "")[0]
+            except OSError:
+                continue
+            if not raw:
+                continue
+            # StartMenuInternet's command value is a quoted exe path
+            # optionally followed by argv; strip surrounding quotes.
+            path = str(raw).strip().strip('"')
+            if path:
+                candidates.append(path)
+
+    import os  # noqa: PLC0415
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pfx86 = os.environ.get(
+        "ProgramFiles(x86)", r"C:\Program Files (x86)",
+    )
+    local_appdata = os.environ.get(
+        "LOCALAPPDATA", "",
+    )
+    candidates.extend([
+        os.path.join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(pfx86, "Google", "Chrome", "Application", "chrome.exe"),
+    ])
+    if local_appdata:
+        candidates.append(
+            os.path.join(
+                local_appdata,
+                "Google", "Chrome", "Application", "chrome.exe",
+            ),
+        )
+
+    for raw in candidates:
+        try:
+            p = Path(raw)
+            if p.is_file():
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def open_chrome_extensions_page() -> bool:
+    """Launch the user's Chrome with the extensions page scrolled to
+    this extension's tile (so the reload icon is one click away).
+
+    The URL ``chrome://extensions/?id=<id>`` is recognized only by
+    Chrome, so we can't hand it to the OS shell (other browsers
+    don't know what to do with chrome://). We locate chrome.exe and
+    invoke it directly. Already-running Chrome instances will open
+    the URL in a new tab; if no Chrome is running, it boots.
+
+    Returns True when the launch succeeded, False on every failure
+    path (no Chrome found, executable missing, subprocess refused).
+    Caller falls back to the text-only instructions in that case.
+    """
+    exe = find_chrome_executable()
+    if exe is None:
+        log.info("chrome.exe not found; can't open chrome://extensions")
+        return False
+    url = f"chrome://extensions/?id={EXTENSION_ID}"
+    try:
+        kwargs: dict[str, Any] = {}
+        if sys.platform.startswith("win"):
+            # DETACHED_PROCESS so Chrome's lifetime doesn't tie to
+            # ours; CREATE_NEW_PROCESS_GROUP so a Ctrl-C in a parent
+            # console doesn't kill it.
+            kwargs["creationflags"] = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+            kwargs["close_fds"] = True
+        subprocess.Popen([str(exe), url], **kwargs)
+        log.info("opened %s via %s", url, exe)
+        return True
+    except OSError as exc:
+        log.warning("Popen for chrome.exe failed: %s", exc)
+        return False
 
 
 def bundled_extension_version() -> str:

@@ -264,3 +264,85 @@ def test_bundled_extension_version_independent_of_extension_dir(
     bundled = bundled_extension_version()
     assert bundled != "0.0.1"
     assert bundled  # non-empty
+
+
+# ---- find_chrome_executable + open_chrome_extensions_page (#102 bug 7) -
+
+
+def test_find_chrome_executable_returns_none_on_non_windows():
+    """The lookup is documented Windows-only; on Linux / macOS the
+    helper bails out cleanly so the version-skew alert can fall
+    through to its text-only instructions."""
+    import sys as _sys
+    from meeting_notetaker.automation.installer import find_chrome_executable
+    if _sys.platform.startswith("win"):
+        # Skip cleanly on Windows test runs -- the function may
+        # actually return a path there.
+        return
+    assert find_chrome_executable() is None
+
+
+def test_open_chrome_extensions_page_returns_false_when_no_chrome(
+    monkeypatch,
+):
+    """When find_chrome_executable returns None, the launch helper
+    is a no-op that returns False. The skew-check caller treats
+    False as 'fall back to status-bar text instructions'."""
+    from meeting_notetaker.automation import installer as automation_installer
+    monkeypatch.setattr(
+        automation_installer, "find_chrome_executable", lambda: None,
+    )
+    assert automation_installer.open_chrome_extensions_page() is False
+
+
+def test_open_chrome_extensions_page_launches_with_extension_id(
+    monkeypatch, tmp_path,
+):
+    """When Chrome IS found, Popen is called with chrome.exe + the
+    deep-link URL that scrolls to our extension's tile."""
+    from meeting_notetaker.automation import installer as automation_installer
+    fake_chrome = tmp_path / "chrome.exe"
+    fake_chrome.write_bytes(b"fake")
+    monkeypatch.setattr(
+        automation_installer, "find_chrome_executable",
+        lambda: fake_chrome,
+    )
+    captured: dict = {}
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+        class _Stub:
+            pass
+        return _Stub()
+
+    monkeypatch.setattr(
+        automation_installer.subprocess, "Popen", fake_popen,
+    )
+    ok = automation_installer.open_chrome_extensions_page()
+    assert ok is True
+    assert captured["args"][0] == str(fake_chrome)
+    url = captured["args"][1]
+    assert url.startswith("chrome://extensions/?id=")
+    assert automation_installer.EXTENSION_ID in url
+
+
+def test_open_chrome_extensions_page_returns_false_on_popen_failure(
+    monkeypatch, tmp_path,
+):
+    from meeting_notetaker.automation import installer as automation_installer
+    fake_chrome = tmp_path / "chrome.exe"
+    fake_chrome.write_bytes(b"x")
+    monkeypatch.setattr(
+        automation_installer, "find_chrome_executable",
+        lambda: fake_chrome,
+    )
+
+    def boom(*_args, **_kwargs):
+        raise OSError("Access denied")
+
+    monkeypatch.setattr(
+        automation_installer.subprocess, "Popen", boom,
+    )
+    assert automation_installer.open_chrome_extensions_page() is False
