@@ -61,17 +61,38 @@ _HKCU_EDGE = r"Software\Microsoft\Edge\NativeMessagingHosts"
 
 
 def installed_extension_version() -> str:
-    """Return the ``version`` string from the installed extension's
-    ``manifest.json`` (the copy Chrome loads via 'Load unpacked').
+    """Return the ``version`` string from the on-disk extension's
+    ``manifest.json`` -- the files Chrome's 'Load unpacked' points at.
 
-    Empty string when the extension hasn't been extracted yet,
-    when ``manifest.json`` is missing, or when the file isn't valid
-    JSON. Used by the version-skew check (#102 bug 7) to compare
-    against the value the running extension reports in its pong;
-    a mismatch surfaces a one-shot QMessageBox asking the user to
-    reload at chrome://extensions.
+    This is the value Chrome will report after a reload at
+    chrome://extensions. Empty string when the extension hasn't been
+    extracted yet, when ``manifest.json`` is missing, or when the
+    file isn't valid JSON.
     """
     target = extension_dir() / "manifest.json"
+    if not target.is_file():
+        return ""
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("version") or "")
+
+
+def bundled_extension_version() -> str:
+    """Return the ``version`` string from the extension manifest that
+    ships with the current app build (``resources/extension/``).
+
+    This is the value the user SHOULD have loaded in Chrome after an
+    app upgrade. The on-disk copy at ``extension_dir()`` doesn't get
+    refreshed by the app installer -- only the user's Settings >
+    Synthesis Automation > 'Install / Verify...' click runs
+    ``extract_extension`` -- so the bundle is the source of truth for
+    'what should Chrome be running.' Used by the version-skew check
+    (#102 bug 7) as the upper bound; mismatch against the pong-reported
+    value triggers the reload alert.
+    """
+    target = resource_path("extension") / "manifest.json"
     if not target.is_file():
         return ""
     try:

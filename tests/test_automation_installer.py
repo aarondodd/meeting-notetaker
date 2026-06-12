@@ -219,3 +219,48 @@ def test_installed_extension_version_empty_when_field_missing(
         encoding="utf-8",
     )
     assert installed_extension_version() == ""
+
+
+# ---- bundled_extension_version (#102 bug 7 follow-up) ------------------
+
+
+def test_bundled_extension_version_reads_resources_manifest(isolated_data_dir):
+    """The shipped bundle's manifest is at resources/extension/manifest.json
+    inside the package. The helper must read that path regardless of
+    whether the on-disk extension_dir copy has been extracted."""
+    from meeting_notetaker.automation.installer import bundled_extension_version
+    # The repo's bundled manifest must exist + carry a non-empty version
+    # string (currently 0.7.11). The exact value drifts with each
+    # extension change; just check shape.
+    version = bundled_extension_version()
+    assert version  # non-empty
+    parts = version.split(".")
+    assert len(parts) >= 2
+    assert all(p.isdigit() for p in parts)
+
+
+def test_bundled_extension_version_independent_of_extension_dir(
+    isolated_data_dir,
+):
+    """bundled_extension_version reads from package resources, NOT
+    from the per-user extension_dir copy. Verify by deliberately
+    staging a different version in extension_dir and confirming
+    the bundled lookup is unaffected."""
+    import json
+    from meeting_notetaker.automation.installer import (
+        bundled_extension_version, installed_extension_version,
+    )
+    from meeting_notetaker.utils.paths import extension_dir
+    dest = extension_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "manifest.json").write_text(
+        json.dumps({
+            "manifest_version": 3, "name": "x", "version": "0.0.1",
+        }),
+        encoding="utf-8",
+    )
+    assert installed_extension_version() == "0.0.1"
+    # Bundled is whatever ships in resources/; deliberately NOT 0.0.1.
+    bundled = bundled_extension_version()
+    assert bundled != "0.0.1"
+    assert bundled  # non-empty

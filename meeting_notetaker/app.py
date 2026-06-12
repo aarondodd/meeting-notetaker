@@ -678,16 +678,22 @@ class MainApp(QObject):
             QTimer.singleShot(500, self._check_extension_version_skew)
 
     def _check_extension_version_skew(self) -> None:
-        """Compare the installed extension's manifest version with
-        the version the running extension reported via pong. When
-        installed > loaded, raise a one-shot QMessageBox asking the
-        user to reload at chrome://extensions.
+        """Compare the bundled extension manifest version with the
+        version Chrome reported via pong. The bundle is the source of
+        truth for 'what Chrome should be running after this app build
+        is installed' -- the app installer doesn't refresh the
+        on-disk extension dir, so the user can be running an old
+        Chrome-loaded extension long after the app upgrade.
 
-        Dismissal is recorded in
+        When bundled > loaded, auto-run ``extract_extension`` so the
+        on-disk files Chrome's 'Load unpacked' points at match the
+        bundle. Then surface a one-shot QMessageBox telling the user
+        to reload at chrome://extensions so Chrome re-reads the new
+        files. Dismissal is recorded in
         ``config.synthesis.extension_update_dismissed_version`` so
         the next launch doesn't nag for the same skew. A real change
-        to the installed extension bumps the version, which makes
-        the dismissed value stale + re-arms the alert automatically.
+        to the bundled extension bumps the manifest version, which
+        makes the dismissed value stale and re-arms the alert.
         """
         if self._extension_version_alerted:
             return
@@ -696,40 +702,76 @@ class MainApp(QObject):
             return
         from .automation import installer as automation_installer  # noqa: PLC0415
         try:
-            installed = automation_installer.installed_extension_version()
+            bundled = automation_installer.bundled_extension_version()
         except Exception:
-            log.exception("Could not read installed extension manifest")
+            log.exception("Could not read bundled extension manifest")
             return
-        if not installed:
+        if not bundled:
             return
         from .utils.updater import is_newer_version  # noqa: PLC0415
-        if not is_newer_version(installed, loaded):
+        if not is_newer_version(bundled, loaded):
             return
         already_dismissed = (
             self.config.synthesis.extension_update_dismissed_version
         ).strip()
-        if already_dismissed == installed:
+        if already_dismissed == bundled:
             # User already saw + acked this exact skew on a prior
             # launch. Don't pester.
             self._extension_version_alerted = True
             return
         self._extension_version_alerted = True
+
+        # Refresh the on-disk extension dir from the bundle so Chrome
+        # has new files to pick up on reload. If this fails (rare:
+        # Chrome holding files open on Windows) we still surface the
+        # alert but with a longer instruction list that includes
+        # clicking Install/Verify in Settings first.
+        extract_error = ""
+        try:
+            automation_installer.extract_extension()
+            log.info(
+                "auto-refreshed extension dir from bundle v%s", bundled,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception(
+                "could not auto-refresh extension dir from bundle"
+            )
+            extract_error = str(exc)
+
         box = QMessageBox(self.window)
         box.setWindowTitle("Update Chrome Extension")
         box.setIcon(QMessageBox.Icon.Information)
-        box.setText(
-            f"A newer Meeting Notetaker Chrome extension is on disk "
-            f"(v{installed}) but Chrome is still running the previous "
-            f"version (v{loaded}).\n\n"
-            "Chrome doesn't auto-pick-up changes to extension files; "
-            "you need to reload it manually:\n\n"
-            "  1. Open chrome://extensions\n"
-            "  2. Find 'Meeting Notetaker Synthesis Bridge'\n"
-            "  3. Click the circular reload (refresh) icon on its tile\n\n"
-            "The Send-to-LLM flow will keep using the older extension "
-            "until you reload. No data is lost; only the synthesis "
-            "automation behavior is affected."
-        )
+        if extract_error:
+            body = (
+                f"This Meeting Notetaker build ships extension v{bundled}, "
+                f"but Chrome is still running v{loaded} from before "
+                "the app upgrade.\n\n"
+                "The app tried to refresh the on-disk extension files "
+                f"automatically but couldn't:\n\n  {extract_error}\n\n"
+                "To finish manually:\n\n"
+                "  1. Settings > Synthesis Automation > 'Install / Verify...'\n"
+                "  2. Open chrome://extensions\n"
+                "  3. Find 'Meeting Notetaker Synthesis Bridge'\n"
+                "  4. Click the circular reload (refresh) icon on its tile\n\n"
+                "Send-to-LLM keeps using the older extension until "
+                "you reload. No data is lost; only the synthesis "
+                "automation behavior is affected."
+            )
+        else:
+            body = (
+                f"This Meeting Notetaker build ships Chrome extension "
+                f"v{bundled}, but Chrome is still running v{loaded} "
+                "from before the app upgrade.\n\n"
+                "The app has refreshed the on-disk files for you. "
+                "Chrome needs one click to pick them up:\n\n"
+                "  1. Open chrome://extensions\n"
+                "  2. Find 'Meeting Notetaker Synthesis Bridge'\n"
+                "  3. Click the circular reload (refresh) icon on its tile\n\n"
+                "Send-to-LLM keeps using the older extension until "
+                "you reload. No data is lost; only the synthesis "
+                "automation behavior is affected."
+            )
+        box.setText(body)
         box.setStandardButtons(
             QMessageBox.StandardButton.Ok
             | QMessageBox.StandardButton.Cancel,
@@ -740,7 +782,7 @@ class MainApp(QObject):
         cancel_btn.setText("Remind me later")
         box.exec()
         if box.clickedButton() is ok_btn:
-            self.config.synthesis.extension_update_dismissed_version = installed
+            self.config.synthesis.extension_update_dismissed_version = bundled
             try:
                 self.config.save()
             except Exception:
