@@ -687,13 +687,16 @@ class MainApp(QObject):
 
         When bundled > loaded, auto-run ``extract_extension`` so the
         on-disk files Chrome's 'Load unpacked' points at match the
-        bundle. Then surface a one-shot QMessageBox telling the user
-        to reload at chrome://extensions so Chrome re-reads the new
-        files. Dismissal is recorded in
-        ``config.synthesis.extension_update_dismissed_version`` so
-        the next launch doesn't nag for the same skew. A real change
-        to the bundled extension bumps the manifest version, which
-        makes the dismissed value stale and re-arms the alert.
+        bundle, then surface a QMessageBox telling the user to
+        reload at chrome://extensions.
+
+        No persistent dismissal: the gap closes naturally when Chrome
+        actually picks up the new files (next pong reports the new
+        version, this check returns early on the equal comparison).
+        Until then the alert reappears on each launch, because the
+        situation isn't actually resolved. The in-memory
+        ``_extension_version_alerted`` latch keeps multiple pongs in
+        a single session from re-firing the dialog.
         """
         if self._extension_version_alerted:
             return
@@ -710,14 +713,6 @@ class MainApp(QObject):
             return
         from .utils.updater import is_newer_version  # noqa: PLC0415
         if not is_newer_version(bundled, loaded):
-            return
-        already_dismissed = (
-            self.config.synthesis.extension_update_dismissed_version
-        ).strip()
-        if already_dismissed == bundled:
-            # User already saw + acked this exact skew on a prior
-            # launch. Don't pester.
-            self._extension_version_alerted = True
             return
         self._extension_version_alerted = True
 
@@ -782,16 +777,15 @@ class MainApp(QObject):
         cancel_btn.setText("Remind me later")
         box.exec()
         if box.clickedButton() is ok_btn:
-            self.config.synthesis.extension_update_dismissed_version = bundled
-            try:
-                self.config.save()
-            except Exception:
-                log.exception("could not persist dismissed extension version")
             # Land the user directly on the extensions page with our
             # row highlighted so the reload icon is one click away.
             # Best-effort: when Chrome can't be located we leave the
             # text-only instructions standing -- they already explain
-            # the steps.
+            # the steps. No persistent dismissal -- if the user
+            # doesn't actually reload, the next launch's pong will
+            # still report the old version and the alert will fire
+            # again. The gap closes naturally when Chrome reports
+            # the new version.
             try:
                 opened = automation_installer.open_chrome_extensions_page()
             except Exception:
