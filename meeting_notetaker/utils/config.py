@@ -328,6 +328,13 @@ class SynthesisConfig:
     # when the message omits them (older app builds).
     llm_response_timeout_seconds: int = 600  # 1 min .. 30 min (1800)
     clipboard_read_seconds: int = 3         # 1 sec .. 30 sec
+    # #102 bug 7: when the installed extension's manifest version is
+    # newer than what Chrome has loaded, the app surfaces a one-shot
+    # QMessageBox asking the user to reload at chrome://extensions.
+    # On dismiss we record the version they acknowledged so the
+    # next launch doesn't nag again for the same delta. Bump (by an
+    # actual extension change) re-arms the alert automatically.
+    extension_update_dismissed_version: str = ""
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for

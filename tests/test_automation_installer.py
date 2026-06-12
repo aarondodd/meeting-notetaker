@@ -151,3 +151,71 @@ def test_uninstall_with_keep_false_removes_extension(isolated_data_dir, tmp_path
     state = installation_state()
     assert state["extension_extracted"] is False
     assert state["native_manifest_written"] is False
+
+
+# ---- installed_extension_version (#102 bug 7) --------------------------
+
+
+def test_installed_extension_version_empty_when_not_extracted(isolated_data_dir):
+    from meeting_notetaker.automation.installer import installed_extension_version
+    # Fresh data dir; extension hasn't been extracted yet.
+    assert installed_extension_version() == ""
+
+
+def test_installed_extension_version_reads_manifest(isolated_data_dir, tmp_path):
+    """After extract_extension lands the manifest in extension_dir,
+    installed_extension_version returns the version field."""
+    import json
+    from meeting_notetaker.automation.installer import (
+        extract_extension, installed_extension_version,
+    )
+    src = tmp_path / "bundled"
+    src.mkdir()
+    (src / "manifest.json").write_text(
+        json.dumps({
+            "manifest_version": 3,
+            "name": "x",
+            "version": "1.2.3",
+            "key": "irrelevant",
+        }),
+        encoding="utf-8",
+    )
+    # extract_extension validates the key/id pair; bypass by calling
+    # the read directly against the destination after a manual copy.
+    from meeting_notetaker.utils.paths import extension_dir
+    dest = extension_dir()
+    import shutil
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+    assert installed_extension_version() == "1.2.3"
+
+
+def test_installed_extension_version_empty_on_malformed_json(
+    isolated_data_dir,
+):
+    """A corrupt manifest is treated as 'not installed' so the
+    skew check is a no-op rather than crashing the alert path."""
+    from meeting_notetaker.automation.installer import installed_extension_version
+    from meeting_notetaker.utils.paths import extension_dir
+    dest = extension_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "manifest.json").write_text(
+        "{not valid json", encoding="utf-8",
+    )
+    assert installed_extension_version() == ""
+
+
+def test_installed_extension_version_empty_when_field_missing(
+    isolated_data_dir,
+):
+    import json
+    from meeting_notetaker.automation.installer import installed_extension_version
+    from meeting_notetaker.utils.paths import extension_dir
+    dest = extension_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "manifest.json").write_text(
+        json.dumps({"manifest_version": 3, "name": "x"}),
+        encoding="utf-8",
+    )
+    assert installed_extension_version() == ""

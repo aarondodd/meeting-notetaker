@@ -238,6 +238,13 @@ class MainApp(QObject):
         self._inflight_syntheses: dict[str, str] = {}  # request_id -> session_id
         self._bridge_ready_state: bool = False
         self._pending_pings: dict[str, "threading.Event"] = {}
+        # #102 bug 7: track the loaded extension version (reported via
+        # pong) so we can compare against the installed manifest and
+        # ask the user to reload at chrome://extensions if needed. The
+        # check runs single-shot per app launch; _extension_version_alerted
+        # latches once a dismissed-vs-current decision has been made.
+        self._loaded_extension_version: str = ""
+        self._extension_version_alerted: bool = False
         self._bridge = Bridge(
             handshake_file=bridge_handshake_path(),
             on_message=self._on_bridge_message,
@@ -651,9 +658,93 @@ class MainApp(QObject):
             evt = self._pending_pings.pop(request_id, None)
             if evt is not None:
                 evt.set()
-            return
-        log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
+            # Fall through to the main-thread emit so the version-
+            # skew check (#102 bug 7) can inspect extension_version.
+        else:
+            log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
         self.bridge_message_received.emit(msg)
+
+    def _on_pong_received(self, msg: dict) -> None:
+        """Capture the extension's reported version + trigger a
+        version-skew check the first time we see it (#102 bug 7)."""
+        version = str(msg.get("extension_version") or "").strip()
+        if not version:
+            return
+        if version == self._loaded_extension_version:
+            return
+        self._loaded_extension_version = version
+        log.info("extension reports version %s", version)
+        if not self._extension_version_alerted:
+            QTimer.singleShot(500, self._check_extension_version_skew)
+
+    def _check_extension_version_skew(self) -> None:
+        """Compare the installed extension's manifest version with
+        the version the running extension reported via pong. When
+        installed > loaded, raise a one-shot QMessageBox asking the
+        user to reload at chrome://extensions.
+
+        Dismissal is recorded in
+        ``config.synthesis.extension_update_dismissed_version`` so
+        the next launch doesn't nag for the same skew. A real change
+        to the installed extension bumps the version, which makes
+        the dismissed value stale + re-arms the alert automatically.
+        """
+        if self._extension_version_alerted:
+            return
+        loaded = self._loaded_extension_version
+        if not loaded:
+            return
+        from .automation import installer as automation_installer  # noqa: PLC0415
+        try:
+            installed = automation_installer.installed_extension_version()
+        except Exception:
+            log.exception("Could not read installed extension manifest")
+            return
+        if not installed:
+            return
+        from .utils.updater import is_newer_version  # noqa: PLC0415
+        if not is_newer_version(installed, loaded):
+            return
+        already_dismissed = (
+            self.config.synthesis.extension_update_dismissed_version
+        ).strip()
+        if already_dismissed == installed:
+            # User already saw + acked this exact skew on a prior
+            # launch. Don't pester.
+            self._extension_version_alerted = True
+            return
+        self._extension_version_alerted = True
+        box = QMessageBox(self.window)
+        box.setWindowTitle("Update Chrome Extension")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(
+            f"A newer Meeting Notetaker Chrome extension is on disk "
+            f"(v{installed}) but Chrome is still running the previous "
+            f"version (v{loaded}).\n\n"
+            "Chrome doesn't auto-pick-up changes to extension files; "
+            "you need to reload it manually:\n\n"
+            "  1. Open chrome://extensions\n"
+            "  2. Find 'Meeting Notetaker Synthesis Bridge'\n"
+            "  3. Click the circular reload (refresh) icon on its tile\n\n"
+            "The Send-to-LLM flow will keep using the older extension "
+            "until you reload. No data is lost; only the synthesis "
+            "automation behavior is affected."
+        )
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Ok
+            | QMessageBox.StandardButton.Cancel,
+        )
+        ok_btn = box.button(QMessageBox.StandardButton.Ok)
+        ok_btn.setText("I'll reload now")
+        cancel_btn = box.button(QMessageBox.StandardButton.Cancel)
+        cancel_btn.setText("Remind me later")
+        box.exec()
+        if box.clickedButton() is ok_btn:
+            self.config.synthesis.extension_update_dismissed_version = installed
+            try:
+                self.config.save()
+            except Exception:
+                log.exception("could not persist dismissed extension version")
 
     def _dispatch_bridge_message(self, msg: dict) -> None:
         msg_type = msg.get("type", "")
@@ -664,6 +755,9 @@ class MainApp(QObject):
             request_id,
             list(self._inflight_syntheses.keys()),
         )
+        if msg_type == "pong":
+            self._on_pong_received(msg)
+            return
         if msg_type == "status":
             session_id = self._inflight_syntheses.get(request_id, "")
             if session_id:

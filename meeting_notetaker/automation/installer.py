@@ -60,6 +60,27 @@ _HKCU_EDGE = r"Software\Microsoft\Edge\NativeMessagingHosts"
 # Extension folder
 
 
+def installed_extension_version() -> str:
+    """Return the ``version`` string from the installed extension's
+    ``manifest.json`` (the copy Chrome loads via 'Load unpacked').
+
+    Empty string when the extension hasn't been extracted yet,
+    when ``manifest.json`` is missing, or when the file isn't valid
+    JSON. Used by the version-skew check (#102 bug 7) to compare
+    against the value the running extension reports in its pong;
+    a mismatch surfaces a one-shot QMessageBox asking the user to
+    reload at chrome://extensions.
+    """
+    target = extension_dir() / "manifest.json"
+    if not target.is_file():
+        return ""
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("version") or "")
+
+
 def extract_extension(*, source: Path | None = None, dest: Path | None = None) -> Path:
     """Copy the bundled extension folder to user space.
 
