@@ -1194,6 +1194,12 @@ class MainApp(QObject):
             prompt=rendered_body,
             new_chat=True,
             chat_url=chat_url,
+            llm_response_timeout_seconds=int(
+                self.config.synthesis.llm_response_timeout_seconds
+            ),
+            clipboard_read_seconds=int(
+                self.config.synthesis.clipboard_read_seconds
+            ),
         )
         if not self._bridge.send(msg):
             self._inflight_syntheses.pop(request_id, None)

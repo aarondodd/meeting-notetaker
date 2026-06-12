@@ -45,6 +45,14 @@ class SynthesizeRequest:
     prompt: str = ""
     new_chat: bool = True
     chat_url: str = ""
+    # #102 bug 6: thread through user-configurable timeouts so slow
+    # LLM responses (or huge bodies whose Copy serialization is
+    # slow) don't trip the extension's defaults and surface as
+    # misleading clipboard-permission errors. 0 means "extension
+    # uses its built-in default" (older app + new extension
+    # compatibility).
+    llm_response_timeout_seconds: int = 0
+    clipboard_read_seconds: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

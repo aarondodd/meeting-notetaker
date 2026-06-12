@@ -317,6 +317,17 @@ class SynthesisConfig:
     # by default; Qt's native PDF path (with pypdf post-processing
     # for clickable TOC entries) is the cross-platform fallback.
     use_word_for_pdf: bool = False
+    # #102 bug 6 (Aaron's 2026-06-12 trace): for very long or slow
+    # LLM responses, the synthesis automation's two hardcoded
+    # timeouts (10 min response wait + 1 s clipboard read window)
+    # surface as a clipboard-read failure that's then rendered with
+    # a permission-flavoured message. Both are now configurable so a
+    # user on a slow model run can extend them without re-cutting a
+    # release. Values flow through SynthesizeRequest to the Chrome
+    # extension; the extension falls back to its built-in defaults
+    # when the message omits them (older app builds).
+    llm_response_timeout_seconds: int = 600  # 1 min .. 30 min (1800)
+    clipboard_read_seconds: int = 3         # 1 sec .. 30 sec
 
     def claude_chat_url(self) -> str:
         """Build the Claude.ai URL the extension should land on for
@@ -583,6 +594,18 @@ class Config:
             errors.append(
                 f"synthesis.llm_target {self.synthesis.llm_target!r} "
                 f"must be one of {VALID_LLM_TARGETS}"
+            )
+        if not (60 <= self.synthesis.llm_response_timeout_seconds <= 1800):
+            errors.append(
+                "synthesis.llm_response_timeout_seconds must be between "
+                "60 and 1800 (1 to 30 minutes), got "
+                f"{self.synthesis.llm_response_timeout_seconds}"
+            )
+        if not (1 <= self.synthesis.clipboard_read_seconds <= 30):
+            errors.append(
+                "synthesis.clipboard_read_seconds must be between "
+                "1 and 30 seconds, got "
+                f"{self.synthesis.clipboard_read_seconds}"
             )
         if self.backup.schedule not in VALID_BACKUP_SCHEDULES:
             errors.append(
