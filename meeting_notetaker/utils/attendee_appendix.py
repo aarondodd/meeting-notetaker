@@ -53,7 +53,11 @@ class AttendeeAppendixEntry:
 # the topic_suggestions prompt later contradicted by asking the
 # LLM to put Topics after Attendee Details (#73 finding #1).
 _APPENDIX_HEADING_RE = re.compile(
-    r"(##\s+Attendee\s+Details\s*\(auto-extracted\).*?)(?=^##\s|\Z)",
+    # See attendee_context: the "(auto-extracted)" suffix is the
+    # spec but the LLM drops it often enough to silently lose the
+    # JSON. Make it optional; the inner JSON-block check is enough
+    # of a gate (#102 bug 9).
+    r"(##\s+Attendee\s+Details(?:\s*\(auto-extracted\))?\b.*?)(?=^##\s|\Z)",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 _JSON_CODE_BLOCK_RE = re.compile(

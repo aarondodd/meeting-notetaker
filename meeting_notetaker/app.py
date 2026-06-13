@@ -929,6 +929,14 @@ class MainApp(QObject):
         markdown = normalize_synthesis_markdown(markdown)
         # Parse + apply the LLM-extracted attendee details appendix
         # (issue #51 Phase 4). Done BEFORE save_notes so the parsed
+        # Strip conversational preambles ("Let me research...",
+        # "Here's the synthesis below:", etc.) Claude sometimes
+        # writes before the synthesis proper. The Chrome-extension
+        # scrape captures whatever's on the clipboard, so without
+        # this filter the preamble lands verbatim in notes.md and
+        # downstream renders (#102 bug 8).
+        from .utils.llm_preamble import strip_preamble  # noqa: PLC0415
+        markdown = strip_preamble(markdown)
         # data is independent of the save path's success.
         self._apply_attendee_details_appendix(session_id, markdown)
         # Persist the four LLM appendices to the sidecar BEFORE the
@@ -952,6 +960,15 @@ class MainApp(QObject):
             markdown, archive_existing=archive_existing,
         )
         self.store.update_session(session_id, has_notes=True)
+        # Mirror the DB flip into the in-memory session object the
+        # SessionView already holds (#102 bug 10). Without this the
+        # next _set_buttons_for_state call -- triggered by anything
+        # from a connection-state poll to a tab switch -- evaluates
+        # has_notes from the stale Python object and can leave the
+        # Send button greyed even though the synthesis landed.
+        sv_session = self.window.session_view._session  # noqa: SLF001
+        if sv_session is not None and sv_session.id == session_id:
+            sv_session.has_notes = True
         self._reindex_search_for(session_id)
         # Targeted SessionView refresh in place of a full
         # _on_session_selected reload (#73 finding #3). The full

@@ -25,7 +25,9 @@ log = logging.getLogger(__name__)
 
 
 _APPENDIX_HEADING_RE = re.compile(
-    r"(##\s+Suggested\s+Topics\s*\(auto-extracted\).*?)(?=^##\s|\Z)",
+    # See attendee_context: optional "(auto-extracted)" suffix so
+    # the LLM dropping it doesn't silently lose the JSON.
+    r"(##\s+Suggested\s+Topics(?:\s*\(auto-extracted\))?\b.*?)(?=^##\s|\Z)",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 _JSON_CODE_BLOCK_RE = re.compile(

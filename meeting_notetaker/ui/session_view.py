@@ -1941,10 +1941,24 @@ class SessionView(QWidget):
             self._synth_banner.setVisible(False)
             self._synth_banner.setText("")
             if self._session is not None:
+                # Use the same OR-with-buffer fallback set_session uses,
+                # so a synthesis that JUST landed in the editor buffer
+                # but hasn't yet flipped the in-memory has_notes flag
+                # still flows through as has_notes=True. Aaron's
+                # 2026-06-13 trace: Send button stuck disabled after a
+                # successful first synthesis until the user swapped
+                # sessions and back -- because set_session uses the OR
+                # fallback while this path didn't (#102 bug 10).
                 self._set_buttons_for_state(
                     self._session.state,
-                    has_transcript=bool(self._raw_transcript_text),
-                    has_notes=bool(self._session.has_notes),
+                    has_transcript=(
+                        self._session.has_transcript
+                        or bool(self._raw_transcript_text)
+                    ),
+                    has_notes=(
+                        self._session.has_notes
+                        or bool(self._notes_view.toPlainText().strip())
+                    ),
                 )
 
     def set_prompt_templates(
