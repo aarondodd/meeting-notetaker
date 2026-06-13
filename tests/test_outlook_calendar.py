@@ -11,7 +11,9 @@ from datetime import datetime, timedelta
 
 from meeting_notetaker.integrations import outlook_calendar
 from meeting_notetaker.integrations.outlook_calendar import (
+    MeetingInfo,
     _DedupStore,
+    _RemainingTodayCache,
     fetch_calendar_range,
     fetch_remaining_today,
     is_available,
@@ -182,7 +184,7 @@ def test_fetch_remaining_today_looks_back_for_in_progress_meetings(monkeypatch):
     now = datetime(2026, 5, 17, 14, 30)
     captured: dict = {}
 
-    def fake_range(start, end):
+    def fake_range(start, end, *, light=False):
         captured["start"] = start
         captured["end"] = end
         # Three candidates:
@@ -223,7 +225,7 @@ def test_fetch_remaining_today_end_of_day_still_safe(monkeypatch):
     lookback window."""
     captured: dict = {}
 
-    def fake_range(start, end):
+    def fake_range(start, end, *, light=False):
         captured["start"] = start
         captured["end"] = end
         return []
@@ -556,3 +558,224 @@ def test_address_entry_property_accessor_fills_when_others_empty():
     assert fields["title"] == "VP Engineering"
     assert fields["company"] == "First Hawaiian Bank"
     assert fields["department"] == "EDA"
+
+
+# ---- _RemainingTodayCache (#102 bug 4) -----------------------------------
+
+
+def _meeting(eid, start_h, end_h, *, now_year=2026, now_month=6, now_day=10):
+    return MeetingInfo(
+        entry_id=eid,
+        subject=f"M-{eid}",
+        start_time=datetime(now_year, now_month, now_day, start_h, 0),
+        end_time=datetime(now_year, now_month, now_day, end_h, 0),
+    )
+
+
+def test_cache_initial_state_is_stale():
+    cache = _RemainingTodayCache(ttl_seconds=60)
+    assert cache.is_fresh(datetime(2026, 6, 10, 9, 0)) is False
+
+
+def test_cache_get_populates_and_returns_filtered(monkeypatch):
+    """get() runs fetch_remaining_today + post-filters by end_time > now
+    so already-ended meetings vanish on the cached read."""
+    cache = _RemainingTodayCache(ttl_seconds=60)
+    fake_payload = [
+        _meeting("done", 8, 9),
+        _meeting("now", 9, 11),
+        _meeting("later", 14, 15),
+    ]
+
+    def fake_fetch(now=None, *, light=False):
+        assert light is True  # cache must request the light variant
+        return list(fake_payload)
+
+    monkeypatch.setattr(outlook_calendar, "fetch_remaining_today", fake_fetch)
+    result = cache.get(now=datetime(2026, 6, 10, 9, 30))
+    subjects = sorted(m.subject for m in result)
+    assert subjects == ["M-later", "M-now"]
+
+
+def test_cache_returns_fresh_without_refetching(monkeypatch):
+    # Generous TTL so the 15-minute span of queries below stays inside
+    # the fresh window. The picker's real-world rhythm (open dialog ->
+    # close -> open again) is seconds, well under the 60s default.
+    cache = _RemainingTodayCache(ttl_seconds=3600)
+    calls = {"n": 0}
+
+    def fake_fetch(now=None, *, light=False):
+        calls["n"] += 1
+        return [_meeting("x", 10, 11)]
+
+    monkeypatch.setattr(outlook_calendar, "fetch_remaining_today", fake_fetch)
+    cache.get(now=datetime(2026, 6, 10, 9, 30))
+    cache.get(now=datetime(2026, 6, 10, 9, 35))
+    cache.get(now=datetime(2026, 6, 10, 9, 45))
+    assert calls["n"] == 1  # only the first call refetched
+
+
+def test_cache_refetches_after_ttl(monkeypatch):
+    cache = _RemainingTodayCache(ttl_seconds=30)
+    calls = {"n": 0}
+
+    def fake_fetch(now=None, *, light=False):
+        calls["n"] += 1
+        return [_meeting("x", 10, 11)]
+
+    monkeypatch.setattr(outlook_calendar, "fetch_remaining_today", fake_fetch)
+    cache.get(now=datetime(2026, 6, 10, 9, 30))
+    # 31 seconds later -> TTL expired
+    cache.get(now=datetime(2026, 6, 10, 9, 30, 31))
+    assert calls["n"] == 2
+
+
+def test_cache_refetches_on_day_rollover(monkeypatch):
+    """Even within the TTL window, a date change invalidates the
+    cached payload -- the lookback start moves to a different day."""
+    cache = _RemainingTodayCache(ttl_seconds=60 * 60 * 6)  # generous TTL
+    calls = {"n": 0}
+
+    def fake_fetch(now=None, *, light=False):
+        calls["n"] += 1
+        return [_meeting("x", 10, 11)]
+
+    monkeypatch.setattr(outlook_calendar, "fetch_remaining_today", fake_fetch)
+    cache.get(now=datetime(2026, 6, 10, 23, 50))
+    cache.get(now=datetime(2026, 6, 11, 0, 1))
+    assert calls["n"] == 2
+
+
+def test_cache_invalidate_drops_state(monkeypatch):
+    cache = _RemainingTodayCache(ttl_seconds=60)
+
+    def fake_fetch(now=None, *, light=False):
+        return [_meeting("x", 10, 11)]
+
+    monkeypatch.setattr(outlook_calendar, "fetch_remaining_today", fake_fetch)
+    cache.get(now=datetime(2026, 6, 10, 9, 0))
+    assert cache.is_fresh(datetime(2026, 6, 10, 9, 1))
+    cache.invalidate()
+    assert not cache.is_fresh(datetime(2026, 6, 10, 9, 1))
+
+
+def test_cache_refresh_forces_refetch(monkeypatch):
+    cache = _RemainingTodayCache(ttl_seconds=60)
+    calls = {"n": 0}
+
+    def fake_fetch(now=None, *, light=False):
+        calls["n"] += 1
+        return [_meeting("x", 10, 11)]
+
+    monkeypatch.setattr(outlook_calendar, "fetch_remaining_today", fake_fetch)
+    cache.get(now=datetime(2026, 6, 10, 9, 0))
+    cache.refresh(now=datetime(2026, 6, 10, 9, 0))
+    assert calls["n"] == 2
+
+
+def test_fetch_remaining_today_passes_light_through(monkeypatch):
+    """The light=True kwarg must reach fetch_calendar_range so the
+    underlying _item_to_info_light path is exercised."""
+    captured = {}
+
+    def fake_range(start, end, *, light=False):
+        captured["light"] = light
+        return []
+
+    monkeypatch.setattr(outlook_calendar, "fetch_calendar_range", fake_range)
+    fetch_remaining_today(now=datetime(2026, 6, 10, 9, 0), light=True)
+    assert captured["light"] is True
+
+
+# ---- _apply_instance_times (#102 follow-up: recurring master/occurrence) -
+
+
+def test_apply_instance_times_passes_through_when_both_none():
+    base = MeetingInfo(
+        entry_id="x",
+        subject="Recurring",
+        start_time=datetime(2026, 1, 5, 9, 0),  # master start
+        end_time=datetime(2026, 1, 5, 10, 0),
+    )
+    out = outlook_calendar._apply_instance_times(
+        base, start=None, end=None,
+    )
+    # No override -> same dataclass identity (or at least same fields).
+    assert out.start_time == base.start_time
+    assert out.end_time == base.end_time
+
+
+def test_apply_instance_times_overrides_start_only():
+    base = MeetingInfo(
+        entry_id="x",
+        subject="Recurring",
+        start_time=datetime(2026, 1, 5, 9, 0),  # master
+        end_time=datetime(2026, 1, 5, 10, 0),
+    )
+    out = outlook_calendar._apply_instance_times(
+        base,
+        start=datetime(2026, 6, 11, 9, 0),  # today's occurrence
+        end=None,
+    )
+    assert out.start_time == datetime(2026, 6, 11, 9, 0)
+    assert out.end_time == base.end_time
+
+
+def test_apply_instance_times_overrides_both():
+    """The Aaron's-2026-06-11-bug shape: the master Start/End from
+    GetItemFromID must be replaced with the occurrence times the
+    light cache captured so the downstream session created_at lines
+    up with the picked day's instance, not the series's first
+    instance."""
+    master = MeetingInfo(
+        entry_id="x",
+        subject="Weekly sync",
+        start_time=datetime(2025, 1, 7, 9, 0),  # series start
+        end_time=datetime(2025, 1, 7, 9, 30),
+        attendees=[],
+        body="",
+        location="",
+        attachments=[],
+    )
+    occurrence_start = datetime(2026, 6, 11, 9, 0)
+    occurrence_end = datetime(2026, 6, 11, 9, 30)
+    out = outlook_calendar._apply_instance_times(
+        master,
+        start=occurrence_start,
+        end=occurrence_end,
+    )
+    assert out.start_time == occurrence_start
+    assert out.end_time == occurrence_end
+    # Non-time fields are unchanged.
+    assert out.subject == master.subject
+    assert out.entry_id == master.entry_id
+
+
+def test_apply_instance_times_preserves_master_when_partial_override():
+    """Defensive: caller passes only `end` (rare). Start keeps master,
+    end takes the override -- no field gets lost."""
+    base = MeetingInfo(
+        entry_id="x",
+        subject="x",
+        start_time=datetime(2025, 1, 7, 9, 0),
+        end_time=datetime(2025, 1, 7, 9, 30),
+    )
+    out = outlook_calendar._apply_instance_times(
+        base, start=None, end=datetime(2026, 6, 11, 9, 30),
+    )
+    assert out.start_time == base.start_time
+    assert out.end_time == datetime(2026, 6, 11, 9, 30)
+
+
+def test_fetch_meeting_by_entry_id_no_outlook_ignores_instance_times():
+    """Without Outlook on the host, the function returns None
+    regardless of whether instance_start/end are passed."""
+    from meeting_notetaker.integrations.outlook_calendar import (
+        fetch_meeting_by_entry_id,
+    )
+    assert fetch_meeting_by_entry_id("anything") is None
+    assert fetch_meeting_by_entry_id(
+        "anything",
+        instance_start=datetime(2026, 6, 11, 9, 0),
+        instance_end=datetime(2026, 6, 11, 9, 30),
+    ) is None

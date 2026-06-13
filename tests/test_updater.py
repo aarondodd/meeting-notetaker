@@ -505,3 +505,99 @@ def test_upgrade_progress_callback_optional(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(updater, "launch_installer", lambda p: (True, ""))
     ok, _msg = updater.upgrade()
     assert ok
+
+
+# ---- prune_updates_cache (#102 bug 5) ----------------------------------
+
+
+def _make_installer(path: Path, mtime: float, body: bytes = b"x") -> Path:
+    path.write_bytes(body)
+    import os
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_prune_updates_cache_keeps_newest_one_by_default(tmp_path, monkeypatch):
+    cache = tmp_path / "updates"
+    cache.mkdir()
+    older = _make_installer(
+        cache / "meeting-notetaker-setup-0.7.9.exe", mtime=1000,
+    )
+    newer = _make_installer(
+        cache / "meeting-notetaker-setup-0.7.10.exe", mtime=2000,
+    )
+    monkeypatch.setattr(updater, "updates_dir", lambda: cache)
+    deleted = updater.prune_updates_cache()
+    assert deleted == [older]
+    assert newer.exists()
+    assert not older.exists()
+
+
+def test_prune_updates_cache_keep_zero_deletes_all(tmp_path, monkeypatch):
+    cache = tmp_path / "updates"
+    cache.mkdir()
+    a = _make_installer(cache / "meeting-notetaker-setup-0.7.9.exe", 1000)
+    b = _make_installer(cache / "meeting-notetaker-setup-0.7.10.exe", 2000)
+    monkeypatch.setattr(updater, "updates_dir", lambda: cache)
+    deleted = updater.prune_updates_cache(keep_newest=0)
+    assert set(deleted) == {a, b}
+    assert not a.exists()
+    assert not b.exists()
+
+
+def test_prune_updates_cache_skips_non_installer_files(tmp_path, monkeypatch):
+    cache = tmp_path / "updates"
+    cache.mkdir()
+    installer = _make_installer(
+        cache / "meeting-notetaker-setup-0.7.9.exe", 1000,
+    )
+    stray = cache / "unrelated.txt"
+    stray.write_text("notes", encoding="utf-8")
+    monkeypatch.setattr(updater, "updates_dir", lambda: cache)
+    updater.prune_updates_cache(keep_newest=0)
+    assert not installer.exists()
+    # Non-matching files left untouched.
+    assert stray.exists()
+
+
+def test_prune_updates_cache_no_cache_returns_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "updates_dir", lambda: tmp_path / "nope")
+    assert updater.prune_updates_cache() == []
+
+
+def test_prune_updates_cache_idempotent(tmp_path, monkeypatch):
+    cache = tmp_path / "updates"
+    cache.mkdir()
+    _make_installer(cache / "meeting-notetaker-setup-0.7.10.exe", 2000)
+    monkeypatch.setattr(updater, "updates_dir", lambda: cache)
+    first = updater.prune_updates_cache()
+    second = updater.prune_updates_cache()
+    # First call had nothing older than the kept newest -> [].
+    # Second call same shape.
+    assert first == []
+    assert second == []
+
+
+def test_prune_updates_cache_handles_unlink_failure(
+    tmp_path, monkeypatch, caplog,
+):
+    cache = tmp_path / "updates"
+    cache.mkdir()
+    older = _make_installer(
+        cache / "meeting-notetaker-setup-0.7.9.exe", 1000,
+    )
+    _make_installer(cache / "meeting-notetaker-setup-0.7.10.exe", 2000)
+    monkeypatch.setattr(updater, "updates_dir", lambda: cache)
+    # Simulate a Windows lock by making unlink raise.
+    original_unlink = Path.unlink
+
+    def boom(self, *args, **kwargs):
+        if self == older:
+            raise PermissionError("locked")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", boom)
+    deleted = updater.prune_updates_cache()
+    # Failure to unlink is non-fatal -- empty deleted list, no raise.
+    assert deleted == []
+    assert older.exists()

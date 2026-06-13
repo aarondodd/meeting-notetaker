@@ -791,6 +791,46 @@ class SettingsDialog(QDialog):
         proj_row.addWidget(self._claude_project_id, 1)
         auto_layout.addLayout(proj_row)
 
+        # #102 bug 6: user-tunable timeouts that flow through the
+        # SynthesizeRequest into the Chrome extension. Defaults
+        # match the extension's built-in values; raise either
+        # field when slow / long LLM responses surface as a
+        # 'clipboard read failed' message that doesn't actually
+        # describe a permissions issue.
+        timeouts_row = QHBoxLayout()
+        timeouts_row.addWidget(QLabel("LLM response wait (min):", self))
+        self._llm_response_timeout = QSpinBox(self)
+        self._llm_response_timeout.setRange(1, 30)
+        self._llm_response_timeout.setSuffix(" min")
+        self._llm_response_timeout.setValue(
+            max(1, int(config.synthesis.llm_response_timeout_seconds / 60)),
+        )
+        self._llm_response_timeout.setToolTip(
+            "How long the Chrome extension waits for the LLM's "
+            "response to finish streaming. Default 10 minutes. "
+            "Raise this if your prompts routinely take longer and "
+            "you see 'response didn't settle' timeouts."
+        )
+        timeouts_row.addWidget(self._llm_response_timeout)
+        timeouts_row.addSpacing(20)
+        timeouts_row.addWidget(QLabel("Clipboard read wait (sec):", self))
+        self._clipboard_read = QSpinBox(self)
+        self._clipboard_read.setRange(1, 30)
+        self._clipboard_read.setSuffix(" s")
+        self._clipboard_read.setValue(
+            int(config.synthesis.clipboard_read_seconds),
+        )
+        self._clipboard_read.setToolTip(
+            "How long the extension polls the clipboard after "
+            "clicking the LLM's Copy button. Default 3 seconds. "
+            "Raise this if long responses surface as a 'couldn't "
+            "read the clipboard' error -- the Copy serialization "
+            "can take longer than the read budget on huge outputs."
+        )
+        timeouts_row.addWidget(self._clipboard_read)
+        timeouts_row.addStretch(1)
+        auto_layout.addLayout(timeouts_row)
+
         # Install / Status row
         self._auto_status = QLabel(self)
         self._auto_status.setWordWrap(True)
@@ -1318,6 +1358,12 @@ class SettingsDialog(QDialog):
         )
         self._config.synthesis.claude_project_id = (
             self._claude_project_id.text().strip()
+        )
+        self._config.synthesis.llm_response_timeout_seconds = (
+            int(self._llm_response_timeout.value()) * 60
+        )
+        self._config.synthesis.clipboard_read_seconds = (
+            int(self._clipboard_read.value())
         )
         self._config.synthesis.auto_extract_attendee_details = (
             self._extract_attendees.isChecked()

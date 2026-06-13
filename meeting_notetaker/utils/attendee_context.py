@@ -35,7 +35,14 @@ class AttendeeContextEntry:
 
 
 _APPENDIX_HEADING_RE = re.compile(
-    r"(##\s+Attendee\s+Context\s*\(auto-extracted\).*?)(?=^##\s|\Z)",
+    # The "(auto-extracted)" suffix is the system-prompt's spec but
+    # Claude routinely drops it ("## Attendee Context" alone), and a
+    # missing suffix silently dropped the JSON before it ever
+    # reached the appendix tray (#102 bug 9). Make the suffix
+    # optional; any user-edited section that happens to share the
+    # heading without JSON content still degrades to an empty list
+    # via the inner JSON-block check, so loosening here is safe.
+    r"(##\s+Attendee\s+Context(?:\s*\(auto-extracted\))?\b.*?)(?=^##\s|\Z)",
     re.IGNORECASE | re.DOTALL | re.MULTILINE,
 )
 _JSON_CODE_BLOCK_RE = re.compile(

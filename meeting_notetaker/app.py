@@ -238,6 +238,13 @@ class MainApp(QObject):
         self._inflight_syntheses: dict[str, str] = {}  # request_id -> session_id
         self._bridge_ready_state: bool = False
         self._pending_pings: dict[str, "threading.Event"] = {}
+        # #102 bug 7: track the loaded extension version (reported via
+        # pong) so we can compare against the installed manifest and
+        # ask the user to reload at chrome://extensions if needed. The
+        # check runs single-shot per app launch; _extension_version_alerted
+        # latches once a dismissed-vs-current decision has been made.
+        self._loaded_extension_version: str = ""
+        self._extension_version_alerted: bool = False
         self._bridge = Bridge(
             handshake_file=bridge_handshake_path(),
             on_message=self._on_bridge_message,
@@ -380,6 +387,15 @@ class MainApp(QObject):
         # Weekly background check for a newer release on GitHub. Defer 2s
         # after show() so the network call never blocks the first paint.
         QTimer.singleShot(2000, self._auto_check_for_updates)
+
+        # Prune stale installer .exe payloads the updater has
+        # accumulated in %APPDATA%\MeetingNotetaker\updates (#102 bug 5).
+        # Each upgrade leaves a fat .exe behind; without sweeping, the
+        # cache grows by one installer per release. Keep the most
+        # recent one in case the user wants to re-run / inspect it;
+        # delete everything older. Deferred 3s so disk I/O doesn't
+        # extend the first-paint critical path.
+        QTimer.singleShot(3000, self._prune_updates_cache)
 
         # Startup stale-scan for the search index. Deferred so it
         # doesn't extend the first-paint critical path; once done,
@@ -642,9 +658,146 @@ class MainApp(QObject):
             evt = self._pending_pings.pop(request_id, None)
             if evt is not None:
                 evt.set()
-            return
-        log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
+            # Fall through to the main-thread emit so the version-
+            # skew check (#102 bug 7) can inspect extension_version.
+        else:
+            log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
         self.bridge_message_received.emit(msg)
+
+    def _on_pong_received(self, msg: dict) -> None:
+        """Capture the extension's reported version + trigger a
+        version-skew check the first time we see it (#102 bug 7)."""
+        version = str(msg.get("extension_version") or "").strip()
+        if not version:
+            return
+        if version == self._loaded_extension_version:
+            return
+        self._loaded_extension_version = version
+        log.info("extension reports version %s", version)
+        if not self._extension_version_alerted:
+            QTimer.singleShot(500, self._check_extension_version_skew)
+
+    def _check_extension_version_skew(self) -> None:
+        """Compare the bundled extension manifest version with the
+        version Chrome reported via pong. The bundle is the source of
+        truth for 'what Chrome should be running after this app build
+        is installed' -- the app installer doesn't refresh the
+        on-disk extension dir, so the user can be running an old
+        Chrome-loaded extension long after the app upgrade.
+
+        When bundled > loaded, auto-run ``extract_extension`` so the
+        on-disk files Chrome's 'Load unpacked' points at match the
+        bundle, then surface a QMessageBox telling the user to
+        reload at chrome://extensions.
+
+        No persistent dismissal: the gap closes naturally when Chrome
+        actually picks up the new files (next pong reports the new
+        version, this check returns early on the equal comparison).
+        Until then the alert reappears on each launch, because the
+        situation isn't actually resolved. The in-memory
+        ``_extension_version_alerted`` latch keeps multiple pongs in
+        a single session from re-firing the dialog.
+        """
+        if self._extension_version_alerted:
+            return
+        loaded = self._loaded_extension_version
+        if not loaded:
+            return
+        from .automation import installer as automation_installer  # noqa: PLC0415
+        try:
+            bundled = automation_installer.bundled_extension_version()
+        except Exception:
+            log.exception("Could not read bundled extension manifest")
+            return
+        if not bundled:
+            return
+        from .utils.updater import is_newer_version  # noqa: PLC0415
+        if not is_newer_version(bundled, loaded):
+            return
+        self._extension_version_alerted = True
+
+        # Refresh the on-disk extension dir from the bundle so Chrome
+        # has new files to pick up on reload. If this fails (rare:
+        # Chrome holding files open on Windows) we still surface the
+        # alert but with a longer instruction list that includes
+        # clicking Install/Verify in Settings first.
+        extract_error = ""
+        try:
+            automation_installer.extract_extension()
+            log.info(
+                "auto-refreshed extension dir from bundle v%s", bundled,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception(
+                "could not auto-refresh extension dir from bundle"
+            )
+            extract_error = str(exc)
+
+        box = QMessageBox(self.window)
+        box.setWindowTitle("Update Chrome Extension")
+        box.setIcon(QMessageBox.Icon.Information)
+        if extract_error:
+            body = (
+                f"This Meeting Notetaker build ships extension v{bundled}, "
+                f"but Chrome is still running v{loaded} from before "
+                "the app upgrade.\n\n"
+                "The app tried to refresh the on-disk extension files "
+                f"automatically but couldn't:\n\n  {extract_error}\n\n"
+                "To finish manually:\n\n"
+                "  1. Settings > Synthesis Automation > 'Install / Verify...'\n"
+                "  2. Open chrome://extensions\n"
+                "  3. Find 'Meeting Notetaker Synthesis Bridge'\n"
+                "  4. Click the circular reload (refresh) icon on its tile\n\n"
+                "Send-to-LLM keeps using the older extension until "
+                "you reload. No data is lost; only the synthesis "
+                "automation behavior is affected."
+            )
+        else:
+            body = (
+                f"This Meeting Notetaker build ships Chrome extension "
+                f"v{bundled}, but Chrome is still running v{loaded} "
+                "from before the app upgrade.\n\n"
+                "The app has refreshed the on-disk files for you. "
+                "Chrome needs one click to pick them up:\n\n"
+                "  1. Open chrome://extensions\n"
+                "  2. Find 'Meeting Notetaker Synthesis Bridge'\n"
+                "  3. Click the circular reload (refresh) icon on its tile\n\n"
+                "Send-to-LLM keeps using the older extension until "
+                "you reload. No data is lost; only the synthesis "
+                "automation behavior is affected."
+            )
+        box.setText(body)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Ok
+            | QMessageBox.StandardButton.Cancel,
+        )
+        ok_btn = box.button(QMessageBox.StandardButton.Ok)
+        ok_btn.setText("I'll reload now")
+        cancel_btn = box.button(QMessageBox.StandardButton.Cancel)
+        cancel_btn.setText("Remind me later")
+        box.exec()
+        if box.clickedButton() is ok_btn:
+            # Land the user directly on the extensions page with our
+            # row highlighted so the reload icon is one click away.
+            # Best-effort: when Chrome can't be located we leave the
+            # text-only instructions standing -- they already explain
+            # the steps. No persistent dismissal -- if the user
+            # doesn't actually reload, the next launch's pong will
+            # still report the old version and the alert will fire
+            # again. The gap closes naturally when Chrome reports
+            # the new version.
+            try:
+                opened = automation_installer.open_chrome_extensions_page()
+            except Exception:
+                log.exception("could not open chrome://extensions")
+                opened = False
+            if not opened:
+                self.window.status(
+                    "Couldn't open Chrome automatically. Open "
+                    "chrome://extensions yourself and click the "
+                    "reload icon on the Meeting Notetaker row.",
+                    timeout_ms=8000,
+                )
 
     def _dispatch_bridge_message(self, msg: dict) -> None:
         msg_type = msg.get("type", "")
@@ -655,6 +808,9 @@ class MainApp(QObject):
             request_id,
             list(self._inflight_syntheses.keys()),
         )
+        if msg_type == "pong":
+            self._on_pong_received(msg)
+            return
         if msg_type == "status":
             session_id = self._inflight_syntheses.get(request_id, "")
             if session_id:
@@ -773,6 +929,14 @@ class MainApp(QObject):
         markdown = normalize_synthesis_markdown(markdown)
         # Parse + apply the LLM-extracted attendee details appendix
         # (issue #51 Phase 4). Done BEFORE save_notes so the parsed
+        # Strip conversational preambles ("Let me research...",
+        # "Here's the synthesis below:", etc.) Claude sometimes
+        # writes before the synthesis proper. The Chrome-extension
+        # scrape captures whatever's on the clipboard, so without
+        # this filter the preamble lands verbatim in notes.md and
+        # downstream renders (#102 bug 8).
+        from .utils.llm_preamble import strip_preamble  # noqa: PLC0415
+        markdown = strip_preamble(markdown)
         # data is independent of the save path's success.
         self._apply_attendee_details_appendix(session_id, markdown)
         # Persist the four LLM appendices to the sidecar BEFORE the
@@ -796,6 +960,15 @@ class MainApp(QObject):
             markdown, archive_existing=archive_existing,
         )
         self.store.update_session(session_id, has_notes=True)
+        # Mirror the DB flip into the in-memory session object the
+        # SessionView already holds (#102 bug 10). Without this the
+        # next _set_buttons_for_state call -- triggered by anything
+        # from a connection-state poll to a tab switch -- evaluates
+        # has_notes from the stale Python object and can leave the
+        # Send button greyed even though the synthesis landed.
+        sv_session = self.window.session_view._session  # noqa: SLF001
+        if sv_session is not None and sv_session.id == session_id:
+            sv_session.has_notes = True
         self._reindex_search_for(session_id)
         # Targeted SessionView refresh in place of a full
         # _on_session_selected reload (#73 finding #3). The full
@@ -1185,6 +1358,12 @@ class MainApp(QObject):
             prompt=rendered_body,
             new_chat=True,
             chat_url=chat_url,
+            llm_response_timeout_seconds=int(
+                self.config.synthesis.llm_response_timeout_seconds
+            ),
+            clipboard_read_seconds=int(
+                self.config.synthesis.clipboard_read_seconds
+            ),
         )
         if not self._bridge.send(msg):
             self._inflight_syntheses.pop(request_id, None)
@@ -1449,7 +1628,7 @@ class MainApp(QObject):
 
         sv = self.window.session_view
         sv.start_clicked.connect(self._on_start_clicked)
-        sv.stop_clicked.connect(lambda _sid: self.controller.stop_session())
+        sv.stop_clicked.connect(self._on_stop_clicked)
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
         sv.send_to_llm_clicked.connect(self._on_send_to_llm)
@@ -2082,6 +2261,27 @@ class MainApp(QObject):
             log.exception("failed to align created_at to meeting start time")
             return
         self.store.update_session(session_id, created_at=iso)
+
+    def _on_stop_clicked(self, session_id: str) -> None:
+        """Tear down screen capture BEFORE the controller's blocking
+        stop_session work begins (#102 bug 2).
+
+        SessionController.stop_session blocks the UI thread for up to
+        ~5s per live transcription worker as they drain their queues.
+        If auto-capture is armed, a QTimer fire could be queued in the
+        event loop during that block and run as soon as it returns --
+        adding the auto-capture's 50ms overlay-hide sleep + mss BitBlt
+        on top of the drain wait, compounding the "Not Responding"
+        impression.
+
+        Stopping the auto-capture timer + hiding the overlay before
+        the controller call cancels any queued tick + lets the
+        overlay's window destruction overlap with the drain wait.
+        """
+        if session_id:
+            self._stop_auto_capture(session_id)
+            self._hide_armed_region_overlay()
+        self.controller.stop_session()
 
     def _on_start_clicked(self, session_id: str) -> None:
         session = self.store.get_session(session_id)
@@ -5950,6 +6150,21 @@ class MainApp(QObject):
         )
 
     # ---- update checks ----------------------------------------------------
+
+    def _prune_updates_cache(self) -> None:
+        """Sweep stale installer .exe files out of the updates cache
+        on startup (#102 bug 5). Best-effort: a failure to delete a
+        single file is logged + skipped, never propagated."""
+        try:
+            from .utils.updater import prune_updates_cache  # noqa: PLC0415
+            deleted = prune_updates_cache()
+            if deleted:
+                log.info(
+                    "Pruned %d stale installer(s) from updates cache",
+                    len(deleted),
+                )
+        except Exception:
+            log.exception("Could not prune updates cache")
 
     def _auto_check_for_updates(self) -> None:
         """Silent weekly check on startup (issue #34).

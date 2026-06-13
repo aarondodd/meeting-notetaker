@@ -90,7 +90,14 @@ class AttendeeSidebar(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setFixedWidth(SIDEBAR_WIDTH)
+        # Min + max instead of setFixedWidth so the splitter can
+        # squeeze the sidebar under pressure when the right column
+        # becomes visible on Start Recording (#102 bug 3, Aaron's
+        # 2026-06-11 follow-up). At full width the sidebar still
+        # gets SIDEBAR_WIDTH; at the minimum it truncates attendee
+        # names with ellipsis but stays clickable.
+        self.setMinimumWidth(120)
+        self.setMaximumWidth(SIDEBAR_WIDTH)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(4)

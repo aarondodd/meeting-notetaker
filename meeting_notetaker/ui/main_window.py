@@ -440,8 +440,16 @@ class MainWindow(QMainWindow):
         self._main_splitter = splitter
         layout.addWidget(splitter)
 
-        # Left pane: session list + buttons
+        # Left pane: session list + buttons.
+        # Minimum width guards against the recording-time splitter
+        # collapse Aaron reported (#102 bug 3): when SessionView's
+        # right-hand content grows (live transcript width, attendee
+        # sidebar, status segments), Qt redistributes the splitter
+        # and the left pane can shrink to a sliver that's hard to
+        # drag back. 240px keeps the date + the first words of the
+        # title visible regardless of what the right pane does.
         left = QWidget(splitter)
+        left.setMinimumWidth(240)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
         header_row = QHBoxLayout()
@@ -558,6 +566,18 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([340, 660])
+
+        # When SessionView's right column (screencap + attendee tag
+        # sidebars) toggles, Qt's layout would otherwise redistribute
+        # the main splitter and shrink the session-list pane. Save
+        # the current splitter sizes BEFORE the visibility change +
+        # restore them on the next event-loop tick so the user's
+        # preferred split survives Start Recording (#102 bug 3
+        # follow-up, Aaron's 2026-06-11 trace).
+        self._saved_splitter_sizes: Optional[list[int]] = None
+        self.session_view.right_column_will_toggle.connect(
+            self._on_right_column_will_toggle,
+        )
 
         self.setStatusBar(QStatusBar(self))
         self.statusBar().showMessage("Ready")
@@ -705,6 +725,25 @@ class MainWindow(QMainWindow):
                 )
             except Exception:
                 pass
+
+    def _on_right_column_will_toggle(self, _will_be_visible: bool) -> None:
+        """Capture the splitter sizes the user is currently on, then
+        schedule a restore after Qt has processed the layout change
+        the visibility toggle triggers."""
+        from PyQt6.QtCore import QTimer  # noqa: PLC0415
+        self._saved_splitter_sizes = self._main_splitter.sizes()
+        QTimer.singleShot(0, self._restore_saved_splitter_sizes)
+
+    def _restore_saved_splitter_sizes(self) -> None:
+        if not self._saved_splitter_sizes:
+            return
+        # Qt clamps setSizes against current child minimum widths;
+        # when both sidebars use min/max instead of setFixedWidth
+        # (#102 bug 3 follow-up) the right column can shrink under
+        # pressure so the user's prior left-pane size lands at or
+        # near where they had it.
+        self._main_splitter.setSizes(self._saved_splitter_sizes)
+        self._saved_splitter_sizes = None
 
     def set_session_list_sort(self, spec: str) -> None:
         """Apply a persisted sort spec to the list.

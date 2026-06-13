@@ -151,3 +151,198 @@ def test_uninstall_with_keep_false_removes_extension(isolated_data_dir, tmp_path
     state = installation_state()
     assert state["extension_extracted"] is False
     assert state["native_manifest_written"] is False
+
+
+# ---- installed_extension_version (#102 bug 7) --------------------------
+
+
+def test_installed_extension_version_empty_when_not_extracted(isolated_data_dir):
+    from meeting_notetaker.automation.installer import installed_extension_version
+    # Fresh data dir; extension hasn't been extracted yet.
+    assert installed_extension_version() == ""
+
+
+def test_installed_extension_version_reads_manifest(isolated_data_dir, tmp_path):
+    """After extract_extension lands the manifest in extension_dir,
+    installed_extension_version returns the version field."""
+    import json
+    from meeting_notetaker.automation.installer import (
+        extract_extension, installed_extension_version,
+    )
+    src = tmp_path / "bundled"
+    src.mkdir()
+    (src / "manifest.json").write_text(
+        json.dumps({
+            "manifest_version": 3,
+            "name": "x",
+            "version": "1.2.3",
+            "key": "irrelevant",
+        }),
+        encoding="utf-8",
+    )
+    # extract_extension validates the key/id pair; bypass by calling
+    # the read directly against the destination after a manual copy.
+    from meeting_notetaker.utils.paths import extension_dir
+    dest = extension_dir()
+    import shutil
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+    assert installed_extension_version() == "1.2.3"
+
+
+def test_installed_extension_version_empty_on_malformed_json(
+    isolated_data_dir,
+):
+    """A corrupt manifest is treated as 'not installed' so the
+    skew check is a no-op rather than crashing the alert path."""
+    from meeting_notetaker.automation.installer import installed_extension_version
+    from meeting_notetaker.utils.paths import extension_dir
+    dest = extension_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "manifest.json").write_text(
+        "{not valid json", encoding="utf-8",
+    )
+    assert installed_extension_version() == ""
+
+
+def test_installed_extension_version_empty_when_field_missing(
+    isolated_data_dir,
+):
+    import json
+    from meeting_notetaker.automation.installer import installed_extension_version
+    from meeting_notetaker.utils.paths import extension_dir
+    dest = extension_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "manifest.json").write_text(
+        json.dumps({"manifest_version": 3, "name": "x"}),
+        encoding="utf-8",
+    )
+    assert installed_extension_version() == ""
+
+
+# ---- bundled_extension_version (#102 bug 7 follow-up) ------------------
+
+
+def test_bundled_extension_version_reads_resources_manifest(isolated_data_dir):
+    """The shipped bundle's manifest is at resources/extension/manifest.json
+    inside the package. The helper must read that path regardless of
+    whether the on-disk extension_dir copy has been extracted."""
+    from meeting_notetaker.automation.installer import bundled_extension_version
+    # The repo's bundled manifest must exist + carry a non-empty version
+    # string (currently 0.7.11). The exact value drifts with each
+    # extension change; just check shape.
+    version = bundled_extension_version()
+    assert version  # non-empty
+    parts = version.split(".")
+    assert len(parts) >= 2
+    assert all(p.isdigit() for p in parts)
+
+
+def test_bundled_extension_version_independent_of_extension_dir(
+    isolated_data_dir,
+):
+    """bundled_extension_version reads from package resources, NOT
+    from the per-user extension_dir copy. Verify by deliberately
+    staging a different version in extension_dir and confirming
+    the bundled lookup is unaffected."""
+    import json
+    from meeting_notetaker.automation.installer import (
+        bundled_extension_version, installed_extension_version,
+    )
+    from meeting_notetaker.utils.paths import extension_dir
+    dest = extension_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "manifest.json").write_text(
+        json.dumps({
+            "manifest_version": 3, "name": "x", "version": "0.0.1",
+        }),
+        encoding="utf-8",
+    )
+    assert installed_extension_version() == "0.0.1"
+    # Bundled is whatever ships in resources/; deliberately NOT 0.0.1.
+    bundled = bundled_extension_version()
+    assert bundled != "0.0.1"
+    assert bundled  # non-empty
+
+
+# ---- find_chrome_executable + open_chrome_extensions_page (#102 bug 7) -
+
+
+def test_find_chrome_executable_returns_none_on_non_windows():
+    """The lookup is documented Windows-only; on Linux / macOS the
+    helper bails out cleanly so the version-skew alert can fall
+    through to its text-only instructions."""
+    import sys as _sys
+    from meeting_notetaker.automation.installer import find_chrome_executable
+    if _sys.platform.startswith("win"):
+        # Skip cleanly on Windows test runs -- the function may
+        # actually return a path there.
+        return
+    assert find_chrome_executable() is None
+
+
+def test_open_chrome_extensions_page_returns_false_when_no_chrome(
+    monkeypatch,
+):
+    """When find_chrome_executable returns None, the launch helper
+    is a no-op that returns False. The skew-check caller treats
+    False as 'fall back to status-bar text instructions'."""
+    from meeting_notetaker.automation import installer as automation_installer
+    monkeypatch.setattr(
+        automation_installer, "find_chrome_executable", lambda: None,
+    )
+    assert automation_installer.open_chrome_extensions_page() is False
+
+
+def test_open_chrome_extensions_page_launches_with_extension_id(
+    monkeypatch, tmp_path,
+):
+    """When Chrome IS found, Popen is called with chrome.exe + the
+    deep-link URL that scrolls to our extension's tile."""
+    from meeting_notetaker.automation import installer as automation_installer
+    fake_chrome = tmp_path / "chrome.exe"
+    fake_chrome.write_bytes(b"fake")
+    monkeypatch.setattr(
+        automation_installer, "find_chrome_executable",
+        lambda: fake_chrome,
+    )
+    captured: dict = {}
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+        class _Stub:
+            pass
+        return _Stub()
+
+    monkeypatch.setattr(
+        automation_installer.subprocess, "Popen", fake_popen,
+    )
+    ok = automation_installer.open_chrome_extensions_page()
+    assert ok is True
+    assert captured["args"][0] == str(fake_chrome)
+    url = captured["args"][1]
+    assert url.startswith("chrome://extensions/?id=")
+    assert automation_installer.EXTENSION_ID in url
+
+
+def test_open_chrome_extensions_page_returns_false_on_popen_failure(
+    monkeypatch, tmp_path,
+):
+    from meeting_notetaker.automation import installer as automation_installer
+    fake_chrome = tmp_path / "chrome.exe"
+    fake_chrome.write_bytes(b"x")
+    monkeypatch.setattr(
+        automation_installer, "find_chrome_executable",
+        lambda: fake_chrome,
+    )
+
+    def boom(*_args, **_kwargs):
+        raise OSError("Access denied")
+
+    monkeypatch.setattr(
+        automation_installer.subprocess, "Popen", boom,
+    )
+    assert automation_installer.open_chrome_extensions_page() is False

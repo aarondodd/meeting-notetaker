@@ -238,12 +238,20 @@ def diagnose() -> DiagnosticResult:
 # ---- Outlook fetch (live; not testable in CI) ------------------------------
 
 
-def fetch_calendar_range(start: datetime, end: datetime) -> list[MeetingInfo]:
+def fetch_calendar_range(
+    start: datetime, end: datetime, *, light: bool = False,
+) -> list[MeetingInfo]:
     """Return calendar items whose Start falls in [start, end].
 
-    Returns [] silently on any failure path (Outlook not running, COM error,
-    pywin32 missing). Used by both fetch_imminent_meetings (narrow +-window)
-    and fetch_remaining_today (now -> end-of-day).
+    When ``light=True``, skip the per-item Recipients walk + Body read
+    + Attachments walk. That trims a 10-15 s fetch (#102 bug 4) down
+    to under a second on Exchange cached-mode profiles where the
+    Recipients enumeration triggers per-attendee GAL lookups. The
+    picker only needs subject + start + end for display; the full
+    fields can be fetched on accept via ``fetch_meeting_by_entry_id``.
+
+    Returns [] silently on any failure path (Outlook not running, COM
+    error, pywin32 missing).
     """
     if not is_available():
         return []
@@ -274,13 +282,88 @@ def fetch_calendar_range(start: datetime, end: datetime) -> list[MeetingInfo]:
         out: list[MeetingInfo] = []
         for item in restricted:
             try:
-                out.append(_item_to_info(item))
+                if light:
+                    out.append(_item_to_info_light(item))
+                else:
+                    out.append(_item_to_info(item))
             except Exception:
                 log.exception("failed to parse calendar item")
         return out
     except Exception:
         log.exception("Outlook calendar fetch failed")
         return []
+
+
+def fetch_meeting_by_entry_id(
+    entry_id: str,
+    *,
+    instance_start: Optional[datetime] = None,
+    instance_end: Optional[datetime] = None,
+) -> Optional[MeetingInfo]:
+    """Re-fetch a single calendar item with full detail (Recipients,
+    Body, Attachments) by its EntryID.
+
+    The picker uses ``light=True`` for the initial list to keep the
+    dialog snappy on Exchange-cached profiles. When the user accepts,
+    the caller resolves the selected entry_id back to a full
+    MeetingInfo via this call -- cheap because it touches exactly
+    one item.
+
+    Recurring-series caveat: Outlook's ``Namespace.GetItemFromID``
+    returns the recurring **master**, not the occurrence the user
+    picked, even when the EntryID came from a Restrict +
+    IncludeRecurrences iteration that yielded the instance. To get
+    the correct date/time on the resulting session, callers pass the
+    instance's ``Start`` / ``End`` (captured by ``_item_to_info_light``
+    during the picker's initial fetch) through ``instance_start`` /
+    ``instance_end``. When provided, those values override the
+    master's Start / End on the returned MeetingInfo so the
+    downstream ``_align_created_at_to_meeting`` lines up with the
+    occurrence the user actually clicked.
+    """
+    if not entry_id or not is_available():
+        return None
+    try:
+        import win32com.client  # type: ignore
+    except ImportError:
+        return None
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+    except Exception as exc:
+        log.debug("Outlook Dispatch failed for fetch_meeting_by_entry_id: %s", exc)
+        return None
+    try:
+        ns = outlook.GetNamespace("MAPI")
+        item = ns.GetItemFromID(entry_id)
+        info = _item_to_info(item)
+    except Exception:
+        log.exception("could not resolve calendar item by EntryID")
+        return None
+    return _apply_instance_times(
+        info, start=instance_start, end=instance_end,
+    )
+
+
+def _apply_instance_times(
+    info: MeetingInfo,
+    *,
+    start: Optional[datetime],
+    end: Optional[datetime],
+) -> MeetingInfo:
+    """Override ``start_time`` / ``end_time`` on ``info`` with caller-
+    supplied instance values when provided. Pure function; the
+    recurring-master patching logic for
+    ``fetch_meeting_by_entry_id`` lives here so it's unit-testable
+    without mocking COM dispatch.
+    """
+    if start is None and end is None:
+        return info
+    from dataclasses import replace  # noqa: PLC0415
+    return replace(
+        info,
+        start_time=start if start is not None else info.start_time,
+        end_time=end if end is not None else info.end_time,
+    )
 
 
 def fetch_imminent_meetings(window_minutes: int = 5) -> list[MeetingInfo]:
@@ -296,7 +379,9 @@ def fetch_imminent_meetings(window_minutes: int = 5) -> list[MeetingInfo]:
     )
 
 
-def fetch_remaining_today(now: Optional[datetime] = None) -> list[MeetingInfo]:
+def fetch_remaining_today(
+    now: Optional[datetime] = None, *, light: bool = False,
+) -> list[MeetingInfo]:
     """Return meetings that haven't yet ended through end-of-local-day.
 
     Used by the "Pick from Calendar..." button in New Session. Includes
@@ -318,8 +403,66 @@ def fetch_remaining_today(now: Optional[datetime] = None) -> list[MeetingInfo]:
         # Sanity: never happens (microsecond=0 doesn't move things backwards),
         # but guard anyway.
         end_of_day = now
-    candidates = fetch_calendar_range(lookback_start, end_of_day)
+    candidates = fetch_calendar_range(lookback_start, end_of_day, light=light)
     return [m for m in candidates if m.end_time > now]
+
+
+# ---- in-memory cache (#102 bug 4) ----------------------------------------
+
+
+class _RemainingTodayCache:
+    """TTL cache for ``fetch_remaining_today(light=True)`` results.
+
+    Picker opens repeatedly are common (user closes the dialog, opens
+    it again, hits Refresh, etc.). Caching the light variant skips the
+    re-dispatch + re-restrict + re-iterate for 60 s by default, which
+    is the wall-clock win the user actually feels.
+
+    Hits are keyed by the local date so cached results don't survive
+    a day rollover (rare on a meeting-app session but real). The TTL
+    bounds staleness within a day -- a meeting added in Outlook in
+    the last minute can be picked up via the dialog's Refresh button.
+    """
+
+    def __init__(self, ttl_seconds: float = 60.0) -> None:
+        self._ttl = ttl_seconds
+        self._stamp: Optional[datetime] = None
+        self._stamp_date = None
+        self._payload: list[MeetingInfo] = []
+
+    def get(self, now: Optional[datetime] = None) -> list[MeetingInfo]:
+        if now is None:
+            now = datetime.now()
+        if not self._is_fresh(now):
+            self._payload = fetch_remaining_today(now, light=True)
+            self._stamp = now
+            self._stamp_date = now.date()
+        # Always filter on read so meetings whose end_time slipped past
+        # now between cache writes don't keep appearing in the picker.
+        return [m for m in self._payload if m.end_time > now]
+
+    def refresh(self, now: Optional[datetime] = None) -> list[MeetingInfo]:
+        self._stamp = None
+        return self.get(now=now)
+
+    def invalidate(self) -> None:
+        self._stamp = None
+        self._stamp_date = None
+        self._payload = []
+
+    def is_fresh(self, now: Optional[datetime] = None) -> bool:
+        return self._is_fresh(now or datetime.now())
+
+    def _is_fresh(self, now: datetime) -> bool:
+        if self._stamp is None or self._stamp_date != now.date():
+            return False
+        # Inclusive bound: a query exactly TTL seconds after the cache
+        # write still counts as fresh. Eliminates a flaky off-by-one
+        # for the picker's typical 60 s rhythm.
+        return (now - self._stamp).total_seconds() <= self._ttl
+
+
+remaining_today_cache = _RemainingTodayCache()
 
 
 def _looks_like_legacy_dn(value: str) -> bool:
@@ -556,6 +699,27 @@ def _resolve_recipient_fields(recipient) -> dict:
         "name": name, "email": email,
         "title": title, "company": company, "department": department,
     }
+
+
+def _item_to_info_light(item) -> MeetingInfo:
+    """Cheap variant of ``_item_to_info`` for picker rows (#102 bug 4).
+
+    Skips Recipients (which triggers GAL lookups via GetExchangeUser
+    on each attendee), Body (full meeting body can be large), and
+    Attachments. Caller resolves the full record on accept via
+    ``fetch_meeting_by_entry_id``. The picker UI only displays
+    subject + start + end, so the trimmed shape is invisible.
+    """
+    return MeetingInfo(
+        entry_id=str(item.EntryID),
+        subject=str(item.Subject or "(no subject)"),
+        start_time=_pywintype_to_datetime(item.Start),
+        end_time=_pywintype_to_datetime(item.End),
+        attendees=[],
+        body="",
+        location=str(getattr(item, "Location", "") or "").strip(),
+        attachments=[],
+    )
 
 
 def _item_to_info(item) -> MeetingInfo:

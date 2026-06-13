@@ -109,3 +109,35 @@ def test_find_span_returns_offsets():
     assert span is not None
     start, end = span
     assert md[start:end].startswith("## Attendee Context")
+
+
+# ---- heading tolerance: optional (auto-extracted) (#102 bug 9) ---------
+
+
+def test_parses_heading_without_auto_extracted_suffix():
+    """Claude routinely drops the "(auto-extracted)" suffix from the
+    heading even though the prompt asks for it. Without this
+    tolerance the JSON silently vanishes into the appendix tray."""
+    from meeting_notetaker.utils.attendee_context import parse_attendee_context
+    src = (
+        "## Summary\n\nBody.\n\n"
+        "## Attendee Context\n\n"
+        "```json\n[{\"name\":\"Alice\",\"observation\":\"Led the discussion.\"}]\n```\n"
+    )
+    out = parse_attendee_context(src)
+    assert len(out) == 1
+    assert out[0].name == "Alice"
+    assert "Led the discussion" in out[0].observation
+
+
+def test_parses_heading_with_auto_extracted_suffix_still():
+    """The original spec'd form must still parse so existing notes
+    files don't regress."""
+    from meeting_notetaker.utils.attendee_context import parse_attendee_context
+    src = (
+        "## Attendee Context (auto-extracted)\n\n"
+        "```json\n[{\"name\":\"Bob\",\"observation\":\"Quiet.\"}]\n```\n"
+    )
+    out = parse_attendee_context(src)
+    assert len(out) == 1
+    assert out[0].name == "Bob"

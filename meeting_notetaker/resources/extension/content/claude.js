@@ -214,8 +214,23 @@
     return false;
   }
 
-  async function runSynthesis(requestId, prompt) {
+  // Default timeouts when the app doesn't pass overrides (older
+  // app build paired with this extension). Kept generous so the
+  // common case still works without configuration. #102 bug 6.
+  const DEFAULT_RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;  // 10 min
+  const DEFAULT_CLIPBOARD_READ_MS = 1000;             // 1 sec
+
+  async function runSynthesis(requestId, prompt, options) {
     _requestId = requestId;
+    const opts = options || {};
+    const responseTimeoutMs =
+      opts.llmResponseTimeoutMs > 0
+        ? opts.llmResponseTimeoutMs
+        : DEFAULT_RESPONSE_TIMEOUT_MS;
+    const clipboardReadMs =
+      opts.clipboardReadMs > 0
+        ? opts.clipboardReadMs
+        : DEFAULT_CLIPBOARD_READ_MS;
 
     // Login detection. If the current page is the Claude sign-in
     // page (likely a redirect from /new because the user isn't
@@ -319,7 +334,7 @@
       minGrowthEvents: 3,
       minGrowthSpanMs: 3000,
       fallbackSettleMs: 5000,
-      timeoutMs: 10 * 60 * 1000,
+      timeoutMs: responseTimeoutMs,
       onTick: (ms, growth, events, stopVisible, stopEverSeen) => {
         if (Date.now() - lastHeartbeat >= HEARTBEAT_MS) {
           lastHeartbeat = Date.now();
@@ -336,7 +351,14 @@
       },
     });
     if (result === null) {
-      fail("timeout", "Claude response didn't settle within 10 minutes.");
+      const mins = Math.round(responseTimeoutMs / 60000);
+      fail(
+        "timeout",
+        `Claude response didn't settle within ${mins} minute(s). ` +
+        "If your prompts routinely take longer than this, raise " +
+        "the 'LLM response wait' value in Settings > Synthesis " +
+        "Automation.",
+      );
       return;
     }
     status(
@@ -403,17 +425,23 @@
     await ensureDocumentFocused();
     copyBtn.click();
 
-    // Retry the clipboard read for up to a second. Claude's copy
-    // writes to clipboard asynchronously; a single 250ms wait isn't
-    // always enough on slower machines or when the UI is still
-    // updating. Each retry takes the longest text seen -- if a
-    // stale clipboard value is replaced with the response text
-    // partway through, we'll catch the longer one.
+    // Retry the clipboard read up to the configured budget.
+    // Claude's copy writes to clipboard asynchronously; a single
+    // wait isn't always enough on slower machines or when the UI
+    // is still updating. Each retry takes the longest text seen --
+    // if a stale clipboard value is replaced with the response
+    // text partway through, we'll catch the longer one. Total
+    // budget is `clipboardReadMs`; we poll every ~200 ms (#102
+    // bug 6).
+    const CLIPBOARD_POLL_INTERVAL_MS = 200;
+    const clipboardAttempts = Math.max(
+      1, Math.floor(clipboardReadMs / CLIPBOARD_POLL_INTERVAL_MS),
+    );
     let clip = "";
     let clipboardErrorDetail = "";
     const MIN_USEFUL_CHARS = 50;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await new Promise((r) => setTimeout(r, 200));
+    for (let attempt = 0; attempt < clipboardAttempts; attempt += 1) {
+      await new Promise((r) => setTimeout(r, CLIPBOARD_POLL_INTERVAL_MS));
       try {
         const cur = await navigator.clipboard.readText();
         if (cur && cur.trim().length > clip.trim().length) {
@@ -464,12 +492,29 @@
           "any response manually -- Chrome will prompt; click Allow. " +
           "Then try Send again.";
       } else {
+        // No specific Chrome error string + a clip too short to be the
+        // response = Claude's Copy hasn't finished serializing to the
+        // clipboard within the read budget, OR the streaming-detector
+        // settled while Claude was still thinking. Both are timing
+        // issues -- not a permissions problem -- so lead with that
+        // advice instead of the bucket-3 permission flavour.
+        const seconds = Math.round(clipboardReadMs / 1000);
         advice =
-          "If permission was already granted, the extension may be " +
-          "clicking the wrong button (an inline code-block Copy " +
-          "instead of the response Copy). Check the Claude tab " +
-          "DevTools console for the 'mn-synth: copyBtn picked' line " +
-          "to see which button was chosen.";
+          `The extension waited ${seconds}s for Claude's Copy ` +
+          "button to write the response to the clipboard, but the " +
+          "clipboard either stayed empty or held something shorter " +
+          "than expected. This is usually a timing issue, not a " +
+          "permissions problem.\n\n" +
+          "Try one of:\n" +
+          "  - Raise 'Clipboard read wait' in Settings > Synthesis " +
+          "Automation (especially helpful for long responses where " +
+          "Claude's copy serialization takes more than a second).\n" +
+          "  - Raise 'LLM response wait' if the response was still " +
+          "streaming when we tried to copy.\n" +
+          "  - Check the Claude tab DevTools console for the " +
+          "'mn-synth: copyBtn picked' line -- if it shows a code-block " +
+          "Copy button instead of the response Copy, the page layout " +
+          "drifted and the selector needs an update.";
       }
       fail(
         "clipboard_unavailable",
@@ -493,7 +538,10 @@
     connection = chrome.runtime.connect({ name: `mn-synth-${requestId}` });
     connection.onMessage.addListener((msg) => {
       if (msg && msg.type === "SYNTHESIZE_START") {
-        runSynthesis(msg.requestId, msg.prompt || "").catch((e) => {
+        runSynthesis(msg.requestId, msg.prompt || "", {
+          llmResponseTimeoutMs: msg.llmResponseTimeoutMs || 0,
+          clipboardReadMs: msg.clipboardReadMs || 0,
+        }).catch((e) => {
           fail("unknown", String(e));
         });
       }

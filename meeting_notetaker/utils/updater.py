@@ -274,6 +274,47 @@ def updates_dir() -> Path:
     return path
 
 
+def prune_updates_cache(*, keep_newest: int = 1) -> list[Path]:
+    """Delete cached installer .exe files older than the most-recently-
+    modified ``keep_newest`` payloads in ``updates_dir()`` (#102 bug 5).
+
+    The updater downloads each release's installer to
+    ``%APPDATA%\\MeetingNotetaker\\updates\\meeting-notetaker-setup-X.Y.Z.exe``
+    and never sweeps the old ones, so the directory bloats by one
+    fat installer per upgrade. Once Inno Setup has finished its job
+    the .exe is dead weight. Call this on app startup to keep the
+    cache bounded.
+
+    Default ``keep_newest=1`` retains the installer that produced the
+    currently-running build (handy if the user wants to inspect or
+    re-run it). Pass ``keep_newest=0`` to delete every cached
+    installer.
+
+    Returns the list of paths that were deleted (best-effort -- a
+    failure to unlink a single file is logged + skipped, not
+    propagated).
+    """
+    cache = updates_dir()
+    if not cache.is_dir():
+        return []
+    installers = sorted(
+        cache.glob("meeting-notetaker-setup-*.exe"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    deleted: list[Path] = []
+    for installer in installers[max(0, keep_newest):]:
+        try:
+            installer.unlink()
+            deleted.append(installer)
+        except OSError as exc:
+            log.warning(
+                "Could not delete cached installer %s: %s",
+                installer, exc,
+            )
+    return deleted
+
+
 def launch_installer(installer_path: Path) -> Tuple[bool, str]:
     """Spawn the installer with silent flags and return immediately.
 

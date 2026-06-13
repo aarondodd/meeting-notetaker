@@ -188,6 +188,8 @@ chrome.runtime.onConnect.addListener(async (port) => {
     target: ctx.target,
     prompt: ctx.prompt || "",
     newChat: ctx.newChat !== false,
+    llmResponseTimeoutMs: ctx.llmResponseTimeoutMs || 0,
+    clipboardReadMs: ctx.clipboardReadMs || 0,
   });
 });
 
@@ -232,6 +234,12 @@ async function startSynthesis(msg) {
     target: targetKey,
     prompt: msg.prompt || "",
     newChat: msg.new_chat !== false,
+    // #102 bug 6: user-tunable timeouts. The app sends seconds; the
+    // content script wants milliseconds. 0 / undefined here means
+    // "extension uses its built-in defaults", which keeps older app
+    // builds compatible with a newer extension.
+    llmResponseTimeoutMs: (msg.llm_response_timeout_seconds || 0) * 1000,
+    clipboardReadMs: (msg.clipboard_read_seconds || 0) * 1000,
   });
 
   // Inject the start trigger after the tab settles. The content script

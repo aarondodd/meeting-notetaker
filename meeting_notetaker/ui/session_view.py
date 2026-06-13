@@ -126,6 +126,13 @@ class SessionView(QWidget):
     export_to_notion_requested = pyqtSignal(str, str, str)
     export_to_confluence_requested = pyqtSignal(str, str, str)
     export_to_obsidian_requested = pyqtSignal(str, str, str)
+    # Emitted just before _right_column.setVisible(...) toggles, with
+    # the upcoming visibility as the payload (#102 bug 3 follow-up).
+    # MainWindow uses it to checkpoint the main splitter sizes BEFORE
+    # the toggle triggers a layout redistribute, then restores them on
+    # the next event-loop tick so the user's preferred split survives
+    # Start Recording.
+    right_column_will_toggle = pyqtSignal(bool)
     # Click-to-tag for in-meeting speaker anchoring. The sidebar emits
     # (session_id, name) per click; the controller persists a SpeakerTag
     # and the post-meeting refiner uses tags to constrain the clusterer.
@@ -1064,6 +1071,16 @@ class SessionView(QWidget):
             return
         self.tag_speaker_clicked.emit(self._session.id, name)
 
+    def _toggle_right_column(self, visible: bool) -> None:
+        """Fire ``right_column_will_toggle`` BEFORE the visibility
+        change so MainWindow can checkpoint the splitter sizes, then
+        flip visibility. Idempotent / cheap when state matches.
+        """
+        if self._right_column.isVisible() == visible:
+            return
+        self.right_column_will_toggle.emit(visible)
+        self._right_column.setVisible(visible)
+
     def _on_attendee_remove_last_clicked(self, name: str) -> None:
         if self._session is None:
             return
@@ -1079,7 +1096,7 @@ class SessionView(QWidget):
         if self._session is None or self._session.state not in (
             STATE_RECORDING, STATE_PAUSED,
         ):
-            self._right_column.setVisible(False)
+            self._toggle_right_column(False)
             return
         current = self._tabs.currentWidget()
         # Comparison uses the page wrappers since v0.7.2 #51 Phase 3
@@ -1087,7 +1104,7 @@ class SessionView(QWidget):
         on_transcript_or_notes = current in (
             self._transcript_view, self._live_notes_page,
         )
-        self._right_column.setVisible(on_transcript_or_notes)
+        self._toggle_right_column(on_transcript_or_notes)
         # The screencap sidebar belongs to My Notes only; hide it on
         # the Transcript tab even though the column is shown for the
         # attendee tag controls.
@@ -1654,13 +1671,14 @@ class SessionView(QWidget):
 
     def set_rich_source_view(self, enabled: bool) -> None:
         """Toggle the styled markdown source view (#91) on every editor
-        that hosts one. Currently just the My Notes editor; the
-        Synthesis editor stays plain because synthesized notes are
-        usually printed / exported rather than scanned in-editor."""
-        try:
-            self._live_notes_editor.set_rich_source_view(enabled)
-        except AttributeError:
-            pass
+        that hosts one. Applies to both My Notes and Synthesis -- the
+        Synthesis tab is just as edit-heavy as My Notes once the user
+        starts cleaning up the LLM's draft (#102 bug 1)."""
+        for editor in (self._live_notes_editor, self._notes_view):
+            try:
+                editor.set_rich_source_view(enabled)
+            except AttributeError:
+                pass
 
     def set_export_outline_options(
         self,
@@ -1923,10 +1941,24 @@ class SessionView(QWidget):
             self._synth_banner.setVisible(False)
             self._synth_banner.setText("")
             if self._session is not None:
+                # Use the same OR-with-buffer fallback set_session uses,
+                # so a synthesis that JUST landed in the editor buffer
+                # but hasn't yet flipped the in-memory has_notes flag
+                # still flows through as has_notes=True. Aaron's
+                # 2026-06-13 trace: Send button stuck disabled after a
+                # successful first synthesis until the user swapped
+                # sessions and back -- because set_session uses the OR
+                # fallback while this path didn't (#102 bug 10).
                 self._set_buttons_for_state(
                     self._session.state,
-                    has_transcript=bool(self._raw_transcript_text),
-                    has_notes=bool(self._session.has_notes),
+                    has_transcript=(
+                        self._session.has_transcript
+                        or bool(self._raw_transcript_text)
+                    ),
+                    has_notes=(
+                        self._session.has_notes
+                        or bool(self._notes_view.toPlainText().strip())
+                    ),
                 )
 
     def set_prompt_templates(
