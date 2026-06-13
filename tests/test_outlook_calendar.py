@@ -14,10 +14,12 @@ from meeting_notetaker.integrations.outlook_calendar import (
     MeetingInfo,
     _DedupStore,
     _RemainingTodayCache,
+    _attachment_is_user_document,
     fetch_calendar_range,
     fetch_remaining_today,
     is_available,
     sanitize_body,
+    strip_bridge_details,
 )
 from meeting_notetaker.utils.live_notes import seed_body_with_calendar
 
@@ -779,3 +781,282 @@ def test_fetch_meeting_by_entry_id_no_outlook_ignores_instance_times():
         instance_start=datetime(2026, 6, 11, 9, 0),
         instance_end=datetime(2026, 6, 11, 9, 30),
     ) is None
+
+
+# ---- strip_bridge_details (#104 bug 2) -------------------------------------
+
+
+_TEAMS_BLOCK = (
+    "________________________________________________________________________________\n"
+    "Microsoft Teams meeting\n"
+    "Join on your computer, mobile app or room device\n"
+    "Click here to join the meeting\n"
+    "Meeting ID: 123 456 789 012\n"
+    "Passcode: abcd\n"
+    "Phone Conference ID: 987 654 321#\n"
+    "________________________________________________________________________________"
+)
+
+
+def test_strip_bridge_removes_teams_block_only():
+    body = "Agenda:\n- Topic 1\n- Topic 2\n\n" + _TEAMS_BLOCK
+    out = strip_bridge_details(body)
+    assert "Agenda:" in out
+    assert "Topic 1" in out
+    assert "Topic 2" in out
+    assert "Microsoft Teams" not in out
+    assert "Meeting ID" not in out
+    assert "Phone Conference ID" not in out
+
+
+def test_strip_bridge_handles_block_above_agenda():
+    body = _TEAMS_BLOCK + "\n\nAgenda below:\n- Status updates"
+    out = strip_bridge_details(body)
+    assert "Agenda below:" in out
+    assert "Status updates" in out
+    assert "Microsoft Teams" not in out
+
+
+def test_strip_bridge_handles_block_between_paragraphs():
+    body = (
+        "Opening notes about the project.\n\n"
+        + _TEAMS_BLOCK
+        + "\n\nFollow-up topics for the meeting."
+    )
+    out = strip_bridge_details(body)
+    assert "Opening notes" in out
+    assert "Follow-up topics" in out
+    assert "Microsoft Teams" not in out
+
+
+def test_strip_bridge_zoom():
+    body = (
+        "Quick sync on the demo.\n"
+        "________________________________________________________________________________\n"
+        "Join Zoom Meeting\n"
+        "https://zoom.us/j/1234567890\n"
+        "Meeting ID: 123 456 7890\n"
+        "Passcode: 999\n"
+        "________________________________________________________________________________"
+    )
+    out = strip_bridge_details(body)
+    assert "Quick sync on the demo." in out
+    assert "Zoom" not in out
+    assert "zoom.us" not in out
+
+
+def test_strip_bridge_google_meet():
+    body = (
+        "Roadmap review.\n"
+        "________________________________________________________________________________\n"
+        "Join with Google Meet\n"
+        "meet.google.com/abc-defg-hij\n"
+        "________________________________________________________________________________"
+    )
+    out = strip_bridge_details(body)
+    assert "Roadmap review." in out
+    assert "Google Meet" not in out
+    assert "meet.google.com" not in out
+
+
+def test_strip_bridge_webex():
+    body = (
+        "Vendor sync.\n"
+        "________________________________________________________________________________\n"
+        "Join Webex meeting\n"
+        "https://example.webex.com/example/j.php?MTID=xyz\n"
+        "Meeting number: 123 456 789\n"
+        "________________________________________________________________________________"
+    )
+    out = strip_bridge_details(body)
+    assert "Vendor sync." in out
+    assert "Webex" not in out
+    assert "webex.com" not in out
+
+
+def test_strip_bridge_no_op_when_no_bracket():
+    # Bare "click here to join" pasted into agenda without the
+    # heavy-underscore bracket -- under-strip beats over-strip.
+    body = "Agenda: discuss the proposal.\nJoin via Teams link in calendar."
+    out = strip_bridge_details(body)
+    assert out == body
+
+
+def test_strip_bridge_no_op_when_bracket_lacks_marker():
+    # Underscore bracket present, but the body inside doesn't carry a
+    # bridge keyword -- user content that happens to be wrapped in a
+    # decorative underscore separator must NOT get clobbered.
+    body = (
+        "Agenda:\n"
+        "________________________________________________________________________________\n"
+        "Pre-read: the attached spec deck\n"
+        "Discussion notes from last session\n"
+        "________________________________________________________________________________\n"
+        "Wrap-up at 3pm"
+    )
+    out = strip_bridge_details(body)
+    assert "Pre-read" in out
+    assert "Discussion notes" in out
+    assert "Wrap-up at 3pm" in out
+
+
+def test_strip_bridge_empty_and_none():
+    assert strip_bridge_details("") == ""
+    assert strip_bridge_details("   ") == ""
+
+
+def test_sanitize_body_runs_bridge_strip_by_default():
+    raw = (
+        "<p>Agenda:</p>"
+        "<p>- Topic A</p>"
+        "<p>________________________________________________________________________________</p>"
+        "<p>Microsoft Teams meeting</p>"
+        "<p>Meeting ID: 1 2 3</p>"
+        "<p>________________________________________________________________________________</p>"
+    )
+    out = sanitize_body(raw)
+    assert "Agenda:" in out
+    assert "Topic A" in out
+    assert "Microsoft Teams" not in out
+    assert "Meeting ID" not in out
+
+
+def test_sanitize_body_strip_bridges_opt_out():
+    raw = (
+        "Agenda:\n"
+        + _TEAMS_BLOCK
+    )
+    out = sanitize_body(raw, strip_bridges=False)
+    assert "Microsoft Teams" in out
+    assert "Meeting ID" in out
+
+
+# ---- _attachment_is_user_document (#104 bug 1) -----------------------------
+
+
+class _FakeAttachmentPropertyAccessor:
+    """PropertyAccessor stand-in. ``props`` maps the MAPI proptag URL
+    to the value Outlook would return; ``raises`` is the set of URLs
+    that should bubble up as a COM exception (mimicking absent
+    properties on real attachments).
+    """
+
+    def __init__(self, props=None, raises=None):
+        self.props = props or {}
+        self.raises = raises or set()
+
+    def GetProperty(self, url):  # noqa: N802 -- COM API name
+        if url in self.raises:
+            raise RuntimeError("property absent")
+        return self.props.get(url)
+
+
+class _FakeAttachment:
+    def __init__(
+        self,
+        *,
+        filename="",
+        display_name="",
+        accessor=None,
+        no_accessor=False,
+    ):
+        self.FileName = filename
+        self.DisplayName = display_name
+        if not no_accessor:
+            self.PropertyAccessor = (
+                accessor or _FakeAttachmentPropertyAccessor()
+            )
+        # When no_accessor=True, intentionally omit the attribute so
+        # getattr-via-property-access raises (covers older Outlook
+        # builds the accessor fallback in _attachment_is_user_document
+        # exists for).
+
+
+def test_attachment_real_document_accepted():
+    a = _FakeAttachment(filename="Q3-Plan.pdf")
+    assert _attachment_is_user_document(a) is True
+
+
+def test_attachment_ics_rejected_by_extension():
+    a = _FakeAttachment(filename="invite.ics")
+    assert _attachment_is_user_document(a) is False
+
+
+def test_attachment_ics_rejected_via_display_name_fallback():
+    a = _FakeAttachment(filename="", display_name="invite.ICS")
+    assert _attachment_is_user_document(a) is False
+
+
+def test_attachment_with_content_id_rejected():
+    a = _FakeAttachment(
+        filename="image001.png",
+        accessor=_FakeAttachmentPropertyAccessor(
+            props={
+                "http://schemas.microsoft.com/mapi/proptag/0x3712001F":
+                    "image001@01D7A3B4.12345678",
+            },
+        ),
+    )
+    assert _attachment_is_user_document(a) is False
+
+
+def test_attachment_with_empty_content_id_accepted():
+    a = _FakeAttachment(
+        filename="Q3-Plan.pdf",
+        accessor=_FakeAttachmentPropertyAccessor(
+            props={
+                "http://schemas.microsoft.com/mapi/proptag/0x3712001F": "",
+            },
+        ),
+    )
+    assert _attachment_is_user_document(a) is True
+
+
+def test_attachment_with_hidden_flag_rejected():
+    a = _FakeAttachment(
+        filename="company-logo.png",
+        accessor=_FakeAttachmentPropertyAccessor(
+            props={
+                "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B": True,
+            },
+        ),
+    )
+    assert _attachment_is_user_document(a) is False
+
+
+def test_attachment_missing_property_accessor_accepted():
+    a = _FakeAttachment(filename="Q3-Plan.pdf", no_accessor=True)
+    assert _attachment_is_user_document(a) is True
+
+
+def test_attachment_property_access_raises_treated_as_user_doc():
+    a = _FakeAttachment(
+        filename="Q3-Plan.pdf",
+        accessor=_FakeAttachmentPropertyAccessor(
+            raises={
+                "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
+                "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B",
+            },
+        ),
+    )
+    assert _attachment_is_user_document(a) is True
+
+
+def test_attachment_inline_signature_ics_combo():
+    # The pathological case Aaron flagged: an invite with both an
+    # inline signature image AND the .ics calendar payload. The
+    # filter must reject both regardless of which signal triggers.
+    sig = _FakeAttachment(
+        filename="image002.jpg",
+        accessor=_FakeAttachmentPropertyAccessor(
+            props={
+                "http://schemas.microsoft.com/mapi/proptag/0x3712001F":
+                    "sig-image@01D7.5678",
+            },
+        ),
+    )
+    ics = _FakeAttachment(filename="meeting.ics")
+    real = _FakeAttachment(filename="Pre-read.docx")
+    assert _attachment_is_user_document(sig) is False
+    assert _attachment_is_user_document(ics) is False
+    assert _attachment_is_user_document(real) is True
