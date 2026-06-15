@@ -89,27 +89,172 @@ class MeetingInfo:
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"[ \t]+")
 _NL_RE = re.compile(r"\n{3,}")
+# Block tags that imply a line break in the rendered output. Inserted
+# as a literal "\n" before tag stripping so the post-strip body keeps
+# its paragraph structure -- critical for `strip_bridge_details` to
+# recognize underscore-bracketed bridge blocks (#104).
+_BLOCK_BREAK_TAG_RE = re.compile(
+    r"</?(?:p|div|br|tr|li|h[1-6])\b[^>]*>", re.IGNORECASE,
+)
 
 
-def sanitize_body(body: str, *, max_chars: int = 4000) -> str:
+# Bridge-block strippers (#104 bug 2). Each pattern anchors on a
+# heavy-underscore bracket (>=30 underscores) wrapping a block whose
+# body carries a high-confidence bridge marker. The bracket marker is
+# what Outlook + Teams + Zoom all use to demarcate the bridge from the
+# real agenda; non-bracketed bridge text is left alone (under-strip
+# beats over-strip per Aaron's #104 spec).
+_TEAMS_BRACKET_RE = re.compile(
+    r"_{30,}.*?"
+    r"(?:Microsoft\s+Teams|Meeting\s+ID:|Phone\s+Conference\s+ID:|teams\.microsoft\.com|teams\.live\.com)"
+    r".*?_{30,}",
+    re.IGNORECASE | re.DOTALL,
+)
+_ZOOM_BRACKET_RE = re.compile(
+    r"_{30,}.*?(?:Join\s+Zoom\s+Meeting|zoom\.us/j/|zoom\.us/my/).*?_{30,}",
+    re.IGNORECASE | re.DOTALL,
+)
+_MEET_BRACKET_RE = re.compile(
+    r"_{30,}.*?(?:meet\.google\.com|Join\s+with\s+Google\s+Meet).*?_{30,}",
+    re.IGNORECASE | re.DOTALL,
+)
+_WEBEX_BRACKET_RE = re.compile(
+    r"_{30,}.*?(?:Join\s+Webex\s+meeting|\.webex\.com/).*?_{30,}",
+    re.IGNORECASE | re.DOTALL,
+)
+_BRIDGE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    _TEAMS_BRACKET_RE,
+    _ZOOM_BRACKET_RE,
+    _MEET_BRACKET_RE,
+    _WEBEX_BRACKET_RE,
+)
+
+
+def strip_bridge_details(text: str) -> str:
+    """Remove well-known conference-bridge blocks from an invite body.
+
+    Operates on plain text (post-HTML-strip). The brackets we look for
+    are the heavy underscore lines Outlook/Teams/Zoom/Meet/Webex use
+    to demarcate the bridge from the human-authored agenda. Each
+    pattern requires BOTH a bracket pair AND a bridge-identifying
+    keyword inside, so user content that happens to include a long
+    underscore run won't get clobbered.
+
+    Non-bracketed bridge text (a bare "Click here to join" link
+    pasted into the agenda) is left alone. Per #104's spec the safer
+    default is under-strip -- the user can clean up in My Notes.
+    """
+    if not text:
+        return text
+    out = text
+    for pat in _BRIDGE_PATTERNS:
+        out = pat.sub("", out)
+    # Collapse the holes the strip left behind without disturbing the
+    # rest of the body's line structure.
+    out = _NL_RE.sub("\n\n", out)
+    return out.strip()
+
+
+def sanitize_body(
+    body: str,
+    *,
+    max_chars: int = 4000,
+    strip_bridges: bool = True,
+) -> str:
     """Strip HTML tags + normalize whitespace + clip to max_chars.
 
     Outlook bodies are usually plain text but can be HTML for invites that
     came from a non-Outlook origin (Google Calendar, web meeting tools).
     The strip is intentionally lossy -- the goal is "readable agenda for a
     human glance", not faithful reproduction.
+
+    Block-level HTML tags (``<p>``, ``<div>``, ``<br>``, ``<tr>``,
+    ``<li>``, headings) are pre-rewritten to newlines before the
+    generic tag strip so the resulting plain text keeps its paragraph
+    structure. Without that step, the entire body would collapse to
+    a single space-separated run and the bridge-block stripper below
+    couldn't find the underscore brackets that demarcate the Teams /
+    Zoom / Meet boilerplate.
+
+    ``strip_bridges`` defaults True -- callers that need the raw body
+    (diagnostic dumps, fixture capture) can pass False.
     """
     if not body:
         return ""
-    out = _HTML_TAG_RE.sub(" ", body)
+    out = _BLOCK_BREAK_TAG_RE.sub("\n", body)
+    out = _HTML_TAG_RE.sub(" ", out)
     out = out.replace("\r\n", "\n").replace("\r", "\n")
     out = _WS_RE.sub(" ", out)
     out = "\n".join(line.rstrip() for line in out.split("\n"))
     out = _NL_RE.sub("\n\n", out)
     out = out.strip()
+    if strip_bridges:
+        out = strip_bridge_details(out)
     if len(out) > max_chars:
         out = out[: max_chars - 3].rstrip() + "..."
     return out
+
+
+# MAPI proptag URLs used to distinguish a user-attached document from
+# a body-render asset (signature image, embedded chrome). Aaron's bug
+# 1 report (#104): the metadata + save walks both accept every
+# Type==1 attachment, which sweeps in inline signature PNGs that the
+# HTML body references via cid: and .ics files that ride along on
+# forwarded / cross-origin invites.
+_PROPTAG_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+_PROPTAG_ATTACHMENT_HIDDEN = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+
+
+def _attachment_is_user_document(attachment) -> bool:
+    """True when an Outlook Attachment looks like a real attached
+    document, not a body-render asset (signature image, embedded
+    logo) or the .ics calendar payload.
+
+    Three signals, any of which disqualifies the attachment:
+
+    1. Extension match on ``.ics``. The calendar-payload attachment
+       Outlook adds when the invite originated outside Exchange.
+    2. ``PR_ATTACH_CONTENT_ID`` is non-empty. The MAPI proptag set on
+       any attachment that the HTML body references inline via
+       ``<img src="cid:...">``. The canonical body-vs-document signal.
+    3. ``PR_ATTACHMENT_HIDDEN`` is true. Set explicitly on signature
+       parts + embedded body chrome so Outlook's own UI keeps them
+       out of the attachment list.
+
+    Property access goes through ``Attachment.PropertyAccessor`` --
+    same pattern ``_resolve_recipient_fields`` uses for the SMTP
+    address lookups on recipients. Errors during property reads
+    (older Outlook builds without the accessor, missing properties)
+    fall through to "treat as user document" rather than dropping a
+    real attachment.
+    """
+    name = (
+        str(getattr(attachment, "FileName", "") or "").strip()
+        or str(getattr(attachment, "DisplayName", "") or "").strip()
+    ).lower()
+    if name.endswith(".ics"):
+        return False
+    try:
+        accessor = attachment.PropertyAccessor
+    except Exception:
+        return True
+    try:
+        cid = accessor.GetProperty(_PROPTAG_ATTACH_CONTENT_ID)
+        if cid is not None and str(cid).strip():
+            return False
+    except Exception:
+        # Property absent -> the value Outlook returns is the
+        # MAPI null sentinel, which surfaces as a COM error. Real
+        # documents typically lack PR_ATTACH_CONTENT_ID; absence
+        # means "not inline", which is what we want.
+        pass
+    try:
+        hidden = accessor.GetProperty(_PROPTAG_ATTACHMENT_HIDDEN)
+        if bool(hidden):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def is_available() -> bool:
@@ -746,6 +891,10 @@ def _item_to_info(item) -> MeetingInfo:
             atype = int(getattr(a, "Type", 0) or 0)
             if atype != 1:
                 continue
+            # #104 bug 1: drop signature images + .ics calendar payload
+            # so they don't land in the session's attachment drawer.
+            if not _attachment_is_user_document(a):
+                continue
             attachments.append(
                 CalendarAttachment(
                     display_name=str(
@@ -806,6 +955,10 @@ def pull_attachments_to_temp(entry_id: str) -> list[Path]:
             except Exception:
                 atype = 0
             if atype != 1:
+                continue
+            # #104 bug 1: skip signature images + .ics here too so the
+            # AttachmentsStore doesn't get the junk on session create.
+            if not _attachment_is_user_document(a):
                 continue
             name = str(
                 getattr(a, "FileName", "") or
