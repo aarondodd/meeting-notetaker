@@ -7,10 +7,14 @@ can pre-fill the session title + seed live_notes from the invite.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer
+
+log = logging.getLogger(__name__)
+
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -20,6 +24,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QProgressDialog,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -174,6 +179,10 @@ class CalendarPickerDialog(QDialog):
         cached = next(
             (m for m in self._meetings if m.entry_id == entry_id), None
         )
+        if not entry_id:
+            self._selected = cached
+            self.accept()
+            return
         # Pass the cached instance times through so the full fetch
         # doesn't accidentally swap the recurring master's Start /
         # End back in for picked occurrences of a recurring series
@@ -183,16 +192,75 @@ class CalendarPickerDialog(QDialog):
         # alignment would otherwise land on the first-ever instance.
         instance_start = cached.start_time if cached else None
         instance_end = cached.end_time if cached else None
-        full = fetch_meeting_by_entry_id(
-            entry_id,
-            instance_start=instance_start,
-            instance_end=instance_end,
-        ) if entry_id else None
+        # Run the full fetch off the UI thread with a busy spinner so
+        # the picker doesn't look frozen during the Recipients walk
+        # (#106). Attendee resolution does a GAL lookup per recipient
+        # via GetExchangeUser + PropertyAccessor fallbacks; on
+        # Exchange Online cached mode that's 1-3 s per attendee. The
+        # light record's already in hand, so a fallback to that path
+        # is safe if the worker fails for any reason.
+        full = self._resolve_with_progress(
+            entry_id, instance_start, instance_end,
+        )
         # Fall back to the light record if the full re-fetch failed --
         # the caller still gets subject + times which is better than
         # nothing, and the empty attendees/body just means no seeding.
         self._selected = full if full is not None else cached
         self.accept()
+
+    def _resolve_with_progress(
+        self,
+        entry_id: str,
+        instance_start: Optional[datetime],
+        instance_end: Optional[datetime],
+    ) -> Optional[MeetingInfo]:
+        """Run ``fetch_meeting_by_entry_id`` on a worker thread with a
+        modal busy-spinner dialog so the user has feedback during
+        attendee resolution (#106).
+
+        Pattern mirrors ``AttachmentsTab.add_files`` -> worker +
+        QProgressDialog: the dialog has no Cancel button (canceling
+        mid-COM-call is messy and the slow phase typically completes
+        in 5-30 s), and ``progress.exec()`` blocks until the worker's
+        ``finished_with_meeting`` slot calls ``progress.close()``.
+        """
+        worker = _MeetingResolveWorker(entry_id, instance_start, instance_end)
+        progress = QProgressDialog(
+            "Resolving meeting attendees...",
+            None,    # no cancel button
+            0, 0,    # range (0,0) = indeterminate "busy" spinner
+            self,
+        )
+        progress.setWindowTitle("Loading meeting")
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setCancelButton(None)
+        # Strip the window-close affordance so the user can't dismiss
+        # the spinner mid-resolve and end up in a half-finished state.
+        progress.setWindowFlag(
+            Qt.WindowType.WindowCloseButtonHint, False,
+        )
+
+        result: dict[str, Optional[MeetingInfo]] = {"meeting": None}
+
+        def _on_done(meeting: Optional[MeetingInfo]) -> None:
+            result["meeting"] = meeting
+            progress.close()
+            # Same deleteLater discipline as _AttachmentImportWorker:
+            # the slot fires from inside the worker's run() before
+            # the OS thread has joined, so deferring cleanup until
+            # after progress.exec() returns + an explicit wait() is
+            # what keeps Qt from raising "QThread: Destroyed while
+            # thread is still running".
+
+        worker.finished_with_meeting.connect(_on_done)
+        progress.show()
+        worker.start()
+        progress.exec()
+        worker.wait()
+        worker.deleteLater()
+        return result["meeting"]
 
 
 def _format_meeting_row(m: MeetingInfo) -> str:
@@ -208,3 +276,66 @@ def _format_meeting_row(m: MeetingInfo) -> str:
     except Exception:
         dur = ""
     return f"{start}  {m.subject}{dur}"
+
+
+class _MeetingResolveWorker(QThread):
+    """Off-UI-thread wrapper around ``fetch_meeting_by_entry_id`` (#106).
+
+    The full meeting resolve does a Recipients walk + GAL lookup per
+    attendee via ``GetExchangeUser`` + ``PropertyAccessor`` fallbacks,
+    which is the slow phase the user perceived as a freeze on the
+    'Use Selected' click. Running it on a QThread + showing a modal
+    spinner is the same fix shape ``AttachmentsTab._AttachmentImport
+    Worker`` uses for the Office-conversion path.
+
+    COM lifetime: ``fetch_meeting_by_entry_id`` calls ``Dispatch
+    ("Outlook.Application")`` which needs an apartment-threaded COM
+    init on the calling thread. The main UI thread has one already;
+    a worker thread has to call ``pythoncom.CoInitialize`` itself.
+    The init is best-effort -- pythoncom is only present on Windows,
+    and on Linux + macOS dev runtimes ``fetch_meeting_by_entry_id``
+    returns ``None`` quickly without ever touching COM.
+    """
+
+    finished_with_meeting = pyqtSignal(object)
+
+    def __init__(
+        self,
+        entry_id: str,
+        instance_start: Optional[datetime],
+        instance_end: Optional[datetime],
+    ) -> None:
+        super().__init__()
+        self.setObjectName("MeetingResolveWorker")
+        self._entry_id = entry_id
+        self._instance_start = instance_start
+        self._instance_end = instance_end
+
+    def run(self) -> None:  # type: ignore[override]
+        co_initialized = False
+        try:
+            import pythoncom  # noqa: PLC0415 -- Windows-only optional dep
+            pythoncom.CoInitialize()
+            co_initialized = True
+        except Exception:
+            # pythoncom absent (non-Windows dev runtime) or already
+            # initialized in this apartment -- fetch can still run.
+            pass
+        try:
+            meeting = fetch_meeting_by_entry_id(
+                self._entry_id,
+                instance_start=self._instance_start,
+                instance_end=self._instance_end,
+            )
+        except Exception:
+            log.exception(
+                "meeting resolve worker failed for %s", self._entry_id,
+            )
+            meeting = None
+        if co_initialized:
+            try:
+                import pythoncom  # noqa: PLC0415
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+        self.finished_with_meeting.emit(meeting)
