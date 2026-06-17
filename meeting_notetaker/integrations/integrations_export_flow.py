@@ -252,12 +252,20 @@ def run_obsidian_export(
         return
     options = dlg.result_options()
     options.vault_name = cfg.vault_name or vault_name_for_path(vault_root)
+    # #108: stamp the active tab into the frontmatter so the next save
+    # from a different tab on the same session doesn't trip a false
+    # "this session is already saved" warning.
+    options.source_tab = tab_label
 
     # Re-publish detection. Scan the vault for any md whose
-    # source_session_id matches; surface Overwrite / Save as new
-    # / Cancel before kicking off the worker.
+    # source_session_id AND source_tab match; surface Overwrite /
+    # Save as new / Cancel before kicking off the worker. Notes
+    # saved before #108 have no source_tab; those are treated as
+    # Synthesis-tab saves for back-compat (the pre-#108 default).
     candidate = find_republish_candidate(
-        search_root=vault_root, session_id=session_id,
+        search_root=vault_root,
+        session_id=session_id,
+        tab_label=tab_label,
     )
     if candidate is not None:
         choice = _ask_republish_choice(
@@ -288,7 +296,6 @@ def run_obsidian_export(
         location_template_name=cfg.location_template_name,
         location_template_custom=cfg.location_template_custom,
     )
-    del tab_label
     _run_worker_with_progress(
         main_app, worker,
         progress_title="Saving to Obsidian",

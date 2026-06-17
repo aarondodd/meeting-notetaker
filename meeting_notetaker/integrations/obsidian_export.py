@@ -82,6 +82,12 @@ class ObsidianPublishOptions:
     open_after_save: bool = True
     # Set by re-publish flow: "save_as_new" (default) or "overwrite".
     on_conflict: str = "save_as_new"
+    # Which session tab is being saved -- "Synthesis", "My Notes", etc.
+    # Threaded into the frontmatter so the re-publish check can tell
+    # apart multiple notes from the same session (#108). Empty string
+    # means the caller didn't pass a tab label; build_frontmatter omits
+    # the field in that case so legacy notes stay byte-identical.
+    source_tab: str = ""
 
 
 # ---- outputs -------------------------------------------------------------
@@ -309,6 +315,10 @@ def build_frontmatter(
             lines.append("tags: [" + ", ".join(cleaned_tags) + "]")
     lines.append("source_app: meeting-notetaker")
     lines.append(f"source_session_id: {session.session_id}")
+    if options.source_tab.strip():
+        # #108: lets the re-publish check distinguish multiple notes
+        # from the same session (Synthesis vs My Notes vs ...).
+        lines.append(f"source_tab: {_yaml_scalar(options.source_tab)}")
     lines.append("---")
     lines.append("")
     return "\n".join(lines)
@@ -411,26 +421,56 @@ def _strip_yaml_scalar(value: str) -> str:
     return value
 
 
+_LEGACY_TAB_LABEL = "Synthesis"
+
+
 def find_republish_candidate(
     *,
     search_root: Path,
     session_id: str,
+    tab_label: str = "",
 ) -> Optional[RepublishCandidate]:
     """Walk ``search_root`` for a markdown file whose frontmatter's
     ``source_session_id`` matches. First match wins; ordering is not
-    promised, but typical use writes a single file per session."""
+    promised, but typical use writes a single file per session.
+
+    ``tab_label`` -- when provided, the candidate must also carry a
+    matching ``source_tab`` field (#108). Files saved before #108
+    landed have no ``source_tab``; for back-compat those legacy
+    files are treated as having been saved from the Synthesis tab,
+    so a Synthesis re-save against a legacy file still surfaces the
+    re-publish prompt, but a My-Notes save against the same legacy
+    file does NOT (which was the original bug: a My-Notes save
+    against an unrelated Synthesis file produced a spurious
+    overwrite warning even though the target filename differed and
+    no overwrite actually happened).
+
+    Passing ``tab_label=""`` keeps the legacy "match on session_id
+    alone" behavior so external callers and existing tests still
+    work.
+    """
     if not search_root.is_dir():
         return None
     for md_path in search_root.rglob("*.md"):
         fm = read_existing_frontmatter(md_path)
         if not fm:
             continue
-        if fm.get("source_session_id") == session_id:
-            return RepublishCandidate(
-                existing_path=md_path,
-                existing_title=str(fm.get("title") or md_path.stem),
-                existing_frontmatter=fm,
-            )
+        if fm.get("source_session_id") != session_id:
+            continue
+        if tab_label:
+            existing_tab = str(fm.get("source_tab") or "").strip()
+            if existing_tab:
+                if existing_tab != tab_label:
+                    continue
+            else:
+                # Legacy file -- treat as if it had source_tab=Synthesis.
+                if tab_label != _LEGACY_TAB_LABEL:
+                    continue
+        return RepublishCandidate(
+            existing_path=md_path,
+            existing_title=str(fm.get("title") or md_path.stem),
+            existing_frontmatter=fm,
+        )
     return None
 
 

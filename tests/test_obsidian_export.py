@@ -347,6 +347,99 @@ def test_find_republish_candidate_handles_missing_frontmatter(tmp_path):
     ) is None
 
 
+# ---- #108: source_tab tagging + tab-aware re-publish detection -------------
+
+
+def test_frontmatter_emits_source_tab_when_set():
+    info = _info()
+    opts = ObsidianPublishOptions(
+        vault_root=Path("/v"), vault_name="v",
+        target_subdir="", filename_stem="s",
+        source_tab="My Notes",
+    )
+    out = build_frontmatter(info, opts)
+    assert "source_tab: My Notes" in out
+
+
+def test_frontmatter_omits_source_tab_when_blank():
+    info = _info()
+    opts = ObsidianPublishOptions(
+        vault_root=Path("/v"), vault_name="v",
+        target_subdir="", filename_stem="s",
+    )
+    out = build_frontmatter(info, opts)
+    # Default source_tab="" -> the field is suppressed so legacy
+    # notes stay byte-identical when external callers haven't yet
+    # been updated.
+    assert "source_tab:" not in out
+
+
+def test_find_republish_candidate_matches_when_tab_label_matches(tmp_path):
+    target = tmp_path / "Note.md"
+    target.write_text(
+        "---\ntitle: x\nsource_session_id: abc-123\n"
+        "source_tab: My Notes\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    cand = find_republish_candidate(
+        search_root=tmp_path, session_id="abc-123", tab_label="My Notes",
+    )
+    assert cand is not None
+    assert cand.existing_path == target
+
+
+def test_find_republish_candidate_skips_when_tab_label_differs(tmp_path):
+    # The original bug: a Synthesis note exists; user saves My Notes
+    # to a different filename; the picker incorrectly flagged the
+    # Synthesis note as a re-publish target.
+    target = tmp_path / "Note.md"
+    target.write_text(
+        "---\ntitle: x\nsource_session_id: abc-123\n"
+        "source_tab: Synthesis\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    assert find_republish_candidate(
+        search_root=tmp_path, session_id="abc-123", tab_label="My Notes",
+    ) is None
+
+
+def test_find_republish_candidate_legacy_file_matches_synthesis_only(tmp_path):
+    # Files saved before #108 have no source_tab. Treat them as if
+    # they had source_tab=Synthesis so a Synthesis re-save still
+    # surfaces the re-publish prompt against the existing file.
+    target = tmp_path / "Note.md"
+    target.write_text(
+        "---\ntitle: x\nsource_session_id: abc-123\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    syn_cand = find_republish_candidate(
+        search_root=tmp_path, session_id="abc-123", tab_label="Synthesis",
+    )
+    assert syn_cand is not None
+    assert syn_cand.existing_path == target
+    # A My-Notes save against the same legacy file must NOT surface
+    # (the original bug Aaron reported).
+    assert find_republish_candidate(
+        search_root=tmp_path, session_id="abc-123", tab_label="My Notes",
+    ) is None
+
+
+def test_find_republish_candidate_no_tab_label_keeps_legacy_behavior(tmp_path):
+    # External callers that don't pass tab_label should see the
+    # pre-#108 match-on-session-id-alone behavior.
+    target = tmp_path / "Note.md"
+    target.write_text(
+        "---\ntitle: x\nsource_session_id: abc-123\n"
+        "source_tab: My Notes\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    cand = find_republish_candidate(
+        search_root=tmp_path, session_id="abc-123",
+    )
+    assert cand is not None
+    assert cand.existing_path == target
+
+
 def test_read_existing_frontmatter_block_sequence(tmp_path):
     p = tmp_path / "n.md"
     p.write_text(
