@@ -171,7 +171,10 @@ class SessionView(QWidget):
     # filtered to that contact.
     contact_clicked_in_drawer = pyqtSignal(int)           # contact_id
     # Right-click on a Slides thumbnail / full view: delete the file.
-    delete_screenshot_clicked = pyqtSignal(str, Path)     # session_id, path
+    # session_id, list[Path]. List shape (#110) so the Slides grid's
+    # multi-select Delete sends one signal carrying every selected
+    # path; single-image full-view callers wrap with [path].
+    delete_screenshot_clicked = pyqtSignal(str, list)
     # Transcript-pane playback control. The bar fires these for the
     # session id MainApp tracks; the seek signal also fires when the
     # user clicks a transcript line (with the line's start - 10s).
@@ -1195,10 +1198,10 @@ class SessionView(QWidget):
         the sidebar's helper text so the user sees 'every Ns'."""
         self._screencap_sidebar.set_auto_interval_seconds(seconds)
 
-    def _on_screenshot_delete_requested(self, path: Path) -> None:
-        if self._session is None:
+    def _on_screenshot_delete_requested(self, paths: list[Path]) -> None:
+        if self._session is None or not paths:
             return
-        self.delete_screenshot_clicked.emit(self._session.id, path)
+        self.delete_screenshot_clicked.emit(self._session.id, list(paths))
 
     def _refresh_screencap_button_enabled(self) -> None:
         """Enabled only while RECORDING or PAUSED, OR while armed.

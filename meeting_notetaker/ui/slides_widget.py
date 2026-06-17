@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon, QImage, QPixmap
+from PyQt6.QtGui import QAction, QIcon, QImage, QKeySequence, QPixmap, QShortcut
 from .scaled_image_label import ScaledImageLabel
 from .transcript_player_bar import TranscriptPlayerBar
 
@@ -57,7 +57,10 @@ class SlidesWidget(QWidget):
     being shown".
     """
 
-    delete_requested = pyqtSignal(Path)  # MainApp does the unlink
+    # MainApp does the unlink. List shape so the grid's multi-select
+    # delete (#110) can ship batches in one round-trip; single-image
+    # callers wrap with [path].
+    delete_requested = pyqtSignal(list)
     play_clicked = pyqtSignal()
     pause_clicked = pyqtSignal()
     seek_ms_requested = pyqtSignal(int)
@@ -95,12 +98,24 @@ class SlidesWidget(QWidget):
         self._list.setSpacing(8)
         self._list.setMovement(QListWidget.Movement.Static)
         self._list.setUniformItemSizes(True)
+        # #110: Ctrl/Shift-click style multi-selection matches every
+        # file-manager-like UI. ExtendedSelection enables the native
+        # Ctrl+Click (toggle), Shift+Click (range), and Ctrl+A flows.
+        self._list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection,
+        )
         self._list.itemDoubleClicked.connect(self._on_thumb_double_clicked)
         # Single-click also opens; matches the rest of the app's
         # one-click navigation pattern.
         self._list.itemClicked.connect(self._on_thumb_clicked)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._on_thumb_context_menu)
+        # #110: Delete key on the grid wipes the current selection
+        # (single or multi). Scoped to the list so it doesn't fire
+        # from anywhere else in the session view.
+        self._delete_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Delete), self._list)
+        self._delete_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        self._delete_shortcut.activated.connect(self._on_delete_shortcut)
         grid_layout.addWidget(self._list, 1)
 
         # --- full-view page ------------------------------------------------
@@ -258,11 +273,34 @@ class SlidesWidget(QWidget):
         self._show_full_for(self._list.row(item))
 
     def _on_thumb_context_menu(self, pos) -> None:
-        item = self._list.itemAt(pos)
-        if item is None:
+        # Build the operating set from current selection. If the
+        # right-click landed on an item NOT in the selection,
+        # promote that item to the operating set (Windows Explorer
+        # convention) so the user doesn't have to also click first.
+        clicked_item = self._list.itemAt(pos)
+        selected = list(self._list.selectedItems())
+        if clicked_item is not None and clicked_item not in selected:
+            self._list.clearSelection()
+            clicked_item.setSelected(True)
+            selected = [clicked_item]
+        if not selected:
             return
-        path = Path(item.data(Qt.ItemDataRole.UserRole))
-        self._popup_actions_menu(self._list.viewport().mapToGlobal(pos), path)
+        paths = [
+            Path(item.data(Qt.ItemDataRole.UserRole)) for item in selected
+        ]
+        self._popup_actions_menu(
+            self._list.viewport().mapToGlobal(pos), paths,
+        )
+
+    def _on_delete_shortcut(self) -> None:
+        """Delete-key handler: confirm + emit for current selection."""
+        paths = [
+            Path(item.data(Qt.ItemDataRole.UserRole))
+            for item in self._list.selectedItems()
+        ]
+        if not paths:
+            return
+        self._confirm_delete_many(paths)
 
     # ------------------------------------------------------------------
     # Full-view handlers
@@ -307,23 +345,33 @@ class SlidesWidget(QWidget):
             return
         path = self._paths[self._current_index]
         self._popup_actions_menu(
-            self._full_view.mapToGlobal(pos), path,
+            self._full_view.mapToGlobal(pos), [path],
         )
 
     # ------------------------------------------------------------------
     # Shared menu
 
-    def _popup_actions_menu(self, global_pos, path: Path) -> None:
+    def _popup_actions_menu(self, global_pos, paths: list[Path]) -> None:
         menu = QMenu(self)
-        copy_action = QAction("Copy image to clipboard", menu)
-        copy_action.triggered.connect(lambda: self._copy_to_clipboard(path))
-        menu.addAction(copy_action)
-        open_action = QAction("Open in default viewer", menu)
-        open_action.triggered.connect(lambda: self._open_in_viewer(path))
-        menu.addAction(open_action)
-        menu.addSeparator()
-        delete_action = QAction("Delete...", menu)
-        delete_action.triggered.connect(lambda: self._confirm_delete(path))
+        # Copy + Open operate on a single image. When multi-selected,
+        # only offer Delete -- copying / opening N at once is not a
+        # meaningful action and would surprise the user.
+        if len(paths) == 1:
+            path = paths[0]
+            copy_action = QAction("Copy image to clipboard", menu)
+            copy_action.triggered.connect(lambda: self._copy_to_clipboard(path))
+            menu.addAction(copy_action)
+            open_action = QAction("Open in default viewer", menu)
+            open_action.triggered.connect(lambda: self._open_in_viewer(path))
+            menu.addAction(open_action)
+            menu.addSeparator()
+            delete_label = "Delete..."
+        else:
+            delete_label = f"Delete {len(paths)} screenshots..."
+        delete_action = QAction(delete_label, menu)
+        delete_action.triggered.connect(
+            lambda: self._confirm_delete_many(paths),
+        )
         menu.addAction(delete_action)
         menu.exec(global_pos)
 
@@ -341,15 +389,40 @@ class SlidesWidget(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _confirm_delete(self, path: Path) -> None:
+        """Single-path entrypoint kept for back-compat with the full-
+        view path + existing tests. Emits the list shape."""
+        self._confirm_delete_many([path])
+
+    def _confirm_delete_many(self, paths: list[Path]) -> None:
+        """Multi-path confirm + emit. Pluralizes the prompt; lists
+        up to a few filenames so the user can sanity-check they're
+        not about to delete the wrong batch."""
+        if not paths:
+            return
+        n = len(paths)
+        if n == 1:
+            text = (
+                "Permanently delete this screenshot?\n\n"
+                f"{paths[0].name}"
+            )
+        else:
+            # Cap the preview at 6 names so the dialog doesn't grow
+            # unmanageably tall when the user picks a big batch.
+            preview = "\n".join(p.name for p in paths[:6])
+            if n > 6:
+                preview += f"\n... and {n - 6} more"
+            text = (
+                f"Permanently delete these {n} screenshots?\n\n{preview}"
+            )
         confirm = QMessageBox.question(
             self,
-            "Delete screenshot",
-            f"Permanently delete this screenshot?\n\n{path.name}",
+            "Delete screenshots" if n > 1 else "Delete screenshot",
+            text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if confirm == QMessageBox.StandardButton.Yes:
-            self.delete_requested.emit(path)
+            self.delete_requested.emit(list(paths))
 
     # ------------------------------------------------------------------
     # Thumbnail helpers

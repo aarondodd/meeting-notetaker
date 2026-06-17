@@ -110,14 +110,15 @@ def test_delete_confirm_yes_emits(qt_app, tmp_path, monkeypatch):
     _make_png(p)
     w = SlidesWidget()
     w.set_screenshots([p])
-    fires: list[Path] = []
+    fires: list[list[Path]] = []
     w.delete_requested.connect(fires.append)
     monkeypatch.setattr(
         QMessageBox, "question",
         lambda *_a, **_k: QMessageBox.StandardButton.Yes,
     )
     w._confirm_delete(p)  # noqa: SLF001
-    assert fires == [p]
+    # #110: signal now carries a list. Single-image callers wrap.
+    assert fires == [[p]]
 
 
 def test_delete_confirm_no_does_not_emit(qt_app, tmp_path, monkeypatch):
@@ -125,7 +126,7 @@ def test_delete_confirm_no_does_not_emit(qt_app, tmp_path, monkeypatch):
     _make_png(p)
     w = SlidesWidget()
     w.set_screenshots([p])
-    fires: list[Path] = []
+    fires: list[list[Path]] = []
     w.delete_requested.connect(fires.append)
     monkeypatch.setattr(
         QMessageBox, "question",
@@ -133,6 +134,123 @@ def test_delete_confirm_no_does_not_emit(qt_app, tmp_path, monkeypatch):
     )
     w._confirm_delete(p)  # noqa: SLF001
     assert fires == []
+
+
+# ---- #110: multi-select delete --------------------------------------------
+
+
+def test_delete_many_emits_list_on_yes(qt_app, tmp_path, monkeypatch):
+    """Confirm + Yes on a multi-path delete emits one signal carrying
+    every path."""
+    paths = []
+    for i in range(3):
+        p = tmp_path / f"{i:04d}-img.png"
+        _make_png(p)
+        paths.append(p)
+    w = SlidesWidget()
+    w.set_screenshots(paths)
+    fires: list[list[Path]] = []
+    w.delete_requested.connect(fires.append)
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *_a, **_k: QMessageBox.StandardButton.Yes,
+    )
+    w._confirm_delete_many(paths)  # noqa: SLF001
+    assert fires == [paths]
+
+
+def test_delete_many_no_op_on_empty(qt_app, tmp_path):
+    w = SlidesWidget()
+    fires: list[list[Path]] = []
+    w.delete_requested.connect(fires.append)
+    w._confirm_delete_many([])  # noqa: SLF001
+    assert fires == []
+
+
+def test_delete_many_pluralized_prompt(qt_app, tmp_path, monkeypatch):
+    """The confirm dialog text reflects the count + first few names."""
+    paths = []
+    for i in range(3):
+        p = tmp_path / f"{i:04d}-img.png"
+        _make_png(p)
+        paths.append(p)
+    w = SlidesWidget()
+    w.set_screenshots(paths)
+    captured: dict = {}
+
+    def fake_question(_self, title, text, *_a, **_k):
+        captured["title"] = title
+        captured["text"] = text
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", fake_question)
+    w._confirm_delete_many(paths)  # noqa: SLF001
+    assert captured["title"] == "Delete screenshots"
+    assert "3 screenshots" in captured["text"]
+    for p in paths:
+        assert p.name in captured["text"]
+
+
+def test_delete_many_truncates_long_preview(qt_app, tmp_path, monkeypatch):
+    paths = []
+    for i in range(10):
+        p = tmp_path / f"{i:04d}-img.png"
+        _make_png(p)
+        paths.append(p)
+    w = SlidesWidget()
+    w.set_screenshots(paths)
+    captured: dict = {}
+
+    def fake_question(_self, title, text, *_a, **_k):
+        captured["text"] = text
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", fake_question)
+    w._confirm_delete_many(paths)  # noqa: SLF001
+    assert "and 4 more" in captured["text"]
+
+
+def test_list_uses_extended_selection_mode(qt_app):
+    """ExtendedSelection enables Ctrl/Shift-click multi-select."""
+    from PyQt6.QtWidgets import QListWidget  # noqa: PLC0415
+    w = SlidesWidget()
+    assert w._list.selectionMode() == QListWidget.SelectionMode.ExtendedSelection  # noqa: SLF001
+
+
+def test_delete_shortcut_no_op_on_empty_selection(qt_app, tmp_path):
+    p = tmp_path / "0001-img.png"
+    _make_png(p)
+    w = SlidesWidget()
+    w.set_screenshots([p])
+    # Default state: nothing selected. Shortcut should not fire the
+    # delete confirm at all (otherwise a stray Delete press would
+    # show a dialog with an empty preview).
+    fires: list[list[Path]] = []
+    w.delete_requested.connect(fires.append)
+    w._on_delete_shortcut()  # noqa: SLF001
+    assert fires == []
+
+
+def test_delete_shortcut_fires_for_selection(qt_app, tmp_path, monkeypatch):
+    paths = []
+    for i in range(2):
+        p = tmp_path / f"{i:04d}-img.png"
+        _make_png(p)
+        paths.append(p)
+    w = SlidesWidget()
+    w.set_screenshots(paths)
+    # Select both items.
+    for i in range(w._list.count()):  # noqa: SLF001
+        w._list.item(i).setSelected(True)  # noqa: SLF001
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *_a, **_k: QMessageBox.StandardButton.Yes,
+    )
+    fires: list[list[Path]] = []
+    w.delete_requested.connect(fires.append)
+    w._on_delete_shortcut()  # noqa: SLF001
+    assert len(fires) == 1
+    assert sorted(fires[0]) == sorted(paths)
 
 
 def test_repopulate_after_delete_clamps_index_in_full_view(qt_app, tmp_path):

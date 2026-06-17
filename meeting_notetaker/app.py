@@ -3579,22 +3579,33 @@ class MainApp(QObject):
             if was_visible and overlay is not None:
                 overlay.show()
 
-    def _on_delete_screenshot(self, session_id: str, path) -> None:
-        try:
-            path.unlink()
-        except OSError:
-            log.exception("could not delete screenshot %s", path)
+    def _on_delete_screenshot(self, session_id: str, paths) -> None:
+        # #110: paths is a list (single-image full-view callers wrap
+        # with [path]). Iterate + log per-file; refresh + status once
+        # at the end so a batch delete doesn't flicker the UI N times.
+        if not paths:
+            return
+        deleted: list[Path] = []
+        for path in paths:
+            try:
+                path.unlink()
+                deleted.append(path)
+            except OSError:
+                log.exception("could not delete screenshot %s", path)
+        if not deleted:
             return
         # Only the active session's SlidesWidget needs refreshing; if
         # the user has navigated away, the next set_session will pick
         # up the new state from disk.
         self.window.session_view.refresh_screenshots()
         # Re-push offsets so the rail and Slides-tab auto-advance
-        # drop the deleted screenshot from their anchor list.
+        # drop the deleted screenshots from their anchor list.
         self._push_screenshot_offsets(session_id)
-        self.window.status(
-            f"Deleted screenshot: {path.name}", timeout_ms=4000,
-        )
+        if len(deleted) == 1:
+            msg = f"Deleted screenshot: {deleted[0].name}"
+        else:
+            msg = f"Deleted {len(deleted)} screenshots"
+        self.window.status(msg, timeout_ms=4000)
 
     # ---- transcript playback ----------------------------------------------
 
