@@ -189,12 +189,14 @@ class SessionView(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._session: Optional[Session] = None
-        # #109: background PDF export state. Set when a worker is in
-        # flight so a second Export PDF click no-ops (status bar
-        # hint) rather than piling up. Worker reference held so
-        # we can wait() + deleteLater() after finish.
+        # #109: background export state. Same shape per target so a
+        # second click no-ops (status bar hint) rather than piling
+        # up. Worker reference held so we can wait() + deleteLater()
+        # after finish.
         self._pdf_export_in_flight: bool = False
         self._pdf_export_worker = None  # type: Optional[_PdfExportWorker]
+        self._word_export_in_flight: bool = False
+        self._word_export_worker = None  # type: Optional[_WordExportWorker]
         self._provisional_segments: dict[tuple[str, float], int] = {}
         # Maps (source, t_start) -> line index in the transcript view.
         self._user_name = ""
@@ -2878,15 +2880,17 @@ class SessionView(QWidget):
         self._refresh_export_buttons_for_in_flight()
 
     def _refresh_export_buttons_for_in_flight(self) -> None:
-        """Toggle just the 'Save as PDF...' menu action while a worker
-        is running -- other Save-to targets (Word, Notion, Confluence,
-        Obsidian) stay live so the user can start a different export
-        while the PDF render finishes in the background. The PDF
-        action returns to its natural enabled state when the worker
-        completes (the menu's parent button is what enforces tab-
-        appropriate enable/disable; the action's own enabled state
-        only matters when the menu is open)."""
+        """Toggle the 'Save as PDF...' / 'Save as Word...' menu actions
+        while their respective workers are running -- other Save-to
+        targets (Notion, Confluence, Obsidian) stay live so the user
+        can start a different export while a long-running one
+        finishes in the background. Each action returns to its
+        natural enabled state when its worker completes (the menu's
+        parent button is what enforces tab-appropriate enable/
+        disable; an action's own enabled state only matters when the
+        menu is open)."""
         self._export_pdf_action.setEnabled(not self._pdf_export_in_flight)
+        self._export_word_action.setEnabled(not self._word_export_in_flight)
 
     def _on_export_word(self) -> None:
         """Save the active tab as a Word (.docx) document.
@@ -2897,13 +2901,27 @@ class SessionView(QWidget):
         Windows with Word installed, we additionally invoke Word COM
         to populate the TOC server-side so the file opens fully
         rendered.
+
+        #109: render + COM populate moved off the UI thread into
+        ``_WordExportWorker``. The COM populate step is the
+        user-noticeable slow phase (Word launch + open + field
+        update + save), so this is where the 'app frozen' symptom
+        shows up most. Same pattern as the PDF worker -- the UI
+        thread does the document build + file picker, hands the
+        worker the body markdown + params, and stays interactive
+        while the worker writes the file.
         """
+        if self._word_export_in_flight:
+            self.window().statusBar().showMessage(
+                "Word export already in progress -- please wait.", 4000,
+            )
+            return
         doc, tab_label = self._build_print_document(
             appendix_defaults=self._appendix_export_defaults,
         )
         if doc is None or self._session is None:
             return
-        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from PyQt6.QtWidgets import QFileDialog
 
         suggested_name = default_export_filename(
             self._session.title, tab_label, ".docx"
@@ -2926,39 +2944,56 @@ class SessionView(QWidget):
             target = target.with_suffix(".docx")
 
         body_md = getattr(doc, "_mn_body_markdown", "") or ""
-        from ..utils.word_export import (  # noqa: PLC0415
-            export_to_docx,
-            is_word_com_available,
-            populate_toc_via_word,
-        )
-        # Word doc Title = same components as the filename
-        # (session title + tab label + date), unsanitized so the
-        # rendered title keeps any special characters.
+        # Drop the UI-thread doc reference -- the worker rebuilds
+        # the docx from the markdown body directly (no QTextDocument
+        # needed for the Word path).
+        del doc
+
         doc_title = default_export_document_title(
             self._session.title, tab_label,
         )
-        stats = export_to_docx(
-            body_md,
-            target,
-            base_dir=session_dir(self._session.id),
-            title=doc_title,
-            include_toc=self._export_toc,
-            toc_max_depth=self._export_toc_max_depth,
+        worker = _WordExportWorker(
+            target_path=target,
+            session_dir=session_dir(self._session.id),
+            doc_title=doc_title,
+            tab_label=tab_label,
+            body_markdown=body_md,
+            export_toc=self._export_toc,
+            export_toc_max_depth=self._export_toc_max_depth,
         )
-        if stats.error:
-            QMessageBox.warning(
-                self, "Export Word",
-                f"Could not write Word document: {stats.error}",
-            )
-            return
-        # Best-effort TOC population via Word COM -- skipped silently
-        # on non-Windows / no Word. Without this, Word shows the TOC
-        # placeholder until the user updates the field manually.
-        if self._export_toc and is_word_com_available():
-            populate_toc_via_word(target, save_in_place=True)
+        self._word_export_in_flight = True
+        self._word_export_worker = worker
+        self._refresh_export_buttons_for_in_flight()
         self.window().statusBar().showMessage(
-            f"Exported Word document to {target.name}", 5000,
+            f"Exporting {tab_label} to Word... (this can take a moment)",
         )
+        worker.progress_message.connect(self._on_word_export_progress)
+        worker.finished_with_result.connect(self._on_word_export_finished)
+        worker.start()
+
+    def _on_word_export_progress(self, message: str) -> None:
+        self.window().statusBar().showMessage(message)
+
+    def _on_word_export_finished(
+        self, success: bool, target_path: str, detail: str,
+    ) -> None:
+        target = Path(target_path)
+        if success:
+            via = f" ({detail})" if detail else ""
+            self.window().statusBar().showMessage(
+                f"Exported Word document to {target.name}{via}", 5000,
+            )
+        else:
+            self.window().statusBar().showMessage(
+                f"Word export failed: {detail or 'unknown error'}", 8000,
+            )
+            log.error("word export failed: %s -> %s", detail, target)
+        if self._word_export_worker is not None:
+            self._word_export_worker.wait()
+            self._word_export_worker.deleteLater()
+            self._word_export_worker = None
+        self._word_export_in_flight = False
+        self._refresh_export_buttons_for_in_flight()
 
     def _render_pdf_via_word(
         self, *, body_md: str, dst: Path, tab_label: str,
@@ -3284,3 +3319,122 @@ class _PdfExportWorker(QThread):
             if stats.error:
                 return False
             return export_to_pdf_via_word(tmp_docx, self._target)
+
+
+class _WordExportWorker(QThread):
+    """Off-UI-thread Word (.docx) render + optional Word COM TOC
+    populate (#109).
+
+    The synchronous ``_on_export_word`` flow was the user-
+    perceivable freeze: ``export_to_docx`` (python-docx) is several
+    seconds on a long doc with images, and the optional
+    ``populate_toc_via_word`` step (Windows + Word installed) shells
+    out to Word, opens the doc, updates fields, and saves -- often
+    the slowest single thing the app does.
+
+    Both phases are off-UI-thread-safe: python-docx is pure Python,
+    and Word COM needs the same ``pythoncom.CoInitialize`` /
+    ``CoUninitialize`` bookend the calendar resolve worker (#106)
+    and PDF export worker established.
+
+    Signals match ``_PdfExportWorker``:
+      * ``progress_message(str)`` -- status-bar text updates during
+        the run.
+      * ``finished_with_result(bool, str, str)`` -- (success,
+        target_path, detail). ``detail`` is 'TOC populated' when
+        the COM populate step ran successfully, '' when the COM
+        path was skipped (no TOC, or no Word COM available), and
+        the exception message on failure.
+    """
+
+    progress_message = pyqtSignal(str)
+    finished_with_result = pyqtSignal(bool, str, str)
+
+    def __init__(
+        self,
+        *,
+        target_path: Path,
+        session_dir: Path,
+        doc_title: str,
+        tab_label: str,
+        body_markdown: str,
+        export_toc: bool,
+        export_toc_max_depth: int,
+    ) -> None:
+        super().__init__()
+        self.setObjectName("WordExportWorker")
+        self._target = target_path
+        self._session_dir = session_dir
+        self._doc_title = doc_title
+        self._tab_label = tab_label
+        self._body_markdown = body_markdown
+        self._export_toc = export_toc
+        self._export_toc_max_depth = export_toc_max_depth
+
+    def run(self) -> None:  # type: ignore[override]
+        co_initialized = False
+        if self._export_toc:
+            try:
+                import pythoncom  # noqa: PLC0415 -- Windows-only optional
+                pythoncom.CoInitialize()
+                co_initialized = True
+            except Exception:
+                # pythoncom absent (non-Windows dev runtime) -- the
+                # TOC populate path checks is_word_com_available
+                # before running, so this isn't fatal.
+                pass
+        try:
+            from ..utils.word_export import (  # noqa: PLC0415
+                export_to_docx,
+                is_word_com_available,
+                populate_toc_via_word,
+            )
+
+            self.progress_message.emit(
+                f"Rendering {self._tab_label} to Word...",
+            )
+            stats = export_to_docx(
+                self._body_markdown,
+                self._target,
+                base_dir=self._session_dir,
+                title=self._doc_title,
+                include_toc=self._export_toc,
+                toc_max_depth=self._export_toc_max_depth,
+            )
+            if stats.error:
+                self.finished_with_result.emit(
+                    False, str(self._target), stats.error,
+                )
+                return
+            detail = ""
+            if self._export_toc and is_word_com_available():
+                self.progress_message.emit(
+                    "Populating TOC via Word (this can take a moment)...",
+                )
+                # Best-effort: even if the populate step fails we
+                # still wrote a valid docx via python-docx, and the
+                # user can update fields manually in Word. So a COM
+                # failure here doesn't fail the whole export -- we
+                # just don't tag the success message with 'TOC
+                # populated'.
+                try:
+                    populate_toc_via_word(self._target, save_in_place=True)
+                    detail = "TOC populated"
+                except Exception as exc:  # noqa: BLE001 -- defensive
+                    log.warning(
+                        "Word COM TOC populate failed for %s: %s",
+                        self._target, exc,
+                    )
+            self.finished_with_result.emit(True, str(self._target), detail)
+        except Exception as exc:
+            log.exception("word export worker failed for %s", self._target)
+            self.finished_with_result.emit(
+                False, str(self._target), str(exc),
+            )
+        finally:
+            if co_initialized:
+                try:
+                    import pythoncom  # noqa: PLC0415
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
