@@ -1763,6 +1763,42 @@ class SessionView(QWidget):
         # links; refresh the tray + preview transform (#64).
         self._refresh_appendix_trays()
 
+    def refresh_button_state(self) -> None:
+        """Re-evaluate every per-tab / per-state button (Print, Save to
+        ..., Send, Copy, etc.) against the current session + buffer
+        content. Public so paths that update has_notes / has_transcript
+        out-of-band (e.g. the synthesis-result handler in MainApp) can
+        force a recompute (#116).
+
+        #102 bug 10 addressed the same symptom by adding an OR-with-
+        buffer fallback to ``set_synthesis_in_progress(False)`` and
+        mirroring the DB has_notes flip into the in-memory session
+        object. Both fixes are correct but ran in the wrong order vs
+        ``_apply_synthesis_result``: the in-progress clear fired
+        before the session object + notes buffer were updated, so the
+        button recompute it triggered evaluated the still-empty
+        fallback and grayed the Save to dropdown. This entrypoint lets
+        the synthesis-result handler re-run the recompute AFTER both
+        updates land.
+
+        Uses the same OR-with-buffer fallback ``set_session`` uses so
+        a freshly-written buffer counts as has_notes even before the
+        DB flip propagates.
+        """
+        if self._session is None:
+            return
+        self._set_buttons_for_state(
+            self._session.state,
+            has_transcript=(
+                self._session.has_transcript
+                or bool(self._raw_transcript_text)
+            ),
+            has_notes=(
+                self._session.has_notes
+                or bool(self._notes_view.toPlainText().strip())
+            ),
+        )
+
     def set_live_notes_text(self, text: str) -> None:
         """Replace the My Notes body + reapply the preview-mode default.
 
