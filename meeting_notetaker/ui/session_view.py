@@ -5,9 +5,10 @@ from pathlib import Path
 from typing import Optional
 
 import bisect
+import logging
 import re
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -61,6 +62,9 @@ from .scaled_image_label import ScaledImageLabel
 from .screencap_sidebar import ScreencapSidebar
 from .slides_widget import SlidesWidget
 from .transcript_player_bar import TranscriptPlayerBar
+
+
+log = logging.getLogger(__name__)
 
 
 # How many milliseconds before the clicked transcript line to seek to.
@@ -188,6 +192,14 @@ class SessionView(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._session: Optional[Session] = None
+        # #109: background export state. Same shape per target so a
+        # second click no-ops (status bar hint) rather than piling
+        # up. Worker reference held so we can wait() + deleteLater()
+        # after finish.
+        self._pdf_export_in_flight: bool = False
+        self._pdf_export_worker = None  # type: Optional[_PdfExportWorker]
+        self._word_export_in_flight: bool = False
+        self._word_export_worker = None  # type: Optional[_WordExportWorker]
         self._provisional_segments: dict[tuple[str, float], int] = {}
         # Maps (source, t_start) -> line index in the transcript view.
         self._user_name = ""
@@ -2731,17 +2743,34 @@ class SessionView(QWidget):
         """Save the active tab as a PDF via Qt's native PDF backend.
 
         Qt's PDF writer preserves images (via direct embedding) and link
-        annotations (Markdown `[text](url)` becomes a clickable PDF
+        annotations (Markdown ``[text](url)`` becomes a clickable PDF
         annotation), where the Windows Print-to-PDF driver typically
         rasterizes both away.
+
+        #109: the actual render + post-process moved off the UI thread
+        into ``_PdfExportWorker``. The UI thread builds the document
+        (so the appendix-inclusion modal still runs in the right
+        context), prompts for the destination, then hands the
+        markdown body + render params to the worker and stays
+        interactive while the worker writes the PDF. Status-bar
+        messages report progress + completion; the Export button is
+        disabled for the duration so a second click can't pile a
+        second export on top.
         """
+        if self._pdf_export_in_flight:
+            # Defensive: the Export button is disabled while a worker
+            # is running, but a menu / shortcut could in theory still
+            # fire. No-op with a status-bar hint instead of queuing.
+            self.window().statusBar().showMessage(
+                "PDF export already in progress -- please wait.", 4000,
+            )
+            return
         doc, tab_label = self._build_print_document(
             appendix_defaults=self._appendix_export_defaults,
         )
         if doc is None or self._session is None:
             return
-        from PyQt6.QtWidgets import QFileDialog, QMessageBox
-        from PyQt6.QtPrintSupport import QPrinter
+        from PyQt6.QtWidgets import QFileDialog
 
         suggested_name = default_export_filename(
             self._session.title, tab_label, ".pdf"
@@ -2763,57 +2792,108 @@ class SessionView(QWidget):
         if target.suffix.lower() != ".pdf":
             target = target.with_suffix(".pdf")
 
-        # #94: when the user opted into "Use Word for PDF export" AND
-        # Word COM is available, render via Word -- the resulting PDF
-        # has Word's native sidebar bookmarks + clickable TOC entries
-        # without any post-processing. Otherwise fall back to Qt's
-        # PDF backend + pypdf post-process.
-        if self._use_word_for_pdf:
-            from ..utils.word_export import is_word_com_available  # noqa: PLC0415
-            if is_word_com_available():
-                body_md = getattr(doc, "_mn_body_markdown", "") or ""
-                if self._render_pdf_via_word(
-                    body_md=body_md, dst=target, tab_label=tab_label,
-                ):
-                    self.window().statusBar().showMessage(
-                        f"Exported PDF (via Word) to {target.name}", 5000,
-                    )
-                    return
-                # Word path failed -- fall through to Qt so the user
-                # still gets a PDF rather than a silent no-op.
+        # The doc has the rendered body markdown stashed on it from
+        # _build_print_document. Forward to the worker; the worker
+        # constructs a fresh PrintTextDocument on its own thread
+        # (QTextDocument is reentrant for new instances).
+        body_md = getattr(doc, "_mn_body_markdown", "") or ""
+        # Drop our reference to the UI-thread doc -- the worker
+        # rebuilds.
+        del doc
 
-        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-        printer.setOutputFileName(str(target))
-        # PDF metadata title matches the rendered H1 -- session title
-        # alone, no tab suffix (#78). The Print-job equivalent above
-        # still uses "title -- tab" because that's a printer-queue
-        # label, not a document property.
-        printer.setDocName(self._session.title)
-        try:
-            doc.clamp_images_to_printer(printer)
-            doc.print(printer)
-        except Exception as exc:
-            QMessageBox.warning(self, "Export PDF", f"Could not write PDF: {exc}")
-            return
-        # #94: post-process the rendered PDF. Qt writes the exact
-        # destination per heading in /Names/Dests during print; the
-        # post-processor copies those entries inline onto each Link
-        # annotation so PDFium-based viewers (Chrome / Edge) actually
-        # navigate to the heading. Non-fatal -- failure leaves the
-        # raw Qt PDF on disk.
-        if self._export_toc or self._export_heading_numbering:
-            body_md = getattr(doc, "_mn_body_markdown", "") or ""
-            if body_md:
-                from ..utils.pdf_post_process import add_pdf_navigation  # noqa: PLC0415
-                add_pdf_navigation(
-                    target,
-                    body_md,
-                    toc_max_depth=self._export_toc_max_depth,
-                )
-        self.window().statusBar().showMessage(
-            f"Exported PDF to {target.name}", 5000
+        session_when = None
+        if self._session.created_at:
+            from datetime import datetime as _dt  # noqa: PLC0415
+            try:
+                session_when = _dt.fromisoformat(
+                    self._session.created_at.replace("Z", "+00:00")
+                ).astimezone()
+            except ValueError:
+                session_when = None
+
+        # The printable markdown the worker re-renders. _build_print_
+        # document's stashed body is the post-transform markdown
+        # (attendee table, appendix injection, outline numbering, TOC);
+        # build_print_markdown wraps it with the header on top.
+        printable = build_print_markdown(
+            session_title=self._session.title,
+            tab_label=tab_label,
+            session_date=session_when,
+            body=body_md,
         )
+
+        worker = _PdfExportWorker(
+            target_path=target,
+            session_dir=session_dir(self._session.id),
+            session_title=self._session.title,
+            tab_label=tab_label,
+            printable_markdown=printable,
+            body_markdown_for_anchors=body_md,
+            use_word=self._use_word_for_pdf,
+            export_toc=self._export_toc,
+            export_heading_numbering=self._export_heading_numbering,
+            export_toc_max_depth=self._export_toc_max_depth,
+        )
+        self._pdf_export_in_flight = True
+        self._pdf_export_worker = worker
+        self._refresh_export_buttons_for_in_flight()
+        self.window().statusBar().showMessage(
+            f"Exporting {tab_label} to PDF... (this can take a moment)",
+        )
+
+        worker.progress_message.connect(self._on_pdf_export_progress)
+        worker.finished_with_result.connect(self._on_pdf_export_finished)
+        worker.start()
+
+    def _on_pdf_export_progress(self, message: str) -> None:
+        """Worker -> status bar text. No timeout so the message persists
+        until the next progress update or completion."""
+        self.window().statusBar().showMessage(message)
+
+    def _on_pdf_export_finished(
+        self, success: bool, target_path: str, detail: str,
+    ) -> None:
+        """Worker done. Re-enable buttons + post the result toast.
+
+        ``detail`` carries either '' or 'via Word' on success, and the
+        exception message on failure. Errors stay in the status bar
+        for 8s so the user has time to read them; successes for 5s
+        (matching the prior synchronous flow's behavior)."""
+        target = Path(target_path)
+        if success:
+            via = f" ({detail})" if detail else ""
+            self.window().statusBar().showMessage(
+                f"Exported PDF to {target.name}{via}", 5000,
+            )
+        else:
+            self.window().statusBar().showMessage(
+                f"PDF export failed: {detail or 'unknown error'}", 8000,
+            )
+            log.error("pdf export failed: %s -> %s", detail, target)
+        if self._pdf_export_worker is not None:
+            # Mirror the AttachmentImportWorker shape: wait + deleteLater
+            # only after exec/event loop has handed control back. Here
+            # the signal is delivered queued on the UI thread, so the
+            # worker's run() has already returned; wait() joins the OS
+            # thread before deletion.
+            self._pdf_export_worker.wait()
+            self._pdf_export_worker.deleteLater()
+            self._pdf_export_worker = None
+        self._pdf_export_in_flight = False
+        self._refresh_export_buttons_for_in_flight()
+
+    def _refresh_export_buttons_for_in_flight(self) -> None:
+        """Toggle the 'Save as PDF...' / 'Save as Word...' menu actions
+        while their respective workers are running -- other Save-to
+        targets (Notion, Confluence, Obsidian) stay live so the user
+        can start a different export while a long-running one
+        finishes in the background. Each action returns to its
+        natural enabled state when its worker completes (the menu's
+        parent button is what enforces tab-appropriate enable/
+        disable; an action's own enabled state only matters when the
+        menu is open)."""
+        self._export_pdf_action.setEnabled(not self._pdf_export_in_flight)
+        self._export_word_action.setEnabled(not self._word_export_in_flight)
 
     def _on_export_word(self) -> None:
         """Save the active tab as a Word (.docx) document.
@@ -2824,13 +2904,27 @@ class SessionView(QWidget):
         Windows with Word installed, we additionally invoke Word COM
         to populate the TOC server-side so the file opens fully
         rendered.
+
+        #109: render + COM populate moved off the UI thread into
+        ``_WordExportWorker``. The COM populate step is the
+        user-noticeable slow phase (Word launch + open + field
+        update + save), so this is where the 'app frozen' symptom
+        shows up most. Same pattern as the PDF worker -- the UI
+        thread does the document build + file picker, hands the
+        worker the body markdown + params, and stays interactive
+        while the worker writes the file.
         """
+        if self._word_export_in_flight:
+            self.window().statusBar().showMessage(
+                "Word export already in progress -- please wait.", 4000,
+            )
+            return
         doc, tab_label = self._build_print_document(
             appendix_defaults=self._appendix_export_defaults,
         )
         if doc is None or self._session is None:
             return
-        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from PyQt6.QtWidgets import QFileDialog
 
         suggested_name = default_export_filename(
             self._session.title, tab_label, ".docx"
@@ -2853,39 +2947,56 @@ class SessionView(QWidget):
             target = target.with_suffix(".docx")
 
         body_md = getattr(doc, "_mn_body_markdown", "") or ""
-        from ..utils.word_export import (  # noqa: PLC0415
-            export_to_docx,
-            is_word_com_available,
-            populate_toc_via_word,
-        )
-        # Word doc Title = same components as the filename
-        # (session title + tab label + date), unsanitized so the
-        # rendered title keeps any special characters.
+        # Drop the UI-thread doc reference -- the worker rebuilds
+        # the docx from the markdown body directly (no QTextDocument
+        # needed for the Word path).
+        del doc
+
         doc_title = default_export_document_title(
             self._session.title, tab_label,
         )
-        stats = export_to_docx(
-            body_md,
-            target,
-            base_dir=session_dir(self._session.id),
-            title=doc_title,
-            include_toc=self._export_toc,
-            toc_max_depth=self._export_toc_max_depth,
+        worker = _WordExportWorker(
+            target_path=target,
+            session_dir=session_dir(self._session.id),
+            doc_title=doc_title,
+            tab_label=tab_label,
+            body_markdown=body_md,
+            export_toc=self._export_toc,
+            export_toc_max_depth=self._export_toc_max_depth,
         )
-        if stats.error:
-            QMessageBox.warning(
-                self, "Export Word",
-                f"Could not write Word document: {stats.error}",
-            )
-            return
-        # Best-effort TOC population via Word COM -- skipped silently
-        # on non-Windows / no Word. Without this, Word shows the TOC
-        # placeholder until the user updates the field manually.
-        if self._export_toc and is_word_com_available():
-            populate_toc_via_word(target, save_in_place=True)
+        self._word_export_in_flight = True
+        self._word_export_worker = worker
+        self._refresh_export_buttons_for_in_flight()
         self.window().statusBar().showMessage(
-            f"Exported Word document to {target.name}", 5000,
+            f"Exporting {tab_label} to Word... (this can take a moment)",
         )
+        worker.progress_message.connect(self._on_word_export_progress)
+        worker.finished_with_result.connect(self._on_word_export_finished)
+        worker.start()
+
+    def _on_word_export_progress(self, message: str) -> None:
+        self.window().statusBar().showMessage(message)
+
+    def _on_word_export_finished(
+        self, success: bool, target_path: str, detail: str,
+    ) -> None:
+        target = Path(target_path)
+        if success:
+            via = f" ({detail})" if detail else ""
+            self.window().statusBar().showMessage(
+                f"Exported Word document to {target.name}{via}", 5000,
+            )
+        else:
+            self.window().statusBar().showMessage(
+                f"Word export failed: {detail or 'unknown error'}", 8000,
+            )
+            log.error("word export failed: %s -> %s", detail, target)
+        if self._word_export_worker is not None:
+            self._word_export_worker.wait()
+            self._word_export_worker.deleteLater()
+            self._word_export_worker = None
+        self._word_export_in_flight = False
+        self._refresh_export_buttons_for_in_flight()
 
     def _render_pdf_via_word(
         self, *, body_md: str, dst: Path, tab_label: str,
@@ -3032,3 +3143,301 @@ def _pretty_state(state: str, *, has_live_transcript: bool = False) -> str:
         STATE_ERROR: "Error",
     }
     return pretty.get(state, state.title())
+
+
+class _PdfExportWorker(QThread):
+    """Off-UI-thread PDF render + post-process (#109).
+
+    The synchronous ``_on_export_pdf`` path was the user-perceived
+    'frozen app' for several seconds during a long export. The
+    slow phases are:
+
+      1. ``doc.print(printer)`` -- Qt's PDF writer paginates +
+         rasterizes images + lays out paragraphs. Scales with doc
+         length.
+      2. ``add_pdf_navigation`` -- pypdf post-process that copies
+         /Names/Dests entries inline onto each Link annotation so
+         PDFium-based viewers (Chrome / Edge) navigate to the
+         heading anchor. Scales with #headings + #links.
+      3. Word COM path: ``export_to_docx`` + ``export_to_pdf_via_word``
+         spawn Word, populate fields, and print. Slowest.
+
+    All three are off-UI-thread-safe: QTextDocument is reentrant
+    for new instances, QPrinter to PDF is a paint device (not a
+    widget), and pypdf is pure Python. Word COM needs apartment-
+    threaded ``pythoncom.CoInitialize`` on the worker, mirroring
+    ``_MeetingResolveWorker`` (#106).
+
+    Signals:
+      * ``progress_message(str)`` -- status-bar text updates during
+        the run (Rendering... / Adding navigation... / etc.).
+      * ``finished_with_result(bool, str, str)`` -- (success,
+        target_path, detail). ``detail`` is 'via Word' on the Word
+        path, '' on the Qt path, or the exception message on
+        failure.
+    """
+
+    progress_message = pyqtSignal(str)
+    finished_with_result = pyqtSignal(bool, str, str)
+
+    def __init__(
+        self,
+        *,
+        target_path: Path,
+        session_dir: Path,
+        session_title: str,
+        tab_label: str,
+        printable_markdown: str,
+        body_markdown_for_anchors: str,
+        use_word: bool,
+        export_toc: bool,
+        export_heading_numbering: bool,
+        export_toc_max_depth: int,
+    ) -> None:
+        super().__init__()
+        self.setObjectName("PdfExportWorker")
+        self._target = target_path
+        self._session_dir = session_dir
+        self._session_title = session_title
+        self._tab_label = tab_label
+        self._printable_markdown = printable_markdown
+        self._body_for_anchors = body_markdown_for_anchors
+        self._use_word = use_word
+        self._export_toc = export_toc
+        self._export_heading_numbering = export_heading_numbering
+        self._export_toc_max_depth = export_toc_max_depth
+
+    def run(self) -> None:  # type: ignore[override]
+        co_initialized = False
+        if self._use_word:
+            try:
+                import pythoncom  # noqa: PLC0415 -- Windows-only optional
+                pythoncom.CoInitialize()
+                co_initialized = True
+            except Exception:
+                # pythoncom absent or already initialized -- the Word
+                # branch will check is_word_com_available below
+                # anyway. Don't fail the whole worker here.
+                pass
+        try:
+            if self._use_word:
+                from ..utils.word_export import is_word_com_available  # noqa: PLC0415
+                if is_word_com_available():
+                    self.progress_message.emit(
+                        f"Rendering {self._tab_label} to PDF (via Word)...",
+                    )
+                    if self._render_via_word():
+                        self.finished_with_result.emit(
+                            True, str(self._target), "via Word",
+                        )
+                        return
+                    # Word path failed -- fall through to the Qt
+                    # backend so the user still gets a PDF rather
+                    # than a silent no-op. Status-bar update tells
+                    # them why the path changed.
+                    self.progress_message.emit(
+                        "Word PDF export failed -- falling back to Qt...",
+                    )
+            # Qt PDF backend.
+            self.progress_message.emit(
+                f"Rendering {self._tab_label} to PDF...",
+            )
+            self._render_via_qt()
+            if self._export_toc or self._export_heading_numbering:
+                self.progress_message.emit("Adding PDF navigation...")
+                self._post_process_navigation()
+            self.finished_with_result.emit(True, str(self._target), "")
+        except Exception as exc:
+            log.exception("pdf export worker failed for %s", self._target)
+            self.finished_with_result.emit(
+                False, str(self._target), str(exc),
+            )
+        finally:
+            if co_initialized:
+                try:
+                    import pythoncom  # noqa: PLC0415
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    def _render_via_qt(self) -> None:
+        """Construct a fresh PrintTextDocument on the worker thread +
+        print to PDF. QTextDocument is reentrant for new instances;
+        we deliberately pass parent=None so the doc isn't tied to a
+        UI-thread QObject."""
+        from PyQt6.QtPrintSupport import QPrinter  # noqa: PLC0415
+
+        from .print_document import PrintTextDocument  # noqa: PLC0415
+        from ..utils.print_html import markdown_to_print_html  # noqa: PLC0415
+
+        doc = PrintTextDocument(self._session_dir, parent=None)
+        doc.setHtml(markdown_to_print_html(self._printable_markdown))
+        doc.force_anchor_styling()
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setOutputFileName(str(self._target))
+        # PDF metadata title is the bare session title (#78).
+        printer.setDocName(self._session_title)
+        doc.clamp_images_to_printer(printer)
+        doc.print(printer)
+
+    def _post_process_navigation(self) -> None:
+        if not self._body_for_anchors:
+            return
+        from ..utils.pdf_post_process import add_pdf_navigation  # noqa: PLC0415
+
+        add_pdf_navigation(
+            self._target,
+            self._body_for_anchors,
+            toc_max_depth=self._export_toc_max_depth,
+        )
+
+    def _render_via_word(self) -> bool:
+        """Mirror of ``SessionView._render_pdf_via_word`` but worker-
+        thread-safe (no ``self._session`` access; all data passed via
+        ctor). Returns True on success."""
+        if not self._body_for_anchors:
+            return False
+        import tempfile  # noqa: PLC0415
+
+        from ..utils.word_export import (  # noqa: PLC0415
+            export_to_docx,
+            export_to_pdf_via_word,
+        )
+
+        doc_title = default_export_document_title(
+            self._session_title, self._tab_label,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            tmp_docx = Path(td) / f"{self._target.stem}.docx"
+            stats = export_to_docx(
+                self._body_for_anchors,
+                tmp_docx,
+                base_dir=self._session_dir,
+                title=doc_title,
+                include_toc=self._export_toc,
+                toc_max_depth=self._export_toc_max_depth,
+            )
+            if stats.error:
+                return False
+            return export_to_pdf_via_word(tmp_docx, self._target)
+
+
+class _WordExportWorker(QThread):
+    """Off-UI-thread Word (.docx) render + optional Word COM TOC
+    populate (#109).
+
+    The synchronous ``_on_export_word`` flow was the user-
+    perceivable freeze: ``export_to_docx`` (python-docx) is several
+    seconds on a long doc with images, and the optional
+    ``populate_toc_via_word`` step (Windows + Word installed) shells
+    out to Word, opens the doc, updates fields, and saves -- often
+    the slowest single thing the app does.
+
+    Both phases are off-UI-thread-safe: python-docx is pure Python,
+    and Word COM needs the same ``pythoncom.CoInitialize`` /
+    ``CoUninitialize`` bookend the calendar resolve worker (#106)
+    and PDF export worker established.
+
+    Signals match ``_PdfExportWorker``:
+      * ``progress_message(str)`` -- status-bar text updates during
+        the run.
+      * ``finished_with_result(bool, str, str)`` -- (success,
+        target_path, detail). ``detail`` is 'TOC populated' when
+        the COM populate step ran successfully, '' when the COM
+        path was skipped (no TOC, or no Word COM available), and
+        the exception message on failure.
+    """
+
+    progress_message = pyqtSignal(str)
+    finished_with_result = pyqtSignal(bool, str, str)
+
+    def __init__(
+        self,
+        *,
+        target_path: Path,
+        session_dir: Path,
+        doc_title: str,
+        tab_label: str,
+        body_markdown: str,
+        export_toc: bool,
+        export_toc_max_depth: int,
+    ) -> None:
+        super().__init__()
+        self.setObjectName("WordExportWorker")
+        self._target = target_path
+        self._session_dir = session_dir
+        self._doc_title = doc_title
+        self._tab_label = tab_label
+        self._body_markdown = body_markdown
+        self._export_toc = export_toc
+        self._export_toc_max_depth = export_toc_max_depth
+
+    def run(self) -> None:  # type: ignore[override]
+        co_initialized = False
+        if self._export_toc:
+            try:
+                import pythoncom  # noqa: PLC0415 -- Windows-only optional
+                pythoncom.CoInitialize()
+                co_initialized = True
+            except Exception:
+                # pythoncom absent (non-Windows dev runtime) -- the
+                # TOC populate path checks is_word_com_available
+                # before running, so this isn't fatal.
+                pass
+        try:
+            from ..utils.word_export import (  # noqa: PLC0415
+                export_to_docx,
+                is_word_com_available,
+                populate_toc_via_word,
+            )
+
+            self.progress_message.emit(
+                f"Rendering {self._tab_label} to Word...",
+            )
+            stats = export_to_docx(
+                self._body_markdown,
+                self._target,
+                base_dir=self._session_dir,
+                title=self._doc_title,
+                include_toc=self._export_toc,
+                toc_max_depth=self._export_toc_max_depth,
+            )
+            if stats.error:
+                self.finished_with_result.emit(
+                    False, str(self._target), stats.error,
+                )
+                return
+            detail = ""
+            if self._export_toc and is_word_com_available():
+                self.progress_message.emit(
+                    "Populating TOC via Word (this can take a moment)...",
+                )
+                # Best-effort: even if the populate step fails we
+                # still wrote a valid docx via python-docx, and the
+                # user can update fields manually in Word. So a COM
+                # failure here doesn't fail the whole export -- we
+                # just don't tag the success message with 'TOC
+                # populated'.
+                try:
+                    populate_toc_via_word(self._target, save_in_place=True)
+                    detail = "TOC populated"
+                except Exception as exc:  # noqa: BLE001 -- defensive
+                    log.warning(
+                        "Word COM TOC populate failed for %s: %s",
+                        self._target, exc,
+                    )
+            self.finished_with_result.emit(True, str(self._target), detail)
+        except Exception as exc:
+            log.exception("word export worker failed for %s", self._target)
+            self.finished_with_result.emit(
+                False, str(self._target), str(exc),
+            )
+        finally:
+            if co_initialized:
+                try:
+                    import pythoncom  # noqa: PLC0415
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
