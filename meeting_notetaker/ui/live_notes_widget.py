@@ -415,6 +415,22 @@ class LiveNotesWidget(QWidget):
         self._a_image.triggered.connect(self._insert_image_action)
         tb.addAction(self._a_image)
 
+        # #111: pick from existing session screen captures. Disabled
+        # when no session is bound (we wouldn't know which
+        # screenshots/ dir to scan); the dialog itself surfaces a
+        # helpful empty-state when the dir exists but is empty.
+        self._a_insert_screenshot = QAction("Screenshot", self)
+        self._a_insert_screenshot.setToolTip(
+            "Insert a screen capture from this session -- pick from a "
+            "thumbnail grid of existing screen captures and the Markdown "
+            "reference lands at the cursor."
+        )
+        self._a_insert_screenshot.setShortcut(QKeySequence("Ctrl+Shift+I"))
+        self._a_insert_screenshot.triggered.connect(
+            self._insert_screenshot_action,
+        )
+        tb.addAction(self._a_insert_screenshot)
+
         self._a_hr = QAction("HR", self)
         self._a_hr.setToolTip("Horizontal rule -- inserts a --- divider on its own line")
         self._a_hr.triggered.connect(self._insert_hr)
@@ -435,7 +451,8 @@ class LiveNotesWidget(QWidget):
             self._a_h1, self._a_h2, self._a_h3,
             self._a_bullet, self._a_number, self._a_task,
             self._a_quote, self._a_code, self._a_codeblock,
-            self._a_link, self._a_image, self._a_hr,
+            self._a_link, self._a_image, self._a_insert_screenshot,
+            self._a_hr,
         ]
 
     # ---- preview toggle ----------------------------------------------------
@@ -660,9 +677,25 @@ class LiveNotesWidget(QWidget):
             return
         self._insert_image_markdown(saved.name, saved.stem, "")
 
-    def _insert_image_markdown(self, filename: str, alt: str, caption: str) -> None:
-        """Insert the Markdown image ref on its own line at the cursor."""
-        markdown = markdown_image_ref(join_relative(IMAGES_SUBDIR, filename), alt, caption)
+    def _insert_image_markdown(
+        self,
+        filename: str,
+        alt: str,
+        caption: str,
+        *,
+        subdir: str = IMAGES_SUBDIR,
+    ) -> None:
+        """Insert the Markdown image ref on its own line at the cursor.
+
+        ``subdir`` defaults to the editor's ``images/`` folder (paste
+        + file-picker insertions). The Insert-Screenshot flow (#111)
+        passes ``subdir='screenshots'`` so the ref points at the
+        existing capture under the session's screenshots/ dir; the
+        preview's setSearchPaths is the session_dir, so any
+        session-relative subdir resolves at render time."""
+        markdown = markdown_image_ref(
+            join_relative(subdir, filename), alt, caption,
+        )
         cursor = self._editor.textCursor()
         block = cursor.block()
         # Push to the start of the next line if the cursor is mid-line.
@@ -672,3 +705,43 @@ class LiveNotesWidget(QWidget):
         cursor.insertText(markdown + "\n")
         self._editor.setTextCursor(cursor)
         self._editor.setFocus()
+
+    def _insert_screenshot_action(self) -> None:
+        """Toolbar handler (#111): pick from the session's existing
+        screen captures and insert a Markdown reference at the
+        cursor.
+
+        Pre-conditions: a session is bound (we need the session_dir
+        to know which screenshots/ folder to scan). When no captures
+        exist yet, the dialog still opens and surfaces an empty-state
+        message so the user understands what to do; the alternative
+        (silent no-op or a one-shot warning) felt worse."""
+        if self._session_dir is None:
+            QMessageBox.information(
+                self,
+                "Insert Screenshot",
+                "Select or create a session first.",
+            )
+            return
+        screenshots_dir = self._session_dir / "screenshots"
+        if screenshots_dir.is_dir():
+            screenshots = sorted(
+                (
+                    p for p in screenshots_dir.iterdir()
+                    if p.suffix.lower() == ".png"
+                ),
+                key=lambda p: p.name,
+            )
+        else:
+            screenshots = []
+        from .insert_screenshot_dialog import InsertScreenshotDialog  # noqa: PLC0415
+
+        dlg = InsertScreenshotDialog(screenshots, parent=self)
+        if dlg.exec() != dlg.DialogCode.Accepted:
+            return
+        chosen = dlg.selected_path()
+        if chosen is None:
+            return
+        self._insert_image_markdown(
+            chosen.name, chosen.stem, "", subdir="screenshots",
+        )
