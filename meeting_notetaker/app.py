@@ -984,6 +984,13 @@ class MainApp(QObject):
             sv.set_notes_text(markdown)
             if archive_path is not None:
                 sv.set_previous_notes(tstore.list_previous_notes())
+            # #116: re-evaluate the button state now that BOTH the
+            # in-memory has_notes flag AND the notes buffer are
+            # populated. The earlier set_synthesis_in_progress(False)
+            # call ran with both still empty, which left the Save
+            # to... dropdown (and Print / Send) greyed on the
+            # Synthesis tab until the user swapped sessions and back.
+            sv.refresh_button_state()
         return archive_path
 
     def _handle_synthesis_result(self, session_id: str, markdown: str, target: str) -> None:

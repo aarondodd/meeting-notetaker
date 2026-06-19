@@ -214,3 +214,101 @@ def test_set_title_is_safe_with_no_session(qt_app):
     view = SessionView()
     # No session bound -- must not crash.
     view.set_title("anything")
+
+
+# ---- #116: refresh_button_state after synthesis lands ----------------------
+
+
+def _empty_session():
+    """Synthesis-just-finished state: has_notes is still False, notes
+    buffer is what just landed via set_notes_text."""
+    return Session(
+        id="bug-116-session",
+        title="Synthesis just finished",
+        created_at="2026-06-18T13:00:00",
+        state=STATE_COMPLETE,
+        has_transcript=True,   # was transcribed
+        has_notes=False,       # synthesis just landed but DB flip races refresh
+        retain_audio=False,
+    )
+
+
+def _select_synthesis_tab(view: SessionView) -> None:
+    view._tabs.setCurrentWidget(view._notes_page)  # noqa: SLF001
+
+
+def test_refresh_button_state_unsticks_save_to_after_synthesis(qt_app):
+    """Reproduces #116 exactly: session with has_notes=False but a
+    populated notes buffer -- without refresh_button_state, the Save
+    to... dropdown stays disabled until the user swaps sessions. After
+    the refresh call, it's enabled."""
+    view = SessionView()
+    view.set_session(
+        _empty_session(),
+        transcript="some transcript content",
+        notes="",
+        previous_notes_paths=[],
+    )
+    _select_synthesis_tab(view)
+    # Simulate the synthesis-result flow: set_synthesis_in_progress
+    # toggled OFF earlier (buttons evaluated with empty buffer + has_
+    # notes=False), then the notes buffer is populated AFTER. Force
+    # the same shape here.
+    view.set_notes_text("# Heading\n\nSynthesized content body.\n")
+    # Without #116's refresh, the export dropdown stays greyed --
+    # _update_print_button was last called with has_notes=False.
+    # Now run refresh_button_state and verify the dropdown enables.
+    view.refresh_button_state()
+    assert view._export_pdf_btn.isEnabled() is True  # noqa: SLF001
+    assert view._print_btn.isEnabled() is True  # noqa: SLF001
+
+
+def test_refresh_button_state_picks_up_in_memory_has_notes_flip(qt_app):
+    """The companion to the buffer-fallback path: when MainApp flips
+    sv._session.has_notes = True directly, refresh_button_state must
+    propagate that into the dropdown."""
+    view = SessionView()
+    view.set_session(
+        _empty_session(),
+        transcript="",
+        notes="",
+        previous_notes_paths=[],
+    )
+    _select_synthesis_tab(view)
+    # Initial state: nothing in buffer, has_notes=False -> disabled.
+    assert view._export_pdf_btn.isEnabled() is False  # noqa: SLF001
+    # Caller flips the in-memory has_notes flag directly (matching
+    # _apply_synthesis_result's sv_session.has_notes = True line).
+    view._session.has_notes = True  # noqa: SLF001
+    view.refresh_button_state()
+    assert view._export_pdf_btn.isEnabled() is True  # noqa: SLF001
+
+
+def test_refresh_button_state_no_op_with_no_session(qt_app):
+    """Must not crash when called with no session bound (defensive)."""
+    view = SessionView()
+    # No session -- just verify the call returns cleanly.
+    view.refresh_button_state()
+    # Buttons remain disabled (no session is the right empty state).
+    assert view._export_pdf_btn.isEnabled() is False  # noqa: SLF001
+
+
+def test_refresh_button_state_my_notes_tab_unaffected_by_notes_buffer(qt_app):
+    """My Notes tab's enabled state is independent of the Synthesis
+    buffer -- the per-tab logic gates on tab membership, not on the
+    contents of every tab. Sanity-check that refresh doesn't break
+    that."""
+    view = SessionView()
+    view.set_session(
+        _empty_session(),
+        transcript="x",
+        notes="",
+        previous_notes_paths=[],
+    )
+    # Stay on My Notes tab.
+    view._tabs.setCurrentWidget(view._live_notes_page)  # noqa: SLF001
+    view.refresh_button_state()
+    # My Notes path enables Save to / Print unconditionally (the
+    # live-notes buffer is always editable, so there's always
+    # something to export).
+    assert view._export_pdf_btn.isEnabled() is True  # noqa: SLF001
