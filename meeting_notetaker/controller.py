@@ -234,7 +234,33 @@ class _BatchTranscribeThread(QThread):
                 for fut in futures:
                     results += fut.result()
             self.progress_pct.emit(100)
-            self.done.emit(interleave(results, []))
+            merged = interleave(results, [])
+            # #118: combined post-merge summary. Per-source rows live
+            # in worker._log_batch_summary; this one captures what
+            # the interleaved timeline looks like + the per-source
+            # contribution to it. Total span is the diagnostic Aaron
+            # wanted on 2026-06-18: when the transcript "feels short",
+            # this answers in one log line whether the speech-content
+            # span is what's expected or genuinely truncated.
+            if merged:
+                span_s = merged[-1].t_end - merged[0].t_start
+                per_source_counts: dict[str, int] = {}
+                for seg in merged:
+                    per_source_counts[seg.source] = (
+                        per_source_counts.get(seg.source, 0) + 1
+                    )
+                log.info(
+                    "batch_transcribe combined: sources=%s "
+                    "merged_segments=%d span=%.1fs per_source=%s",
+                    [src for src, _ in tasks],
+                    len(merged), span_s, per_source_counts,
+                )
+            else:
+                log.info(
+                    "batch_transcribe combined: sources=%s no segments emitted",
+                    [src for src, _ in tasks],
+                )
+            self.done.emit(merged)
         except Exception as exc:  # pragma: no cover - thread safety net
             log.exception("batch transcribe failed")
             self.failed.emit(str(exc))
