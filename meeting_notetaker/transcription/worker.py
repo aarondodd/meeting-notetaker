@@ -205,7 +205,65 @@ def batch_transcribe(
         on_progress_pct(source, 1.0)
     if progress:
         progress(f"Transcribed {source}: {len(result)} segments")
+    # #118: post-batch diagnostics. Captures the input/output shape
+    # so "only the first N min transcribed" reports can be self-
+    # diagnosing from the runtime log alone (no session artifacts
+    # required). One INFO line per source; the combined post-merge
+    # summary lives in _BatchTranscribeThread.run.
+    _log_batch_summary(source, info, duration, result, session_start_offset)
     return result
+
+
+def _log_batch_summary(
+    source: str,
+    info,
+    duration: float,
+    segments: list[TranscriptSegment],
+    session_start_offset: float,
+) -> None:
+    """Single INFO line summarizing what came out of a per-source
+    faster-whisper transcribe call (#118).
+
+    Fields:
+      * ``input``    -- input audio duration (info.duration; what the
+                        worker received off disk).
+      * ``vad_surv`` -- duration after VAD silence removal, when
+                        faster-whisper reports it (newer versions
+                        expose ``info.duration_after_vad``; older
+                        ones don't, in which case we log "n/a").
+      * ``segments`` -- count of non-empty segments emitted.
+      * ``speech``   -- summed segment duration (sum of seg.end -
+                        seg.start). Approximates the actual speech
+                        audio surviving VAD + transcription.
+      * ``span``     -- first-segment start through last-segment end
+                        in the original audio timeline (after
+                        subtracting session_start_offset so the
+                        numbers are wav-local, not session-wide).
+      * ``chars``    -- total characters across all segment texts.
+    """
+    duration_after_vad = getattr(info, "duration_after_vad", None)
+    if isinstance(duration_after_vad, (int, float)):
+        vad_str = f"{float(duration_after_vad):.1f}s"
+    else:
+        vad_str = "n/a"
+    if segments:
+        first_t = segments[0].t_start - session_start_offset
+        last_t = segments[-1].t_end - session_start_offset
+        speech_dur = sum(s.t_end - s.t_start for s in segments)
+        total_chars = sum(len(s.text) for s in segments)
+        log.info(
+            "batch_transcribe %s done: input=%.1fs vad_surv=%s "
+            "segments=%d speech=%.1fs span=%.1f-%.1fs chars=%d",
+            source, duration, vad_str,
+            len(segments), speech_dur,
+            first_t, last_t, total_chars,
+        )
+    else:
+        log.info(
+            "batch_transcribe %s done: input=%.1fs vad_surv=%s "
+            "segments=0 (no speech transcribed)",
+            source, duration, vad_str,
+        )
 
 
 def interleave(segments_a: Iterable[TranscriptSegment], segments_b: Iterable[TranscriptSegment]) -> list[TranscriptSegment]:
