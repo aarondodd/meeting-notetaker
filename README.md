@@ -9,21 +9,25 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.8-dev. End-to-end capture, transcription, synthesis,
+> **Status:** v0.7.11. End-to-end capture, transcription, synthesis,
 > screen capture, retained-audio playback + export, and transcript-
-> synchronized playback all working. v0.7.6 adds Notion and Confluence
-> as save-to destinations alongside PDF (with a Verify-gated picker
-> dialog, page title field, Create-folder affordance, and an opt-in
-> Include-attachments flow), preserves formatting on clipboard pastes
-> into the notes editors, polishes the PDF (black underlined links,
-> session-title-only header), reorganizes the menu bar (File now
-> mirrors the right-click session menu; Tools owns Settings + the
-> catalog editors), and refreshes the Attendees tray with a
-> Department column. Earlier v0.7.x layered a unified Appendix system
-> on top of the v0.7.2 Contact model: four LLM-emitted sections
-> parsed into a sidecar JSON store, surfaced in a collapsible tray,
-> edited via a tabular dialog, and bundled into preview / PDF / ZIP
-> exports as Markdown tables.
+> synchronized playback all working. v0.7.11 ships a stack of fixes
+> and UI polish on top of v0.7.10's Save to Obsidian: the Appendix
+> tray no longer collapses after an editor flush, Save / Print
+> buttons re-evaluate correctly after synthesis lands, calendar
+> invites drop signature images + bridge boilerplate at import,
+> PDF and Word exports run off the UI thread with status-bar
+> progress, the Slides tab gains multi-select delete, and the My
+> Notes editor gains an Insert Screenshot picker. v0.7.10 added
+> Save to Obsidian (local vault publish with frontmatter, image
+> dedup, daily-note backlink, re-publish detection); v0.7.9 added
+> audio robustness fixes plus the #93/#94 PDF and Word export
+> pipeline. v0.7.6 added Notion and Confluence as save-to
+> destinations alongside PDF. Earlier v0.7.x layered a unified
+> Appendix system on top of the v0.7.2 Contact model: four
+> LLM-emitted sections parsed into a sidecar JSON store, surfaced
+> in a collapsible tray, edited via a tabular dialog, and bundled
+> into preview / PDF / ZIP exports as Markdown tables.
 >
 > **What this tool is.** A note-synthesis pipeline, not a verbatim
 > transcription product. The transcript exists to seed an LLM
@@ -46,6 +50,99 @@ leaves the machine; no API key required.
 > the same person" given the surrounding text. Tunable merge /
 > match thresholds in Settings, plus live click-to-tag during
 > recording, let you correct in-meeting.
+
+## What's new in v0.7.11
+
+Bug-fix and UX-polish release on top of v0.7.10. The big-ticket items:
+
+- **Appendix tray no longer empties after edits / Save to Obsidian /
+  Word export (#120).** Since the strip-always-on change in v0.7.10,
+  the synthesis tab's debounced editor flush was re-parsing the
+  stripped notes buffer and writing an empty payload to the appendix
+  sidecar -- which deleted the sidecar file. Any user keystroke in
+  the synthesis tab (or any path that triggered the flush, including
+  the Save to Obsidian / Export to Word file-dialog yielding the
+  event loop) would collapse the Appendix bottom tray to just the
+  Links section. The four LLM-derived sections (Attendee Context,
+  Attendee Details, Suggested Topics, Referenced Attachments) and
+  Session Attachments would vanish. Editor flush no longer touches
+  the sidecar; the two legitimate write paths (paste-back and the
+  AppendixEditDialog) are unchanged.
+
+- **Synthesis Save to... / Print / Send buttons re-enable correctly
+  after a fresh synthesis (#116).** A v0.6.6-era ordering bug
+  resurfaced: `set_synthesis_in_progress(False)` ran before the
+  in-memory `has_notes` flag and the notes buffer were populated,
+  so the button recompute it triggered evaluated stale state and
+  left the dropdown disabled until the user swapped sessions. The
+  synthesis-result handler now re-runs the button-state recompute
+  after both updates land.
+
+- **PDF and Word exports run off the UI thread (#109).** Both
+  `_on_export_pdf` and `_on_export_word` previously froze the app
+  for several seconds (longer on a doc with a big TOC; longest on
+  the Word COM path that opens Word + populates fields + saves).
+  The render moves to dedicated worker threads
+  (`_PdfExportWorker`, `_WordExportWorker`) with status-bar
+  progress; the rest of the app stays interactive. Word COM gets
+  the apartment-threaded `pythoncom.CoInitialize` bookend.
+
+- **Calendar import cleanup (#104).** Two fixes on the calendar-
+  invite import path:
+  - Attachment filter: `.ics` calendar payloads and inline
+    signature images (anything with `PR_ATTACH_CONTENT_ID` set or
+    `PR_ATTACHMENT_HIDDEN=true`) are now dropped from the session's
+    attachment drawer. Previously every Type-1 attachment landed,
+    including invisible body-render assets.
+  - Bridge stripping: Teams / Zoom / Meet / Webex bridge blocks
+    (anchored on 30+ underscore brackets with a bridge keyword
+    inside) are now stripped from the agenda body during sanitize.
+    The block-level HTML pre-rewrite preserves paragraph structure
+    so the underscore brackets are visible to the stripper. Non-
+    bracketed bridge text (a bare "Click here to join") is left
+    alone -- under-strip beats over-strip.
+
+- **Calendar picker spinner (#106).** The "Use Selected" click in
+  the Pick from Calendar dialog now runs `fetch_meeting_by_entry_id`
+  on a background `QThread` with a modal busy spinner. The full
+  meeting resolve does a Recipients walk + GAL lookup per attendee
+  (1-3 s per attendee on Exchange Online cached mode) and used to
+  look like the app had frozen.
+
+- **Slides multi-select delete (#110).** The Slides tab's
+  thumbnail grid now supports Ctrl+Click / Shift+Click selection
+  and a Delete-key batch action. Right-click on a single selection
+  keeps the Copy / Open / Delete menu; right-click on a multi
+  selection offers only Delete. The confirmation dialog lists up
+  to six filenames so the user can eyeball the batch.
+
+- **Insert Screenshot... in My Notes (#111).** New toolbar action
+  (Ctrl+Shift+I) on the My Notes editor opens a thumbnail-grid
+  picker over the session's existing screen captures. Pick one
+  and the Markdown reference lands at the cursor. Friendly empty-
+  state when the session has no captures yet.
+
+- **Save to Obsidian: per-tab re-publish detection (#108).** The
+  Obsidian save flow now stamps `source_tab` (Synthesis / My Notes)
+  into the note's frontmatter, and the re-publish check matches on
+  both `source_session_id` AND `source_tab`. Saving My Notes from a
+  session that already has a Synthesis save no longer surfaces a
+  spurious overwrite warning against the (unrelated) Synthesis
+  file.
+
+- **Batch transcription diagnostics (#118).** Post-batch summary
+  log lines (one per source, plus a combined post-merge line) now
+  emit input duration, VAD-survived duration, segment count,
+  speech duration, span (wav-local), and character count. The
+  goal: when a transcript "feels short", the runtime log answers
+  in one read whether VAD over-stripped, the audio was actually
+  short, or the perception was off. No more "need to preserve the
+  session" for post-mortems.
+
+- **v0.7.11 bugfix batch (#102).** Ten fixes shipped together across
+  the synthesis editor, screen capture, splitter, calendar, backups,
+  Chrome extension, and synthesis automation. See PR #102 for the
+  per-bug detail.
 
 ## What's new in v0.7.8
 
