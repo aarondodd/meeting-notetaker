@@ -1867,17 +1867,18 @@ class SessionView(QWidget):
             return
         body = self._notes_view.toPlainText()
         self.synthesis_notes_changed.emit(self._session.id, body)
-        # Synthesis edits may add / remove appendix JSON blocks;
-        # re-parse + persist to the sidecar so the tray + preview
-        # transform pick up the change without round-tripping
-        # through the save loop (#64 + sidecar followup).
-        try:
-            from ..utils.appendix_store import AppendixStore  # noqa: PLC0415
-            AppendixStore(self._session.id).save_from_notes(body)
-        except Exception:
-            # Sidecar persistence is best-effort; the tray will fall
-            # back to parsing the in-memory text on the next refresh.
-            pass
+        # #120: do NOT call AppendixStore.save_from_notes(body) here.
+        # Since #93 made strip-always-on, notes.md never carries the
+        # raw H2 "(auto-extracted)" JSON blocks anymore, so parsing
+        # `body` always yields empty payload, which AppendixStore.save
+        # treats as "delete the sidecar". That wiped the four LLM
+        # sections on any editor flush and collapsed the tray to just
+        # the Links + Session Attachments sections. The sidecar is
+        # written exclusively from `_apply_synthesis_result` (raw LLM
+        # output, before strip) and `_on_appendix_edit_requested`
+        # (dialog accept), so editor-debounce flushes have no business
+        # touching it. We still refresh the tray so newly-typed links
+        # in the Links section update.
         self._refresh_appendix_trays()
 
     def _on_live_notes_changed(self) -> None:
