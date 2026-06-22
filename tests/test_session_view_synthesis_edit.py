@@ -312,3 +312,70 @@ def test_refresh_button_state_my_notes_tab_unaffected_by_notes_buffer(qt_app):
     # live-notes buffer is always editable, so there's always
     # something to export).
     assert view._export_pdf_btn.isEnabled() is True  # noqa: SLF001
+
+
+# ---- #120: editor flush must NOT wipe the appendix sidecar ------------------
+
+
+def test_flush_notes_does_not_clobber_appendix_sidecar(qt_app, fake_session):
+    """Regression for #120 (appendix tray collapses to Links after save
+    to Obsidian / export to Word).
+
+    Setup: sidecar carries the four LLM sections (as it would after
+    paste-back). The synthesis buffer is the *stripped* notes.md (no
+    JSON blocks, matching the #93 always-on strip). A debounced editor
+    flush MUST NOT call save_from_notes on the stripped buffer -- that
+    parses zero entries and AppendixStore.save deletes the sidecar.
+    """
+    from meeting_notetaker.utils.appendix_store import AppendixStore
+    from meeting_notetaker.utils.attendee_appendix import AttendeeAppendixEntry
+    from meeting_notetaker.utils.attendee_context import AttendeeContextEntry
+    from meeting_notetaker.utils.invite_mentions import InviteMentionEntry
+
+    # Seed the sidecar as paste-back would have.
+    store = AppendixStore(fake_session.id)
+    store.save(
+        attendee_context=[
+            AttendeeContextEntry(name="Alice", observation="Lead PM"),
+        ],
+        attendee_details=[
+            AttendeeAppendixEntry(
+                name="Alice", title="PM", company="Acme",
+                department="", email="alice@acme.test", phone="",
+            ),
+        ],
+        topics=["Q3 roadmap", "Hiring"],
+        referenced_attachments=[
+            InviteMentionEntry(name="agenda.pdf", context="Reviewed"),
+        ],
+    )
+    assert store.exists()
+
+    view = SessionView()
+    # Stripped notes body -- mirrors what set_notes_text receives from
+    # _apply_synthesis_result after strip_all_appendices.
+    view.set_session(
+        fake_session,
+        transcript="",
+        notes="# Synthesis\n\nMeeting summary prose only.\n",
+        previous_notes_paths=[],
+    )
+    # Simulate a user keystroke in the synthesis tab + the debounced
+    # flush firing (the path that fires when the user has edited
+    # the synthesis tab and then clicks Save to Obsidian / Export to
+    # Word).
+    view._notes_view.set_preview_mode(False)  # noqa: SLF001
+    view._notes_view.setPlainText(  # noqa: SLF001
+        "# Synthesis\n\nMeeting summary prose only. Edited.\n",
+    )
+    view.flush_pending_notes()
+
+    # Sidecar must survive the flush.
+    assert store.exists(), (
+        "appendix sidecar was deleted by _flush_notes -- #120 regression"
+    )
+    ctx, details, topics, referenced = store.load_as_dataclasses()
+    assert [e.name for e in ctx] == ["Alice"]
+    assert [e.name for e in details] == ["Alice"]
+    assert topics == ["Q3 roadmap", "Hiring"]
+    assert [e.name for e in referenced] == ["agenda.pdf"]
