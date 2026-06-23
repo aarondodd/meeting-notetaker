@@ -9,47 +9,47 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-> **Status:** v0.7.11. End-to-end capture, transcription, synthesis,
-> screen capture, retained-audio playback + export, and transcript-
-> synchronized playback all working. v0.7.11 ships a stack of fixes
-> and UI polish on top of v0.7.10's Save to Obsidian: the Appendix
-> tray no longer collapses after an editor flush, Save / Print
-> buttons re-evaluate correctly after synthesis lands, calendar
-> invites drop signature images + bridge boilerplate at import,
-> PDF and Word exports run off the UI thread with status-bar
-> progress, the Slides tab gains multi-select delete, and the My
-> Notes editor gains an Insert Screenshot picker. v0.7.10 added
-> Save to Obsidian (local vault publish with frontmatter, image
-> dedup, daily-note backlink, re-publish detection); v0.7.9 added
-> audio robustness fixes plus the #93/#94 PDF and Word export
-> pipeline. v0.7.6 added Notion and Confluence as save-to
-> destinations alongside PDF. Earlier v0.7.x layered a unified
-> Appendix system on top of the v0.7.2 Contact model: four
-> LLM-emitted sections parsed into a sidecar JSON store, surfaced
-> in a collapsible tray, edited via a tabular dialog, and bundled
-> into preview / PDF / ZIP exports as Markdown tables.
->
-> **What this tool is.** A note-synthesis pipeline, not a verbatim
-> transcription product. The transcript exists to seed an LLM
-> synthesis pass; the LLM smooths the kinds of errors a CPU-only
-> Whisper run produces (homophones like "there" vs "their", mild
-> punctuation drift, occasional dropped articles). If you need
-> legal-grade verbatim transcripts, use Teams' built-in
-> transcription or a hosted service -- this app trades raw accuracy
-> for local-only processing, low CPU cost, and an LLM-friendly
-> transcript that synthesizes well.
->
-> **Diarization (speaker identification) is rough.** The current
-> pass reliably separates two or three distinct voices in clean
-> audio, but a four-person meeting routinely splits into 20+
-> "speakers" depending on mic, codec, and noise floor. The goal is
-> *sufficient speaker context to attribute concepts and discussion
-> threads to the right person* -- not perfect labeling. The
-> synthesis prompt sees speaker labels as hints, and the LLM is
-> fully capable of reconciling "Speaker 7 and Speaker 12 are likely
-> the same person" given the surrounding text. Tunable merge /
-> match thresholds in Settings, plus live click-to-tag during
-> recording, let you correct in-meeting.
+**Status:** v0.7.11. End-to-end capture, transcription, synthesis,
+screen capture, retained-audio playback + export, and transcript-
+synchronized playback all working. v0.7.11 ships a stack of fixes
+and UI polish on top of v0.7.10's Save to Obsidian: the Appendix
+tray no longer collapses after an editor flush, Save / Print
+buttons re-evaluate correctly after synthesis lands, calendar
+invites drop signature images + bridge boilerplate at import,
+PDF and Word exports run off the UI thread with status-bar
+progress, the Slides tab gains multi-select delete, and the My
+Notes editor gains an Insert Screenshot picker. v0.7.10 added
+Save to Obsidian (local vault publish with frontmatter, image
+dedup, daily-note backlink, re-publish detection); v0.7.9 added
+audio robustness fixes plus the #93/#94 PDF and Word export
+pipeline. v0.7.6 added Notion and Confluence as save-to
+destinations alongside PDF. Earlier v0.7.x layered a unified
+Appendix system on top of the v0.7.2 Contact model: four
+LLM-emitted sections parsed into a sidecar JSON store, surfaced
+in a collapsible tray, edited via a tabular dialog, and bundled
+into preview / PDF / ZIP exports as Markdown tables.
+
+**What this tool is.** A note-synthesis pipeline, not a verbatim
+transcription product. The transcript exists to seed an LLM
+synthesis pass; the LLM smooths the kinds of errors a CPU-only
+Whisper run produces (homophones like "there" vs "their", mild
+punctuation drift, occasional dropped articles). If you need
+legal-grade verbatim transcripts, use Teams' built-in
+transcription or a hosted service -- this app trades raw accuracy
+for local-only processing, low CPU cost, and an LLM-friendly
+transcript that synthesizes well.
+
+**Diarization (speaker identification) is rough.** The current
+pass reliably separates two or three distinct voices in clean
+audio, but a four-person meeting routinely splits into 20+
+"speakers" depending on mic, codec, and noise floor. The goal is
+*sufficient speaker context to attribute concepts and discussion
+threads to the right person* -- not perfect labeling. The
+synthesis prompt sees speaker labels as hints, and the LLM is
+fully capable of reconciling "Speaker 7 and Speaker 12 are likely
+the same person" given the surrounding text. Tunable merge /
+match thresholds in Settings, plus live click-to-tag during
+recording, let you correct in-meeting.
 
 ## What's new in v0.7.11
 
