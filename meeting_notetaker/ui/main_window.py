@@ -569,12 +569,26 @@ class MainWindow(QMainWindow):
 
         # When SessionView's right column (screencap + attendee tag
         # sidebars) toggles, Qt's layout would otherwise redistribute
-        # the main splitter and shrink the session-list pane. Save
-        # the current splitter sizes BEFORE the visibility change +
-        # restore them on the next event-loop tick so the user's
-        # preferred split survives Start Recording (#102 bug 3
-        # follow-up, Aaron's 2026-06-11 trace).
+        # the main splitter and shrink the session-list pane.
+        #
+        # The first attempt (#102 bug 3 follow-up) saved sizes on
+        # ``right_column_will_toggle`` and called ``setSizes`` on the
+        # next event-loop tick. That was insufficient: Qt clamps
+        # ``setSizes`` against current child minimum widths, so once
+        # ``right_column.setVisible(True)`` had grown session_view's
+        # minimum, the restore could not violate it -- the left pane
+        # stayed shrunk. The intermediate layout-then-restore also
+        # produced a visible flicker.
+        #
+        # This pass pins the LEFT pane's ``minimumWidth`` to its
+        # current width BEFORE the visibility flip; Qt's layout pass
+        # then physically cannot shrink the left pane, and session_view
+        # absorbs the right-column appearance internally (the inner
+        # editor + sidebar layout shifts, which is the only resize the
+        # user wants per the spec). The original minimum is restored
+        # on the next event-loop tick so handle-drag still works.
         self._saved_splitter_sizes: Optional[list[int]] = None
+        self._saved_left_min_width: Optional[int] = None
         self.session_view.right_column_will_toggle.connect(
             self._on_right_column_will_toggle,
         )
@@ -727,23 +741,49 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_right_column_will_toggle(self, _will_be_visible: bool) -> None:
-        """Capture the splitter sizes the user is currently on, then
-        schedule a restore after Qt has processed the layout change
-        the visibility toggle triggers."""
+        """Pin the left-pane width so the outer splitter does NOT
+        redistribute when session_view's child layout changes.
+
+        Saving sizes + calling ``setSizes`` after the fact (the
+        previous attempt) is best-effort: Qt clamps ``setSizes``
+        against the new minimum-width chain, so a session_view that
+        grew its minimum because the right_column became visible
+        wins, leaving the left pane shrunk. The visible
+        layout-then-restore flicker was also a real complaint.
+
+        Pinning the left pane's ``minimumWidth`` to its current width
+        BEFORE the visibility flip prevents Qt's layout pass from
+        shrinking it at all. session_view has to absorb the right
+        column inside its own bounds (the inner editor / sidebar
+        layout adjusts, matching the spec: only the session editor
+        itself should ever auto-resize).
+        """
         from PyQt6.QtCore import QTimer  # noqa: PLC0415
-        self._saved_splitter_sizes = self._main_splitter.sizes()
+        sizes = self._main_splitter.sizes()
+        left = self._main_splitter.widget(0)
+        if left is None or len(sizes) < 2:
+            return
+        self._saved_splitter_sizes = list(sizes)
+        self._saved_left_min_width = left.minimumWidth()
+        left.setMinimumWidth(sizes[0])
         QTimer.singleShot(0, self._restore_saved_splitter_sizes)
 
     def _restore_saved_splitter_sizes(self) -> None:
-        if not self._saved_splitter_sizes:
+        if (
+            self._saved_splitter_sizes is None
+            or self._saved_left_min_width is None
+        ):
             return
-        # Qt clamps setSizes against current child minimum widths;
-        # when both sidebars use min/max instead of setFixedWidth
-        # (#102 bug 3 follow-up) the right column can shrink under
-        # pressure so the user's prior left-pane size lands at or
-        # near where they had it.
+        left = self._main_splitter.widget(0)
+        if left is not None:
+            # Unpin so handle-drag works again. The setSizes call below
+            # is belt-and-suspenders: with the pin in place during the
+            # toggle, the splitter sizes should already match what we
+            # saved.
+            left.setMinimumWidth(self._saved_left_min_width)
         self._main_splitter.setSizes(self._saved_splitter_sizes)
         self._saved_splitter_sizes = None
+        self._saved_left_min_width = None
 
     def set_session_list_sort(self, spec: str) -> None:
         """Apply a persisted sort spec to the list.
