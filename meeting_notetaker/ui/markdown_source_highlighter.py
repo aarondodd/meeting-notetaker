@@ -169,12 +169,15 @@ class MarkdownSourceHighlighter(QSyntaxHighlighter):
         if link_color.isValid():
             self._link_text_fmt.setForeground(QBrush(link_color))
 
-        # Blockquote -- italic + subtle left indent via the foreground.
+        # Blockquote -- italic + dimmer than body text. PlaceholderText
+        # is Qt's role for "dim but still legible" and tracks OS
+        # light/dark themes; Mid was chrome-grey and rendered
+        # dark-on-dark in dark mode (#125).
         self._quote_fmt = QTextCharFormat()
         self._quote_fmt.setFontItalic(True)
-        mid_color = self._palette.color(QPalette.ColorRole.Mid)
-        if mid_color.isValid():
-            self._quote_fmt.setForeground(QBrush(mid_color))
+        quote_color = self._palette.color(QPalette.ColorRole.PlaceholderText)
+        if quote_color.isValid():
+            self._quote_fmt.setForeground(QBrush(quote_color))
 
         # List marker (- / * / + / 1.). Distinct color so the structure
         # pops; rest of the line gets normal inline processing.
