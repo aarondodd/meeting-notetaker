@@ -381,3 +381,24 @@ def test_detach_via_setDocument_None(qt_app):
     doc, _editor, hl = _make_recorder("# Heading")
     hl.setDocument(None)
     doc.setPlainText("## Different")
+
+
+def test_blockquote_foreground_is_not_palette_mid(qt_app):
+    """Regression for #125: the blockquote format must NOT pull its
+    foreground from QPalette.ColorRole.Mid. Mid is a chrome color
+    (scrollbar troughs, disabled UI) and renders dark-on-dark in dark
+    mode. The current fix uses PlaceholderText; this test guards
+    against a future refactor silently reverting to Mid or any color
+    that matches the Mid role value."""
+    from PyQt6.QtGui import QPalette
+
+    _doc, _editor, hl = _make_recorder("> quoted")
+    quote_fg = hl._quote_fmt.foreground().color()
+    assert quote_fg.isValid(), "quote format has no foreground set"
+
+    mid = hl._palette.color(QPalette.ColorRole.Mid)
+    if mid.isValid():
+        assert quote_fg.rgba() != mid.rgba(), (
+            "blockquote foreground matches palette Mid role -- would "
+            "render dark-on-dark in dark mode (#125)"
+        )
