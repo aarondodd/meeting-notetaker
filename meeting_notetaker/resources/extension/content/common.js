@@ -377,7 +377,68 @@
   // handled), we trust the editor. If nothing observable changes after
   // the dispatch, we fall back to execCommand line-by-line with
   // insertLineBreak between -- a slower but always-works path.
-  function pasteIntoComposer(composer, text) {
+  // Page-world helper injection. Content scripts run in an isolated
+  // realm where DOM expando properties added by the page (e.g. TipTap's
+  // composer.editor) are hidden. We inject a small script (via
+  // web_accessible_resources so it isn't blocked by page CSP) that
+  // installs a request/response protocol over CustomEvents. Isolated
+  // realm dispatches 'mn-synth-page-request', page realm replies with
+  // 'mn-synth-page-response'. #127.
+  const PAGE_WORLD_COMPOSER_SELECTOR = 'div[contenteditable="true"][data-testid="chat-input"]';
+  let _pageWorldInjectedPromise = null;
+  function injectPageWorldOnce() {
+    if (_pageWorldInjectedPromise) return _pageWorldInjectedPromise;
+    _pageWorldInjectedPromise = new Promise((resolve) => {
+      try {
+        const url = chrome.runtime.getURL("injected/page-world.js");
+        const s = document.createElement("script");
+        s.src = url;
+        s.async = false;
+        s.dataset.mnSynth = "page-world";
+        s.addEventListener("load", () => { s.remove(); resolve(true); }, { once: true });
+        s.addEventListener("error", (e) => {
+          console.warn("mn-synth: page-world injection failed", e);
+          resolve(false);
+        }, { once: true });
+        (document.head || document.documentElement).appendChild(s);
+      } catch (e) {
+        console.warn("mn-synth: page-world injection threw", e);
+        resolve(false);
+      }
+    });
+    return _pageWorldInjectedPromise;
+  }
+
+  // Round-trip a request to the page-world helper. Resolves with the
+  // reply's result object, or null on timeout / failure to inject.
+  async function callPageWorld(action, args, timeoutMs = 2500) {
+    const injected = await injectPageWorldOnce();
+    if (!injected) return null;
+    return new Promise((resolve) => {
+      const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      let done = false;
+      const handler = (evt) => {
+        if (done) return;
+        if (!evt.detail || evt.detail.id !== id) return;
+        done = true;
+        window.removeEventListener("mn-synth-page-response", handler);
+        resolve(evt.detail.result);
+      };
+      window.addEventListener("mn-synth-page-response", handler);
+      setTimeout(() => {
+        if (done) return;
+        done = true;
+        window.removeEventListener("mn-synth-page-response", handler);
+        console.warn("mn-synth: page-world call timed out", { action, id });
+        resolve(null);
+      }, timeoutMs);
+      window.dispatchEvent(new CustomEvent("mn-synth-page-request", {
+        detail: { id, action, args },
+      }));
+    });
+  }
+
+  async function pasteIntoComposer(composer, text) {
     if (!composer) return false;
     composer.focus();
 
@@ -394,27 +455,25 @@
       // entirely; the composer stays visually blank until refresh but
       // the subsequent Send-button click DOES POST the message to
       // Claude's backend, so end-to-end automation works.
-      console.log(
-        "mn-synth: path 0 probe -- composer.editor typeof:",
-        typeof composer.editor,
-        "chain typeof:",
-        typeof composer.editor?.chain,
-      );
-      if (composer.editor && typeof composer.editor.chain === "function") {
-        console.log("mn-synth: taking path 0 (TipTap editor API)");
-        try {
-          composer.editor.chain().focus().insertContent(text).run();
-          console.log("mn-synth: path 0 completed without error");
-          return true;
-        } catch (e) {
-          console.warn(
-            "mn-synth: composer.editor.chain() threw, falling through to synthetic paste",
-            e,
-          );
-        }
-      } else {
+      // Path 0: page-realm TipTap Editor API. Content scripts run in
+      // an isolated JS realm and cannot see DOM expando properties set
+      // by the page (composer.editor is undefined from here even when
+      // it's a live object in the page realm). We inject a tiny helper
+      // into the page realm once, then dispatch a CustomEvent to it;
+      // the helper runs editor.chain().focus().insertContent(text).run()
+      // in-realm and replies with the outcome. #127.
+      const pageRes = await callPageWorld("paste", {
+        composerSelector: PAGE_WORLD_COMPOSER_SELECTOR,
+        text,
+      }, 2500);
+      if (pageRes && pageRes.ok) {
+        console.log("mn-synth: path 0 (page-world) succeeded via", pageRes.method);
+        return true;
+      }
+      if (pageRes) {
         console.warn(
-          "mn-synth: path 0 skipped -- composer.editor not usable from isolated realm",
+          "mn-synth: path 0 (page-world) failed, falling through to synthetic paste:",
+          pageRes.error || "unknown",
         );
       }
 
