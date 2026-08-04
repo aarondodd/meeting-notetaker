@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meeting Notetaker Synthesis Bridge",
-  "version": "0.7.11",
+  "version": "0.7.12",
   "description": "Drives Claude.ai (and later M365 Copilot) for Meeting Notetaker so the synthesis copy/paste step is one click. The browser stays the intermediary -- no audio or transcript bypasses the LLM chat window.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiweEMkjwAUd00+UAMffryJJY8g3vrx7wrXciDO7ad0hNoyHwIBglKr9Jp1Xy7pOAuFSx/NN/9lK259LR2VS9x0WlGyYLf9cJ5j9gQcNtSp67oMsOJSd1ReKhR5ZbAJzYIXsVdVCkrqkU6tZOZPkT+Odq9C3qOkD3D593NwRczIBCyc6cYiuVKgxRvK+qFR7/rRhTMv0WRWvLcEvJtTh9nbmjxnu6ZyPQHcDeoWl1mBrBZPLs94U2hcejIso00MWlC6x6YpHe0f5GcjtXm3qKRusqPQf+ANWMVYm6A0w2wTq7oXgDOUyzCIVxj4VoSBw19GTyC/06h5OEo7AJS1PwzQIDAQAB",
   "minimum_chrome_version": "120",

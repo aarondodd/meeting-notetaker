@@ -4,6 +4,14 @@
 // extra build step isn't worth it for a 100-line helper file).
 
 (function () {
+  // Distinctive load-time marker so we can tell at a glance which
+  // build of common.js the tab actually has. Bump the string whenever
+  // you push a new build so a stale content script is obvious.
+  console.log(
+    "%c[mn-synth] common.js loaded, build 2026-08-04-c (executeScript path 0)",
+    "color: cyan; font-weight: bold",
+  );
+
   const STATUS = {
     OPENING_TAB: "opening_tab",
     AWAITING_LOGIN: "awaiting_login",
@@ -410,6 +418,11 @@
   }
 
   async function pasteIntoComposer(composer, text) {
+    console.log(
+      "%c[mn-synth] pasteIntoComposer entry",
+      "color: cyan",
+      { hasComposer: !!composer, isCE: composer?.isContentEditable, len: text?.length },
+    );
     if (!composer) return false;
     composer.focus();
 
