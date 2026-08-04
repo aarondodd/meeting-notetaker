@@ -154,6 +154,10 @@ class PromptEditorDialog(QDialog):
         self._history_list = QListWidget(right)
         self._history_list.setMaximumHeight(110)
         self._history_list.itemDoubleClicked.connect(self._on_history_doubleclick)
+        # currentItemChanged is wired here (once) rather than in
+        # _reload_history() -- the previous placement re-connected on
+        # every history reload, so the handler accumulated invocations.
+        self._history_list.currentItemChanged.connect(self._on_history_selected)
         right_layout.addWidget(self._history_list)
         revert_btn_row = QHBoxLayout()
         self._revert_btn = QPushButton("Revert to selected", right)
@@ -300,7 +304,6 @@ class PromptEditorDialog(QDialog):
                 ap.body[:200] + ("..." if len(ap.body) > 200 else "")
             )
             self._history_list.addItem(item)
-        self._history_list.currentItemChanged.connect(self._on_history_selected)
 
     def _on_history_selected(
         self,

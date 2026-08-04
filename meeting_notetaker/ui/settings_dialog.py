@@ -2022,22 +2022,7 @@ class SettingsDialog(QDialog):
 
         dlg = PromptEditorDialog(parent=self)
         dlg.exec()
-        # Repopulate the default-template picker so newly-created
-        # prompts show up and deleted ones drop out. Preserve the
-        # currently-selected default if it still exists.
-        current = self._default_template.currentData() if hasattr(
-            self, "_default_template"
-        ) else ""
-        self._default_template.blockSignals(True)
-        self._default_template.clear()
-        for tpl in _prompts_mod.list_templates():
-            self._default_template.addItem(tpl.display_name, tpl.name)
-        if current:
-            for i in range(self._default_template.count()):
-                if self._default_template.itemData(i) == current:
-                    self._default_template.setCurrentIndex(i)
-                    break
-        self._default_template.blockSignals(False)
+        self._refresh_default_template_picker()
         # The parent is the MainWindow; MainApp's _on_edit_prompts
         # owns the SessionView refresh when the editor is opened from
         # the Tools menu. Settings opens the editor inline; we let the
@@ -2045,6 +2030,24 @@ class SettingsDialog(QDialog):
         # picker. A future enhancement could re-emit a signal here to
         # force the refresh immediately; keeping the surface narrow
         # for now.
+
+    def _refresh_default_template_picker(self) -> None:
+        """Repopulate the default-template dropdown from the current
+        prompt list, preserving the selection when possible. Called
+        after the prompt editor closes so newly-created prompts show
+        up and deleted ones drop out without reopening Settings."""
+        from ..utils import prompts as _prompts_mod  # noqa: PLC0415
+
+        current = self._default_template_picker.currentData() or ""
+        self._default_template_picker.blockSignals(True)
+        self._default_template_picker.clear()
+        for tpl in _prompts_mod.list_templates():
+            self._default_template_picker.addItem(tpl.display_name, tpl.name)
+        if current:
+            idx = self._default_template_picker.findData(current)
+            if idx >= 0:
+                self._default_template_picker.setCurrentIndex(idx)
+        self._default_template_picker.blockSignals(False)
 
     def _open_vocabulary_file(self) -> None:
         path = seed_vocabulary_file()
