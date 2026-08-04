@@ -383,6 +383,29 @@
 
     // Branch on contentEditable. textarea path stays unchanged.
     if (composer.isContentEditable) {
+      // Path 0: TipTap Editor API. Claude swapped composer from
+      // Lexical to TipTap/ProseMirror around 2026-08 (#127). The
+      // synthetic ClipboardEvent path below still gets
+      // defaultPrevented==true from TipTap's paste handler AND the
+      // internal document state does update (text persists across a
+      // page refresh), but the view refuses to re-render without a
+      // trusted user gesture and no message actually sends. Calling
+      // the editor's own commands avoids the synthetic-event path
+      // entirely; the composer stays visually blank until refresh but
+      // the subsequent Send-button click DOES POST the message to
+      // Claude's backend, so end-to-end automation works.
+      if (composer.editor && typeof composer.editor.chain === "function") {
+        try {
+          composer.editor.chain().focus().insertContent(text).run();
+          return true;
+        } catch (e) {
+          console.warn(
+            "mn-synth: composer.editor.chain() threw, falling through to synthetic paste",
+            e,
+          );
+        }
+      }
+
       const before = (composer.innerText || composer.textContent || "").length;
 
       // Path 1: synthetic paste with DataTransfer (Lexical / ProseMirror).
