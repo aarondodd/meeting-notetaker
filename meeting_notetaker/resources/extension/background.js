@@ -456,6 +456,56 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  // Content script (isolated realm) asks us to run paste code in the
+  // page's realm so it can reach TipTap's composer.editor expando
+  // property. Uses chrome.scripting.executeScript(world: "MAIN") which
+  // is Chrome's canonical MV3 primitive for this. #127.
+  if (msg && msg.type === "PASTE_IN_PAGE") {
+    const tabId = _sender?.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: "no sender tab id" });
+      return false;
+    }
+    chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [msg.composerSelector, msg.text],
+      func: (composerSelector, text) => {
+        const composer = document.querySelector(composerSelector);
+        if (!composer) return { ok: false, error: "composer not found" };
+        if (composer.editor && typeof composer.editor.chain === "function") {
+          try {
+            composer.editor.chain().focus().insertContent(text).run();
+            return { ok: true, method: "editor.chain" };
+          } catch (e) { /* fall through */ }
+        }
+        if (composer.editor?.commands?.insertContent) {
+          try {
+            composer.editor.commands.insertContent(text);
+            return { ok: true, method: "editor.commands" };
+          } catch (e) { /* fall through */ }
+        }
+        const view = composer.editor?.view;
+        if (view?.state && typeof view.dispatch === "function") {
+          try {
+            view.dispatch(view.state.tr.insertText(text));
+            return { ok: true, method: "view.dispatch" };
+          } catch (e) {
+            return { ok: false, error: "view.dispatch threw: " + String(e) };
+          }
+        }
+        return { ok: false, error: "no editor API on composer" };
+      },
+    })
+      .then((results) => {
+        const r = results && results[0] && results[0].result;
+        sendResponse(r || { ok: false, error: "executeScript returned no result" });
+      })
+      .catch((e) => {
+        sendResponse({ ok: false, error: "executeScript threw: " + String(e) });
+      });
+    return true; // async response
+  }
 });
 
 // Try to attach to the host at startup so the popup shows the right

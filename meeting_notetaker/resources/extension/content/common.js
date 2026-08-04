@@ -4,6 +4,11 @@
 // extra build step isn't worth it for a 100-line helper file).
 
 (function () {
+  // Distinctive load-time marker so we can tell at a glance which
+  // build of common.js the tab actually has. Bump the string whenever
+  // you push a new build so a stale content script is obvious.
+  console.log("[mn-synth] common.js loaded, build 2026-08-04");
+
   const STATUS = {
     OPENING_TAB: "opening_tab",
     AWAITING_LOGIN: "awaiting_login",
@@ -377,12 +382,66 @@
   // handled), we trust the editor. If nothing observable changes after
   // the dispatch, we fall back to execCommand line-by-line with
   // insertLineBreak between -- a slower but always-works path.
-  function pasteIntoComposer(composer, text) {
+  // Content scripts run in an isolated JS realm where DOM expando
+  // properties added by the page (e.g. TipTap's composer.editor) are
+  // hidden. To reach composer.editor.chain(), the paste code must run
+  // in the page realm. We do that by asking the background service
+  // worker to invoke chrome.scripting.executeScript with world:'MAIN'.
+  // This is Chrome's canonical MV3 primitive for this exact case --
+  // no <script> injection, no CustomEvent bridge, no CSP concerns. #127.
+  const PAGE_WORLD_COMPOSER_SELECTOR = 'div[contenteditable="true"][data-testid="chat-input"]';
+  function callPageWorld(action, args) {
+    return new Promise((resolve) => {
+      const payload = { type: "PASTE_IN_PAGE", ...args };
+      if (action !== "paste") {
+        // Only paste is supported over this transport today.
+        resolve({ ok: false, error: "unsupported action " + action });
+        return;
+      }
+      try {
+        chrome.runtime.sendMessage(payload, (reply) => {
+          if (chrome.runtime.lastError) {
+            console.warn("mn-synth: PASTE_IN_PAGE reply error:", chrome.runtime.lastError.message);
+            resolve({ ok: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          resolve(reply || { ok: false, error: "no reply from background" });
+        });
+      } catch (e) {
+        console.warn("mn-synth: PASTE_IN_PAGE dispatch threw:", e);
+        resolve({ ok: false, error: String(e) });
+      }
+    });
+  }
+
+  async function pasteIntoComposer(composer, text) {
     if (!composer) return false;
     composer.focus();
 
     // Branch on contentEditable. textarea path stays unchanged.
     if (composer.isContentEditable) {
+      // Path 0: page-realm TipTap Editor API via chrome.scripting.
+      // executeScript(world: 'MAIN'), routed through the background
+      // service worker. Content scripts can't reach composer.editor
+      // from the isolated realm; the background can invoke code that
+      // runs in the page realm where the editor instance lives.
+      // Claude swapped composer from Lexical to TipTap/ProseMirror
+      // around 2026-08; synthetic paste events update ProseMirror's
+      // internal state but the view refuses to re-render without a
+      // trusted user gesture, so no message actually sends. #127.
+      const pageRes = await callPageWorld("paste", {
+        composerSelector: PAGE_WORLD_COMPOSER_SELECTOR,
+        text,
+      });
+      if (pageRes && pageRes.ok) {
+        console.log("mn-synth: path 0 succeeded via", pageRes.method);
+        return true;
+      }
+      console.warn(
+        "mn-synth: path 0 failed, falling through to synthetic paste:",
+        pageRes?.error || "unknown",
+      );
+
       const before = (composer.innerText || composer.textContent || "").length;
 
       // Path 1: synthetic paste with DataTransfer (Lexical / ProseMirror).

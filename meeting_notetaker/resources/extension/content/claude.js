@@ -282,7 +282,7 @@
       return;
     }
 
-    if (!pasteIntoComposer(composer, prompt)) {
+    if (!(await pasteIntoComposer(composer, prompt))) {
       fail("paste_failed", "Composer rejected the pasted prompt.");
       return;
     }

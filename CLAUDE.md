@@ -218,6 +218,44 @@ correctness assertions.
 
 ## Status
 
+Released version is v0.7.11 (tag `v0.7.11`, 2026-06-22). Test suite is 2340
+passing, 1 skipped. The per-version notes below stop at v0.6.4 and were never
+carried forward through the v0.7.x line; treat `git log` and the GitHub
+releases page as authoritative for anything after v0.6.4, and read the
+"v0.6.4 (current)" heading below as "v0.6.4 (last version documented here)".
+
+### 2026-08-03: claude.ai composer swap broke synthesis automation
+
+claude.ai replaced its chat composer with TipTap/ProseMirror. The composer is
+`div[contenteditable="true"][data-testid="chat-input"]` and exposes TipTap's
+Editor instance as `composer.editor`.
+
+The extension's synthetic ClipboardEvent still mutates ProseMirror's internal
+document (pasted text survives a refresh) but the view never repaints and no
+send fires. The event reports `defaultPrevented: true`, so `pasteIntoComposer`
+recorded success and the flow advanced to AWAITING_RESPONSE, waiting forever on
+a response that was never requested. Worth remembering as a class of bug: the
+success check measured that something handled the event, not that the text
+landed, so the app hung instead of failing.
+
+Fix (issue #127, PR #128, branch `fix-claude-tiptap-composer-127`): a new path 0
+in `pasteIntoComposer` (`content/common.js`, 23 lines) that calls
+`composer.editor.chain().focus().insertContent(text).run()` when the composer
+exposes an Editor instance. Every existing synthetic-event path is kept as a
+fallback for other sites and future drift.
+
+Verified against the live site, not a fixture:
+
+- The send button is `aria-label="Send message"` and is always enabled. It does
+  not gate on `disabled` or `aria-disabled`, and a programmatic `.click()`
+  reaches the backend (`[COMPLETION] Completion request succeeded`). There is no
+  trusted-gesture wall on send.
+- The composer stays visibly blank for the whole automated run, because
+  ProseMirror will not repaint without a trusted gesture. Cosmetic only.
+- `claude.js` already lists `button[aria-label="Send message"]` among its send
+  selectors, and the response scraper's strategy 5 (walk up from the last user
+  message) still resolves. Neither needed changing.
+
 ### v0.1 (tag `v0.1.0`)
 
 - 42 unit tests passing on Linux.
