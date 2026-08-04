@@ -8,7 +8,7 @@
   // build of common.js the tab actually has. Bump the string whenever
   // you push a new build so a stale content script is obvious.
   console.log(
-    "%c[mn-synth] common.js loaded, build 2026-08-04-c (executeScript path 0)",
+    "%c[mn-synth] common.js loaded, build 2026-08-04-d (attr logging)",
     "color: cyan; font-weight: bold",
   );
 
@@ -419,9 +419,15 @@
 
   async function pasteIntoComposer(composer, text) {
     console.log(
-      "%c[mn-synth] pasteIntoComposer entry",
-      "color: cyan",
-      { hasComposer: !!composer, isCE: composer?.isContentEditable, len: text?.length },
+      "[mn-synth] pasteIntoComposer entry",
+      "hasComposer:", !!composer,
+      "tag:", composer?.tagName,
+      "testid:", composer?.getAttribute?.("data-testid") || "",
+      "role:", composer?.getAttribute?.("role") || "",
+      "attrCE:", composer?.getAttribute?.("contenteditable"),
+      "isCE:", composer?.isContentEditable,
+      "classes:", (composer?.className || "").toString().slice(0, 100),
+      "len:", text?.length,
     );
     if (!composer) return false;
     composer.focus();
@@ -505,10 +511,14 @@
           document.execCommand("insertText", false, lines[i]);
         }
       }
+      console.log("[mn-synth] path 3 (execCommand line-by-line) completed");
       return true;
     }
 
+    console.log("[mn-synth] composer.isContentEditable was falsy, checking textarea path");
+
     if ("value" in composer) {
+      console.log("[mn-synth] taking textarea 'value' path");
       const nativeSetter = Object.getOwnPropertyDescriptor(
         Object.getPrototypeOf(composer),
         "value",
@@ -518,6 +528,7 @@
       composer.dispatchEvent(new Event("change", { bubbles: true }));
       return true;
     }
+    console.warn("[mn-synth] composer had neither contentEditable nor value; returning false");
     return false;
   }
 
