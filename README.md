@@ -9,9 +9,18 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-**Status:** v0.7.11. End-to-end capture, transcription, synthesis,
+**Status:** v0.7.12. End-to-end capture, transcription, synthesis,
 screen capture, retained-audio playback + export, and transcript-
-synchronized playback all working. v0.7.11 ships a stack of fixes
+synchronized playback all working. v0.7.12 is a targeted bug-fix
+release: the bundled Chrome extension now drives Claude.ai's
+TipTap composer via chrome.scripting.executeScript(world:'MAIN')
+after Anthropic swapped away from Lexical (synthesis was silently
+timing out with no message being sent), and the Settings > Edit
+Prompts button no longer crashes on close (attribute typo dating
+back to the in-app prompt editor's introduction). Also includes a
+new `scripts/probe-claude.js` diagnostic so the next time
+Anthropic drifts the DOM, a single-paste probe reports the whole
+integration surface at once. v0.7.11 shipped a stack of fixes
 and UI polish on top of v0.7.10's Save to Obsidian: the Appendix
 tray no longer collapses after an editor flush, Save / Print
 buttons re-evaluate correctly after synthesis lands, calendar
