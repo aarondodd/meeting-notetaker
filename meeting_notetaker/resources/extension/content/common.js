@@ -7,10 +7,7 @@
   // Distinctive load-time marker so we can tell at a glance which
   // build of common.js the tab actually has. Bump the string whenever
   // you push a new build so a stale content script is obvious.
-  console.log(
-    "%c[mn-synth] common.js loaded, build 2026-08-04-d (attr logging)",
-    "color: cyan; font-weight: bold",
-  );
+  console.log("[mn-synth] common.js loaded, build 2026-08-04");
 
   const STATUS = {
     OPENING_TAB: "opening_tab",
@@ -418,44 +415,24 @@
   }
 
   async function pasteIntoComposer(composer, text) {
-    console.log(
-      "[mn-synth] pasteIntoComposer entry",
-      "hasComposer:", !!composer,
-      "tag:", composer?.tagName,
-      "testid:", composer?.getAttribute?.("data-testid") || "",
-      "role:", composer?.getAttribute?.("role") || "",
-      "attrCE:", composer?.getAttribute?.("contenteditable"),
-      "isCE:", composer?.isContentEditable,
-      "classes:", (composer?.className || "").toString().slice(0, 100),
-      "len:", text?.length,
-    );
     if (!composer) return false;
     composer.focus();
 
     // Branch on contentEditable. textarea path stays unchanged.
     if (composer.isContentEditable) {
-      // Path 0: TipTap Editor API. Claude swapped composer from
-      // Lexical to TipTap/ProseMirror around 2026-08 (#127). The
-      // synthetic ClipboardEvent path below still gets
-      // defaultPrevented==true from TipTap's paste handler AND the
-      // internal document state does update (text persists across a
-      // page refresh), but the view refuses to re-render without a
-      // trusted user gesture and no message actually sends. Calling
-      // the editor's own commands avoids the synthetic-event path
-      // entirely; the composer stays visually blank until refresh but
-      // the subsequent Send-button click DOES POST the message to
-      // Claude's backend, so end-to-end automation works.
       // Path 0: page-realm TipTap Editor API via chrome.scripting.
       // executeScript(world: 'MAIN'), routed through the background
       // service worker. Content scripts can't reach composer.editor
       // from the isolated realm; the background can invoke code that
-      // runs in the page realm where the editor instance lives. #127.
-      console.log("mn-synth: attempting path 0 (executeScript world:MAIN)");
+      // runs in the page realm where the editor instance lives.
+      // Claude swapped composer from Lexical to TipTap/ProseMirror
+      // around 2026-08; synthetic paste events update ProseMirror's
+      // internal state but the view refuses to re-render without a
+      // trusted user gesture, so no message actually sends. #127.
       const pageRes = await callPageWorld("paste", {
         composerSelector: PAGE_WORLD_COMPOSER_SELECTOR,
         text,
       });
-      console.log("mn-synth: path 0 reply:", pageRes);
       if (pageRes && pageRes.ok) {
         console.log("mn-synth: path 0 succeeded via", pageRes.method);
         return true;
@@ -511,14 +488,10 @@
           document.execCommand("insertText", false, lines[i]);
         }
       }
-      console.log("[mn-synth] path 3 (execCommand line-by-line) completed");
       return true;
     }
 
-    console.log("[mn-synth] composer.isContentEditable was falsy, checking textarea path");
-
     if ("value" in composer) {
-      console.log("[mn-synth] taking textarea 'value' path");
       const nativeSetter = Object.getOwnPropertyDescriptor(
         Object.getPrototypeOf(composer),
         "value",
@@ -528,7 +501,6 @@
       composer.dispatchEvent(new Event("change", { bubbles: true }));
       return true;
     }
-    console.warn("[mn-synth] composer had neither contentEditable nor value; returning false");
     return false;
   }
 
