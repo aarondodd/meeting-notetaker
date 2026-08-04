@@ -394,9 +394,17 @@
       // entirely; the composer stays visually blank until refresh but
       // the subsequent Send-button click DOES POST the message to
       // Claude's backend, so end-to-end automation works.
+      console.log(
+        "mn-synth: path 0 probe -- composer.editor typeof:",
+        typeof composer.editor,
+        "chain typeof:",
+        typeof composer.editor?.chain,
+      );
       if (composer.editor && typeof composer.editor.chain === "function") {
+        console.log("mn-synth: taking path 0 (TipTap editor API)");
         try {
           composer.editor.chain().focus().insertContent(text).run();
+          console.log("mn-synth: path 0 completed without error");
           return true;
         } catch (e) {
           console.warn(
@@ -404,6 +412,10 @@
             e,
           );
         }
+      } else {
+        console.warn(
+          "mn-synth: path 0 skipped -- composer.editor not usable from isolated realm",
+        );
       }
 
       const before = (composer.innerText || composer.textContent || "").length;
