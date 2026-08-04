@@ -48,11 +48,5 @@
       "js": ["content/common.js", "content/copilot.js"],
       "run_at": "document_idle"
     }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["injected/page-world.js"],
-      "matches": ["*://claude.ai/*", "*://*.claude.ai/*"]
-    }
   ]
 }
