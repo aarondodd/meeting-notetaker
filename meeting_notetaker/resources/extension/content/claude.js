@@ -28,18 +28,25 @@
   }
   const { STATUS, looksLikeInterstitial, looksLikeLoginPage,
     showToast, clearToast, watchForInterstitialClear,
-    waitForSelector, waitForResponseStreaming, pasteIntoComposer,
+    waitForSelector, waitForSelectorPriority,
+    waitForResponseStreaming, pasteIntoComposer,
     findCopyButtonForMessage, htmlToMarkdown } = helpers;
 
-  // Composer probes. We try data-testids and contenteditable in order;
-  // the trailing 'div[contenteditable="true"]' is the catch-all that
-  // works even if Claude has renamed every other attribute.
+  // Composer probes. Ordered from most specific to least. This list is
+  // walked in priority order per tick by waitForSelectorPriority --
+  // never comma-joined -- so a lower-priority selector cannot beat a
+  // higher-priority one just because it matches earlier in DOM order.
+  //
+  // The bare 'textarea' catch-all was deliberately removed on 2026-08-05
+  // (#131): ambient textareas on the page (page telemetry, hidden a11y
+  // widgets, off-screen inputs left by dismissed modals) can mount
+  // before Claude's TipTap composer, and the previous implementation
+  // matched them first, routed the paste there, and silently hung.
   const COMPOSER_SELECTORS = [
     'div[contenteditable="true"][data-testid="chat-input"]',
     'div[contenteditable="true"][role="textbox"]',
     'div[contenteditable="true"]',
     'textarea[data-testid="chat-input"]',
-    'textarea',
   ];
 
   // Send-button probes. Mostly aria-label-based; the last entry tries
@@ -274,7 +281,7 @@
     // hasn't shown the chat composer yet. The tabs.onUpdated re-fire
     // path is the primary recovery; this is a backup for cases where
     // the URL stays the same but the composer takes time to render.
-    const composer = await waitForSelector(COMPOSER_SELECTORS.join(","), {
+    const composer = await waitForSelectorPriority(COMPOSER_SELECTORS, {
       timeoutMs: 5 * 60 * 1000,
     });
     if (!composer) {
