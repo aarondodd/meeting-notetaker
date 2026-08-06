@@ -218,11 +218,18 @@ correctness assertions.
 
 ## Status
 
-Released version is v0.7.11 (tag `v0.7.11`, 2026-06-22). Test suite is 2340
-passing, 1 skipped. The per-version notes below stop at v0.6.4 and were never
-carried forward through the v0.7.x line; treat `git log` and the GitHub
-releases page as authoritative for anything after v0.6.4, and read the
+Released version is v0.7.12 (tag `v0.7.12`, 2026-08-04). Test suite is 2340
+passing, 1 skipped as of v0.7.11. The per-version notes below stop at v0.6.4 and
+were never carried forward through the v0.7.x line; treat `git log` and the
+GitHub releases page as authoritative for anything after v0.6.4, and read the
 "v0.6.4 (current)" heading below as "v0.6.4 (last version documented here)".
+
+Maintenance note (2026-08-05): this file is ~410 lines against a 300-line soft
+limit, and the cheapest way back under it is compressing the pre-v0.6.4
+per-version sections into one paragraph rather than trimming the architecture
+and gotchas above, which are what the file is actually read for. Doing that, and
+writing the missing v0.7.x history, is project work for whoever next opens this
+repo.
 
 ### 2026-08-03: claude.ai composer swap broke synthesis automation
 
@@ -255,6 +262,22 @@ Verified against the live site, not a fixture:
 - `claude.js` already lists `button[aria-label="Send message"]` among its send
   selectors, and the response scraper's strategy 5 (walk up from the last user
   message) still resolves. Neither needed changing.
+
+#### What actually shipped (v0.7.12, 2026-08-04)
+
+The path-0 sketch above is not the final implementation. `composer.editor` is a
+page-attached expando property, and the extension's content script runs in an
+isolated realm where those are invisible, so the console-verified call could not
+be made from `content/common.js` directly. The merged fix routes the paste
+through the service worker with
+`chrome.scripting.executeScript({world: "MAIN"})` (`background.js` plus
+`content/common.js`); the synthetic-event paths remain as fallbacks. Merged as
+PR #128 and released in v0.7.12 alongside PR #130 (issue #129, the Settings >
+Edit Prompts AttributeError crash). `scripts/probe-claude.js` was added in the
+same PR: paste it into a claude.ai console, `mnProbe()` enumerates every DOM
+surface the extension depends on and `mnProbeSend()` runs an end-to-end send,
+tagging eight paste primitives so the composer's final text shows which worked.
+See `docs/troubleshooting-automation.md`.
 
 ### v0.1 (tag `v0.1.0`)
 
