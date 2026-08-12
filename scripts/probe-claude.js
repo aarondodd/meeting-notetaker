@@ -110,6 +110,32 @@
         ariaDisabled: els[0]?.getAttribute("aria-disabled"),
       };
     });
+    // Broad button snapshot: catches renamed send buttons without a
+    // second round trip. Filtered to buttons with an aria-label,
+    // data-testid, or type="submit" so we don't dump the whole page.
+    // Only populated when the strict selectors match zero (i.e. the
+    // extension would fail to find the send button here). #131.
+    const anySendMatched = sendMatches.some((m) => m.count > 0);
+    const sendCandidates = anySendMatched
+      ? []
+      : Array.from(document.querySelectorAll('button, [role="button"]'))
+          .filter((b) => {
+            return (
+              b.getAttribute("aria-label") ||
+              b.getAttribute("data-testid") ||
+              b.getAttribute("type") === "submit"
+            );
+          })
+          .slice(0, 100)
+          .map((b) => ({
+            tag: b.tagName,
+            aria: b.getAttribute("aria-label"),
+            testid: b.getAttribute("data-testid"),
+            type: b.getAttribute("type"),
+            disabled:
+              b.hasAttribute("disabled") ||
+              b.getAttribute("aria-disabled") === "true",
+          }));
     const assistantMatches = ASSISTANT_SELECTORS.map((sel) => ({
       selector: sel,
       count: document.querySelectorAll(sel).length,
@@ -118,7 +144,13 @@
       selector: sel,
       count: document.querySelectorAll(sel).length,
     }));
-    return { composerMatches, sendMatches, assistantMatches, userMatches };
+    return {
+      composerMatches,
+      sendMatches,
+      sendCandidates,
+      assistantMatches,
+      userMatches,
+    };
   };
 
   const probeEditorApi = (composer) => {
@@ -282,6 +314,21 @@
     report.editorApi = safe(() => probeEditorApi(found.element));
     report.pastePrimitives = safe(() => probePastePrimitives(found.element));
     report.copyButtons = safe(probeCopyButtons);
+    // Callout: send button is often only rendered when composer has
+    // content. If our strict send selectors matched zero, warn the
+    // operator that they need to type into the composer and re-run to
+    // see the real send button. #131.
+    const sendMatches = report.selectors?.sendMatches || [];
+    const anySendMatched = sendMatches.some((m) => m.count > 0);
+    if (!anySendMatched) {
+      report.sendButtonHint =
+        "no send button matched -- Claude typically only renders it " +
+        "when the composer contains text. Type any character into the " +
+        "composer and re-run mnProbe() to catch the real button. " +
+        "sendCandidates (broad button snapshot) is populated to help " +
+        "surface a renamed button in the meantime.";
+      console.warn(`[mn-probe] ${report.sendButtonHint}`);
+    }
     const json = JSON.stringify(report, null, 2);
     console.log(report);
     try { copy(json); console.log("%c[mn-probe] full JSON copied to clipboard", "color: green"); }

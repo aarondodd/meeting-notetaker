@@ -7,7 +7,7 @@
   // Distinctive load-time marker so we can tell at a glance which
   // build of common.js the tab actually has. Bump the string whenever
   // you push a new build so a stale content script is obvious.
-  console.log("[mn-synth] common.js loaded, build 2026-08-04");
+  console.log("[mn-synth] common.js loaded, build 2026-08-05 (composer priority + paste assert #131)");
 
   const STATUS = {
     OPENING_TAB: "opening_tab",
@@ -158,6 +158,37 @@
         if (el) {
           resolve(el);
           return;
+        }
+        if (Date.now() > deadline) {
+          resolve(null);
+          return;
+        }
+        setTimeout(tick, intervalMs);
+      };
+      tick();
+    });
+  }
+
+  // Like waitForSelector, but selectors are tried in priority order per
+  // tick. Comma-joining a selector list into one querySelector call
+  // returns the first match in DOM order, which lets an ambient element
+  // (e.g. a hidden textarea injected by page telemetry) beat the
+  // higher-priority TipTap composer just because it's earlier in the
+  // DOM. Walking the list per tick guarantees that a lower-priority
+  // catch-all cannot short-circuit a specific selector that WOULD match
+  // if it were the sole query.
+  function waitForSelectorPriority(selectors, opts = {}) {
+    return new Promise((resolve) => {
+      const intervalMs = opts.intervalMs || 100;
+      const timeoutMs = opts.timeoutMs || 30000;
+      const deadline = Date.now() + timeoutMs;
+      const tick = () => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) {
+            resolve(el);
+            return;
+          }
         }
         if (Date.now() > deadline) {
           resolve(null);
@@ -414,11 +445,22 @@
     });
   }
 
-  async function pasteIntoComposer(composer, text) {
-    if (!composer) return false;
+  // Read the composer's current text, whether it's a contentEditable
+  // TipTap/Lexical/ProseMirror div or a plain textarea/input.
+  function readComposerContent(el) {
+    if (!el) return "";
+    if (el.isContentEditable) return el.innerText || el.textContent || "";
+    if ("value" in el) return el.value || "";
+    return "";
+  }
+
+  // The paste-attempt engine. Returns a string naming the successful
+  // path, or null if no path even claimed success. Wrapped by
+  // pasteIntoComposer, which additionally VERIFIES the paste actually
+  // landed in the composer content (see below).
+  async function _attemptPaste(composer, text) {
     composer.focus();
 
-    // Branch on contentEditable. textarea path stays unchanged.
     if (composer.isContentEditable) {
       // Path 0: page-realm TipTap Editor API via chrome.scripting.
       // executeScript(world: 'MAIN'), routed through the background
@@ -435,7 +477,7 @@
       });
       if (pageRes && pageRes.ok) {
         console.log("mn-synth: path 0 succeeded via", pageRes.method);
-        return true;
+        return `path0:${pageRes.method}`;
       }
       console.warn(
         "mn-synth: path 0 failed, falling through to synthetic paste:",
@@ -463,15 +505,11 @@
         // older Chromium; fall through to the line-by-line path.
       }
 
-      if (pasteHandled) {
-        return true;
-      }
+      if (pasteHandled) return "path1:ClipboardEvent";
 
       // Path 2: did the composer text grow at all?
       const after = (composer.innerText || composer.textContent || "").length;
-      if (after > before) {
-        return true;
-      }
+      if (after > before) return "path2:grow";
 
       // Path 3: insertText line-by-line. Some editors silently drop
       // the synthetic paste; we still owe them a multi-line insert.
@@ -488,7 +526,7 @@
           document.execCommand("insertText", false, lines[i]);
         }
       }
-      return true;
+      return "path3:execCommand";
     }
 
     if ("value" in composer) {
@@ -499,9 +537,63 @@
       nativeSetter.call(composer, text);
       composer.dispatchEvent(new Event("input", { bubbles: true }));
       composer.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
+      return "textarea:nativeSetter";
     }
-    return false;
+    return null;
+  }
+
+  // Returns how much the composer content grew must be to count as a
+  // successful paste. Text-length-relative with a 500-char cap and a
+  // 20-char floor so an empty composer easily fails the check but a
+  // 30k prompt doesn't need to roundtrip exactly (TipTap may collapse
+  // whitespace, wrap in list nodes, etc). Exposed for tests. #131.
+  function pasteVerificationThreshold(textLen) {
+    return Math.max(20, Math.min(textLen * 0.5, 500));
+  }
+
+  async function pasteIntoComposer(composer, text) {
+    if (!composer) return false;
+    // Snapshot the composer content BEFORE any focus/paste side effect
+    // so the assertion below measures actual paste growth, not
+    // "composer had content already".
+    const beforeLen = readComposerContent(composer).length;
+
+    const method = await _attemptPaste(composer, text);
+    if (method === null) return false;
+
+    // Verify the composer actually contains what we sent. Guards
+    // against #131: waitForSelector's comma-collapse plus a bare
+    // `textarea` catch-all can land us on an ambient element that has
+    // no relationship to Claude's real chat input. Every paste path
+    // reports success optimistically; that success is worthless if the
+    // composer is still empty. Returning false here lets the caller
+    // fail fast instead of clicking send on nothing and waiting 10 min
+    // on a response that will never stream.
+    const afterLen = readComposerContent(composer).length;
+    const grew = afterLen - beforeLen;
+    const threshold = pasteVerificationThreshold(text.length);
+    if (grew < threshold) {
+      console.warn(
+        "mn-synth: paste method",
+        method,
+        "reported success but composer grew only",
+        grew,
+        "chars vs required",
+        threshold,
+        "(text.length =",
+        text.length,
+        "); treating as failed paste. #131",
+      );
+      return false;
+    }
+    console.log(
+      "mn-synth: pasteIntoComposer verified",
+      method,
+      "grew",
+      grew,
+      "chars",
+    );
+    return true;
   }
 
   // Find Claude's response-level Copy button. Claude renders two
@@ -783,11 +875,14 @@
     clearToast,
     watchForInterstitialClear,
     waitForSelector,
+    waitForSelectorPriority,
     waitForStableFalse,
     waitForResponseStreaming,
     findGenericStopButton,
     findCopyButtonForMessage,
     htmlToMarkdown,
     pasteIntoComposer,
+    readComposerContent,
+    pasteVerificationThreshold,
   };
 })();
