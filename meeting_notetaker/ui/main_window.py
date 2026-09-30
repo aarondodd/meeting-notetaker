@@ -39,7 +39,7 @@ from ..models.session import (
     Session,
 )
 from ..utils.icons import app_icon
-from ..utils.paths import has_retained_audio
+from ..utils.paths import has_retained_audio, recoverable_recording
 from .classification_navigator import ClassificationNavigator
 from .session_view import SessionView
 from .status_indicators import SegmentState, StatusSegment
@@ -165,6 +165,9 @@ class MainWindow(QMainWindow):
     # slot and trigger the standard batch transcription + speaker
     # refinement pipeline.
     import_audio_requested = pyqtSignal()
+    # Re-run transcription for a failed session (state ERROR) from the
+    # WAVs its interrupted recording left on disk.
+    transcribe_recording_requested = pyqtSignal(str)  # session_id
     # View menu (v0.7.7 new): pop-out preview window for My Notes
     # (audience screenshare scenario) + shortcut to the Fonts section
     # in Settings. MainApp owns both handlers.
@@ -231,6 +234,11 @@ class MainWindow(QMainWindow):
             self.import_audio_requested.emit,
         )
         file_menu.addAction(self._action_import_audio)
+        self._action_transcribe_recording = QAction("&Transcribe Failed Recording...", self)
+        self._action_transcribe_recording.triggered.connect(
+            self._emit_transcribe_recording,
+        )
+        file_menu.addAction(self._action_transcribe_recording)
         # Export submenu mirrors the right-click Export-* entries so a
         # mouse-averse user has parity from the menu bar.
         export_menu = file_menu.addMenu("&Export")
@@ -375,6 +383,7 @@ class MainWindow(QMainWindow):
             self._action_edit_timestamp,
             self._action_import_transcript,
             self._action_import_audio,
+            self._action_transcribe_recording,
             self._action_export_recording,
             self._action_export_video,
             self._action_export_package,
@@ -898,6 +907,7 @@ class MainWindow(QMainWindow):
         item.setToolTip(_COL_ATTACHMENTS, attachments_tooltip)
         item.setToolTip(_COL_STATE, state_tooltip)
         item.setData(_COL_TITLE, Qt.ItemDataRole.UserRole, s.id)
+        item.setData(_COL_STATE, Qt.ItemDataRole.UserRole, s.state)
         # Stash the full ISO created_at so Edit Timestamp can seed the
         # dialog without losing sub-minute precision (the visible "YYYY-MM-DD
         # HH:MM" column drops seconds + timezone).
@@ -931,6 +941,9 @@ class MainWindow(QMainWindow):
         # handles refusal-to-overwrite-existing-audio inside the
         # controller hook (#88).
         self._action_import_audio.setEnabled(single is not None)
+        self._action_transcribe_recording.setEnabled(
+            single is not None and self._can_transcribe_recording(single)
+        )
         # Pop-out preview: single-session-only -- the popout mirrors
         # the currently-selected session's live notes, so it has
         # nothing useful to show when no session is loaded.
@@ -956,6 +969,28 @@ class MainWindow(QMainWindow):
         self._file_save_menu.setEnabled(single is not None)
 
     # ---- File-menu emit helpers ----------------------------------------
+
+    def _session_state(self, session_id: str) -> Optional[str]:
+        root = self._list.invisibleRootItem()
+        for i in range(root.childCount()):
+            item = root.child(i)
+            if item.data(_COL_TITLE, Qt.ItemDataRole.UserRole) == session_id:
+                return item.data(_COL_STATE, Qt.ItemDataRole.UserRole)
+        return None
+
+    def _can_transcribe_recording(self, session_id: str) -> bool:
+        """Failed sessions only, and only with capture WAVs on disk."""
+        if self._session_state(session_id) != STATE_ERROR:
+            return False
+        try:
+            return recoverable_recording(session_id).usable
+        except OSError:
+            return False
+
+    def _emit_transcribe_recording(self) -> None:
+        ids = self.selected_session_ids()
+        if len(ids) == 1:
+            self.transcribe_recording_requested.emit(ids[0])
 
     def _emit_export_recording(self) -> None:
         ids = self.selected_session_ids()
@@ -1009,6 +1044,10 @@ class MainWindow(QMainWindow):
         action_export_package.setEnabled(bool(single_id))
         action_delete_recording = menu.addAction("Delete recording...")
         action_delete_recording.setEnabled(has_audio)
+        action_transcribe = menu.addAction("Transcribe failed recording...")
+        action_transcribe.setEnabled(
+            bool(single_id) and self._can_transcribe_recording(single_id)
+        )
         menu.addSeparator()
         action_delete = menu.addAction("Delete...")
         action = menu.exec(self._list.viewport().mapToGlobal(pos))
@@ -1026,6 +1065,8 @@ class MainWindow(QMainWindow):
             self.export_package_requested.emit(single_id)
         elif action is action_delete_recording and single_id:
             self._confirm_delete_recording(single_id)
+        elif action is action_transcribe and single_id:
+            self.transcribe_recording_requested.emit(single_id)
         elif action is action_delete:
             self._delete_selected()
 

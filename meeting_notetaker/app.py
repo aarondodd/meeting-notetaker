@@ -91,6 +91,7 @@ from .utils import updater as updater_mod
 from .utils.config import Config
 from .utils.icons import app_icon
 from .utils.live_notes import extract_section, parse_attendees, seed_body_with_calendar
+from .utils import crash_guard
 from .utils.main_loop_watchdog import MainLoopWatchdog
 from .utils.paths import (
     app_data_dir,
@@ -173,6 +174,14 @@ class MainApp(QObject):
         self.store = SessionStore()
         self.controller = SessionController(self.store, self.config, parent=self)
         self.window = MainWindow()
+        # An exception escaping a slot is logged by crash_guard and the
+        # app keeps running; tell the user without a modal dialog.
+        crash_guard.set_notifier(
+            lambda msg: self.window.status(
+                f"Internal error ({msg}). The app kept running; details are in the log.",
+                timeout_ms=15000,
+            )
+        )
         self.tray = TrayIcon(self.window)
         self._calendar_monitor = None  # set lazily by _apply_calendar_config
         self._audio_monitor = None  # set lazily by _apply_audio_monitor_config
@@ -515,13 +524,26 @@ class MainApp(QObject):
     def _on_transcript_playback_split_changed(self, pct: int) -> None:
         """Persist the user's new splitter ratio (debounced)."""
         self.config.ui.transcript_playback_split_top_pct = int(pct)
-        # Coalesce rapid drag events into one disk write 500 ms after
-        # the last move; starting a running timer just resets it.
-        if not hasattr(self, "_save_split_timer"):
-            self._save_split_timer = QTimer(self)
-            self._save_split_timer.setSingleShot(True)
-            self._save_split_timer.setInterval(500)
-            self._save_split_timer.timeout.connect(self.config.save)
+        self._schedule_config_save()
+
+    def _schedule_config_save(self) -> None:
+        """Debounced config.save(): coalesce rapid UI changes (splitter
+        drags) into one disk write 500 ms after the last one; starting
+        a running timer just resets it.
+
+        Created on first use. The sort-header handler used to call
+        _save_split_timer.start() directly, but only the splitter
+        handler created the timer (and never started it), so a sort
+        click before any splitter drag raised AttributeError.
+        """
+        timer = getattr(self, "_save_split_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(500)
+            timer.timeout.connect(self.config.save)
+            self._save_split_timer = timer
+        timer.start()
 
     def _persist_window_layout(self) -> None:
         """Serialize + write window size/position + splitter state
@@ -552,7 +574,6 @@ class MainApp(QObject):
         # Saved synchronously -- this is a one-shot user click, not a
         # drag event that would benefit from debouncing.
         self.config.save()
-        self._save_split_timer.start()
 
     def _apply_synthesis_automation(self) -> None:
         """Push the current setting state into the SessionView, swapping
@@ -1609,6 +1630,9 @@ class MainApp(QObject):
         # transcribe + speaker pipeline against it.
         self.window.import_audio_requested.connect(
             self._on_file_menu_import_audio,
+        )
+        self.window.transcribe_recording_requested.connect(
+            self._on_transcribe_failed_recording,
         )
         # View menu (v0.7.7).
         self.window.pop_out_notes_preview_requested.connect(
@@ -3183,6 +3207,39 @@ class MainApp(QObject):
             sys_wav=result.decoded_wav_path if result.slot == "sys" else None,
             run_diarization=result.run_diarization,
         )
+
+    def _on_transcribe_failed_recording(self, session_id: str) -> None:
+        """File > Transcribe Failed Recording... / list context menu.
+
+        Re-runs the batch transcription + speaker pipeline over the
+        audio a crashed recording left on disk. The controller mixes
+        any orphaned per-endpoint system-audio tracks first.
+        """
+        session = self.store.get_session(session_id)
+        if session is None:
+            return
+        if session.state != STATE_ERROR:
+            QMessageBox.information(
+                self.window, "Transcribe Failed Recording",
+                "Only sessions marked as failed (after an interrupted "
+                "recording) can be transcribed this way.",
+            )
+            return
+        reply = QMessageBox.question(
+            self.window,
+            "Transcribe Failed Recording",
+            f"Transcribe the recording left by \"{session.title}\"?\n\n"
+            "The full transcription pass runs over the saved audio and "
+            "replaces any partial transcript. This can take a while for a "
+            "long meeting. The audio is kept afterwards regardless of the "
+            "session's Keep recording setting.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if self.controller.transcribe_failed_session(session):
+            self.window.status("Transcribing the failed recording...", timeout_ms=6000)
 
     def _on_file_menu_import_transcript(self) -> None:
         """File > Import Transcript... -- forwards to the same handler
@@ -6389,13 +6446,18 @@ class MainApp(QObject):
         orphans = self.controller.recover_orphans()
         if not orphans:
             return
+        # The list was built before the orphans were flipped to error;
+        # rebuild it so the state badge and the per-state actions
+        # (Transcribe Failed Recording) see the new state.
+        self._refresh_session_list()
         titles = "\n".join(f"  - {s.title} ({s.state})" for s in orphans)
         QMessageBox.information(
             self.window,
             "Crash Recovery",
             "Found sessions left mid-recording from a previous run. They have been marked "
-            "as 'error' so you can decide whether to keep the partial transcripts or delete "
-            "them.\n\n" + titles,
+            "as 'error'. To transcribe what was recorded, select one and choose "
+            "File > Transcribe Failed Recording... (also on the right-click menu).\n\n"
+            + titles,
         )
 
     # ---- misc -------------------------------------------------------------
@@ -6930,6 +6992,10 @@ def main() -> int:
             logging.FileHandler(str(log_path()), encoding="utf-8"),
         ],
     )
+    # Must precede any signal/slot traffic: without a replaced
+    # sys.excepthook, PyQt6 turns an exception escaping a slot into
+    # qFatal(), which kills the windowed build with no trace in the log.
+    crash_guard.install()
 
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName("Meeting Notetaker")
