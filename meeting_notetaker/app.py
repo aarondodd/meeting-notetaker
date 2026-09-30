@@ -524,13 +524,26 @@ class MainApp(QObject):
     def _on_transcript_playback_split_changed(self, pct: int) -> None:
         """Persist the user's new splitter ratio (debounced)."""
         self.config.ui.transcript_playback_split_top_pct = int(pct)
-        # Coalesce rapid drag events into one disk write 500 ms after
-        # the last move; starting a running timer just resets it.
-        if not hasattr(self, "_save_split_timer"):
-            self._save_split_timer = QTimer(self)
-            self._save_split_timer.setSingleShot(True)
-            self._save_split_timer.setInterval(500)
-            self._save_split_timer.timeout.connect(self.config.save)
+        self._schedule_config_save()
+
+    def _schedule_config_save(self) -> None:
+        """Debounced config.save(): coalesce rapid UI changes (splitter
+        drags) into one disk write 500 ms after the last one; starting
+        a running timer just resets it.
+
+        Created on first use. The sort-header handler used to call
+        _save_split_timer.start() directly, but only the splitter
+        handler created the timer (and never started it), so a sort
+        click before any splitter drag raised AttributeError.
+        """
+        timer = getattr(self, "_save_split_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(500)
+            timer.timeout.connect(self.config.save)
+            self._save_split_timer = timer
+        timer.start()
 
     def _persist_window_layout(self) -> None:
         """Serialize + write window size/position + splitter state
@@ -561,7 +574,6 @@ class MainApp(QObject):
         # Saved synchronously -- this is a one-shot user click, not a
         # drag event that would benefit from debouncing.
         self.config.save()
-        self._save_split_timer.start()
 
     def _apply_synthesis_automation(self) -> None:
         """Push the current setting state into the SessionView, swapping
