@@ -375,6 +375,19 @@ list:
 - **Delete recording...** -- removes the audio files but keeps
   the transcript + notes.
 
+## Transcribing a failed recording
+
+If the app exits while a session is recording, the next launch marks
+that session as failed (the red cross in the state column) and lists
+it in a Crash Recovery dialog. The audio captured up to that point is
+still on disk. Select the session and choose **File > Transcribe
+Failed Recording...** (also on the session list's right-click menu)
+to run the full transcription and speaker pass over it. With
+multi-endpoint capture on, the per-endpoint system-audio tracks the
+interrupted recording never mixed are combined first. The audio is
+kept afterwards even if the session was not set to keep its
+recording, so a bad transcription pass never costs you the source.
+
 ## Importing a transcript (no recording)
 
 Sometimes a meeting happens without a local recording -- you joined

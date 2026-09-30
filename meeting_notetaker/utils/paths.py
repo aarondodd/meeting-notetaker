@@ -84,6 +84,60 @@ def session_audio_files(session_id: str) -> list[Path]:
     return out
 
 
+# A WAV header alone is 44 bytes; anything at or below that holds no PCM.
+_WAV_HEADER_BYTES = 44
+
+
+def _has_pcm(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > _WAV_HEADER_BYTES
+    except OSError:
+        return False
+
+
+class RecoverableRecording:
+    """The raw capture a session left on disk, for re-transcription.
+
+    A recording interrupted by a crash never reaches Stop, so the
+    multi-endpoint loopback sidecars (`sys.0.wav`, `sys.1.wav`, ...)
+    are never mixed into `sys.wav` and never deleted. `sidecars` lists
+    them so the caller can mix before transcribing.
+    """
+
+    def __init__(self, mic: Path | None, sys_wav: Path | None, sidecars: list[Path]):
+        self.mic = mic
+        self.sys = sys_wav
+        self.sidecars = sidecars
+
+    @property
+    def usable(self) -> bool:
+        return self.mic is not None or self.sys is not None or bool(self.sidecars)
+
+
+def recoverable_recording(session_id: str) -> RecoverableRecording:
+    """Find the uncompressed capture files a session can be re-transcribed from.
+
+    Only WAVs count: an .opus / .flac file means the session already
+    went through finalize, so it is not a failed capture.
+    """
+    audio_dir = session_dir(session_id) / "audio"
+    if not audio_dir.is_dir():
+        return RecoverableRecording(None, None, [])
+    mic = audio_dir / "mic.wav"
+    sys_wav = audio_dir / "sys.wav"
+    sidecars = []
+    for p in audio_dir.glob("sys.*.wav"):
+        idx = p.name[len("sys."):-len(".wav")]
+        if idx.isdigit() and _has_pcm(p):
+            sidecars.append(p)
+    sidecars.sort(key=lambda p: int(p.name[len("sys."):-len(".wav")]))
+    return RecoverableRecording(
+        mic if _has_pcm(mic) else None,
+        sys_wav if _has_pcm(sys_wav) else None,
+        sidecars,
+    )
+
+
 def has_retained_audio(session_id: str) -> bool:
     return bool(session_audio_files(session_id))
 
