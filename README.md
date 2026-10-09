@@ -9,19 +9,36 @@ for synthesis by any LLM you trust -- either via clipboard or a
 bundled Chrome extension that drives Claude.ai for you. No audio
 leaves the machine; no API key required.
 
-**Status:** v0.7.13. End-to-end capture, transcription, synthesis,
+**Status:** v0.7.14. End-to-end capture, transcription, synthesis,
 screen capture, retained-audio playback + export, and transcript-
-synchronized playback all working. v0.7.13 hardens the Chrome
-extension's composer selection against a class of 10-min silent
-hangs: the composer probe now walks its selector list in priority
-order (a bare `textarea` catch-all previously matched ambient page
-elements before Claude's TipTap composer mounted), and
-`pasteIntoComposer` verifies the composer actually grew instead of
-trusting a paste path's optimistic return. If a paste lands in the
-wrong element the extension now fails fast with a diagnostic log
-rather than waiting on a response that will never stream. Builds
-directly on v0.7.12's TipTap fix (`chrome.scripting.executeScript`
-with `world: 'MAIN'`) and Settings > Edit Prompts crash fix.
+synchronized playback all working. v0.7.14 keeps the app alive when
+an exception escapes a Qt slot and lets you re-transcribe a crashed
+recording. Previously PyQt6 turned any such exception into
+`qFatal()`, and the windowed Windows build has no stderr and no
+console, so the process vanished with nothing in the log; on top of
+that, `__fastfail` on Windows bypasses the faulthandler hook the
+MainLoopWatchdog installs. `utils/crash_guard.py` now installs
+`sys.excepthook`, `threading.excepthook` and a Qt message handler at
+startup, so the traceback lands in `meeting_notetaker.log` with
+"Unhandled exception (app kept running)" and the status bar surfaces
+a brief notice. One concrete trigger is fixed in the same release:
+`_on_session_list_sort_changed` referenced a `_save_split_timer`
+only created by the transcript/playback splitter handler, so a
+Date/Title header click before any splitter drag raised
+`AttributeError` and killed the app; present since v0.6.5. File >
+Transcribe Failed Recording (also on the session list's right-click
+menu) re-runs the batch + speaker pipeline over the WAVs a crashed
+session left on disk; orphaned per-endpoint `sys.N.wav` sidecars
+are mixed into `sys.wav` off the GUI thread first. The batch pass
+is forced on and the audio is always kept for this path, so a bad
+transcription never costs the source. `mix_sidecar_wavs` now streams
+in ~1 s blocks (a 75-minute four-endpoint meeting is ~3.5 GB of PCM;
+the old in-memory algorithm peaked several times that). The session
+list is refreshed after crash recovery so the error badge and the
+new action appear immediately. Builds on v0.7.13's composer
+selector-priority walk and `pasteIntoComposer` grow assertion,
+v0.7.12's TipTap fix (`chrome.scripting.executeScript` with `world:
+'MAIN'`) and Settings > Edit Prompts crash fix.
 `scripts/probe-claude.js` also gains a broad button snapshot when
 strict send-button selectors match zero, so a future DOM rename
 surfaces the new label without another round-trip. v0.7.11 shipped a stack of fixes

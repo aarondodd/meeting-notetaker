@@ -218,11 +218,38 @@ correctness assertions.
 
 ## Status
 
-Released version is v0.7.12 (tag `v0.7.12`, 2026-08-04). Test suite is 2340
-passing, 1 skipped as of v0.7.11. The per-version notes below stop at v0.6.4 and
-were never carried forward through the v0.7.x line; treat `git log` and the
-GitHub releases page as authoritative for anything after v0.6.4, and read the
-"v0.6.4 (current)" heading below as "v0.6.4 (last version documented here)".
+Released version is v0.7.14 (tag `v0.7.14`, 2026-10-09), which shipped PR #133
+(squash-merge `f85052d`): PyQt6 slot exceptions now land in the log instead of
+killing the windowed build (`utils/crash_guard.py` installs `sys.excepthook`,
+`threading.excepthook` and a Qt message handler at startup, so a traceback
+reaches `meeting_notetaker.log` as "Unhandled exception (app kept running)" and
+the status bar surfaces the error without a modal). One concrete trigger was
+fixed in the same release: `_on_session_list_sort_changed` referenced a
+`_save_split_timer` only created by the splitter handler, so a Date/Title
+header click before any splitter drag raised `AttributeError` and killed the
+app (present since v0.6.5 f656904); the sort handler already saves
+synchronously so the stray start was removed, and the splitter handler was
+rewritten to create the timer on first use through a shared
+`_schedule_config_save` helper. File > Transcribe Failed Recording (also on
+the session list's right-click menu) re-runs the batch + speaker pipeline over
+the WAVs a crashed recording left on disk; orphaned multi-endpoint
+`sys.N.wav` sidecars are mixed off the GUI thread first by a new
+`_SidecarMixThread`, and `transcribe_failed_session` on the controller forces
+the batch pass on and sets `keep_audio` so a bad pass never deletes the only
+copy. `mix_sidecar_wavs` was rewritten to stream in ~1 s blocks; a reference
+test pins the output byte-identical to the old in-memory algorithm across
+block boundaries. The session list is now refreshed after crash recovery so
+recovered sessions show the error badge instead of the stale recording badge.
+Test suite collects 2368 on main (3 new test files, 14 new tests). Aaron
+confirmed the fix on his laptop before release. The extension manifest reads
+0.7.15 against this 0.7.14 release: the offset is deliberate dev-loop
+cache-busting so Chrome force-reloads on the next "Load unpacked", mirroring
+the pattern v0.7.12 and v0.7.13 shipped with. The per-version notes below
+stop at v0.6.4 and were never carried forward through the v0.7.x line; treat
+`git log` and the GitHub releases page as authoritative for anything after
+v0.6.4, and read the "v0.6.4 (current)" heading below as "v0.6.4 (last
+version documented here)". Whether a session-list crash can still happen from
+some other raising line is unknown until the guard logs the next occurrence.
 
 Maintenance note (2026-08-05): this file is ~410 lines against a 300-line soft
 limit, and the cheapest way back under it is compressing the pre-v0.6.4
