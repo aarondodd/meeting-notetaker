@@ -188,3 +188,38 @@ def test_sidecar_path_format(tmp_path, qt_app=None):
     )
     assert rec._sidecar_path(0) == tmp_path / "sys.0.wav"  # noqa: SLF001
     assert rec._sidecar_path(3) == tmp_path / "sys.3.wav"  # noqa: SLF001
+
+
+def _reference_mix(arrays: list[np.ndarray]) -> np.ndarray:
+    """The pre-streaming in-memory algorithm, kept as the oracle."""
+    max_len = max(a.size for a in arrays)
+    acc = np.zeros(max_len, dtype=np.int32)
+    for a in arrays:
+        pad = np.zeros(max_len, dtype=np.int32)
+        pad[-a.size:] = a.astype(np.int32)
+        acc += pad
+    return (acc // len(arrays)).astype(np.int16)
+
+
+def test_mix_streaming_matches_in_memory_reference_across_blocks(tmp_path, monkeypatch):
+    # Small block size so the three sidecars span many blocks and the
+    # end-alignment offsets land mid-block.
+    import meeting_notetaker.audio.multi_loopback as ml
+    monkeypatch.setattr(ml, "_MIX_BLOCK_FRAMES", 7)
+    rng = np.random.default_rng(0)
+    frame_counts = [53, 41, 12]
+    arrays = []
+    paths = []
+    for i, n in enumerate(frame_counts):
+        a = rng.integers(-30000, 30000, size=n * 2, dtype=np.int16)
+        p = tmp_path / f"sys.{i}.wav"
+        _write_wav(p, a, rate=48000, channels=2)
+        arrays.append(a)
+        paths.append(p)
+    out = tmp_path / "sys.wav"
+    assert mix_sidecar_wavs(paths, out) is True
+    with wave.open(str(out), "rb") as rf:
+        assert rf.getnchannels() == 2
+        assert rf.getnframes() == 53
+        got = np.frombuffer(rf.readframes(rf.getnframes()), dtype=np.int16)
+    np.testing.assert_array_equal(got, _reference_mix(arrays))

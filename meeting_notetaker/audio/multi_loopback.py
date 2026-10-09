@@ -107,23 +107,10 @@ def discover_output_endpoints() -> list[dict]:
     return out
 
 
-def _read_wav(path: Path) -> tuple[np.ndarray, int, int]:
-    """Read a WAV into (samples_int16, sample_rate, channels). Empty for missing."""
-    if not path.exists():
-        return np.zeros(0, dtype=np.int16), 0, 0
-    with wave.open(str(path), "rb") as rf:
-        rate = rf.getframerate()
-        ch = rf.getnchannels()
-        sample_width = rf.getsampwidth()
-        if sample_width != 2:
-            log.warning(
-                "_read_wav: %s has sample_width=%d, expected 2; skipping",
-                path, sample_width,
-            )
-            return np.zeros(0, dtype=np.int16), rate, ch
-        raw = rf.readframes(rf.getnframes())
-    pcm = np.frombuffer(raw, dtype=np.int16)
-    return pcm, rate, ch
+# Frames per mixing block. At 48 kHz stereo this is ~1 s of audio,
+# so peak memory stays at a few MB per sidecar regardless of how long
+# the recording ran.
+_MIX_BLOCK_FRAMES = 48000
 
 
 def mix_sidecar_wavs(
@@ -136,51 +123,83 @@ def mix_sidecar_wavs(
     to LoopbackRecorder._maybe_pad_wav at Stop (which pads leading +
     trailing silence). Length differences past that point are end-
     aligned by leading-zero padding so a hot-plug endpoint that
-    joined late doesn't pull the rest of the mix earlier.
+    joined late doesn't pull the rest of the mix earlier. End
+    alignment is also right for sidecars orphaned by a crash, which
+    all stopped at the same moment.
 
     Returns True on a successful write. Mismatched sample rates or
     channel counts across sidecars trip a log warning and the mixer
     picks the most common shape; minority-shape sidecars are dropped.
+
+    Streams in blocks of `_MIX_BLOCK_FRAMES`: a 75-minute meeting
+    captured on four endpoints is ~3.5 GB of int16 PCM, and loading it
+    whole (plus the int32 accumulator) needs several times that.
     """
     if not sidecar_paths:
         return False
-    decoded: list[tuple[np.ndarray, int, int]] = []
-    for p in sidecar_paths:
-        pcm, rate, ch = _read_wav(p)
-        if pcm.size == 0:
-            continue
-        decoded.append((pcm, rate, ch))
-    if not decoded:
-        return False
-    # Pick the most common (rate, channels) pair; drop the rest.
-    shapes = [(rate, ch) for _, rate, ch in decoded]
-    shape_counts: dict[tuple[int, int], int] = {}
-    for s in shapes:
-        shape_counts[s] = shape_counts.get(s, 0) + 1
-    winner_shape = max(shape_counts, key=shape_counts.get)
-    decoded = [(p, r, c) for (p, r, c) in decoded if (r, c) == winner_shape]
-    rate, channels = winner_shape
-    # Sum sample-wise. Promote to int32 so the sum stays within range.
-    # Divide by N to avoid clipping when multiple endpoints are
-    # simultaneously loud (rare; one endpoint usually dominates).
-    max_len = max(pcm.size for pcm, _, _ in decoded)
-    acc = np.zeros(max_len, dtype=np.int32)
-    for pcm, _, _ in decoded:
-        if pcm.size < max_len:
-            pad = np.zeros(max_len, dtype=np.int32)
-            pad[-pcm.size:] = pcm.astype(np.int32)
-            acc += pad
-        else:
-            acc += pcm.astype(np.int32)
-    acc = acc // len(decoded)
-    mixed = acc.astype(np.int16)
-    canonical_path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(canonical_path), "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        wf.writeframes(mixed.tobytes())
-    return True
+    readers: list[wave.Wave_read] = []
+    try:
+        opened: list[tuple[wave.Wave_read, int, int, int]] = []
+        for p in sidecar_paths:
+            if not Path(p).exists():
+                continue
+            rf = wave.open(str(p), "rb")
+            readers.append(rf)
+            if rf.getsampwidth() != 2:
+                log.warning(
+                    "mix_sidecar_wavs: %s has sample_width=%d, expected 2; skipping",
+                    p, rf.getsampwidth(),
+                )
+                continue
+            if rf.getnframes() == 0:
+                continue
+            opened.append((rf, rf.getframerate(), rf.getnchannels(), rf.getnframes()))
+        if not opened:
+            return False
+        shape_counts: dict[tuple[int, int], int] = {}
+        for _, rate, ch, _ in opened:
+            shape_counts[(rate, ch)] = shape_counts.get((rate, ch), 0) + 1
+        winner_shape = max(shape_counts, key=shape_counts.get)
+        dropped = [o for o in opened if (o[1], o[2]) != winner_shape]
+        if dropped:
+            log.warning(
+                "mix_sidecar_wavs: dropping %d sidecar(s) whose (rate, channels) "
+                "differs from %s", len(dropped), winner_shape,
+            )
+        sources = [(rf, n) for rf, r, c, n in opened if (r, c) == winner_shape]
+        rate, channels = winner_shape
+        max_frames = max(n for _, n in sources)
+        divisor = len(sources)
+        canonical_path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(canonical_path), "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            pos = 0
+            while pos < max_frames:
+                block = min(_MIX_BLOCK_FRAMES, max_frames - pos)
+                acc = np.zeros(block * channels, dtype=np.int32)
+                for rf, n in sources:
+                    # Source starts (max_frames - n) frames in; frames
+                    # before that are the leading-silence pad.
+                    offset = max_frames - n
+                    lo = max(pos, offset)
+                    hi = pos + block
+                    if lo >= hi:
+                        continue
+                    pcm = np.frombuffer(rf.readframes(hi - lo), dtype=np.int16)
+                    dst = (lo - pos) * channels
+                    acc[dst:dst + pcm.size] += pcm
+                acc //= divisor
+                wf.writeframes(acc.astype(np.int16).tobytes())
+                pos += block
+        return True
+    finally:
+        for rf in readers:
+            try:
+                rf.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class MultiEndpointLoopbackRecorder(QObject):

@@ -60,7 +60,7 @@ from .transcription import model_manager
 from .transcription.worker import LiveTranscriptionWorker, batch_transcribe, interleave
 from .utils.config import Config
 from .utils.live_notes import extract_section, parse_attendees
-from .utils.paths import app_data_dir, session_audio_dir, session_dir
+from .utils.paths import app_data_dir, recoverable_recording, session_audio_dir, session_dir
 from .utils.vocabulary import derive_session_hotwords, join_hotwords, load_vocabulary
 
 
@@ -142,6 +142,52 @@ class _RetainedAudioEncodeWorker(QThread):
             )
         finally:
             self.done.emit()
+
+
+class _SidecarMixThread(QThread):
+    """Mix orphaned multi-endpoint loopback sidecars into sys.wav off
+    the GUI thread (failed-session recovery). Emits done(ok)."""
+
+    done = pyqtSignal(bool)
+
+    def __init__(self, sidecars: list[Path], target: Path) -> None:
+        super().__init__(None)
+        self._sidecars = list(sidecars)
+        self._target = target
+
+    def run(self) -> None:
+        ok = False
+        try:
+            from .audio.multi_loopback import mix_sidecar_wavs  # noqa: PLC0415
+            ok = mix_sidecar_wavs(self._sidecars, self._target)
+        except Exception:
+            log.exception("recovery: mix_sidecar_wavs raised")
+        finally:
+            self.done.emit(ok)
+
+
+def _wav_duration_seconds(path: Path) -> Optional[float]:
+    import wave  # noqa: PLC0415
+    try:
+        with wave.open(str(path), "rb") as rf:
+            rate = rf.getframerate()
+            return rf.getnframes() / rate if rate else None
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
+def _estimate_ended_at(started_at: Optional[str], duration: Optional[float]) -> str:
+    """started_at + recorded duration, or now when either is unknown."""
+    if started_at and duration is not None:
+        try:
+            start = datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc,
+            )
+            end = start.timestamp() + duration
+            return datetime.fromtimestamp(end, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass
+    return utc_now_iso()
 
 
 class _BatchTranscribeThread(QThread):
@@ -390,6 +436,11 @@ class _ProcessingState:
     # _finalize_session time. Held here so the worker survives until
     # its finished signal fires.
     encode_worker: Optional["_RetainedAudioEncodeWorker"] = None
+    # Set for re-transcription of a failed recording: finalize keeps the
+    # audio even when the session is not set to retain it, because the
+    # WAVs are the only copy of the meeting and a bad batch result must
+    # not be followed by their deletion.
+    keep_audio: bool = False
 
 
 class SessionController(QObject):
@@ -464,6 +515,9 @@ class SessionController(QObject):
         # the live-engine teardown so a follow-on recording can start while
         # this session's batch + speaker passes run in the background.
         self._processing_sessions: dict[str, _ProcessingState] = {}
+        # Failed-session recovery: sidecar-mix workers still running,
+        # keyed by session id. Processing proper starts when one finishes.
+        self._recovery_mixers: dict[str, "_SidecarMixThread"] = {}
 
     def _collect_hotwords(self, session: Session) -> str:
         """Combine global vocabulary + this session's attendees + agenda proper nouns.
@@ -856,17 +910,43 @@ class SessionController(QObject):
                 "Import audio: neither mic nor system track was provided."
             )
             return
+        # Imported sessions don't have an Outlook-style ended_at; set it
+        # to now so the session list shows them as completed.
+        self._start_disk_processing(
+            session,
+            mic_wav=mic_wav,
+            sys_wav=sys_wav,
+            run_diarization=run_diarization,
+            ended_at=utc_now_iso(),
+        )
 
+    def _start_disk_processing(
+        self,
+        session: Session,
+        *,
+        mic_wav: Optional[Path],
+        sys_wav: Optional[Path],
+        run_diarization: bool,
+        ended_at: str,
+        speaker_tags: Optional[list[SpeakerTag]] = None,
+        force_batch: bool = False,
+        keep_audio: bool = False,
+        duration_seconds: Optional[int] = None,
+    ) -> None:
+        """Shared core of import-audio and failed-session recovery:
+        run on-disk WAVs through batch transcription + speaker
+        refinement + finalize, exactly as the post-Stop path does."""
         hotwords = self._collect_hotwords(session)
         proc_state = _ProcessingState(
             session=session,
             mic_wav=mic_wav,
             sys_wav=sys_wav,
             live_segments=[],
-            speaker_tags=[],
+            speaker_tags=list(speaker_tags or []),
+            keep_audio=keep_audio,
         )
         self._processing_sessions[session.id] = proc_state
-        skip_batch = self.config.transcription.skip_batch_refinement
+        skip_batch = self.config.transcription.skip_batch_refinement and not force_batch
         will_run_refinement = bool(
             run_diarization
             and self.config.speakers.enabled
@@ -878,12 +958,10 @@ class SessionController(QObject):
             will_run_refinement=will_run_refinement,
         )
 
-        # Imported sessions don't have an Outlook-style ended_at; set it
-        # to now so the session list shows them as completed.
-        self.store.update_session(
-            session.id,
-            ended_at=utc_now_iso(),
-        )
+        end_fields: dict = {"ended_at": ended_at}
+        if duration_seconds is not None:
+            end_fields["duration_seconds"] = duration_seconds
+        self.store.update_session(session.id, **end_fields)
 
         if skip_batch:
             self._finalize_session(session.id, batch_segments=None)
@@ -915,6 +993,114 @@ class SessionController(QObject):
         batch_thread.failed.connect(lambda msg, _sid=sid: self._on_batch_failed(_sid, msg))
         proc_state.batch_thread = batch_thread
         batch_thread.start()
+
+    # ---- failed-session recovery ---------------------------------------
+
+    def transcribe_failed_session(self, session: Session) -> bool:
+        """Re-run transcription for a session whose recording was cut
+        off (state ERROR after crash recovery) from the WAVs it left.
+
+        A crash mid-recording leaves mic.wav plus, in multi-endpoint
+        mode, the unmixed per-endpoint sys.N.wav sidecars. Those are
+        mixed into sys.wav off the GUI thread first, then the session
+        goes through the same batch + speaker + finalize path as a
+        normal Stop. The batch pass always runs here, even with
+        skip_batch_refinement on, since the live transcript of a
+        crashed session is partial; and the audio is always kept.
+
+        Returns True if processing (or the mix that precedes it) started.
+        """
+        if self._active_recording_session is not None:
+            self.error.emit("Stop the active recording before transcribing another session.")
+            return False
+        if session.id in self._processing_sessions or session.id in self._recovery_mixers:
+            self.error.emit("This session is already being processed.")
+            return False
+        rec = recoverable_recording(session.id)
+        if not rec.usable:
+            self.error.emit("No recording was found on disk for this session.")
+            return False
+        self.store.update_session(session.id, state=STATE_PROCESSING)
+        session.state = STATE_PROCESSING
+        self.state_changed.emit(session.id, STATE_PROCESSING)
+        if rec.sys is None and rec.sidecars:
+            self.status.emit(
+                f"Mixing {len(rec.sidecars)} system-audio track(s) from the "
+                "interrupted recording..."
+            )
+            worker = _SidecarMixThread(rec.sidecars, session_audio_dir(session.id) / "sys.wav")
+            worker.done.connect(
+                lambda ok, _s=session, _mic=rec.mic, _sc=rec.sidecars:
+                    self._on_recovery_mix_done(_s, _mic, _sc, ok)
+            )
+            self._recovery_mixers[session.id] = worker
+            worker.start()
+            return True
+        self._start_recovery_processing(session, rec.mic, rec.sys)
+        return True
+
+    def _on_recovery_mix_done(
+        self,
+        session: Session,
+        mic_wav: Optional[Path],
+        sidecars: list[Path],
+        ok: bool,
+    ) -> None:
+        _retire_thread(self._recovery_mixers.pop(session.id, None))
+        sys_wav: Optional[Path] = recoverable_recording(session.id).sys if ok else None
+        if sys_wav is not None:
+            # Same disk discipline as MultiEndpointLoopbackRecorder.stop:
+            # once sys.wav holds the mix, the sidecars are redundant.
+            for sp in sidecars:
+                try:
+                    sp.unlink()
+                except OSError:
+                    log.warning("could not delete sidecar %s", sp)
+        else:
+            log.warning("recovery: sidecar mix failed for %s", session.id)
+            if mic_wav is None:
+                self.store.update_session(session.id, state=STATE_ERROR)
+                session.state = STATE_ERROR
+                self.state_changed.emit(session.id, STATE_ERROR)
+                self.error.emit(
+                    "Could not mix the system-audio tracks and there is no "
+                    "microphone track; nothing to transcribe. The files are "
+                    "still in the session's audio folder."
+                )
+                return
+            self.status.emit(
+                "System-audio mix failed; transcribing the microphone track only."
+            )
+        self._start_recovery_processing(session, mic_wav, sys_wav)
+
+    def _start_recovery_processing(
+        self,
+        session: Session,
+        mic_wav: Optional[Path],
+        sys_wav: Optional[Path],
+    ) -> None:
+        tags: list[SpeakerTag] = []
+        try:
+            tags = SpeakerTagStore(session_dir(session.id)).load()
+        except Exception:
+            log.exception("recovery: speaker tags unreadable for %s", session.id)
+        duration = max(
+            (_wav_duration_seconds(p) for p in (mic_wav, sys_wav) if p is not None),
+            default=None,
+        )
+        self._start_disk_processing(
+            session,
+            mic_wav=mic_wav,
+            sys_wav=sys_wav,
+            run_diarization=True,
+            speaker_tags=tags,
+            ended_at=session.ended_at or _estimate_ended_at(session.started_at, duration),
+            duration_seconds=(
+                int(duration) if duration is not None and not session.duration_seconds else None
+            ),
+            force_batch=True,
+            keep_audio=True,
+        )
 
     def stop_session(self) -> None:
         if self._active_recording_session is None:
@@ -1059,7 +1245,7 @@ class SessionController(QObject):
             store.write_segments(batch_segments)
             self.store.update_session(session.id, has_transcript=True)
             self.transcript_replaced.emit(session.id, batch_segments)
-        if not session.retain_audio:
+        if not session.retain_audio and not proc_state.keep_audio:
             audio_dir = session_audio_dir(session.id)
             try:
                 shutil.rmtree(audio_dir, ignore_errors=True)
