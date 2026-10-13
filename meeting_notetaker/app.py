@@ -6997,7 +6997,12 @@ def main() -> int:
     # qFatal(), which kills the windowed build with no trace in the log.
     crash_guard.install()
 
-    qt_app = QApplication(sys.argv)
+    # Pull --force out of argv before QApplication sees it; Qt otherwise
+    # logs an unknown-option warning for every unrecognised dash flag.
+    force_lock = "--force" in sys.argv[1:]
+    qt_argv = [a for a in sys.argv if a != "--force"]
+
+    qt_app = QApplication(qt_argv)
     qt_app.setApplicationName("Meeting Notetaker")
     qt_app.setApplicationDisplayName("Meeting Notetaker")
     qt_app.setOrganizationName("Aaron Dodd")
@@ -7005,14 +7010,22 @@ def main() -> int:
     qt_app.setQuitOnLastWindowClosed(False)
     qt_app.setWindowIcon(app_icon())
 
-    if not acquire_lock():
-        QMessageBox.information(
+    if not acquire_lock(force=force_lock):
+        reply = QMessageBox.question(
             None,
             "Meeting Notetaker",
-            "Another Meeting Notetaker instance is already running.\n"
-            "Click its tray icon to bring the window forward.",
+            "Another Meeting Notetaker instance appears to be running.\n"
+            "Click its tray icon to bring the window forward.\n\n"
+            "If no window exists, the previous run may have left a stale lock. "
+            "Start anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        return 0
+        if reply != QMessageBox.StandardButton.Yes:
+            return 0
+        # Second attempt forces past the lockfile. Launching with --force
+        # from the command line gets to the same place without the prompt.
+        acquire_lock(force=True)
 
     app = MainApp(qt_app)
     try:
