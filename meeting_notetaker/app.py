@@ -17,14 +17,6 @@ from typing import Callable, Optional
 from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from .automation import messages as automation_messages
-from .automation.bridge import Bridge, HandshakeState
-from .automation.targets import get_target
-from .utils.chrome_process import (
-    SynthesisConnectionState,
-    is_chrome_running,
-    launch_chrome,
-)
 from .controller import SessionController
 from .diarization.persistence import (
     load_diarization,
@@ -96,7 +88,6 @@ from .utils.main_loop_watchdog import MainLoopWatchdog
 from .utils.paths import (
     app_data_dir,
     audio_session_state_path,
-    bridge_handshake_path,
     calendar_state_path,
     log_path,
     rotate_log_on_launch,
@@ -139,21 +130,6 @@ def _upgrade_path_blurb() -> str:
 
 
 class MainApp(QObject):
-    # Cross-thread inbound message from the synthesis bridge. The bridge
-    # reader runs on its own worker thread; we emit this signal from
-    # that thread to bounce the message onto the Qt main thread (Qt's
-    # auto-connection promotes a cross-thread emit to QueuedConnection,
-    # which is what we want). Replaces the QTimer.singleShot(0, lambda)
-    # approach used in v1, which silently failed on Windows because
-    # QTimer's slot was registered on the bridge worker thread (no Qt
-    # event loop) and never fired (Aaron's 2026-05-22 repro: bridge
-    # received messages but the result never reached the app).
-    bridge_message_received = pyqtSignal(dict)
-    # Same thread-safety concern for connect/disconnect callbacks --
-    # they fire on the bridge's accept/reader threads and need to
-    # bounce to the main thread before touching UI / triggering a poll.
-    bridge_state_changed = pyqtSignal()
-
     def __init__(self, qt_app: QApplication) -> None:
         super().__init__()
         self.qt_app = qt_app
@@ -237,50 +213,10 @@ class MainApp(QObject):
         # we don't reload identical files on every selection.
         self._player_loaded_session_id: Optional[str] = None
 
-        # Synthesis automation bridge. Listens on a loopback port for the
-        # Chrome native-messaging host to connect; route inbound result/
-        # status events to the matching in-flight synthesis. The bridge
-        # runs whether or not the toggle is on -- letting it idle costs
-        # nothing (a single bound TCP port), and starting it lazily
-        # would mean the Verify button in the install wizard wouldn't
-        # have anything to probe against the first time.
-        self._inflight_syntheses: dict[str, str] = {}  # request_id -> session_id
-        self._bridge_ready_state: bool = False
-        self._pending_pings: dict[str, "threading.Event"] = {}
-        # #102 bug 7: track the loaded extension version (reported via
-        # pong) so we can compare against the installed manifest and
-        # ask the user to reload at chrome://extensions if needed. The
-        # check runs single-shot per app launch; _extension_version_alerted
-        # latches once a dismissed-vs-current decision has been made.
-        self._loaded_extension_version: str = ""
-        self._extension_version_alerted: bool = False
-        self._bridge = Bridge(
-            handshake_file=bridge_handshake_path(),
-            on_message=self._on_bridge_message,
-            on_connect=self._on_bridge_connect,
-            on_disconnect=self._on_bridge_disconnect,
-            app_version=__version__,
-        )
-        try:
-            self._bridge.start()
-        except OSError:
-            log.exception("synthesis bridge failed to bind a loopback port")
-        # Three-state synthesis connection: Chrome-running x bridge-
-        # connected. The poll runs every 5s, the keep-alive ping runs
-        # every 25s but only when state==RUNNING_CONNECTED. Both timers
-        # start in _wire_signals so they exist before any UI shows.
-        self._synth_state = SynthesisConnectionState.NOT_RUNNING
-        self._synth_poll_timer = QTimer(self)
-        self._synth_poll_timer.setInterval(5000)
-        self._synth_poll_timer.timeout.connect(self._poll_synthesis_state)
-        self._synth_keepalive_timer = QTimer(self)
-        self._synth_keepalive_timer.setInterval(25000)
-        self._synth_keepalive_timer.timeout.connect(self._send_keepalive_ping)
-        # Bridge worker thread emits these signals; the connects below
-        # auto-promote to QueuedConnection so the slots run on the
-        # main thread regardless of which thread emitted.
-        self.bridge_message_received.connect(self._dispatch_bridge_message)
-        self.bridge_state_changed.connect(self._poll_synthesis_state)
+        # v0.8: synthesis routes through an MCP server the user wires
+        # into their own Claude surface (Chrome extension, Claude
+        # Desktop, Claude Code). The in-app automation bridge was
+        # retired in this release; see docs/mcp-setup.md.
 
         # Cross-session search index (FTS5). Created lazily so a corrupt
         # search.db doesn't keep the app from launching; opened on first
@@ -376,13 +312,6 @@ class MainApp(QObject):
         self._wire_signals()
         self._apply_user_name()
         self._apply_fonts()
-        self._apply_synthesis_automation()
-        # Kick off the state poll immediately so the status bar shows
-        # the right indicator on first paint, then settle into the
-        # 5-second cadence.
-        self._poll_synthesis_state()
-        self._synth_poll_timer.start()
-        self._synth_keepalive_timer.start()
         self._refresh_session_list()
         self._handle_crash_recovery()
         self._warn_if_store_python()
@@ -575,333 +504,6 @@ class MainApp(QObject):
         # drag event that would benefit from debouncing.
         self.config.save()
 
-    def _apply_synthesis_automation(self) -> None:
-        """Push the current setting state into the SessionView, swapping
-        the Generate + Paste buttons for the single Send button or
-        vice-versa. Called at startup and after Settings is closed."""
-        self.window.session_view.set_automation_enabled(
-            self.config.synthesis.automation_enabled,
-            self.config.synthesis.llm_target,
-        )
-
-    # ---- synthesis automation: connection state polling --------------------
-
-    def _poll_synthesis_state(self) -> None:
-        """Re-compute the three-state synthesis-connection value and
-        propagate to the status bar + SessionView Send-button gating.
-
-        Runs every 5 seconds via _synth_poll_timer. Cheap: one psutil
-        process_iter pass + a property read on the bridge."""
-        new_state = SynthesisConnectionState.derive(
-            chrome_running=is_chrome_running(),
-            bridge_connected=self._bridge_ready_state,
-        )
-        if new_state == self._synth_state:
-            return
-        old_state = self._synth_state
-        self._synth_state = new_state
-        log.info(
-            "synthesis state: %s -> %s",
-            old_state.value,
-            new_state.value,
-        )
-        self._refresh_status_indicators()
-        # Push the gating into SessionView so the Send button reflects
-        # the new state without waiting for the next session-state event.
-        self.window.session_view.set_synthesis_connection_state(new_state)
-        # On just-became-connected transitions, fire a keepalive ping
-        # right away rather than waiting up to 25s for the next tick --
-        # the bridge is fresh and a quick pong confirms end-to-end.
-        if (
-            new_state == SynthesisConnectionState.RUNNING_CONNECTED
-            and old_state != SynthesisConnectionState.RUNNING_CONNECTED
-        ):
-            self._send_keepalive_ping()
-
-    def _send_keepalive_ping(self) -> None:
-        """Fire a ping to keep the MV3 service worker awake.
-
-        Only runs when state is RUNNING_CONNECTED -- a ping into a
-        nonexistent peer is wasted work, and we don't want to log
-        warnings every 25s when Chrome is closed."""
-        if self._synth_state != SynthesisConnectionState.RUNNING_CONNECTED:
-            return
-        ping_id = f"keepalive-{secrets.token_hex(4)}"
-        ping = automation_messages.PingRequest(request_id=ping_id)
-        if not self._bridge.send(ping):
-            log.debug("keepalive ping send failed (peer dropped)")
-
-    # ---- synthesis automation: bridge callbacks ----------------------------
-
-    def _on_bridge_connect(self, state: HandshakeState) -> None:
-        log.info(
-            "bridge: extension connected (id=%s host=%s)",
-            state.extension_id,
-            state.host_version,
-        )
-        self._bridge_ready_state = True
-        # Bounce the re-poll to the main thread via signal (these
-        # callbacks fire on the bridge's accept/reader thread).
-        self.bridge_state_changed.emit()
-
-    def _on_bridge_disconnect(self) -> None:
-        log.info("bridge: extension disconnected")
-        self._bridge_ready_state = False
-        self.bridge_state_changed.emit()
-
-    def _on_bridge_message(self, msg: dict) -> None:
-        """Inbound from the extension. Runs on the bridge's reader
-        thread.
-
-        Pongs are signaled inline (threading.Event is thread-safe) so
-        a blocking _ping_extension on the main Qt thread doesn't
-        deadlock waiting for itself; everything else is emitted via
-        pyqtSignal, which Qt auto-routes across threads using
-        QueuedConnection so the slot runs on the main thread.
-
-        We log on the bridge thread BEFORE the emit so future drops
-        can be distinguished: if the bridge-thread log fires but
-        _dispatch_bridge_message doesn't, the cross-thread bounce
-        failed (signal/connection misconfigured). If the bridge-
-        thread log doesn't fire, the message never reached the
-        bridge at all (the failure is upstream in the extension /
-        native host / TCP path).
-        """
-        msg_type = msg.get("type", "")
-        request_id = msg.get("request_id", "")
-        # Pongs arrive every keep-alive cycle (~25s) and never carry
-        # information beyond "the worker is alive"; logging them at
-        # INFO floods the production log. The Verify-wizard handshake
-        # tracks pongs via a threading.Event so the log line wasn't
-        # load-bearing for correctness either.
-        if msg_type == "pong":
-            log.debug("bridge worker: <- pong rid=%s", request_id)
-            evt = self._pending_pings.pop(request_id, None)
-            if evt is not None:
-                evt.set()
-            # Fall through to the main-thread emit so the version-
-            # skew check (#102 bug 7) can inspect extension_version.
-        else:
-            log.info("bridge worker: <- %s rid=%s", msg_type, request_id)
-        self.bridge_message_received.emit(msg)
-
-    def _on_pong_received(self, msg: dict) -> None:
-        """Capture the extension's reported version + trigger a
-        version-skew check the first time we see it (#102 bug 7)."""
-        version = str(msg.get("extension_version") or "").strip()
-        if not version:
-            return
-        if version == self._loaded_extension_version:
-            return
-        self._loaded_extension_version = version
-        log.info("extension reports version %s", version)
-        if not self._extension_version_alerted:
-            QTimer.singleShot(500, self._check_extension_version_skew)
-
-    def _check_extension_version_skew(self) -> None:
-        """Compare the bundled extension manifest version with the
-        version Chrome reported via pong. The bundle is the source of
-        truth for 'what Chrome should be running after this app build
-        is installed' -- the app installer doesn't refresh the
-        on-disk extension dir, so the user can be running an old
-        Chrome-loaded extension long after the app upgrade.
-
-        When bundled > loaded, auto-run ``extract_extension`` so the
-        on-disk files Chrome's 'Load unpacked' points at match the
-        bundle, then surface a QMessageBox telling the user to
-        reload at chrome://extensions.
-
-        No persistent dismissal: the gap closes naturally when Chrome
-        actually picks up the new files (next pong reports the new
-        version, this check returns early on the equal comparison).
-        Until then the alert reappears on each launch, because the
-        situation isn't actually resolved. The in-memory
-        ``_extension_version_alerted`` latch keeps multiple pongs in
-        a single session from re-firing the dialog.
-        """
-        if self._extension_version_alerted:
-            return
-        loaded = self._loaded_extension_version
-        if not loaded:
-            return
-        from .automation import installer as automation_installer  # noqa: PLC0415
-        try:
-            bundled = automation_installer.bundled_extension_version()
-        except Exception:
-            log.exception("Could not read bundled extension manifest")
-            return
-        if not bundled:
-            return
-        from .utils.updater import is_newer_version  # noqa: PLC0415
-        if not is_newer_version(bundled, loaded):
-            return
-        self._extension_version_alerted = True
-
-        # Refresh the on-disk extension dir from the bundle so Chrome
-        # has new files to pick up on reload. If this fails (rare:
-        # Chrome holding files open on Windows) we still surface the
-        # alert but with a longer instruction list that includes
-        # clicking Install/Verify in Settings first.
-        extract_error = ""
-        try:
-            automation_installer.extract_extension()
-            log.info(
-                "auto-refreshed extension dir from bundle v%s", bundled,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception(
-                "could not auto-refresh extension dir from bundle"
-            )
-            extract_error = str(exc)
-
-        box = QMessageBox(self.window)
-        box.setWindowTitle("Update Chrome Extension")
-        box.setIcon(QMessageBox.Icon.Information)
-        if extract_error:
-            body = (
-                f"This Meeting Notetaker build ships extension v{bundled}, "
-                f"but Chrome is still running v{loaded} from before "
-                "the app upgrade.\n\n"
-                "The app tried to refresh the on-disk extension files "
-                f"automatically but couldn't:\n\n  {extract_error}\n\n"
-                "To finish manually:\n\n"
-                "  1. Settings > Synthesis Automation > 'Install / Verify...'\n"
-                "  2. Open chrome://extensions\n"
-                "  3. Find 'Meeting Notetaker Synthesis Bridge'\n"
-                "  4. Click the circular reload (refresh) icon on its tile\n\n"
-                "Send-to-LLM keeps using the older extension until "
-                "you reload. No data is lost; only the synthesis "
-                "automation behavior is affected."
-            )
-        else:
-            body = (
-                f"This Meeting Notetaker build ships Chrome extension "
-                f"v{bundled}, but Chrome is still running v{loaded} "
-                "from before the app upgrade.\n\n"
-                "The app has refreshed the on-disk files for you. "
-                "Chrome needs one click to pick them up:\n\n"
-                "  1. Open chrome://extensions\n"
-                "  2. Find 'Meeting Notetaker Synthesis Bridge'\n"
-                "  3. Click the circular reload (refresh) icon on its tile\n\n"
-                "Send-to-LLM keeps using the older extension until "
-                "you reload. No data is lost; only the synthesis "
-                "automation behavior is affected."
-            )
-        box.setText(body)
-        box.setStandardButtons(
-            QMessageBox.StandardButton.Ok
-            | QMessageBox.StandardButton.Cancel,
-        )
-        ok_btn = box.button(QMessageBox.StandardButton.Ok)
-        ok_btn.setText("I'll reload now")
-        cancel_btn = box.button(QMessageBox.StandardButton.Cancel)
-        cancel_btn.setText("Remind me later")
-        box.exec()
-        if box.clickedButton() is ok_btn:
-            # Land the user directly on the extensions page with our
-            # row highlighted so the reload icon is one click away.
-            # Best-effort: when Chrome can't be located we leave the
-            # text-only instructions standing -- they already explain
-            # the steps. No persistent dismissal -- if the user
-            # doesn't actually reload, the next launch's pong will
-            # still report the old version and the alert will fire
-            # again. The gap closes naturally when Chrome reports
-            # the new version.
-            try:
-                opened = automation_installer.open_chrome_extensions_page()
-            except Exception:
-                log.exception("could not open chrome://extensions")
-                opened = False
-            if not opened:
-                self.window.status(
-                    "Couldn't open Chrome automatically. Open "
-                    "chrome://extensions yourself and click the "
-                    "reload icon on the Meeting Notetaker row.",
-                    timeout_ms=8000,
-                )
-
-    def _dispatch_bridge_message(self, msg: dict) -> None:
-        msg_type = msg.get("type", "")
-        request_id = msg.get("request_id", "")
-        log.info(
-            "bridge <- %s rid=%s inflight=%s",
-            msg_type,
-            request_id,
-            list(self._inflight_syntheses.keys()),
-        )
-        if msg_type == "pong":
-            self._on_pong_received(msg)
-            return
-        if msg_type == "status":
-            session_id = self._inflight_syntheses.get(request_id, "")
-            if session_id:
-                event = msg.get("event", "")
-                detail = msg.get("detail", "")
-                label = self._format_status_event(event, detail)
-                if label:
-                    self.window.status(label, timeout_ms=4000)
-                    # Mirror the status into the synthesis banner so
-                    # the user sees the same progress without having
-                    # to look at the bottom status bar.
-                    self.window.session_view.set_synthesis_in_progress(
-                        session_id, True, status_text=label,
-                    )
-            return
-        if msg_type == "result":
-            markdown = msg.get("markdown", "")
-            target = msg.get("target", "")
-            log.info(
-                "bridge result rid=%s len=%d target=%s",
-                request_id,
-                len(markdown),
-                target,
-            )
-            session_id = self._inflight_syntheses.pop(request_id, "")
-            if not session_id:
-                log.warning(
-                    "result for unknown request %s (inflight keys=%s); "
-                    "dropping %d-char synthesis",
-                    request_id,
-                    list(self._inflight_syntheses.keys()),
-                    len(markdown),
-                )
-                # Surface the orphaned result to the user instead of
-                # dropping silently -- they at least see what came
-                # back even if we can't route it to a session. Helps
-                # debug the v0.6.3 result-routing path.
-                self.window.status(
-                    f"Synthesis returned {len(markdown)} chars but "
-                    "the originating session was unrecognized -- "
-                    "see the log.",
-                    timeout_ms=10000,
-                )
-                return
-            self._handle_synthesis_result(session_id, markdown, target)
-            return
-        if msg_type == "error":
-            session_id = self._inflight_syntheses.pop(request_id, "")
-            code = msg.get("code", "unknown")
-            detail = msg.get("detail", "")
-            self._handle_synthesis_error(session_id, code, detail)
-            return
-        log.debug("ignored bridge message of type %r", msg_type)
-
-    @staticmethod
-    def _format_status_event(event: str, detail: str) -> str:
-        labels = {
-            automation_messages.STATUS_OPENING_TAB: "Synthesis: opening browser tab",
-            automation_messages.STATUS_AWAITING_LOGIN: "Synthesis: waiting for sign-in",
-            automation_messages.STATUS_PROXY_ACK_NEEDED:
-                "Synthesis: click PROCEED in the browser to acknowledge AI use",
-            automation_messages.STATUS_PROXY_ACK_CLEARED:
-                "Synthesis: proxy ack cleared, continuing",
-            automation_messages.STATUS_PASTING: "Synthesis: pasting prompt",
-            automation_messages.STATUS_AWAITING_RESPONSE: "Synthesis: waiting for response",
-            automation_messages.STATUS_RESPONSE_STREAMING: "Synthesis: response streaming",
-            automation_messages.STATUS_DONE: "Synthesis: response received",
-        }
-        return labels.get(event, "")
-
     def _strip_all_appendices(self, markdown: str) -> str:
         """Run every LLM-appendix strip helper in sequence.
 
@@ -946,7 +548,7 @@ class MainApp(QObject):
         # expected source view (matching browser text-selection paste)
         # is tight-list. No-op for any target that already returns
         # tight markdown.
-        from .automation.markdown_normalize import normalize_synthesis_markdown  # noqa: PLC0415
+        from .utils.markdown_normalize import normalize_synthesis_markdown  # noqa: PLC0415
         markdown = normalize_synthesis_markdown(markdown)
         # Parse + apply the LLM-extracted attendee details appendix
         # (issue #51 Phase 4). Done BEFORE save_notes so the parsed
@@ -1014,201 +616,6 @@ class MainApp(QObject):
             sv.refresh_button_state()
         return archive_path
 
-    def _handle_synthesis_result(self, session_id: str, markdown: str, target: str) -> None:
-        # Clear the in-progress indicator first so the banner is gone
-        # by the time any modal dialogs surface.
-        self.window.session_view.set_synthesis_in_progress(session_id, False)
-        if not markdown.strip():
-            QMessageBox.warning(
-                self.window,
-                "Synthesis Automation",
-                "The extension returned an empty response. Try again, or "
-                "fall back to the manual Generate / Paste flow by disabling "
-                "automation in Settings.",
-            )
-            return
-        try:
-            archive_path = self._apply_synthesis_result(
-                session_id, markdown, archive_existing=True,
-            )
-        except OSError:
-            log.exception("save_notes failed for %s", session_id)
-            QMessageBox.critical(
-                self.window,
-                "Synthesis Automation",
-                "Couldn't save the synthesis to disk; see the log for "
-                "details.",
-            )
-            return
-        if archive_path:
-            self.window.status(
-                f"Synthesis received. Prior notes archived to {archive_path.name}",
-                timeout_ms=8000,
-            )
-        else:
-            self.window.status("Synthesis received.", timeout_ms=5000)
-
-    def _handle_synthesis_error(self, session_id: str, code: str, detail: str) -> None:
-        # Clear the in-progress banner / re-enable Send before
-        # showing the error dialog.
-        if session_id:
-            self.window.session_view.set_synthesis_in_progress(session_id, False)
-        # The clipboard-unavailable path is the most common first-run
-        # failure (Chrome shows a per-site permission prompt on the
-        # initial programmatic clipboard read and the user has to
-        # click Allow). Treat it as informational rather than a scary
-        # "Warning" dialog -- the fix is one click and the response
-        # is still visible in the browser tab.
-        if code == automation_messages.ERR_CLIPBOARD_UNAVAILABLE:
-            QMessageBox.information(
-                self.window,
-                "Clipboard permission needed",
-                "Couldn't read Claude's response back from your browser.\n\n"
-                "Chrome requires a one-time permission grant before an "
-                "extension can read the clipboard for a given site. To "
-                "fix this:\n\n"
-                "1. Switch to your Claude.ai tab.\n"
-                "2. Click Claude's own Copy button on the response.\n"
-                "3. When Chrome asks 'Allow claude.ai to see text and "
-                "images copied to the clipboard?', click Allow.\n"
-                "4. Return here and click Send to Claude.ai again.\n\n"
-                "Your response is still in the Claude tab -- nothing is lost. "
-                "You can also copy + paste it manually for this one synthesis "
-                "by switching automation off in Settings.",
-            )
-            return
-        # Map other known codes to friendlier messages.
-        friendly = {
-            automation_messages.ERR_NO_TAB:
-                "Couldn't open a browser tab. Is Chrome running?",
-            automation_messages.ERR_NOT_LOGGED_IN:
-                "Couldn't find the chat composer. Are you signed in to the target LLM?",
-            automation_messages.ERR_PASTE_FAILED:
-                "Couldn't paste into the chat. The LLM page may have changed; "
-                "fall back to manual Generate / Paste for this session.",
-            automation_messages.ERR_TIMEOUT:
-                "The response didn't finish in time. Check the browser tab "
-                "to see if it's still streaming.",
-            automation_messages.ERR_INTERSTITIAL_TIMEOUT:
-                "The proxy interstitial didn't clear within the time window. "
-                "Click PROCEED in the browser and try Send again.",
-        }
-        message = friendly.get(code, detail or "Unknown error")
-        QMessageBox.warning(self.window, "Synthesis Automation", message)
-
-    # ---- synthesis automation: send + ping ---------------------------------
-
-    def _on_send_to_llm(self, session_id: str, target_key: str) -> None:
-        session = self.store.get_session(session_id)
-        if session is None:
-            return
-        # Three-state-aware preflight. If Chrome isn't running, launch
-        # it and wait for the bridge to connect. The Send button is
-        # disabled in RUNNING_DISCONNECTED so we shouldn't see that
-        # path here, but guard for the race where the state poll
-        # missed a transition.
-        if self._synth_state == SynthesisConnectionState.NOT_RUNNING:
-            if not self._launch_chrome_and_wait_for_connection(session_id):
-                return
-        elif self._synth_state == SynthesisConnectionState.RUNNING_DISCONNECTED:
-            QMessageBox.warning(
-                self.window,
-                "Synthesis Automation",
-                "Chrome is running but the extension hasn't connected "
-                "back to the app. The extension service worker may be "
-                "asleep -- it should reconnect within ~60s. If it "
-                "persists, open the Meeting Notetaker extension popup "
-                "in Chrome and click 'Reconnect to app', or reload the "
-                "extension at chrome://extensions.",
-            )
-            return
-        elif not self._bridge_ready_state:
-            # Defensive: state thinks connected but bridge says no.
-            # Rare race; surface a clear error.
-            QMessageBox.warning(
-                self.window,
-                "Synthesis Automation",
-                "Lost connection to the extension while preparing to "
-                "send. Try again in a moment.",
-            )
-            return
-        try:
-            target = get_target(target_key)
-        except ValueError:
-            QMessageBox.warning(
-                self.window,
-                "Synthesis Automation",
-                f"Unknown LLM target {target_key!r}. Pick a valid target in Settings.",
-            )
-            return
-        if not target.implemented:
-            QMessageBox.information(
-                self.window,
-                "Synthesis Automation",
-                f"{target.label} automation isn't implemented in this "
-                "build. Switch the target to Claude.ai in Settings, or "
-                "disable automation to use the manual flow.",
-            )
-            return
-
-        store = TranscriptStore(session_id)
-        transcript = store.read_transcript()
-        if not transcript.strip():
-            QMessageBox.information(
-                self.window, "Synthesis Automation",
-                "This session has no transcript yet.",
-            )
-            return
-        self.window.session_view.flush_pending_live_notes()
-        live_notes = store.read_live_notes()
-        try:
-            when = datetime.fromisoformat(
-                session.created_at.replace("Z", "+00:00")
-            ).astimezone()
-        except ValueError:
-            when = datetime.now().astimezone()
-
-        # Pick the prompt template using the three-tier fallback:
-        # 1. session's saved choice (SessionView dropdown)
-        # 2. global Settings default_template_name
-        # 3. bundled "default" template (or first available)
-        templates = prompts_mod.list_templates()
-
-        def _find(name: str):
-            return next((t for t in templates if t.name == name), None)
-
-        chosen = None
-        chosen_name = store.read_prompt_template_name()
-        if chosen_name:
-            chosen = _find(chosen_name)
-        if chosen is None and self.config.synthesis.default_template_name:
-            chosen = _find(self.config.synthesis.default_template_name)
-        if chosen is None:
-            chosen = _find("default") or (templates[0] if templates else None)
-        if chosen is None:
-            QMessageBox.warning(
-                self.window, "Synthesis Automation",
-                "No prompt templates found in the prompts folder.",
-            )
-            return
-        rendered = prompts_mod.render(
-            chosen,
-            session_title=session.title,
-            session_date=when,
-            transcript=transcript,
-            live_notes=live_notes,
-            user_name=self.config.ui.user_name,
-            include_system_prompts=(
-                self.config.synthesis.auto_extract_attendee_details
-            ),
-        )
-        self._dispatch_rendered_synthesis(
-            session_id=session_id,
-            target_key=target_key,
-            target=target,
-            rendered_body=rendered,
-        )
-
     def _resolve_session_prompt_template(
         self,
         session_id: str,
@@ -1236,18 +643,15 @@ class MainApp(QObject):
             chosen = _find("default") or templates[0]
         return chosen
 
+
     def _on_edit_and_send(self, session_id: str) -> None:
-        """Sidekick to Send / Generate (#90).
+        """Open the prompt-edit dialog, then copy the edited body to
+        the clipboard (#90).
 
-        Renders the synthesis prompt for the session, opens the
-        SessionPromptEditDialog with the rendered body, and on Accept
-        dispatches the edited body through the same automation bridge
-        or clipboard path the standard Send/Generate uses.
-
-        Refuses with a user-readable message if the session has no
-        transcript yet AND no notes (mirrors the SessionView enable
-        gate from #87 -- the user shouldn't have been able to click
-        the button in that state, but a defensive check costs nothing).
+        Previously this method branched between automation and manual
+        clipboard paths. The in-app automation bridge was retired in
+        v0.8 (synthesis now routes through an MCP server a Claude
+        surface drives), so this handler is always clipboard-only.
         """
         from .ui.session_prompt_dialog import SessionPromptEditDialog  # noqa: PLC0415
 
@@ -1293,7 +697,6 @@ class MainApp(QObject):
             rendered_prompt=rendered,
             session_title=session.title,
             template_name=chosen.name,
-            automation_enabled=self.config.synthesis.automation_enabled,
             parent=self.window,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1301,271 +704,13 @@ class MainApp(QObject):
         result = dialog.result_payload
         if result is None:
             return
-        if result.action == "send":
-            self._dispatch_edited_synthesis(session_id, result.edited_body)
-        else:
-            self._copy_edited_prompt_to_clipboard(result.edited_body)
-
-    def _dispatch_edited_synthesis(
-        self, session_id: str, edited_body: str,
-    ) -> None:
-        """Send the edited prompt through the automation bridge using
-        the configured LLM target. Performs the same Chrome-launch +
-        connection preflight as _on_send_to_llm so the edit flow
-        survives cold-start Chrome state without duplicating logic."""
-        target_key = self.config.synthesis.llm_target or "claude"
-        if self._synth_state == SynthesisConnectionState.NOT_RUNNING:
-            if not self._launch_chrome_and_wait_for_connection(session_id):
-                return
-        elif self._synth_state == SynthesisConnectionState.RUNNING_DISCONNECTED:
-            QMessageBox.warning(
-                self.window, "Synthesis Automation",
-                "Chrome is running but the extension hasn't connected "
-                "back to the app. Try Reconnect from the extension popup.",
-            )
-            return
-        elif not self._bridge_ready_state:
-            QMessageBox.warning(
-                self.window, "Synthesis Automation",
-                "Lost connection to the extension. Try again in a moment.",
-            )
-            return
-        try:
-            target = get_target(target_key)
-        except ValueError:
-            QMessageBox.warning(
-                self.window, "Synthesis Automation",
-                f"Unknown LLM target {target_key!r}.",
-            )
-            return
-        if not target.implemented:
-            QMessageBox.information(
-                self.window, "Synthesis Automation",
-                f"{target.label} automation isn't implemented in this build.",
-            )
-            return
-        self._dispatch_rendered_synthesis(
-            session_id=session_id,
-            target_key=target_key,
-            target=target,
-            rendered_body=edited_body,
-        )
-
-    def _copy_edited_prompt_to_clipboard(self, edited_body: str) -> None:
-        """Manual mode counterpart to _dispatch_edited_synthesis.
-        Copies the edited body to the clipboard so the user can paste
-        it into their LLM chat manually."""
         clipboard = QApplication.clipboard()
-        clipboard.setText(edited_body)
+        clipboard.setText(result.edited_body)
         self.window.status(
-            "Edited prompt copied to clipboard. Paste it into your LLM, "
+            "Edited prompt copied to clipboard. Paste it into Claude, "
             "then use Paste Response Back to bring the synthesis in.",
             timeout_ms=8000,
         )
-
-    def _dispatch_rendered_synthesis(
-        self,
-        *,
-        session_id: str,
-        target_key: str,
-        target,
-        rendered_body: str,
-    ) -> None:
-        """Bridge-send + in-progress banner, given an already-rendered
-        prompt body. Shared between the standard Send to LLM path and
-        the #90 Edit & Send path so the edited body and the auto-
-        rendered body go through identical downstream plumbing."""
-        request_id = secrets.token_hex(8)
-        self._inflight_syntheses[request_id] = session_id
-        chat_url = ""
-        if target_key == "claude":
-            chat_url = self.config.synthesis.claude_chat_url()
-        msg = automation_messages.SynthesizeRequest(
-            request_id=request_id,
-            target=target_key,
-            prompt=rendered_body,
-            new_chat=True,
-            chat_url=chat_url,
-            llm_response_timeout_seconds=int(
-                self.config.synthesis.llm_response_timeout_seconds
-            ),
-            clipboard_read_seconds=int(
-                self.config.synthesis.clipboard_read_seconds
-            ),
-        )
-        if not self._bridge.send(msg):
-            self._inflight_syntheses.pop(request_id, None)
-            self.window.session_view.set_synthesis_in_progress(
-                session_id, False
-            )
-            QMessageBox.warning(
-                self.window, "Synthesis Automation",
-                "Couldn't reach the extension. Try Reconnect from the "
-                "extension popup, or fall back to manual Generate / Paste.",
-            )
-            return
-        self.window.session_view.set_synthesis_in_progress(
-            session_id, True, status_text=f"Sent to {target.label}, waiting for response..."
-        )
-        self.window.status(
-            f"Sent to {target.label}. The response will land in the Synthesis tab.",
-            timeout_ms=6000,
-        )
-
-    def _launch_chrome_and_wait_for_connection(self, session_id: str) -> bool:
-        """When the user clicks Send and Chrome isn't running, launch
-        chrome.exe (passing claude.ai/new as the URL so it opens
-        directly to the synthesis target), then wait up to 60s for
-        the bridge to report a connected peer.
-
-        Returns True if Chrome launched AND the bridge connected
-        within the timeout; False otherwise (with an error dialog
-        already shown).
-
-        Cold start can be slow: the user might be waking the machine,
-        Chrome has to load + restore tabs + spin up the extension
-        service worker + native messaging host + TCP connection. 60s
-        is generous; we use a QEventLoop so the UI stays responsive.
-        """
-        from PyQt6.QtCore import QEventLoop  # noqa: PLC0415
-
-        # Show the in-progress banner so the user sees something
-        # happening immediately. Updated as the launch progresses.
-        self.window.session_view.set_synthesis_in_progress(
-            session_id,
-            True,
-            status_text="Starting Chrome...",
-        )
-        # If a Claude project is configured, launch Chrome directly
-        # at the project URL so the cold-start tab is the right one.
-        # (Without this, Chrome would land on /new and the synthesis
-        # would still work because background.js opens its own tab,
-        # but we'd briefly leave the /new tab as a stray.)
-        cold_url = self.config.synthesis.claude_chat_url()
-        ok = launch_chrome(cold_url)
-        if not ok:
-            self.window.session_view.set_synthesis_in_progress(session_id, False)
-            QMessageBox.warning(
-                self.window,
-                "Synthesis Automation",
-                "Couldn't find or launch Chrome on this machine. "
-                "Install Chrome from https://www.google.com/chrome/ "
-                "or open it manually before clicking Send.",
-            )
-            return False
-
-        # Wait for the bridge to report connected. 60-second budget.
-        self.window.session_view.set_synthesis_in_progress(
-            session_id,
-            True,
-            status_text="Waiting for Chrome to load extension...",
-        )
-        loop = QEventLoop()
-        connect_poll = QTimer()
-        connect_poll.setInterval(200)
-        connect_poll.timeout.connect(
-            lambda: self._bridge.is_connected and loop.quit()
-        )
-        deadline = QTimer()
-        deadline.setSingleShot(True)
-        deadline.setInterval(60_000)
-        deadline.timeout.connect(loop.quit)
-        connect_poll.start()
-        deadline.start()
-        loop.exec()
-        connect_poll.stop()
-        deadline.stop()
-
-        if not self._bridge.is_connected:
-            self.window.session_view.set_synthesis_in_progress(session_id, False)
-            QMessageBox.warning(
-                self.window,
-                "Synthesis Automation",
-                "Chrome started but the Meeting Notetaker extension "
-                "didn't connect back within 60 seconds.\n\n"
-                "Check that the extension is enabled at chrome://"
-                "extensions and that it shows 'Connected' in its "
-                "popup. Then try Send again.",
-            )
-            return False
-        # Force one fresh state-poll so the indicator + button reflect
-        # the connection before we proceed.
-        self._poll_synthesis_state()
-        return True
-
-    def _ping_extension(self, timeout_sec: float) -> bool:
-        """Used by the Settings install wizard's Verify step. Returns
-        True if the extension is reachable within the timeout.
-
-        Two phases:
-
-        1. Wait for the bridge to report a connected peer. The
-           extension's connectNative() doesn't fire until either Chrome
-           starts the extension, the alarm-based retry ticks (every
-           minute), or the user clicks Reconnect in the extension
-           popup. If the user clicked Verify before the extension's
-           service worker had time to reconnect, we sit here until
-           one of those events lands a peer.
-
-        2. Once connected, send a ping and wait for a pong. Catches
-           the case where the bridge has a peer but the per-host
-           protocol is broken (mismatched extension ID, etc.).
-
-        Runs on the Qt main thread. Uses a QEventLoop with a polling
-        QTimer so paints and other event-loop work continue during
-        the wait -- a 60-second ``threading.Event.wait()`` would
-        freeze the install wizard window."""
-        from PyQt6.QtCore import QEventLoop  # noqa: PLC0415
-
-        # Phase 1: wait for peer.
-        deadline_ms = int(timeout_sec * 1000)
-        if not self._bridge.is_connected:
-            loop = QEventLoop()
-            connect_poll = QTimer()
-            connect_poll.setInterval(100)
-            connect_poll.timeout.connect(
-                lambda: self._bridge.is_connected and loop.quit()
-            )
-            deadline = QTimer()
-            deadline.setSingleShot(True)
-            deadline.setInterval(deadline_ms)
-            deadline.timeout.connect(loop.quit)
-            connect_poll.start()
-            deadline.start()
-            loop.exec()
-            connect_poll.stop()
-            deadline.stop()
-        if not self._bridge.is_connected:
-            return False
-
-        # Phase 2: ping/pong probe.
-        request_id = f"ping-{secrets.token_hex(4)}"
-        evt = threading.Event()
-        self._pending_pings[request_id] = evt
-        ping = automation_messages.PingRequest(request_id=request_id)
-        if not self._bridge.send(ping):
-            self._pending_pings.pop(request_id, None)
-            return False
-
-        # Use a short window for the actual pong (the connection is
-        # already established, so a pong should come back in well
-        # under a second).
-        loop = QEventLoop()
-        poll = QTimer()
-        poll.setInterval(50)
-        poll.timeout.connect(lambda: evt.is_set() and loop.quit())
-        pong_deadline = QTimer()
-        pong_deadline.setSingleShot(True)
-        pong_deadline.setInterval(5000)
-        pong_deadline.timeout.connect(loop.quit)
-        poll.start()
-        pong_deadline.start()
-        loop.exec()
-        poll.stop()
-        pong_deadline.stop()
-
-        self._pending_pings.pop(request_id, None)
-        return evt.is_set()
 
     # ---- wiring ------------------------------------------------------------
 
@@ -1662,8 +807,9 @@ class MainApp(QObject):
         sv.stop_clicked.connect(self._on_stop_clicked)
         sv.generate_prompt_clicked.connect(self._on_generate_prompt)
         sv.paste_notes_clicked.connect(self._on_paste_notes)
-        sv.send_to_llm_clicked.connect(self._on_send_to_llm)
-        # Edit & Send / Edit & Copy Prompt (#90).
+        # Edit & Copy Prompt (#90). Legacy name "edit_and_send"; the
+        # dialog now always copies to clipboard since the in-app
+        # automation bridge was retired in v0.8.
         sv.edit_and_send_clicked.connect(self._on_edit_and_send)
         # Issue #80: empty-state import button on the Transcript tab.
         sv.import_transcript_clicked.connect(self._on_import_transcript)
@@ -5758,7 +4904,6 @@ class MainApp(QObject):
         dialog = SettingsDialog(
             self.config,
             parent=self.window,
-            ping_extension=self._ping_extension,
             classification_store=self.classification,
         )
         # Backups group exposes a Backup Now button; route it through
@@ -5781,7 +4926,6 @@ class MainApp(QObject):
         self._apply_fonts()
         self._apply_calendar_config()
         self._apply_audio_monitor_config()
-        self._apply_synthesis_automation()
         self.apply_backup_idle_scheduler_config()
         self._refresh_status_indicators()
         # Push the new auto-capture interval to the sidebar so the
@@ -5887,21 +5031,13 @@ class MainApp(QObject):
         )
 
     def _synthesis_segment(self) -> Optional[SegmentState]:
-        """SegmentState for the synthesis-automation pill, or None.
+        """SegmentState for the synthesis pill.
 
-        Hidden when automation is disabled in Settings. Otherwise the
-        dot color tracks the bridge state: green when the extension is
-        connected, yellow when Chrome is cold (Send will launch it),
-        red when Chrome is up but the extension isn't talking back.
+        The in-app automation bridge was retired in v0.8; synthesis
+        now routes through an MCP server a Claude surface drives, so
+        this pane always hides its indicator and the caller skips it.
         """
-        if not self.config.synthesis.automation_enabled:
-            return None
-        state = self._synth_state
-        return SegmentState(
-            color=state.dot_color(),
-            short_label="Synthesis",
-            tooltip=state.status_tooltip(),
-        )
+        return None
 
     def _detection_segment(self) -> Optional[SegmentState]:
         """SegmentState for the ad-hoc-meeting-detect pill, or None.

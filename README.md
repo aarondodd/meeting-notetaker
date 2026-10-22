@@ -5,11 +5,29 @@ system audio (whatever is playing through your speakers, including
 Teams / Zoom / Meet calls), transcribes both streams on-device with
 faster-whisper, captures screenshots of any region you draw, plays
 the recording back in-app, and hands the resulting transcript to you
-for synthesis by any LLM you trust -- either via clipboard or a
-bundled Chrome extension that drives Claude.ai for you. No audio
-leaves the machine; no API key required.
+for synthesis by any LLM you trust. Synthesis routes through a local
+MCP server that your Chrome Claude extension, Claude Desktop, or
+Claude Code consumes; the clipboard-paste fallback stays available
+when you'd rather handle it by hand. No audio leaves the machine; no
+API key required.
 
-**Status:** v0.7.14. End-to-end capture, transcription, synthesis,
+## What's new in v0.8 (pre-release)
+
+v0.8 replaces the bundled Chrome extension with a local Model Context
+Protocol (MCP) server. See [docs/mcp-setup.md](docs/mcp-setup.md) for
+the one-page setup. The old automation path is retired: no more
+unpacked-extension install, no more native-messaging host, no more
+selector hunts against claude.ai's shifting markup. Everything the
+synthesis flow needs (list meetings, read transcripts, render a
+prompt, save notes) now lives behind MCP tools your Claude surface
+calls directly.
+
+To migrate: pick MCP in Settings > Synthesis via MCP, paste the
+config snippet into your Claude client. The clipboard Generate +
+Paste Response Back flow is unchanged and remains the default for
+users not on MCP.
+
+Status at v0.7.14 released, v0.8.0 in pre-release. End-to-end capture, transcription, synthesis,
 screen capture, retained-audio playback + export, and transcript-
 synchronized playback all working. v0.7.14 keeps the app alive when
 an exception escapes a Qt slot and lets you re-transcribe a crashed

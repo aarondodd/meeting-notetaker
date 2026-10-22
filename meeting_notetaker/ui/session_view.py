@@ -82,16 +82,11 @@ class SessionView(QWidget):
     stop_clicked = pyqtSignal(str)
     generate_prompt_clicked = pyqtSignal(str)
     paste_notes_clicked = pyqtSignal(str)
-    # Synthesis Automation: emitted instead of the Generate/Paste pair
-    # when the user has the feature enabled in Settings. Carries the
-    # session id and the LLM target key ("claude" / "copilot").
-    send_to_llm_clicked = pyqtSignal(str, str)      # session_id, target
     # Issue #90: sidekick button that opens the SessionPromptEditDialog
     # with the rendered prompt for one-shot editing before dispatch.
-    # Same enable gate as the Send/Generate pair; MainApp does the
-    # render + dialog + downstream routing in one handler. Carries the
-    # session id; the target (claude / copilot) is resolved by MainApp
-    # from the automation toggle the same way send_to_llm_clicked does.
+    # The handler in MainApp copies the edited body to the clipboard;
+    # the in-app automation bridge was retired in v0.8 in favor of the
+    # MCP server (see docs/mcp-setup.md).
     edit_and_send_clicked = pyqtSignal(str)         # session_id
     # Issue #80: empty-state affordance on the Transcript tab. MainApp
     # opens the ImportTranscriptDialog and writes the result to
@@ -204,25 +199,13 @@ class SessionView(QWidget):
         # Maps (source, t_start) -> line index in the transcript view.
         self._user_name = ""
         self._raw_transcript_text = ""
-        # Synthesis Automation state. set_automation_enabled() flips
-        # both at construction (via main_window) and when Settings is
-        # closed; the click handler reads _automation_target to know
-        # which LLM to route to.
-        self._automation_enabled = False
-        self._automation_target = ""
-        # Per-session "synthesis automation is mid-flight" state. We
-        # only need a single slot because the SessionView shows one
-        # session at a time; MainApp tracks which session_id owns it
-        # so re-entering a session while its synthesis is still
-        # running keeps the indicator on.
+        # Per-session "a synthesis is mid-flight" state. In v0.8 this
+        # is only used by the paste-back flow's in-progress banner; the
+        # in-app automation bridge was retired in favor of the MCP
+        # server (see docs/mcp-setup.md). MainApp tracks which
+        # session_id owns it so re-entering a session mid-synthesis
+        # keeps the indicator on.
         self._synth_in_progress_session_id: Optional[str] = None
-        # Current (chrome_running, bridge_connected) combined state.
-        # Set by MainApp via set_synthesis_connection_state on each
-        # 5-second poll tick + on bridge connect/disconnect. Defaults
-        # to NOT_RUNNING so the Send button enables until proven
-        # otherwise -- the launch-on-Send path handles the case
-        # where Chrome really isn't up.
-        self._synth_connection_state = None  # SynthesisConnectionState, set by app
         # Screen-capture armed state. True once the user clicked Start
         # Screen Capture and drew a region; flipped back when they
         # click Stop or the recording ends. Drives both the toggle
@@ -371,37 +354,6 @@ class SessionView(QWidget):
         self._paste_btn = QPushButton("Paste Response Back...", self)
         self._paste_btn.clicked.connect(self._on_paste_notes)
         synthesis.addWidget(self._paste_btn)
-        # Synthesis Automation: single Send button that replaces the
-        # Generate + Paste pair when settings.synthesis.automation_enabled
-        # is on. Toggled via set_automation_enabled() at construction +
-        # whenever Settings is closed. Copy button stays visible
-        # regardless of the toggle (Aaron's call -- the manual copy
-        # path is still useful when the extension isn't reachable).
-        # Same split-button shape as Generate: main click sends, the
-        # dropdown arrow exposes the edit-before-send path.
-        self._send_btn = QToolButton(self)
-        self._send_btn.setText("Send to Claude.ai")
-        self._send_btn.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonTextOnly,
-        )
-        self._send_btn.setPopupMode(
-            QToolButton.ToolButtonPopupMode.MenuButtonPopup,
-        )
-        self._send_btn.setToolTip(
-            "Send the synthesis prompt to the configured web LLM via "
-            "the Meeting Notetaker browser extension. The response "
-            "lands in the Synthesis tab automatically. Use the "
-            "dropdown to edit the rendered prompt before sending."
-        )
-        self._send_btn.clicked.connect(self._on_send_to_llm)
-        self._send_menu = QMenu(self._send_btn)
-        self._send_edit_action = self._send_menu.addAction(
-            "Edit prompt before sending...",
-        )
-        self._send_edit_action.triggered.connect(self._on_edit_and_send)
-        self._send_btn.setMenu(self._send_menu)
-        self._send_btn.setVisible(False)
-        synthesis.addWidget(self._send_btn)
         self._copy_btn = QPushButton("Copy", self)
         self._copy_btn.setToolTip(
             "Copy the active tab's contents to the clipboard. The button "
@@ -1927,22 +1879,11 @@ class SessionView(QWidget):
         if self._session:
             self.paste_notes_clicked.emit(self._session.id)
 
-    def _on_send_to_llm(self) -> None:
-        if self._session and self._automation_target:
-            # Optimistically mark in-progress so a double-click can't
-            # fire two synthesis tabs. The controller will call
-            # set_synthesis_in_progress with the same id; idempotent.
-            self.set_synthesis_in_progress(self._session.id, True, status_text=None)
-            self.send_to_llm_clicked.emit(
-                self._session.id, self._automation_target
-            )
-
     def _on_edit_and_send(self) -> None:
-        """Dropdown menu item next to Send / Generate (#90): MainApp
-        renders the prompt, opens the SessionPromptEditDialog, and
-        dispatches the edited body through whichever downstream path
-        (automation bridge or clipboard) the current mode requires.
-        We just emit -- the work happens in app.py."""
+        """Dropdown menu item next to Generate (#90): MainApp renders
+        the prompt, opens the SessionPromptEditDialog, and copies the
+        edited body to the clipboard. The in-app automation bridge was
+        retired in v0.8; the signal name is kept for compatibility."""
         if self._session is not None:
             self.edit_and_send_clicked.emit(self._session.id)
 
@@ -1983,9 +1924,8 @@ class SessionView(QWidget):
         )
         if showing_this and self._synth_in_progress_session_id == session_id:
             text = status_text or "Waiting for Claude.ai response..."
-            self._synth_banner.setText(f"⏳  {text}")
+            self._synth_banner.setText(f"[...]  {text}")
             self._synth_banner.setVisible(True)
-            self._send_btn.setEnabled(False)
         else:
             # Either we're not the displayed session, or the synthesis
             # finished -- hide the banner and let the next state
@@ -2095,60 +2035,6 @@ class SessionView(QWidget):
             return
         name = self._prompt_template_picker.currentData() or ""
         self.prompt_template_changed.emit(self._session.id, name)
-
-    def set_synthesis_connection_state(self, state) -> None:
-        """Update the SessionView's view of the synthesis connection
-        state. MainApp's poll loop calls this every 5 seconds plus on
-        bridge connect/disconnect transitions. Re-evaluates the Send
-        button enable state immediately."""
-        self._synth_connection_state = state
-        if self._session is not None:
-            self._set_buttons_for_state(
-                self._session.state,
-                has_transcript=bool(self._raw_transcript_text),
-                has_notes=bool(self._session.has_notes),
-            )
-
-    def set_automation_enabled(self, enabled: bool, target_key: str = "claude") -> None:
-        """Swap between manual (Generate + Paste) and automated (Send)
-        synthesis buttons. Copy / Print / Export PDF stay visible
-        regardless -- the user keeps the manual escape hatches.
-
-        target_key drives the Send button label so the user knows
-        where they're sending without opening Settings."""
-        self._automation_enabled = enabled
-        self._automation_target = target_key if enabled else ""
-        self._generate_btn.setVisible(not enabled)
-        self._paste_btn.setVisible(not enabled)
-        self._send_btn.setVisible(enabled)
-        # Label reflects the configured target.
-        if enabled:
-            try:
-                from ..automation.targets import get_target
-
-                target = get_target(target_key)
-                self._send_btn.setText(f"Send to {target.label}")
-                if not target.implemented:
-                    self._send_btn.setEnabled(False)
-                    self._send_btn.setToolTip(
-                        f"{target.label} automation is not yet "
-                        "implemented. Pick a different target in "
-                        "Settings, or toggle automation off to use the "
-                        "manual Generate / Paste flow."
-                    )
-            except ValueError:
-                self._send_btn.setText("Send to LLM")
-        # Visibility change alone is enough; the next state update
-        # from the controller will refresh enabled-state via the
-        # _set_buttons_for_state path. If we're already in a state
-        # where the transcript is ready, force a refresh now so the
-        # button enables without waiting for the next state event.
-        if self._session is not None:
-            self._set_buttons_for_state(
-                self._session.state,
-                has_transcript=bool(self._raw_transcript_text),
-                has_notes=bool(self._session.has_notes if self._session else False),
-            )
 
     def _on_copy_active_tab(self) -> None:
         if not self._session:
@@ -2433,46 +2319,11 @@ class SessionView(QWidget):
         )
         self._generate_btn.setEnabled(can_synthesize)
         self._paste_btn.setEnabled(can_synthesize)
-        # Dropdown menu actions (#90) share the same gate. The button-
+        # Dropdown menu action (#90) shares the same gate. The button-
         # level enabled state already grays the dropdown arrow, but
         # disabling the QAction is explicit insurance against the
         # arrow being clickable when nothing's available.
         self._generate_edit_action.setEnabled(can_synthesize)
-        self._send_edit_action.setEnabled(can_synthesize)
-        # Send button: gated by FOUR conditions. All must be true.
-        #
-        #   1. There's a transcript to synthesize (can_synthesize).
-        #   2. The target LLM has a working content-script adapter
-        #      (Copilot is stub-only in v0.6.3 so its target.implemented
-        #      is False; Claude is True).
-        #   3. There's no synthesis already in flight for THIS session
-        #      (prevents double-click → two tabs).
-        #   4. The connection state allows it: NOT_RUNNING (we'll
-        #      launch Chrome on click) or RUNNING_CONNECTED (normal
-        #      flow). RUNNING_DISCONNECTED disables because the
-        #      extension is broken and a click would just fail.
-        if self._automation_enabled and self._automation_target:
-            from ..automation.targets import get_target
-
-            try:
-                implemented = get_target(self._automation_target).implemented
-            except ValueError:
-                implemented = False
-            self_id = self._session.id if self._session else ""
-            in_progress_here = (
-                self._synth_in_progress_session_id is not None
-                and self._synth_in_progress_session_id == self_id
-            )
-            connection_ok = (
-                self._synth_connection_state is None
-                or self._synth_connection_state.send_button_enabled()
-            )
-            self._send_btn.setEnabled(
-                can_synthesize
-                and implemented
-                and not in_progress_here
-                and connection_ok
-            )
         self._update_copy_button(has_session=has_session)
         self._update_print_button(has_session=has_session, has_notes=has_notes)
 

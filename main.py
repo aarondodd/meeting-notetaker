@@ -46,25 +46,25 @@ def _run_check_deps() -> int:
     return 1 if counts[Status.MISSING] > 0 else 0
 
 
-def _run_native_host() -> int:
-    """Synthesis automation bridge: act as the Chrome native-messaging
-    host. Routes length-prefixed JSON frames between Chrome's stdio
-    and the running app's TCP loopback bridge.
+def _run_mcp_server() -> int:
+    """Launch the stdio MCP server.
 
-    Invoked by chrome via the manifest at
-    %LOCALAPPDATA%\\MeetingNotetaker\\automation\\com.meeting_notetaker.bridge.json,
-    which points at this exe with --native-host.
+    Invoked from the user's MCP client config (Chrome Claude extension,
+    Claude Desktop, Claude Code) as:
+
+        <path-to-meeting-notetaker.exe> --mcp-server
+
+    No GUI starts. The server reads JSON-RPC messages from stdin and
+    writes responses to stdout; logs go to stderr.
     """
-    from meeting_notetaker.automation.native_host import run
-    from meeting_notetaker.utils.paths import bridge_handshake_path
-
-    return run(bridge_handshake_path())
+    from meeting_notetaker.mcp.server import main
+    return main()
 
 
 if __name__ == "__main__":
     if "--check-deps" in sys.argv[1:]:
         sys.exit(_run_check_deps())
-    if "--native-host" in sys.argv[1:]:
-        sys.exit(_run_native_host())
+    if "--mcp-server" in sys.argv[1:]:
+        sys.exit(_run_mcp_server())
     from meeting_notetaker.app import main   # noqa: E402  -- import after truststore inject
     sys.exit(main())

@@ -1,8 +1,8 @@
 """Tighten the markdown that Claude.ai's Copy button writes.
 
-The synthesis-automation flow clicks Claude's "Copy" button and reads
-the clipboard via ``navigator.clipboard.readText()``. Claude's
-serialization is valid CommonMark but uses **loose** list spacing --
+The paste-back flow receives whatever Claude.ai's Copy button put on
+the clipboard. Claude's serialization is valid CommonMark but uses
+**loose** list spacing --
 a blank line between every list item, plus 2+ blank lines between
 sections. Rendered output is identical to a tight list, but the
 source view in our Synthesis pane (and the on-disk ``notes.md``)
