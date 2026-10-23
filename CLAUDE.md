@@ -241,7 +241,30 @@ test pins the output byte-identical to the old in-memory algorithm across
 block boundaries. The session list is now refreshed after crash recovery so
 recovered sessions show the error badge instead of the stale recording badge.
 Test suite collects 2368 on main (3 new test files, 14 new tests). Aaron
-confirmed the fix on his laptop before release. The extension manifest reads
+confirmed the fix on his laptop before release.
+
+Open work (unmerged): the single-instance lock treats any live PID as a running
+Meeting Notetaker, so a crashed or SIGKILL'd previous launch leaves a lockfile
+whose PID gets handed to an unrelated process by the OS and the next launch
+hits "Another Meeting Notetaker instance is already running" with no window to
+foreground. `utils/single_instance.py` now also records the resolved image
+path at acquire time, reads the live image for the stored PID via
+QueryFullProcessImageNameW on Windows and /proc/<pid>/exe on Linux, and only
+blocks when both match; a mismatch, a dead PID, or an unparseable lockfile is
+treated as stale and overwritten. `acquire(force=True)` is the escape hatch,
+exposed as a `--force` command-line flag on the frozen build and offered as a
+Yes/No prompt the first time the user hits the dialog, so there is a path
+forward even if a future detection gets it wrong. A legacy single-line
+lockfile (PID only, from pre-fix builds) still works and falls back to the
+old PID-alive check for backwards compat. 13 pure-Python tests pin the
+behavior across fresh acquire, dead-PID stale, recycled-PID stale (spawning
+`sleep` to produce a live PID whose image is not ours), live-match blocks,
+force overrides a live match, garbage lockfile, empty lockfile, release
+leaves foreign lockfiles alone, and the two `_normalise_image` branches;
+mutation controls confirm the recycled-image and force branches each cover
+their test. Two end-to-end smokes under offscreen Qt: with and without
+`--force` the app recovers from a stale lock and rewrites it with its own
+PID + image. The extension manifest reads
 0.7.15 against this 0.7.14 release: the offset is deliberate dev-loop
 cache-busting so Chrome force-reloads on the next "Load unpacked", mirroring
 the pattern v0.7.12 and v0.7.13 shipped with. The per-version notes below
