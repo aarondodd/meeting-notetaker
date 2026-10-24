@@ -63,17 +63,25 @@ def _run_mcp_server() -> int:
 
 
 def _run_web_ui() -> int:
-    """Launch the local web UI.
+    """Launch the GUI with the local web UI enabled this run.
 
-    Invoked as ``<path-to-meeting-notetaker.exe> --web-ui`` on the
-    user's work machine. Binds 127.0.0.1 only and opens the default
-    browser so the Chrome Claude extension (running in that browser)
-    can read the page, drive the synthesis workflow, and POST the
-    result back. The underlying operations are the same ten MCP tools
-    that --mcp-server serves over stdio.
+    `<path-to-meeting-notetaker.exe> --web-ui` used to spawn a bare
+    HTTP server with no GUI, which left the single-instance lock
+    uninvolved (so the user could end up with the GUI plus a
+    standalone --web-ui exe at once) and had no on-screen surface for
+    the actual URL when something went wrong. The flag now routes
+    through the GUI with FORCE_WEB_UI_THIS_RUN set, so there is one
+    process, the lock prevents a second launch, and the resolved URL
+    is visible in Settings > Synthesis.
+
+    Pure headless operation (no Qt) is still available by calling
+    ``meeting_notetaker.web.server:main`` directly from a Python
+    entry point; the flag is wired to the GUI path because that is
+    the shape every user hits.
     """
-    from meeting_notetaker.web.server import main
-    return main()
+    import meeting_notetaker.app as _app
+    _app.FORCE_WEB_UI_THIS_RUN = True
+    return _app.main()
 
 
 if __name__ == "__main__":
@@ -82,6 +90,10 @@ if __name__ == "__main__":
     if "--mcp-server" in sys.argv[1:]:
         sys.exit(_run_mcp_server())
     if "--web-ui" in sys.argv[1:]:
+        # Qt doesn't recognize --web-ui and would log a warning for
+        # every unknown dash flag. Pull it out of argv before the
+        # GUI entry point passes argv to QApplication.
+        sys.argv = [a for a in sys.argv if a != "--web-ui"]
         sys.exit(_run_web_ui())
     from meeting_notetaker.app import main   # noqa: E402  -- import after truststore inject
     sys.exit(main())

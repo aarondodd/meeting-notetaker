@@ -46,6 +46,7 @@ from ..utils.config import (
     VALID_OBSIDIAN_LOCATION_TEMPLATES,
 )
 from ..utils.mcp_setup import mcp_launcher_command, mcp_client_config_snippet
+from ..web.server import background_server_url
 from ..utils.paths import prompts_dir, vocabulary_path
 from ..utils.vocabulary import seed_vocabulary_file
 from .speakers_manage_dialog import SpeakersManageDialog
@@ -754,6 +755,22 @@ class SettingsDialog(QDialog):
         )
         auto_layout.addWidget(self._mcp_enabled)
 
+        self._start_web_ui_on_launch = QCheckBox(
+            "Start the web UI automatically when Meeting Notetaker launches",
+            self,
+        )
+        self._start_web_ui_on_launch.setChecked(
+            config.synthesis.start_web_ui_on_launch
+        )
+        self._start_web_ui_on_launch.setToolTip(
+            "When ticked, Meeting Notetaker starts the local web UI "
+            "on a background thread at launch so the Chrome Claude "
+            "extension can reach it without you clicking anything. "
+            "The server binds 127.0.0.1 only. Takes effect on the "
+            "next launch; use the button below to start it right now."
+        )
+        auto_layout.addWidget(self._start_web_ui_on_launch)
+
         # Transport 1: local web UI, driven by the Chrome Claude extension.
         web_label = QLabel(
             "Chrome Claude extension (local web UI):",
@@ -784,6 +801,9 @@ class SettingsDialog(QDialog):
         web_row.addWidget(self._mcp_web_btn)
         self._mcp_web_status = QLabel("", self)
         self._mcp_web_status.setStyleSheet("color: #57606a;")
+        running_url = background_server_url()
+        if running_url:
+            self._mcp_web_status.setText(f"running at {running_url}")
         web_row.addWidget(self._mcp_web_status)
         web_row.addStretch(1)
         auto_layout.addLayout(web_row)
@@ -1334,6 +1354,9 @@ class SettingsDialog(QDialog):
         self._config.ui.preview_font_size = int(self._preview_font_size.value())
         self._config.ui.markdown_rich_editor = self._markdown_rich_editor.isChecked()
         self._config.synthesis.mcp_enabled = self._mcp_enabled.isChecked()
+        self._config.synthesis.start_web_ui_on_launch = (
+            self._start_web_ui_on_launch.isChecked()
+        )
         self._config.synthesis.auto_extract_attendee_details = (
             self._extract_attendees.isChecked()
         )

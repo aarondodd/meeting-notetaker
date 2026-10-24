@@ -613,3 +613,18 @@ def test_synthesis_timeout_round_trips_through_toml(tmp_path, isolated_data_dir)
     assert dst.synthesis.clipboard_read_seconds == 10
 
 
+def test_start_web_ui_on_launch_defaults_false(isolated_data_dir):
+    """Fresh installs do not start a server until the user opts in."""
+    cfg = Config()
+    assert cfg.synthesis.start_web_ui_on_launch is False
+
+
+def test_start_web_ui_on_launch_round_trip(tmp_path, isolated_data_dir):
+    """The flag survives save and reload so Settings persists it."""
+    src = Config()
+    src.synthesis.start_web_ui_on_launch = True
+    src.save(tmp_path / "config.toml")
+    dst = Config.load(tmp_path / "config.toml")
+    assert dst.synthesis.start_web_ui_on_launch is True
+
+

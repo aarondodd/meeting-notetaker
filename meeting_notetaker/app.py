@@ -100,6 +100,13 @@ from .version import __version__
 
 log = logging.getLogger("meeting_notetaker")
 
+# Set by main.py when the user launched with `--web-ui` so this run
+# starts the local web UI even when the saved config has
+# synthesis.start_web_ui_on_launch off. Routes --web-ui through the
+# single GUI process rather than a separate server exe, which keeps
+# the single-instance lock in play (no "two instances" surprise).
+FORCE_WEB_UI_THIS_RUN: bool = False
+
 
 # Map session state to tray state.
 _TRAY_FOR_STATE = {
@@ -217,6 +224,23 @@ class MainApp(QObject):
         # into their own Claude surface (Chrome extension, Claude
         # Desktop, Claude Code). The in-app automation bridge was
         # retired in this release; see docs/mcp-setup.md.
+        #
+        # The web UI transport (for the Chrome Claude extension) can
+        # auto-start in-process so the user does not need a separate
+        # `main.py --web-ui` command. Driven by Settings > Synthesis
+        # or by the --web-ui CLI shortcut (which sets
+        # FORCE_WEB_UI_THIS_RUN before this import runs).
+        self._web_ui_url: Optional[str] = None
+        if (
+            self.config.synthesis.start_web_ui_on_launch
+            or FORCE_WEB_UI_THIS_RUN
+        ):
+            try:
+                from .web.server import start_background_server  # noqa: PLC0415
+                self._web_ui_url = start_background_server()
+                log.info("web UI auto-started at %s", self._web_ui_url)
+            except Exception:
+                log.exception("web UI auto-start failed; synthesis path still available via Settings")
 
         # Cross-session search index (FTS5). Created lazily so a corrupt
         # search.db doesn't keep the app from launching; opened on first

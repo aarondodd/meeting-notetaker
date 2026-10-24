@@ -240,6 +240,13 @@ class SynthesisConfig:
     # signal the app may use to tweak hints or to suppress legacy
     # UI once Aaron confirms the user has moved over.
     mcp_enabled: bool = False
+    # When set, MainApp starts the local web UI on a daemon thread at
+    # launch (bound to 127.0.0.1) so the Chrome Claude extension can
+    # reach it without the user running `main.py --web-ui` as a
+    # separate process. The port is still picked by the web server's
+    # 8765 + 20 fallback range, and the resolved URL is logged + shown
+    # in Settings > Synthesis.
+    start_web_ui_on_launch: bool = False
     # v0.6.3..v0.7.14: in-app automation bridge to Chrome. Retired in
     # v0.8 (replaced by the MCP path). The fields below stay in the
     # dataclass so stale config.toml files load cleanly, and the
