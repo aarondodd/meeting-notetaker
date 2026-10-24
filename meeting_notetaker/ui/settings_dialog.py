@@ -723,20 +723,20 @@ class SettingsDialog(QDialog):
         # everything LLM-related in one place. The sub-groups keep
         # their own QGroupBox so the visual subdivision survives.
         #
-        # v0.8 retired the in-app Chrome extension in favor of a local
-        # MCP server. The toggle below records that the user has
-        # opted in; the actual synthesis happens inside the user's
-        # Claude surface (Chrome Claude extension, Claude Desktop,
-        # Claude Code) once it points its MCP config at this app.
+        # v0.8 retired the in-app Chrome extension in favor of an MCP
+        # service layer. Two transports consume it: a local web UI
+        # (for the Chrome Claude extension, which cannot be given a
+        # stdio config) and the stdio MCP server (for Claude Desktop
+        # and Claude Code). The toggle below only records that the
+        # user has opted in; the real synthesis happens in whichever
+        # Claude surface they use.
         auto_group = QGroupBox("Synthesis via MCP", self)
         auto_layout = QVBoxLayout(auto_group)
         auto_blurb = QLabel(
-            "Meeting Notetaker can expose your meetings to any Claude "
-            "surface via a local MCP server. Opt in below and paste the "
-            "config snippet into your Chrome Claude extension, Claude "
-            "Desktop, or Claude Code. Your meetings never leave the "
-            "machine; the Claude surface synthesizes locally against "
-            "the data it reads through MCP.",
+            "Meeting Notetaker exposes its ten MCP tools over two "
+            "transports. Pick whichever your Claude surface supports; "
+            "both read the same data and leave your meetings on this "
+            "machine.",
             self,
         )
         auto_blurb.setWordWrap(True)
@@ -749,58 +749,77 @@ class SettingsDialog(QDialog):
         self._mcp_enabled.setChecked(config.synthesis.mcp_enabled)
         self._mcp_enabled.setToolTip(
             "Record that this install is wired into a Claude surface "
-            "via MCP. Toggles the setup helpers below."
+            "via MCP. Does not auto-start the web UI; use the button "
+            "below."
         )
         auto_layout.addWidget(self._mcp_enabled)
 
-        # Step 1: install the Chrome Claude extension (link only).
-        step1_row = QHBoxLayout()
-        step1_label = QLabel(
-            "1. Install the Claude extension in Chrome:",
+        # Transport 1: local web UI, driven by the Chrome Claude extension.
+        web_label = QLabel(
+            "Chrome Claude extension (local web UI):",
             self,
         )
-        step1_row.addWidget(step1_label)
-        self._mcp_claude_ext_btn = QPushButton(
-            "Open Chrome Web Store...", self,
+        web_label.setStyleSheet("font-weight: 600;")
+        auto_layout.addWidget(web_label)
+        web_blurb = QLabel(
+            "Start a localhost page. Open the Chrome Claude side panel "
+            "and point it at the page. It can read your meetings, drive "
+            "the synthesis workflow, and POST the result back to this "
+            "app. Only you and the extension can reach the page "
+            "(127.0.0.1 only).",
+            self,
         )
-        self._mcp_claude_ext_btn.setToolTip(
-            "Opens the Claude extension listing in your browser. If "
-            "you already have the extension, skip this step."
+        web_blurb.setWordWrap(True)
+        auto_layout.addWidget(web_blurb)
+        web_row = QHBoxLayout()
+        self._mcp_web_btn = QPushButton(
+            "Start web UI and open in browser...", self,
         )
-        self._mcp_claude_ext_btn.clicked.connect(self._on_open_claude_extension)
-        step1_row.addWidget(self._mcp_claude_ext_btn)
-        step1_row.addStretch(1)
-        auto_layout.addLayout(step1_row)
+        self._mcp_web_btn.setToolTip(
+            "Starts a local HTTP server bound to 127.0.0.1 and opens "
+            "the default browser. If it is already running, re-opens "
+            "the same URL."
+        )
+        self._mcp_web_btn.clicked.connect(self._on_start_web_ui)
+        web_row.addWidget(self._mcp_web_btn)
+        self._mcp_web_status = QLabel("", self)
+        self._mcp_web_status.setStyleSheet("color: #57606a;")
+        web_row.addWidget(self._mcp_web_status)
+        web_row.addStretch(1)
+        auto_layout.addLayout(web_row)
 
-        # Step 2: launcher command the client needs.
-        step2_label = QLabel(
-            "2. Launcher command for your MCP client:",
+        # Transport 2: stdio MCP for Claude Desktop / Claude Code.
+        stdio_label = QLabel(
+            "Claude Desktop or Claude Code (stdio MCP):",
             self,
         )
-        auto_layout.addWidget(step2_label)
+        stdio_label.setStyleSheet("font-weight: 600; margin-top: 6px;")
+        auto_layout.addWidget(stdio_label)
+        stdio_blurb = QLabel(
+            "Paste the config snippet below into your client's MCP "
+            "config file (claude_desktop_config.json for Desktop, "
+            "~/.claude.json or .mcp.json for Code). The Chrome Claude "
+            "extension has no paste target for this snippet; use the "
+            "web UI path above there.",
+            self,
+        )
+        stdio_blurb.setWordWrap(True)
+        auto_layout.addWidget(stdio_blurb)
         self._mcp_launcher_edit = QLineEdit(self)
         self._mcp_launcher_edit.setReadOnly(True)
         self._mcp_launcher_edit.setText(mcp_launcher_command())
         self._mcp_launcher_edit.setToolTip(
-            "Full command your MCP client (Chrome Claude extension, "
-            "Claude Desktop, Claude Code) runs to launch the Meeting "
-            "Notetaker MCP server."
+            "Full command Claude Desktop or Claude Code runs to launch "
+            "the Meeting Notetaker MCP server."
         )
         auto_layout.addWidget(self._mcp_launcher_edit)
-
-        # Step 3: client-config snippet, copy-to-clipboard.
-        step3_label = QLabel(
-            "3. Config snippet to paste into your client:",
-            self,
-        )
-        auto_layout.addWidget(step3_label)
         snippet = mcp_client_config_snippet()
         self._mcp_snippet_edit = QLineEdit(self)
         self._mcp_snippet_edit.setReadOnly(True)
         self._mcp_snippet_edit.setText(snippet.replace("\n", " ").replace("  ", " "))
         self._mcp_snippet_edit.setToolTip(
-            "Full JSON object spelled out in docs/mcp-setup.md. Use "
-            "Copy below to grab the formatted multi-line version."
+            "Full JSON object; see docs/mcp-setup.md for the "
+            "pretty-printed form plus client-specific instructions."
         )
         auto_layout.addWidget(self._mcp_snippet_edit)
         snippet_row = QHBoxLayout()
@@ -809,8 +828,7 @@ class SettingsDialog(QDialog):
         snippet_row.addWidget(self._mcp_copy_btn)
         self._mcp_docs_btn = QPushButton("Open setup guide...", self)
         self._mcp_docs_btn.setToolTip(
-            "Opens docs/mcp-setup.md on GitHub -- step-by-step for "
-            "Chrome Claude, Claude Desktop, and Claude Code."
+            "Opens docs/mcp-setup.md on GitHub."
         )
         self._mcp_docs_btn.clicked.connect(self._on_open_mcp_docs)
         snippet_row.addWidget(self._mcp_docs_btn)
@@ -2044,17 +2062,10 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------
     # Synthesis via MCP (v0.8+)
 
-    _CLAUDE_EXTENSION_URL = (
-        "https://chromewebstore.google.com/detail/claude/"
-        "nkeimhogjdpnpccoofpliimaahmaaome"
-    )
     _MCP_SETUP_DOC_URL = (
         "https://github.com/aarondodd/meeting-notetaker/"
         "blob/main/docs/mcp-setup.md"
     )
-
-    def _on_open_claude_extension(self) -> None:
-        QDesktopServices.openUrl(QUrl(self._CLAUDE_EXTENSION_URL))
 
     def _on_open_mcp_docs(self) -> None:
         QDesktopServices.openUrl(QUrl(self._MCP_SETUP_DOC_URL))
@@ -2065,6 +2076,22 @@ class SettingsDialog(QDialog):
 
         snippet = mcp_client_config_snippet()
         QApplication.clipboard().setText(snippet)
+
+    def _on_start_web_ui(self) -> None:
+        """Launch the local web UI (idempotent) and open the browser."""
+        try:
+            from ..web.server import start_background_server  # noqa: PLC0415
+            url = start_background_server()
+        except Exception as exc:
+            self._mcp_web_status.setText(f"web UI failed to start: {exc}")
+            return
+        self._mcp_web_status.setText(f"running at {url}")
+        try:
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception:
+            # The URL is already visible beside the button; the user can
+            # paste it manually if the OS browser hook misbehaves.
+            pass
 
 
 def _populate_device_picker(

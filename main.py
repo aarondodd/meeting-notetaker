@@ -49,15 +49,30 @@ def _run_check_deps() -> int:
 def _run_mcp_server() -> int:
     """Launch the stdio MCP server.
 
-    Invoked from the user's MCP client config (Chrome Claude extension,
-    Claude Desktop, Claude Code) as:
+    Invoked from a Claude Desktop or Claude Code MCP client config as:
 
         <path-to-meeting-notetaker.exe> --mcp-server
 
     No GUI starts. The server reads JSON-RPC messages from stdin and
-    writes responses to stdout; logs go to stderr.
+    writes responses to stdout; logs go to stderr. The Chrome Claude
+    extension does not consume stdio MCP configs; it drives the web UI
+    at --web-ui instead.
     """
     from meeting_notetaker.mcp.server import main
+    return main()
+
+
+def _run_web_ui() -> int:
+    """Launch the local web UI.
+
+    Invoked as ``<path-to-meeting-notetaker.exe> --web-ui`` on the
+    user's work machine. Binds 127.0.0.1 only and opens the default
+    browser so the Chrome Claude extension (running in that browser)
+    can read the page, drive the synthesis workflow, and POST the
+    result back. The underlying operations are the same ten MCP tools
+    that --mcp-server serves over stdio.
+    """
+    from meeting_notetaker.web.server import main
     return main()
 
 
@@ -66,5 +81,7 @@ if __name__ == "__main__":
         sys.exit(_run_check_deps())
     if "--mcp-server" in sys.argv[1:]:
         sys.exit(_run_mcp_server())
+    if "--web-ui" in sys.argv[1:]:
+        sys.exit(_run_web_ui())
     from meeting_notetaker.app import main   # noqa: E402  -- import after truststore inject
     sys.exit(main())

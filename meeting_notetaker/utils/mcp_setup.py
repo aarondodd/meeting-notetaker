@@ -46,10 +46,12 @@ def mcp_client_config_snippet() -> str:
     """Multi-line JSON snippet the user pastes into their MCP client.
 
     Shape matches Claude Desktop's ``claude_desktop_config.json``,
-    which Claude Code and the Chrome Claude extension both consume
-    with the same ``mcpServers`` schema. The one key is the server
-    name (``meeting-notetaker``) and the command plus args the client
-    spawns.
+    which Claude Code consumes with the same ``mcpServers`` schema.
+    The Chrome Claude extension does not accept a stdio MCP config
+    (its Custom Connectors UI only takes remote server URLs), so it
+    uses the local web UI transport instead; see docs/mcp-setup.md.
+    The one key is the server name (``meeting-notetaker``) and the
+    command plus args the client spawns.
     """
     argv = mcp_launcher_argv()
     body = {
