@@ -385,6 +385,138 @@ def test_api_template_unknown(seeded_meetings):
 # ---- error path propagation --------------------------------------------
 
 
+def test_meetings_list_renders_series_contact_topic_filters(seeded_meetings):
+    """The expanded filter form carries the new classification selects
+    and the Export column; `(any)` is selected by default. Covers the
+    graceful-degrade path when the classification store returns no
+    in-use rows."""
+    status, _h, body = handlers.dispatch(_req("GET", "/meetings"))
+    assert status == 200
+    text = body.decode("utf-8")
+    for name in ('name="series_id"', 'name="contact_id"', 'name="topic_id"'):
+        assert name in text, f"missing filter select: {name}"
+    # The label text runs together with the leading `<select ...>`.
+    assert "Series <select" in text
+    assert "Person <select" in text
+    assert "Topic <select" in text
+    # The Export column exists even without a configured vault; the
+    # per-row cell displays the "not configured" hint.
+    assert "<th>Export</th>" in text
+    assert "not configured" in text
+
+
+def test_meetings_list_filters_pass_through_to_tools(seeded_meetings, monkeypatch):
+    """series_id in the query string reaches tools.list_meetings as an int."""
+    captured: list[dict] = []
+    real_list = tools.list_meetings
+
+    def spy(args: dict) -> dict:
+        captured.append(args)
+        return real_list(args)
+
+    monkeypatch.setattr(tools, "list_meetings", spy)
+    # Also patch the handlers' reference since it imported the name.
+    monkeypatch.setattr(handlers.tools, "list_meetings", spy)
+    status, _h, _body = handlers.dispatch(
+        _req("GET", "/meetings", query={"series_id": "42"})
+    )
+    assert status == 200
+    assert any(c.get("series_id") == 42 for c in captured), captured
+
+
+def test_meetings_list_invalid_series_id_degrades(seeded_meetings):
+    """A non-integer series_id must not raise; the filter is dropped."""
+    status, _h, _body = handlers.dispatch(
+        _req("GET", "/meetings", query={"series_id": "not-an-int"})
+    )
+    assert status == 200
+
+
+def test_meeting_detail_renders_synthesis_as_markdown(seeded_meetings, monkeypatch):
+    """Synthesis body comes back as rendered HTML in a .md container,
+    not inside the plain <pre> wrapper."""
+    completed_id, _new_id = seeded_meetings
+    TranscriptStore(completed_id).save_notes(
+        "# Decisions\n\n- ship it\n- *soon*\n",
+        archive_existing=False,
+    )
+    status, _h, body = handlers.dispatch(
+        _req("GET", f"/meetings/{completed_id}")
+    )
+    assert status == 200
+    text = body.decode("utf-8")
+    # Rich container is present, not the fallback <pre>.
+    assert '<div class="md">' in text
+    assert "<h1>Decisions</h1>" in text
+    assert "<li>ship it</li>" in text
+
+
+def test_meeting_detail_obsidian_section_shows_not_configured(seeded_meetings):
+    """Without a configured vault, the Export to Obsidian section
+    renders the hint rather than the Save button."""
+    completed_id, _new_id = seeded_meetings
+    status, _h, body = handlers.dispatch(
+        _req("GET", f"/meetings/{completed_id}")
+    )
+    assert status == 200
+    text = body.decode("utf-8")
+    assert ">Export to Obsidian<" in text
+    assert "vault is not configured" in text
+    assert 'action="/meetings/' not in text.split(">Export to Obsidian<", 1)[1].split(">Synthesis workflow<", 1)[0]
+
+
+def test_meeting_export_obsidian_without_vault_flashes_err(seeded_meetings):
+    """Form POST with no vault configured redirects to the detail
+    page with an `obsidian_err=...` query param that becomes the flash."""
+    completed_id, _new_id = seeded_meetings
+    status, hdrs, _body = handlers.dispatch(
+        _req("POST", f"/meetings/{completed_id}/export/obsidian", form={})
+    )
+    assert status == 303
+    assert hdrs["Location"].startswith(f"/meetings/{completed_id}")
+    assert "obsidian_err=" in hdrs["Location"]
+    # Loading the detail page with that query renders the err flash.
+    import urllib.parse  # local import; the module is already imported above
+    parsed = urllib.parse.urlparse(hdrs["Location"])
+    query = urllib.parse.parse_qs(parsed.query)
+    status, _h, body = handlers.dispatch(
+        _req("GET", f"/meetings/{completed_id}",
+             query={"obsidian_err": query["obsidian_err"][0]})
+    )
+    assert status == 200
+    text = body.decode("utf-8")
+    assert 'class="flash err"' in text
+    assert "Obsidian export failed" in text
+
+
+def test_meeting_export_obsidian_json_returns_400_without_vault(seeded_meetings):
+    """JSON POST surfaces the error as a 400 so curl automation sees it."""
+    completed_id, _new_id = seeded_meetings
+    status, _h, body = handlers.dispatch(
+        _req(
+            "POST",
+            f"/meetings/{completed_id}/export/obsidian",
+            headers={"accept": "application/json"},
+            json_body={},
+        )
+    )
+    assert status == 400
+    data = json.loads(body)
+    assert "Obsidian vault is not configured" in data["error"]
+
+
+def test_api_classification_route_returns_empty_lists(isolated_data_dir):
+    """With no classification rows yet, the endpoint returns three
+    empty arrays rather than an error."""
+    status, _h, body = handlers.dispatch(
+        _req("GET", "/api/classification",
+             headers={"accept": "application/json"})
+    )
+    assert status == 200
+    data = json.loads(body)
+    assert data == {"series": [], "contacts": [], "topics": []}
+
+
 def test_dispatcher_wraps_handler_exceptions(monkeypatch):
     """An exception in a handler must not crash the server; it should
     produce an HTML 500 for HTML routes and a JSON 500 for /api/."""

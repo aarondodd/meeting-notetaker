@@ -42,13 +42,22 @@ form at the top:
 
 - `state`: `new`, `recording`, `complete`, `error`.
 - `folder_id`: scopes to one folder/topic.
+- `series_id`: filter by series (meeting-series grouping).
+- `contact_id`: filter by person who attended.
+- `topic_id`: filter by free-text topic tag.
 - `has_transcript=1`: only meetings with a captured transcript.
 - `has_notes=1`: only meetings that already have a saved synthesis.
 - `limit`: maximum rows returned (default 25).
 
 Each row carries the meeting title, state, created-at, duration, and
-has-transcript / has-synthesis indicators, plus a link to the detail
-page at `/meetings/<id>`.
+has-transcript / has-synthesis indicators, a link to the detail page
+at `/meetings/<id>`, and an Export column with a "To Obsidian" button
+that writes the current synthesis to the configured vault directly
+from the list.
+
+To resolve a user's text ("the Platform series", "meetings with
+Alex", "auth topic") into a filter id, GET `/api/classification` or
+call the `list_classification` MCP tool and match by name.
 
 ### `/meetings/<id>` (detail)
 
@@ -68,7 +77,12 @@ page carries:
 - Save form: `<form action="/meetings/<id>/save" method="POST">`
   containing `<textarea name="notes">` and a submit button labeled
   **Save synthesis**.
-- Optional flash message after a save, under `<div class="flash ok">`.
+- Export to Obsidian: `<form action="/meetings/<id>/export/obsidian"
+  method="POST">` with a **Save to Obsidian** button, shown only when
+  the user has configured an Obsidian vault_root in Settings AND the
+  meeting already has a saved synthesis.
+- Optional flash message after any save, under `<div class="flash
+  ok">` (`ok`) or `<div class="flash err">` (`err`).
 
 ### `/templates`
 
@@ -139,8 +153,10 @@ MCP tools:
 | GET `/api/meetings/<id>/prompt?template_name=` | rendered prompt body |
 | POST `/api/meetings/<id>/save` `{"notes": "..."}` | writes notes.md, archives prior |
 | POST `/api/meetings/<id>/template` `{"template_name": "..."}` | switches template |
+| POST `/api/meetings/<id>/export/obsidian` | saves synthesis into the Obsidian vault |
 | GET `/api/templates` | list |
 | GET `/api/templates/<name>` | raw template body |
+| GET `/api/classification` | `{series:[...], contacts:[...], topics:[...]}` |
 
 Both JSON POST bodies and form-encoded bodies are accepted on the
 mutating routes, so the HTML form on the detail page and a scripted

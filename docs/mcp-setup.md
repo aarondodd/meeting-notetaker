@@ -167,7 +167,7 @@ JSON in and JSON out; the response shape matches the MCP tools.
 
 | Method and path | Tool it mirrors |
 | :--- | :--- |
-| GET `/api/meetings?limit=&state=&folder_id=&has_transcript=&has_notes=` | `list_meetings` |
+| GET `/api/meetings?limit=&state=&folder_id=&series_id=&contact_id=&topic_id=&has_transcript=&has_notes=` | `list_meetings` |
 | GET `/api/meetings/<id>` | `get_meeting` |
 | GET `/api/meetings/<id>/transcript` | `get_transcript` |
 | GET `/api/meetings/<id>/live_notes` | `get_live_notes` |
@@ -175,8 +175,10 @@ JSON in and JSON out; the response shape matches the MCP tools.
 | GET `/api/meetings/<id>/prompt?template_name=` | `render_synthesis_prompt` |
 | POST `/api/meetings/<id>/save` (`{"notes": "..."}`) | `save_notes` |
 | POST `/api/meetings/<id>/template` (`{"template_name": "..."}`) | `set_prompt_template` |
+| POST `/api/meetings/<id>/export/obsidian` | `export_meeting_to_obsidian` |
 | GET `/api/templates` | `list_templates` |
 | GET `/api/templates/<name>` | `get_template` |
+| GET `/api/classification` | `list_classification` |
 
 Both JSON POST bodies and form-encoded bodies are accepted on the
 mutating routes, so the HTML form on the detail page and a scripted
@@ -188,7 +190,8 @@ The MCP server exposes these ten tools; each one is schema-advertised
 so the Claude surface sees descriptions and types directly. The web
 UI and JSON API are built on top of the same functions.
 
-- `list_meetings(limit?, state?, folder_id?)`: recent sessions
+- `list_meetings(limit?, state?, folder_id?, series_id?, contact_id?, topic_id?)`:
+  recent sessions, now also filterable by classification
 - `get_meeting(meeting_id)`: metadata plus parsed attendees
 - `get_transcript(meeting_id)`: raw transcript body
 - `get_live_notes(meeting_id)`: user-authored live-notes buffer
@@ -200,6 +203,10 @@ UI and JSON API are built on top of the same functions.
 - `save_notes(meeting_id, notes)`: write notes.md, archive prior
 - `set_prompt_template(meeting_id, template_name)`: per-meeting
   template override
+- `list_classification()`: series / contacts / topics in use, for
+  mapping a user's text onto the id filters above
+- `export_meeting_to_obsidian(meeting_id)`: publish the current
+  synthesis into the configured Obsidian vault
 
 The canonical flow is: `list_meetings` to pick an id,
 `render_synthesis_prompt` to get a ready-to-execute prompt, let your

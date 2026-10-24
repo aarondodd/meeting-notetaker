@@ -52,6 +52,9 @@ def list_meetings(args: dict) -> dict:
         limit: optional int, default 20, max 200.
         state: optional filter, one of the lifecycle states; omit for all.
         folder_id: optional folder filter; empty string means unfiled only.
+        series_id: optional int filter; only meetings tagged with this series.
+        contact_id: optional int filter; only meetings this contact attended.
+        topic_id: optional int filter; only meetings tagged with this topic.
     """
     limit = int(args.get("limit", 20))
     if limit < 1:
@@ -62,6 +65,31 @@ def list_meetings(args: dict) -> dict:
     if state is not None and state not in ALL_STATES:
         return {"error": f"unknown state '{state}'; valid: {sorted(ALL_STATES)}"}
     folder_filter = args.get("folder_id")
+
+    # Classification filters are opt-in: no store open unless at least
+    # one id was passed. Keeps the common unfiltered path on the single
+    # SessionStore query the stdio clients already measured against.
+    allowed_ids: Optional[set[str]] = None
+    for key, lookup in (
+        ("series_id", "session_ids_for_series"),
+        ("contact_id", "session_ids_for_contact"),
+        ("topic_id", "session_ids_for_topic"),
+    ):
+        raw = args.get(key)
+        if raw in (None, "", "any"):
+            continue
+        try:
+            class_id = int(raw)
+        except (TypeError, ValueError):
+            return {"error": f"{key} must be an integer or empty"}
+        try:
+            from ..models.classification import ClassificationStore  # noqa: PLC0415
+            with ClassificationStore() as cstore:
+                ids = set(getattr(cstore, lookup)(class_id))
+        except Exception as exc:
+            return {"error": f"classification lookup failed: {exc}"}
+        allowed_ids = ids if allowed_ids is None else allowed_ids & ids
+
     with SessionStore() as store:
         if folder_filter is None:
             sessions = store.list_sessions()
@@ -69,7 +97,187 @@ def list_meetings(args: dict) -> dict:
             sessions = store.list_sessions(folder_id=folder_filter or None)
         if state is not None:
             sessions = [s for s in sessions if s.state == state]
+        if allowed_ids is not None:
+            sessions = [s for s in sessions if s.id in allowed_ids]
         return {"meetings": [_session_summary(s) for s in sessions[:limit]]}
+
+
+def list_classification(_args: dict) -> dict:
+    """Return the series / contacts / topics currently in use.
+
+    The web UI feeds these into the /meetings filter dropdowns; the
+    stdio clients can call it to let a model name a filter by text.
+    "In use" means the row has at least one session tagged with it,
+    which matches the Python app's navigator convention (offering a
+    classification value that returns zero rows wastes a click).
+    """
+    try:
+        from ..models.classification import ClassificationStore  # noqa: PLC0415
+        with ClassificationStore() as cstore:
+            series = [
+                {"id": s.id, "name": s.name}
+                for s in cstore.list_series_in_use()
+            ]
+            contacts = [
+                {"id": c.id, "display_name": c.display_name}
+                for c in cstore.list_contacts_in_use()
+            ]
+            topics = [
+                {"id": t.id, "name": t.name}
+                for t in cstore.list_topics_in_use()
+            ]
+    except Exception as exc:
+        return {"error": f"classification store unavailable: {exc}"}
+    return {"series": series, "contacts": contacts, "topics": topics}
+
+
+def export_meeting_to_obsidian(args: dict) -> dict:
+    """Publish a meeting's current synthesis to the configured Obsidian vault.
+
+    Reads the vault config from the user's live Config and lets the
+    Obsidian integration decide the subfolder + filename from the
+    configured location template. Fails cleanly if the vault is not
+    configured or no notes.md exists.
+    """
+    mid = args.get("meeting_id")
+    if not mid:
+        return {"error": "meeting_id is required"}
+    config = Config.load()
+    vault_root = (config.obsidian.vault_root or "").strip()
+    if not vault_root:
+        return {
+            "error": (
+                "Obsidian vault is not configured. Set the vault path in "
+                "Settings > Obsidian first."
+            )
+        }
+    from pathlib import Path  # noqa: PLC0415
+    vault_path = Path(vault_root)
+    if not vault_path.is_dir():
+        return {
+            "error": (
+                f"Configured Obsidian vault_root does not exist: {vault_root}"
+            )
+        }
+    with SessionStore() as store:
+        session = store.get_session(mid)
+    if not session:
+        return {"error": f"no meeting with id {mid}"}
+    tstore = TranscriptStore(mid)
+    body = tstore.read_notes()
+    if not body.strip():
+        return {
+            "error": (
+                "No synthesis saved yet; use save_notes before exporting."
+            )
+        }
+    try:
+        from ..integrations.obsidian_export import (  # noqa: PLC0415
+            ObsidianPublishOptions,
+            ObsidianSessionInfo,
+            export_to_obsidian,
+            resolve_location_template,
+            resolve_filename_template,
+            sanitize_obsidian_stem,
+            truncate_filename_stem,
+        )
+    except Exception as exc:
+        return {"error": f"obsidian_export unavailable: {exc}"}
+
+    attendees = parse_attendees(tstore.read_live_notes())
+    started_at = None
+    if session.started_at:
+        try:
+            started_at = datetime.fromisoformat(session.started_at)
+        except ValueError:
+            started_at = None
+    duration_minutes = None
+    if session.duration_seconds:
+        duration_minutes = max(1, int(round(session.duration_seconds / 60)))
+
+    # Enrich with series + topics when available, so wikilinks and
+    # frontmatter land the same way the GUI's Save to Obsidian path
+    # does. A missing classification store is a quiet downgrade; the
+    # fields default to empty.
+    series_name = ""
+    topic_names: list[str] = []
+    try:
+        from ..models.classification import ClassificationStore  # noqa: PLC0415
+        with ClassificationStore() as cstore:
+            series = cstore.series_for_session(mid)
+            if series:
+                series_name = series.name
+            topic_names = [
+                t.name for t in cstore.topics_for_session(mid)
+            ]
+    except Exception:
+        pass
+
+    sess_info = ObsidianSessionInfo(
+        session_id=session.id,
+        title=session.title or "Untitled",
+        started_at=started_at,
+        duration_minutes=duration_minutes,
+        attendees=attendees,
+        series=series_name,
+        tags=topic_names,
+    )
+
+    sub = resolve_location_template(
+        template_name=config.obsidian.location_template_name,
+        template_custom=config.obsidian.location_template_custom,
+        session=sess_info,
+        when=started_at,
+    )
+    stem = truncate_filename_stem(
+        sanitize_obsidian_stem(
+            resolve_filename_template(
+                template_name=config.obsidian.location_template_name,
+                template_custom=config.obsidian.location_template_custom,
+                session=sess_info,
+                when=started_at,
+            ),
+            fallback=session.id,
+        )
+    )
+    options = ObsidianPublishOptions(
+        vault_root=vault_path,
+        vault_name=config.obsidian.vault_name or vault_path.name,
+        target_subdir=sub,
+        filename_stem=stem,
+        write_frontmatter=config.obsidian.write_frontmatter,
+        wikilink_attendees=config.obsidian.wikilink_attendees,
+        wikilink_series=config.obsidian.wikilink_series,
+        include_classification=config.obsidian.include_classification,
+        include_attachments=config.obsidian.default_include_attachments,
+        daily_note_backlink=config.obsidian.daily_note_backlink,
+        open_after_save=False,  # web UI never opens the vault URI itself
+        on_conflict="save_as_new",
+        source_tab="Synthesis",
+    )
+    try:
+        from ..utils.paths import sessions_dir  # noqa: PLC0415
+        session_dir = sessions_dir() / session.id
+        result = export_to_obsidian(
+            session=sess_info,
+            body=body,
+            options=options,
+            session_dir=session_dir,
+            attachments=[],
+            when=started_at,
+            location_template_name=config.obsidian.location_template_name,
+            location_template_custom=config.obsidian.location_template_custom,
+        )
+    except Exception as exc:
+        return {"error": f"obsidian export failed: {exc}"}
+    return {
+        "meeting_id": mid,
+        "vault_root": str(vault_path),
+        "vault_name": options.vault_name,
+        "page_url": result.page_url,
+        "title": result.title,
+        "message": result.message,
+    }
 
 
 def get_meeting(args: dict) -> dict:
@@ -299,6 +507,18 @@ TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Folder filter; empty string returns unfiled only.",
                 },
+                "series_id": {
+                    "type": "integer",
+                    "description": "Classification series id; omit for any series.",
+                },
+                "contact_id": {
+                    "type": "integer",
+                    "description": "Classification contact id; omit for any contact.",
+                },
+                "topic_id": {
+                    "type": "integer",
+                    "description": "Classification topic id; omit for any topic.",
+                },
             }
         ),
         handler=list_meetings,
@@ -393,6 +613,29 @@ TOOLS: list[Tool] = [
             required=["meeting_id"],
         ),
         handler=set_prompt_template,
+    ),
+    Tool(
+        name="list_classification",
+        description=(
+            "List classification values currently in use (series, contacts, "
+            "topics). Use before calling list_meetings with series_id, "
+            "contact_id, or topic_id to turn a user's text into the id."
+        ),
+        input_schema=_schema({}),
+        handler=list_classification,
+    ),
+    Tool(
+        name="export_meeting_to_obsidian",
+        description=(
+            "Publish a meeting's current synthesis to the configured "
+            "Obsidian vault. Reads the vault location, filename template, "
+            "and frontmatter flags from Settings > Obsidian. Fails if the "
+            "vault is unconfigured or the meeting has no saved synthesis."
+        ),
+        input_schema=_schema(
+            {"meeting_id": {"type": "string"}}, required=["meeting_id"],
+        ),
+        handler=export_meeting_to_obsidian,
     ),
 ]
 

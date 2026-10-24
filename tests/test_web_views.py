@@ -171,3 +171,147 @@ def test_html_escapes_hostile_input():
     assert "<script>alert" not in html
     assert "&lt;script&gt;alert(1)" in html
     assert "&lt;/pre&gt;" in html
+
+
+def test_render_markdown_renders_core_blocks():
+    out = views.render_markdown(
+        "# h1\n\n- a\n- b\n\n**bold** _italic_ ~~strike~~\n\n"
+        "| col | val |\n|-----|-----|\n| x   | 1   |\n"
+    )
+    assert '<div class="md">' in out
+    assert "<h1>h1</h1>" in out
+    assert "<li>a</li>" in out
+    assert "<strong>bold</strong>" in out
+    assert "<em>italic</em>" in out
+    assert "<del>strike</del>" in out
+    assert "<table>" in out and "<th>col</th>" in out
+
+
+def test_render_markdown_neutralizes_raw_html():
+    out = views.render_markdown(
+        "<script>alert(1)</script>\n\nfine body"
+    )
+    assert "<script>alert" not in out
+    assert "&lt;script&gt;alert(1)" in out
+    assert "fine body" in out
+
+
+def test_render_markdown_empty_body_returns_empty_string():
+    assert views.render_markdown("") == ""
+
+
+def test_detail_renders_synthesis_as_markdown_container():
+    meeting = {
+        "id": "mid", "title": "Markdown case", "state": "complete",
+        "started_at": "", "ended_at": "", "duration_seconds": 0,
+        "has_transcript": True, "has_notes": True, "attendees": [],
+    }
+    html = views.render_meeting_detail(
+        meeting=meeting,
+        transcript="raw transcript\nline two",
+        live_notes="# Attendees\n- Me",
+        existing_notes="## Decisions\n\n- ship it",
+        prompt_text="prompt",
+        prompt_template_name="",
+        templates=[],
+    )
+    # Synthesis + live notes render inside .md; transcript stays <pre>.
+    assert '<div class="md">' in html
+    assert "<h2>Decisions</h2>" in html
+    assert "<li>ship it</li>" in html
+    # Attendees from live_notes get the same treatment.
+    assert "<h1>Attendees</h1>" in html
+    # Transcript still raw <pre>.
+    assert "raw transcript\nline two" in html
+
+
+def test_list_renders_classification_filters_and_export_column():
+    classification = {
+        "series": [{"id": 1, "name": "Platform"}],
+        "contacts": [{"id": 7, "display_name": "Alex"}],
+        "topics": [{"id": 3, "name": "auth"}],
+    }
+    html = views.render_meeting_list(
+        meetings=[
+            {
+                "id": "mid", "title": "sync", "state": "complete",
+                "started_at": "2026-10-25T01:02:03",
+                "created_at": "2026-10-25T01:02:03",
+                "has_transcript": True, "has_notes": True,
+                "duration_seconds": 60,
+            },
+        ],
+        folders=[],
+        filters={"series_id": "1"},
+        total_shown=1,
+        classification=classification,
+        obsidian_configured=True,
+    )
+    # Classification selects + their options.
+    assert 'name="series_id"' in html
+    assert 'value="1" selected' in html
+    assert ">Platform<" in html
+    assert 'name="contact_id"' in html and ">Alex<" in html
+    assert 'name="topic_id"' in html and ">auth<" in html
+    # Export column + per-row Obsidian button.
+    assert "<th>Export</th>" in html
+    assert "To Obsidian" in html
+
+
+def test_list_export_column_shows_not_configured_when_vault_absent():
+    html = views.render_meeting_list(
+        meetings=[
+            {
+                "id": "mid", "title": "sync", "state": "complete",
+                "has_transcript": True, "has_notes": True,
+                "duration_seconds": 60, "started_at": "",
+            },
+        ],
+        folders=[], filters={}, total_shown=1,
+        classification={"series": [], "contacts": [], "topics": []},
+        obsidian_configured=False,
+    )
+    assert "not configured" in html
+    assert "To Obsidian" not in html
+
+
+def test_detail_renders_obsidian_section_when_configured_and_has_notes():
+    meeting = {
+        "id": "mid", "title": "sync", "state": "complete",
+        "started_at": "", "ended_at": "", "duration_seconds": 0,
+        "has_transcript": True, "has_notes": True, "attendees": [],
+    }
+    html = views.render_meeting_detail(
+        meeting=meeting,
+        transcript="t",
+        live_notes="",
+        existing_notes="body",
+        prompt_text="",
+        prompt_template_name="",
+        templates=[],
+        obsidian_configured=True,
+    )
+    assert ">Export to Obsidian<" in html
+    assert 'action="/meetings/mid/export/obsidian"' in html
+    assert "Save to Obsidian" in html
+
+
+def test_detail_obsidian_section_renders_configured_but_no_notes_hint():
+    meeting = {
+        "id": "mid", "title": "sync", "state": "new",
+        "started_at": "", "ended_at": "", "duration_seconds": 0,
+        "has_transcript": False, "has_notes": False, "attendees": [],
+    }
+    html = views.render_meeting_detail(
+        meeting=meeting,
+        transcript="",
+        live_notes="",
+        existing_notes="",
+        prompt_text="",
+        prompt_template_name="",
+        templates=[],
+        obsidian_configured=True,
+    )
+    assert ">Export to Obsidian<" in html
+    assert "Save a synthesis below first" in html
+    assert "Save to Obsidian" not in html

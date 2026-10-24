@@ -128,6 +128,24 @@ def _apply_list_filters(request: Request) -> tuple[dict, dict]:
         # Treat an explicit empty string as "unfiled only"; omission as "any".
         args["folder_id"] = folder_val
 
+    # Classification filters: series_id / contact_id / topic_id. Each
+    # one is an integer id; the string value stays in raw so the HTML
+    # form keeps its selection after submit. An empty value or
+    # literal "any" means no filter (the default (any) option).
+    for key in ("series_id", "contact_id", "topic_id"):
+        val = _first(request.query.get(key))
+        if val is None:
+            continue
+        raw[key] = val
+        if val == "" or val == "any":
+            continue
+        try:
+            args[key] = int(val)
+        except ValueError:
+            # Invalid id goes to raw so the user sees their input in
+            # the form; the tool call simply gets an empty filter.
+            pass
+
     has_transcript = _first(request.query.get("has_transcript"))
     if has_transcript == "1":
         raw["has_transcript"] = "1"
@@ -137,6 +155,22 @@ def _apply_list_filters(request: Request) -> tuple[dict, dict]:
         raw["has_notes"] = "1"
 
     return args, raw
+
+
+def _obsidian_configured() -> bool:
+    """Cheap test for whether a vault export is wired up.
+
+    Reads Config once per request; the common case is a user who sets
+    this once in Settings, so round-tripping config is fine. On error
+    (missing config.toml etc.) return False so the UI shows the
+    'not configured' hint rather than a 500.
+    """
+    try:
+        from ..utils.config import Config  # noqa: PLC0415
+        config = Config.load()
+    except Exception:
+        return False
+    return bool((config.obsidian.vault_root or "").strip())
 
 
 # ---------------------------------------------------------------------------
@@ -184,11 +218,19 @@ def meetings_list(request: Request) -> Response:
             for f in store.list_folders()
         ]
 
+    classification = tools.list_classification({})
+    if "error" in classification:
+        # A disabled classification store should degrade quietly: no
+        # chip dropdowns, same filters as before.
+        classification = {"series": [], "contacts": [], "topics": []}
+
     body = views.render_meeting_list(
         meetings=meetings,
         folders=folders,
         filters=raw_filters,
         total_shown=len(meetings),
+        classification=classification,
+        obsidian_configured=_obsidian_configured(),
     )
     return _html(200, body)
 
@@ -219,6 +261,12 @@ def meeting_detail(request: Request) -> Response:
     tmpl_set_flag = _first(request.query.get("template_set"))
     if tmpl_set_flag:
         flash_tuple = ("ok", f"Template set to '{tmpl_set_flag}'.")
+    obsidian_ok = _first(request.query.get("obsidian"))
+    if obsidian_ok:
+        flash_tuple = ("ok", f"Saved to Obsidian: {obsidian_ok}")
+    obsidian_err = _first(request.query.get("obsidian_err"))
+    if obsidian_err:
+        flash_tuple = ("err", f"Obsidian export failed: {obsidian_err}")
 
     body = views.render_meeting_detail(
         meeting=meta["meeting"],
@@ -229,6 +277,7 @@ def meeting_detail(request: Request) -> Response:
         prompt_template_name=template_name,
         templates=templates,
         flash=flash_tuple,
+        obsidian_configured=_obsidian_configured(),
     )
     return _html(200, body)
 
@@ -247,6 +296,31 @@ def meeting_save(request: Request) -> Response:
     if wants_json:
         return _json(200, result)
     return _redirect(f"/meetings/{urllib.parse.quote(mid)}?saved=1")
+
+
+def meeting_export_obsidian(request: Request) -> Response:
+    """Save a meeting's synthesis into the configured Obsidian vault.
+
+    Form-POST path redirects (303) back to the meeting detail with a
+    flash describing the result; JSON path returns the tool's response
+    body with a 200/400 status so curl automation can read it.
+    """
+    mid = request.path_params["id"]
+    result = tools.export_meeting_to_obsidian({"meeting_id": mid})
+    wants_json = _wants_json(request)
+    if wants_json:
+        status = 400 if "error" in result else 200
+        return _json(status, result)
+    quoted_mid = urllib.parse.quote(mid)
+    if "error" in result:
+        return _redirect(
+            f"/meetings/{quoted_mid}"
+            f"?obsidian_err={urllib.parse.quote(result['error'])}"
+        )
+    msg = result.get("message") or result.get("page_url") or "ok"
+    return _redirect(
+        f"/meetings/{quoted_mid}?obsidian={urllib.parse.quote(msg)}"
+    )
 
 
 def meeting_set_template(request: Request) -> Response:
@@ -371,6 +445,20 @@ def api_template(request: Request) -> Response:
     return _json(status, result)
 
 
+def api_classification(_req: Request) -> Response:
+    result = tools.list_classification({})
+    status = 500 if "error" in result else 200
+    return _json(status, result)
+
+
+def api_export_obsidian(request: Request) -> Response:
+    result = tools.export_meeting_to_obsidian(
+        {"meeting_id": request.path_params["id"]}
+    )
+    status = 400 if "error" in result else 200
+    return _json(status, result)
+
+
 # ---------------------------------------------------------------------------
 # Routing table
 # ---------------------------------------------------------------------------
@@ -403,6 +491,11 @@ ROUTES: list[Route] = [
         _compile(r"/meetings/(?P<id>[A-Za-z0-9_\-]+)/template"),
         meeting_set_template,
     ),
+    Route(
+        "POST",
+        _compile(r"/meetings/(?P<id>[A-Za-z0-9_\-]+)/export/obsidian"),
+        meeting_export_obsidian,
+    ),
     Route("GET", _compile(r"/templates"), templates_list),
     # JSON API.
     Route("GET", _compile(r"/api/meetings"), api_meetings),
@@ -413,8 +506,14 @@ ROUTES: list[Route] = [
     Route("GET", _compile(r"/api/meetings/(?P<id>[A-Za-z0-9_\-]+)/prompt"), api_prompt),
     Route("POST", _compile(r"/api/meetings/(?P<id>[A-Za-z0-9_\-]+)/save"), api_save),
     Route("POST", _compile(r"/api/meetings/(?P<id>[A-Za-z0-9_\-]+)/template"), api_set_template),
+    Route(
+        "POST",
+        _compile(r"/api/meetings/(?P<id>[A-Za-z0-9_\-]+)/export/obsidian"),
+        api_export_obsidian,
+    ),
     Route("GET", _compile(r"/api/templates"), api_templates),
     Route("GET", _compile(r"/api/templates/(?P<name>[A-Za-z0-9_\-]+)"), api_template),
+    Route("GET", _compile(r"/api/classification"), api_classification),
 ]
 
 

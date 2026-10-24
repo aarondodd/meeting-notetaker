@@ -20,6 +20,34 @@ def _esc(value) -> str:
     return html.escape(str(value), quote=True)
 
 
+def render_markdown(body: str) -> str:
+    """Return a ``<div class="md">...</div>`` block rendering ``body``.
+
+    Uses mistune 3 with ``escape=True`` so any raw HTML or injected
+    `<script>` from the model's output is neutralized at parse time;
+    the hostile-input tests under ``test_web_views.py`` already pin
+    this behavior for the detail page. When mistune is not importable
+    (defensive: it is in requirements.txt and the pyinstaller hints),
+    falls back to the previous ``<pre>...</pre>`` presentation so the
+    page still renders the content.
+    """
+    if not body:
+        return ""
+    try:
+        import mistune  # noqa: PLC0415
+    except Exception:  # pragma: no cover - mistune ships in requirements
+        return f'<pre class="md-fallback">{_esc(body)}</pre>'
+    try:
+        md = mistune.create_markdown(
+            escape=True,
+            plugins=["strikethrough", "table", "task_lists", "url"],
+        )
+        rendered = md(body)
+    except Exception:  # pragma: no cover
+        return f'<pre class="md-fallback">{_esc(body)}</pre>'
+    return f'<div class="md">{rendered}</div>'
+
+
 def _page(title: str, body: str, flash: str | None = None) -> str:
     flash_html = ""
     if flash:
@@ -69,15 +97,46 @@ def _yesno_badge(flag: bool, label_yes: str = "yes", label_no: str = "no") -> st
 # ---------------------------------------------------------------------------
 
 
+def _classification_options(
+    kind_label: str,
+    rows: list[dict],
+    name_key: str,
+    current: str,
+) -> str:
+    """Build an "(any)" + sorted-row options list for a classification select.
+
+    ``current`` is the str() of the selected id as it comes off the query
+    string; an empty string / "any" keeps the (any) default selected.
+    """
+    opts = [
+        '<option value=""'
+        + ("" if current and current != "any" else " selected")
+        + '>(any)</option>'
+    ]
+    for row in rows:
+        rid = str(row["id"])
+        sel = " selected" if current == rid else ""
+        opts.append(
+            f'<option value="{_esc(rid)}"{sel}>{_esc(row[name_key])}</option>'
+        )
+    return "".join(opts)
+
+
 def render_meeting_list(
     *,
     meetings: list[dict],
     folders: list[dict],
     filters: dict,
     total_shown: int,
+    classification: dict | None = None,
+    obsidian_configured: bool = False,
 ) -> str:
     """Render /meetings. ``filters`` carries the live query string so the
-    form repopulates after submit; ``folders`` is the full folder list."""
+    form repopulates after submit; ``folders`` is the full folder list,
+    ``classification`` is ``{"series": [...], "contacts": [...], "topics": [...]}``
+    for the series / person / topic dropdowns, and ``obsidian_configured``
+    gates the per-row Save to Obsidian button."""
+    classification = classification or {"series": [], "contacts": [], "topics": []}
     options = "".join(
         f'<option value="{_esc(s)}"'
         f'{" selected" if filters.get("state") == s else ""}>{_esc(s)}</option>'
@@ -95,6 +154,18 @@ def render_meeting_list(
             f'{" selected" if filters.get("folder_id") == folder["id"] else ""}'
             f'>{_esc(folder["name"])}</option>'
         )
+    series_options = _classification_options(
+        "series", classification.get("series", []), "name",
+        filters.get("series_id", ""),
+    )
+    contact_options = _classification_options(
+        "contact", classification.get("contacts", []), "display_name",
+        filters.get("contact_id", ""),
+    )
+    topic_options = _classification_options(
+        "topic", classification.get("topics", []), "name",
+        filters.get("topic_id", ""),
+    )
     limit_val = _esc(filters.get("limit", 50))
     has_transcript_checked = (
         " checked" if filters.get("has_transcript") == "1" else ""
@@ -108,6 +179,12 @@ def render_meeting_list(
         f'{options}</select></label>\n'
         '  <label>Folder '
         f'<select name="folder_id">{folder_options}</select></label>\n'
+        '  <label>Series '
+        f'<select name="series_id">{series_options}</select></label>\n'
+        '  <label>Person '
+        f'<select name="contact_id">{contact_options}</select></label>\n'
+        '  <label>Topic '
+        f'<select name="topic_id">{topic_options}</select></label>\n'
         '  <label><input type="checkbox" name="has_transcript" value="1"'
         f'{has_transcript_checked}> has transcript</label>\n'
         '  <label><input type="checkbox" name="has_notes" value="1"'
@@ -119,19 +196,39 @@ def render_meeting_list(
         '</form>'
     )
     if not meetings:
-        rows_html = '<tr><td colspan="6" style="color:#6e7781">No meetings match these filters.</td></tr>'
+        rows_html = '<tr><td colspan="7" style="color:#6e7781">No meetings match these filters.</td></tr>'
     else:
         rows: list[str] = []
         for m in meetings:
+            mid = _esc(m["id"])
+            has_notes = bool(m.get("has_notes"))
+            if obsidian_configured and has_notes:
+                obsidian_cell = (
+                    f'<form method="post" class="inline-form" '
+                    f'action="/meetings/{mid}/export/obsidian">'
+                    '<button type="submit" class="secondary tiny">To Obsidian</button>'
+                    '</form>'
+                )
+            elif obsidian_configured:
+                obsidian_cell = (
+                    '<span class="muted" title="Save a synthesis first; the row-level '
+                    'button writes notes.md to the configured vault.">needs synthesis</span>'
+                )
+            else:
+                obsidian_cell = (
+                    '<span class="muted" title="Set Obsidian vault_root in Settings.">'
+                    'not configured</span>'
+                )
             rows.append(
                 "<tr>\n"
-                f'  <td><a class="row-link" href="/meetings/{_esc(m["id"])}">'
+                f'  <td><a class="row-link" href="/meetings/{mid}">'
                 f'{_esc(m.get("title") or "(untitled)")}</a></td>\n'
                 f'  <td>{_esc((m.get("started_at") or m.get("created_at") or "")[:19])}</td>\n'
                 f"  <td>{_state_badge(m.get('state', ''))}</td>\n"
                 f"  <td>{_yesno_badge(bool(m.get('has_transcript')))}</td>\n"
-                f"  <td>{_yesno_badge(bool(m.get('has_notes')), 'synthesized', 'none')}</td>\n"
+                f"  <td>{_yesno_badge(has_notes, 'synthesized', 'none')}</td>\n"
                 f'  <td>{_esc(m.get("duration_seconds") or "")}</td>\n'
+                f'  <td>{obsidian_cell}</td>\n'
                 "</tr>"
             )
         rows_html = "\n".join(rows)
@@ -140,6 +237,7 @@ def render_meeting_list(
         "<thead><tr>"
         "<th>Title</th><th>When</th><th>State</th>"
         "<th>Transcript</th><th>Synthesis</th><th>Duration (s)</th>"
+        "<th>Export</th>"
         "</tr></thead>\n"
         f"<tbody>\n{rows_html}\n</tbody>\n"
         "</table>"
@@ -179,6 +277,7 @@ def render_meeting_detail(
     prompt_template_name: str,
     templates: list[dict],
     flash: tuple[str, str] | None = None,
+    obsidian_configured: bool = False,
 ) -> str:
     mid = meeting["id"]
     title = meeting.get("title") or "(untitled)"
@@ -217,11 +316,59 @@ def render_meeting_detail(
         '  <button type="submit" class="secondary">Set template</button>\n'
         '</form>'
     )
-    existing_html = (
-        f'<pre>{_esc(existing_notes)}</pre>'
-        if existing_notes
-        else '<p style="color:#6e7781;font-size:13px;margin:0">No synthesis saved yet.</p>'
-    )
+
+    # Synthesis + live notes render markdown richly (headings, lists,
+    # tables, strikethrough, task lists, autolinks). The transcript
+    # stays <pre> because it is a plain log, not Markdown. render_markdown
+    # uses escape=True so raw HTML in the body is neutralized, matching
+    # the hostile-input pin for the detail page.
+    if existing_notes:
+        existing_html = render_markdown(existing_notes)
+    else:
+        existing_html = (
+            '<p style="color:#6e7781;font-size:13px;margin:0">'
+            'No synthesis saved yet.</p>'
+        )
+    if live_notes:
+        live_notes_html = render_markdown(live_notes)
+    else:
+        live_notes_html = '<pre>(empty)</pre>'
+
+    # Save-to-Obsidian form (detail page). Button is disabled with a
+    # tooltip when the vault is unconfigured, when the meeting has no
+    # synthesis yet, or when the handler has nothing to export.
+    has_notes = bool(meeting.get("has_notes")) or bool(existing_notes)
+    if obsidian_configured and has_notes:
+        obsidian_section = (
+            '<section>\n'
+            '  <h2>Export to Obsidian</h2>\n'
+            '  <p style="font-size:13px;color:#57606a;margin:0 0 10px">'
+            'Writes the current synthesis to your configured vault using the '
+            'location template and frontmatter rules from Settings &gt; Obsidian.</p>\n'
+            f'  <form method="post" action="/meetings/{_esc(mid)}/export/obsidian">\n'
+            '    <button type="submit">Save to Obsidian</button>\n'
+            '  </form>\n'
+            '</section>\n'
+        )
+    elif obsidian_configured:
+        obsidian_section = (
+            '<section>\n'
+            '  <h2>Export to Obsidian</h2>\n'
+            '  <p style="font-size:13px;color:#6e7781;margin:0">'
+            'Save a synthesis below first; the export writes the current '
+            'notes.md to the vault.</p>\n'
+            '</section>\n'
+        )
+    else:
+        obsidian_section = (
+            '<section>\n'
+            '  <h2>Export to Obsidian</h2>\n'
+            '  <p style="font-size:13px;color:#6e7781;margin:0">'
+            'Obsidian vault is not configured. Open Meeting Notetaker &gt; '
+            'Settings &gt; Obsidian and set the vault path.</p>\n'
+            '</section>\n'
+        )
+
     body = (
         f'<section>\n  <h2>{_esc(title)}</h2>\n'
         f'  <div class="meta-grid">{meta_html}</div>\n'
@@ -231,7 +378,7 @@ def render_meeting_detail(
         '</section>\n'
         '<section>\n  <h2>Live notes</h2>\n'
         '  <details><summary>Show / hide</summary>\n'
-        f'  <pre>{_esc(live_notes) or "(empty)"}</pre>\n'
+        f'  {live_notes_html}\n'
         '  </details>\n'
         '</section>\n'
         '<section>\n  <h2>Transcript</h2>\n'
@@ -242,6 +389,7 @@ def render_meeting_detail(
         '<section>\n  <h2>Current synthesis</h2>\n'
         f'  {existing_html}\n'
         '</section>\n'
+        f'{obsidian_section}'
         '<section>\n  <h2>Synthesis workflow</h2>\n'
         f'  <p style="font-size:13px;color:#57606a;margin-top:0">Template to use for the prompt below. Changing this re-renders the prompt on reload.</p>\n'
         f'  {template_picker_html}\n'

@@ -161,4 +161,80 @@ form.inline { display: inline-flex; gap: 8px; align-items: center; }
   font-size: 11px;
   padding: 20px 0;
 }
+
+/* Rich markdown rendering for synthesis + live-notes panes.
+   Kept tight so the surrounding section chrome still dominates. */
+.md {
+  font-size: 14px;
+  color: #1f2328;
+}
+.md h1, .md h2, .md h3, .md h4 {
+  font-weight: 600;
+  margin: 14px 0 8px;
+  line-height: 1.3;
+}
+.md h1 { font-size: 20px; border-bottom: 1px solid #eaeef2; padding-bottom: 6px; }
+.md h2 { font-size: 17px; }
+.md h3 { font-size: 15px; color: #24292f; }
+.md h4 { font-size: 14px; color: #24292f; }
+.md p { margin: 0 0 10px; }
+.md ul, .md ol { margin: 0 0 10px 0; padding-left: 22px; }
+.md li { margin-bottom: 2px; }
+.md li > p { margin: 0; }
+.md blockquote {
+  border-left: 3px solid #d0d7de;
+  padding: 2px 10px;
+  color: #57606a;
+  margin: 0 0 10px;
+}
+.md code {
+  background: #f6f8fa;
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+}
+.md pre {
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  padding: 10px;
+  overflow-x: auto;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+}
+.md pre code { background: transparent; padding: 0; }
+.md table {
+  border-collapse: collapse;
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+.md table th, .md table td {
+  border: 1px solid #d0d7de;
+  padding: 4px 10px;
+  text-align: left;
+}
+.md table th {
+  background: #f6f8fa;
+  font-weight: 600;
+}
+.md a { color: #0969da; }
+.md hr {
+  border: none;
+  border-top: 1px solid #d0d7de;
+  margin: 14px 0;
+}
+.md del { color: #8c959f; }
+.md input[type="checkbox"] { margin-right: 4px; }
+
+/* Inline per-row export form (meeting list "To Obsidian" button). */
+form.inline-form { display: inline; margin: 0; }
+button.tiny {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+.muted {
+  color: #8c959f;
+  font-size: 12px;
+}
 """
