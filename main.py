@@ -46,25 +46,42 @@ def _run_check_deps() -> int:
     return 1 if counts[Status.MISSING] > 0 else 0
 
 
-def _run_native_host() -> int:
-    """Synthesis automation bridge: act as the Chrome native-messaging
-    host. Routes length-prefixed JSON frames between Chrome's stdio
-    and the running app's TCP loopback bridge.
+def _run_mcp_server() -> int:
+    """Launch the stdio MCP server.
 
-    Invoked by chrome via the manifest at
-    %LOCALAPPDATA%\\MeetingNotetaker\\automation\\com.meeting_notetaker.bridge.json,
-    which points at this exe with --native-host.
+    Invoked from a Claude Desktop or Claude Code MCP client config as:
+
+        <path-to-meeting-notetaker.exe> --mcp-server
+
+    No GUI starts. The server reads JSON-RPC messages from stdin and
+    writes responses to stdout; logs go to stderr. The Chrome Claude
+    extension does not consume stdio MCP configs; it drives the web UI
+    at --web-ui instead.
     """
-    from meeting_notetaker.automation.native_host import run
-    from meeting_notetaker.utils.paths import bridge_handshake_path
+    from meeting_notetaker.mcp.server import main
+    return main()
 
-    return run(bridge_handshake_path())
+
+def _run_web_ui() -> int:
+    """Launch the local web UI.
+
+    Invoked as ``<path-to-meeting-notetaker.exe> --web-ui`` on the
+    user's work machine. Binds 127.0.0.1 only and opens the default
+    browser so the Chrome Claude extension (running in that browser)
+    can read the page, drive the synthesis workflow, and POST the
+    result back. The underlying operations are the same ten MCP tools
+    that --mcp-server serves over stdio.
+    """
+    from meeting_notetaker.web.server import main
+    return main()
 
 
 if __name__ == "__main__":
     if "--check-deps" in sys.argv[1:]:
         sys.exit(_run_check_deps())
-    if "--native-host" in sys.argv[1:]:
-        sys.exit(_run_native_host())
+    if "--mcp-server" in sys.argv[1:]:
+        sys.exit(_run_mcp_server())
+    if "--web-ui" in sys.argv[1:]:
+        sys.exit(_run_web_ui())
     from meeting_notetaker.app import main   # noqa: E402  -- import after truststore inject
     sys.exit(main())

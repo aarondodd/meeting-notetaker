@@ -38,8 +38,6 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices, QFontDatabase
 
 from ..audio.devices import AudioDevice, list_input_devices, list_loopback_devices
-from ..automation import installer
-from ..automation.targets import ALL_TARGETS, get_target
 from ..diarization import user_voiceprint
 from ..diarization.store import open_speaker_store
 from ..utils.config import (
@@ -47,9 +45,9 @@ from ..utils.config import (
     VALID_MODEL_SIZES,
     VALID_OBSIDIAN_LOCATION_TEMPLATES,
 )
+from ..utils.mcp_setup import mcp_launcher_command, mcp_client_config_snippet
 from ..utils.paths import prompts_dir, vocabulary_path
 from ..utils.vocabulary import seed_vocabulary_file
-from .automation_install_dialog import AutomationInstallDialog
 from .speakers_manage_dialog import SpeakersManageDialog
 from .voice_enrollment_dialog import VoiceEnrollmentDialog
 
@@ -60,29 +58,17 @@ class SettingsDialog(QDialog):
         config: Config,
         parent: Optional[QWidget] = None,
         *,
-        ping_extension: Optional[callable] = None,
         classification_store=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
         # Wide enough by default to fit the longest row (Backups folder
-        # picker + Browse button, Synthesis Claude project ID) without
-        # horizontal scrolling. The nav list on the left takes ~180 px
-        # and the right pane needs ~620 px for the widest content.
-        # v0.7.5: switched from single long-scrolling pane to nav +
-        # stacked pages (#67 follow-up). The right pane carries its
-        # own scroll for sections that still overflow vertically
-        # (Speakers, Backups, Synthesis).
+        # picker + Browse button) without horizontal scrolling. The nav
+        # list on the left takes ~180 px and the right pane needs
+        # ~620 px for the widest content.
         self.resize(900, 650)
         self._config = config
-        # The install wizard's Verify step probes the live bridge to
-        # confirm the extension is reachable. The Settings dialog
-        # doesn't own a bridge; the controller does. Inject the probe
-        # function here so the wizard can call it without a circular
-        # dependency. ``None`` is fine in tests / off-Windows where the
-        # wizard falls back to "is_fully_installed()".
-        self._ping_extension = ping_extension
         # Phase 2: optional classification store passed through to
         # the Manage Speakers dialog so its Contact-link column
         # renders Contact display_names rather than raw ids. None
@@ -732,128 +718,123 @@ class SettingsDialog(QDialog):
 
         self._add_section("Fonts", fonts_group)
 
-        # Synthesis (combined Automation + Prompt Templates) ---------
+        # Synthesis (combined MCP + Prompt Templates) ---------------
         # Both sub-groups live on a single page so the user finds
         # everything LLM-related in one place. The sub-groups keep
         # their own QGroupBox so the visual subdivision survives.
-        auto_group = QGroupBox("Automation", self)
+        #
+        # v0.8 retired the in-app Chrome extension in favor of an MCP
+        # service layer. Two transports consume it: a local web UI
+        # (for the Chrome Claude extension, which cannot be given a
+        # stdio config) and the stdio MCP server (for Claude Desktop
+        # and Claude Code). The toggle below only records that the
+        # user has opted in; the real synthesis happens in whichever
+        # Claude surface they use.
+        auto_group = QGroupBox("Synthesis via MCP", self)
         auto_layout = QVBoxLayout(auto_group)
         auto_blurb = QLabel(
-            "When enabled, the Generate Synthesis Prompt + Paste Response "
-            "Back buttons are replaced by a single \"Send to <LLM>\" "
-            "button. The browser stays the intermediary -- the extension "
-            "drives the same chat window you would use manually. "
-            "Requires a one-time install (unpacked Chrome extension).",
+            "Meeting Notetaker exposes its ten MCP tools over two "
+            "transports. Pick whichever your Claude surface supports; "
+            "both read the same data and leave your meetings on this "
+            "machine.",
             self,
         )
         auto_blurb.setWordWrap(True)
         auto_layout.addWidget(auto_blurb)
 
-        self._auto_enabled = QCheckBox("Enable synthesis automation", self)
-        self._auto_enabled.setChecked(config.synthesis.automation_enabled)
-        auto_layout.addWidget(self._auto_enabled)
+        self._mcp_enabled = QCheckBox(
+            "Enable synthesis via MCP (recommended)",
+            self,
+        )
+        self._mcp_enabled.setChecked(config.synthesis.mcp_enabled)
+        self._mcp_enabled.setToolTip(
+            "Record that this install is wired into a Claude surface "
+            "via MCP. Does not auto-start the web UI; use the button "
+            "below."
+        )
+        auto_layout.addWidget(self._mcp_enabled)
 
-        target_row = QHBoxLayout()
-        target_row.addWidget(QLabel("Send to:", self))
-        self._auto_target = QComboBox(self)
-        for tgt in ALL_TARGETS:
-            label = tgt.label
-            if not tgt.implemented:
-                label = f"{label} (not yet implemented)"
-            self._auto_target.addItem(label, tgt.key)
-        # Select current.
-        for i in range(self._auto_target.count()):
-            if self._auto_target.itemData(i) == config.synthesis.llm_target:
-                self._auto_target.setCurrentIndex(i)
-                break
-        target_row.addWidget(self._auto_target, 1)
-        auto_layout.addLayout(target_row)
+        # Transport 1: local web UI, driven by the Chrome Claude extension.
+        web_label = QLabel(
+            "Chrome Claude extension (local web UI):",
+            self,
+        )
+        web_label.setStyleSheet("font-weight: 600;")
+        auto_layout.addWidget(web_label)
+        web_blurb = QLabel(
+            "Start a localhost page. Open the Chrome Claude side panel "
+            "and point it at the page. It can read your meetings, drive "
+            "the synthesis workflow, and POST the result back to this "
+            "app. Only you and the extension can reach the page "
+            "(127.0.0.1 only).",
+            self,
+        )
+        web_blurb.setWordWrap(True)
+        auto_layout.addWidget(web_blurb)
+        web_row = QHBoxLayout()
+        self._mcp_web_btn = QPushButton(
+            "Start web UI and open in browser...", self,
+        )
+        self._mcp_web_btn.setToolTip(
+            "Starts a local HTTP server bound to 127.0.0.1 and opens "
+            "the default browser. If it is already running, re-opens "
+            "the same URL."
+        )
+        self._mcp_web_btn.clicked.connect(self._on_start_web_ui)
+        web_row.addWidget(self._mcp_web_btn)
+        self._mcp_web_status = QLabel("", self)
+        self._mcp_web_status.setStyleSheet("color: #57606a;")
+        web_row.addWidget(self._mcp_web_status)
+        web_row.addStretch(1)
+        auto_layout.addLayout(web_row)
 
-        # Optional Claude project ID. When set, syntheses land in the
-        # named project on Claude.ai rather than the default chat list.
-        # Aaron's use case: stop flooding the default conversation list
-        # with one chat per meeting; pin them all to a "Meeting Notes"
-        # project he can browse later.
-        proj_row = QHBoxLayout()
-        proj_row.addWidget(QLabel("Claude project ID:", self))
-        self._claude_project_id = QLineEdit(self)
-        self._claude_project_id.setText(config.synthesis.claude_project_id)
-        self._claude_project_id.setPlaceholderText(
-            "Optional UUID (e.g. 019e5077-c745-7541-b2c8-08caeb0f3051)"
+        # Transport 2: stdio MCP for Claude Desktop / Claude Code.
+        stdio_label = QLabel(
+            "Claude Desktop or Claude Code (stdio MCP):",
+            self,
         )
-        self._claude_project_id.setToolTip(
-            "Optional. Paste the UUID portion of a Claude.ai project "
-            "URL. When set, every Send-to-Claude opens that project "
-            "(https://claude.ai/project/<id>) instead of /new, so "
-            "synthesized meeting notes accumulate inside the project. "
-            "Leave blank to land in the default chat list."
+        stdio_label.setStyleSheet("font-weight: 600; margin-top: 6px;")
+        auto_layout.addWidget(stdio_label)
+        stdio_blurb = QLabel(
+            "Paste the config snippet below into your client's MCP "
+            "config file (claude_desktop_config.json for Desktop, "
+            "~/.claude.json or .mcp.json for Code). The Chrome Claude "
+            "extension has no paste target for this snippet; use the "
+            "web UI path above there.",
+            self,
         )
-        proj_row.addWidget(self._claude_project_id, 1)
-        auto_layout.addLayout(proj_row)
+        stdio_blurb.setWordWrap(True)
+        auto_layout.addWidget(stdio_blurb)
+        self._mcp_launcher_edit = QLineEdit(self)
+        self._mcp_launcher_edit.setReadOnly(True)
+        self._mcp_launcher_edit.setText(mcp_launcher_command())
+        self._mcp_launcher_edit.setToolTip(
+            "Full command Claude Desktop or Claude Code runs to launch "
+            "the Meeting Notetaker MCP server."
+        )
+        auto_layout.addWidget(self._mcp_launcher_edit)
+        snippet = mcp_client_config_snippet()
+        self._mcp_snippet_edit = QLineEdit(self)
+        self._mcp_snippet_edit.setReadOnly(True)
+        self._mcp_snippet_edit.setText(snippet.replace("\n", " ").replace("  ", " "))
+        self._mcp_snippet_edit.setToolTip(
+            "Full JSON object; see docs/mcp-setup.md for the "
+            "pretty-printed form plus client-specific instructions."
+        )
+        auto_layout.addWidget(self._mcp_snippet_edit)
+        snippet_row = QHBoxLayout()
+        self._mcp_copy_btn = QPushButton("Copy config to clipboard", self)
+        self._mcp_copy_btn.clicked.connect(self._on_copy_mcp_snippet)
+        snippet_row.addWidget(self._mcp_copy_btn)
+        self._mcp_docs_btn = QPushButton("Open setup guide...", self)
+        self._mcp_docs_btn.setToolTip(
+            "Opens docs/mcp-setup.md on GitHub."
+        )
+        self._mcp_docs_btn.clicked.connect(self._on_open_mcp_docs)
+        snippet_row.addWidget(self._mcp_docs_btn)
+        snippet_row.addStretch(1)
+        auto_layout.addLayout(snippet_row)
 
-        # #102 bug 6: user-tunable timeouts that flow through the
-        # SynthesizeRequest into the Chrome extension. Defaults
-        # match the extension's built-in values; raise either
-        # field when slow / long LLM responses surface as a
-        # 'clipboard read failed' message that doesn't actually
-        # describe a permissions issue.
-        timeouts_row = QHBoxLayout()
-        timeouts_row.addWidget(QLabel("LLM response wait (min):", self))
-        self._llm_response_timeout = QSpinBox(self)
-        self._llm_response_timeout.setRange(1, 30)
-        self._llm_response_timeout.setSuffix(" min")
-        self._llm_response_timeout.setValue(
-            max(1, int(config.synthesis.llm_response_timeout_seconds / 60)),
-        )
-        self._llm_response_timeout.setToolTip(
-            "How long the Chrome extension waits for the LLM's "
-            "response to finish streaming. Default 10 minutes. "
-            "Raise this if your prompts routinely take longer and "
-            "you see 'response didn't settle' timeouts."
-        )
-        timeouts_row.addWidget(self._llm_response_timeout)
-        timeouts_row.addSpacing(20)
-        timeouts_row.addWidget(QLabel("Clipboard read wait (sec):", self))
-        self._clipboard_read = QSpinBox(self)
-        self._clipboard_read.setRange(1, 30)
-        self._clipboard_read.setSuffix(" s")
-        self._clipboard_read.setValue(
-            int(config.synthesis.clipboard_read_seconds),
-        )
-        self._clipboard_read.setToolTip(
-            "How long the extension polls the clipboard after "
-            "clicking the LLM's Copy button. Default 3 seconds. "
-            "Raise this if long responses surface as a 'couldn't "
-            "read the clipboard' error -- the Copy serialization "
-            "can take longer than the read budget on huge outputs."
-        )
-        timeouts_row.addWidget(self._clipboard_read)
-        timeouts_row.addStretch(1)
-        auto_layout.addLayout(timeouts_row)
-
-        # Install / Status row
-        self._auto_status = QLabel(self)
-        self._auto_status.setWordWrap(True)
-        self._auto_status.setTextFormat(Qt.TextFormat.RichText)
-        auto_layout.addWidget(self._auto_status)
-
-        auto_actions = QHBoxLayout()
-        self._auto_install_btn = QPushButton("Install / Verify...", self)
-        self._auto_install_btn.clicked.connect(self._on_install_clicked)
-        auto_actions.addWidget(self._auto_install_btn)
-        self._auto_uninstall_btn = QPushButton("Uninstall bridge", self)
-        self._auto_uninstall_btn.setToolTip(
-            "Removes the native-messaging bridge registration. Leaves "
-            "the extension files on disk so you can re-verify later "
-            "without re-extracting. To fully remove the extension from "
-            "Chrome, also remove it at chrome://extensions."
-        )
-        self._auto_uninstall_btn.clicked.connect(self._on_uninstall_clicked)
-        auto_actions.addWidget(self._auto_uninstall_btn)
-        auto_actions.addStretch(1)
-        auto_layout.addLayout(auto_actions)
-
-        self._refresh_automation_status()
 
         # Prompt Templates sub-group of Synthesis -----------------------
         prompts_group = QGroupBox("Prompt Templates", self)
@@ -1352,19 +1333,7 @@ class SettingsDialog(QDialog):
         )
         self._config.ui.preview_font_size = int(self._preview_font_size.value())
         self._config.ui.markdown_rich_editor = self._markdown_rich_editor.isChecked()
-        self._config.synthesis.automation_enabled = self._auto_enabled.isChecked()
-        self._config.synthesis.llm_target = (
-            self._auto_target.currentData() or "claude"
-        )
-        self._config.synthesis.claude_project_id = (
-            self._claude_project_id.text().strip()
-        )
-        self._config.synthesis.llm_response_timeout_seconds = (
-            int(self._llm_response_timeout.value()) * 60
-        )
-        self._config.synthesis.clipboard_read_seconds = (
-            int(self._clipboard_read.value())
-        )
+        self._config.synthesis.mcp_enabled = self._mcp_enabled.isChecked()
         self._config.synthesis.auto_extract_attendee_details = (
             self._extract_attendees.isChecked()
         )
@@ -2091,77 +2060,38 @@ class SettingsDialog(QDialog):
             self._refresh_voiceprint_row()
 
     # ------------------------------------------------------------------
-    # Synthesis automation
+    # Synthesis via MCP (v0.8+)
 
-    def _refresh_automation_status(self) -> None:
-        state = installer.installation_state()
-        bits: list[str] = []
-        if state["extension_extracted"]:
-            bits.append(
-                f"Extension files: <code>{state['extension_path']}</code>"
-            )
-        else:
-            bits.append("Extension files: not extracted")
-        if state["native_manifest_written"]:
-            bits.append("Bridge manifest: written")
-        else:
-            bits.append("Bridge manifest: not written")
-        if state.get("registry_chrome"):
-            bits.append("Chrome registration: ok")
-        elif state["native_manifest_written"]:
-            bits.append(
-                "<span style='color: #b91c1c;'>Chrome registration: missing</span>"
-                if __import__("sys").platform.startswith("win")
-                else "Chrome registration: (non-Windows)"
-            )
-        if installer.is_fully_installed():
-            bits.insert(0, "<b style='color: #047857;'>Installed.</b>")
-        elif state["extension_extracted"] or state["native_manifest_written"]:
-            bits.insert(0, "<b style='color: #b45309;'>Partially installed.</b>")
-        else:
-            bits.insert(0, "Not installed.")
-        self._auto_status.setText("<br>".join(bits))
+    _MCP_SETUP_DOC_URL = (
+        "https://github.com/aarondodd/meeting-notetaker/"
+        "blob/main/docs/mcp-setup.md"
+    )
 
-    def _on_install_clicked(self) -> None:
-        # The Chrome native-messaging wrapper has to point at a single
-        # executable; CLI args go in the wrapper body, not the manifest.
-        # Frozen build: <app.exe> --native-host. Dev: <python> main.py
-        # --native-host. We resolve the right shape here and hand the
-        # wizard a single zero-arg installer.
-        import sys as _sys
-        from pathlib import Path as _Path
-        from ..utils.paths import package_root
+    def _on_open_mcp_docs(self) -> None:
+        QDesktopServices.openUrl(QUrl(self._MCP_SETUP_DOC_URL))
 
-        if getattr(_sys, "frozen", False):
-            host_exe = _Path(_sys.executable)
-            host_args = ["--native-host"]
-        else:
-            host_exe = _Path(_sys.executable)
-            host_args = [
-                str(package_root().parent / "main.py"),
-                "--native-host",
-            ]
+    def _on_copy_mcp_snippet(self) -> None:
+        """Copy the full multi-line JSON snippet to the clipboard."""
+        from PyQt6.QtWidgets import QApplication  # noqa: PLC0415
 
-        def do_install() -> dict:
-            installer.extract_extension()
-            installer.write_native_host_manifest(
-                host_executable=host_exe,
-                host_args=host_args,
-            )
-            installer.register_native_host()
-            return installer.installation_state()
+        snippet = mcp_client_config_snippet()
+        QApplication.clipboard().setText(snippet)
 
-        wizard = AutomationInstallDialog(
-            do_install=do_install,
-            ping_extension=self._ping_extension,
-            parent=self,
-        )
-        wizard.exec()
-        self._refresh_automation_status()
-
-    def _on_uninstall_clicked(self) -> None:
-        installer.uninstall(keep_extension_files=True)
-        self._refresh_automation_status()
+    def _on_start_web_ui(self) -> None:
+        """Launch the local web UI (idempotent) and open the browser."""
+        try:
+            from ..web.server import start_background_server  # noqa: PLC0415
+            url = start_background_server()
+        except Exception as exc:
+            self._mcp_web_status.setText(f"web UI failed to start: {exc}")
+            return
+        self._mcp_web_status.setText(f"running at {url}")
+        try:
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception:
+            # The URL is already visible beside the button; the user can
+            # paste it manually if the OS browser hook misbehaves.
+            pass
 
 
 def _populate_device_picker(

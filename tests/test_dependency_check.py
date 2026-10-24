@@ -23,10 +23,11 @@ def test_run_checks_returns_one_entry_per_group():
     assert "Core" in group_names
     assert "Transcription" in group_names
     assert "Speaker identification" in group_names
-    # Order is stable -- Core first, Synthesis automation last (added
-    # in v0.6.3 -- prior to that, the last group was Ad-hoc detection).
+    # Order is stable: Core first, "Synthesis via MCP" last. The
+    # Chrome-extension-driven "Synthesis automation" group was retired
+    # in v0.8 and replaced with the MCP server group.
     assert group_names[0] == "Core"
-    assert group_names[-1] == "Synthesis automation"
+    assert group_names[-1] == "Synthesis via MCP"
     assert "Ad-hoc meeting detection (Windows)" in group_names
 
 

@@ -4,13 +4,13 @@ Issue #42: the synthesis pulled into the app's Synthesis pane carries
 extra blank lines between every bullet and 2+ blank lines between
 sections. A user who manually selects + Ctrl+C's the same response
 gets tight markdown. The post-clipboard normalizer in
-``meeting_notetaker.automation.markdown_normalize`` collapses the
+``meeting_notetaker.utils.markdown_normalize`` collapses the
 loose form into the tight form so the saved notes.md matches the
 user's expectation.
 """
 from __future__ import annotations
 
-from meeting_notetaker.automation.markdown_normalize import (
+from meeting_notetaker.utils.markdown_normalize import (
     normalize_synthesis_markdown,
 )
 

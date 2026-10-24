@@ -356,13 +356,6 @@ def test_synthesis_round_trip(isolated_data_dir):
     assert loaded.synthesis.llm_target == "copilot"
 
 
-def test_synthesis_validation_rejects_unknown_target(isolated_data_dir):
-    cfg = Config()
-    cfg.synthesis.llm_target = "gemini"
-    errors = cfg.validate()
-    assert any("synthesis.llm_target" in e for e in errors)
-
-
 def test_claude_project_id_defaults_empty(isolated_data_dir):
     cfg = Config()
     assert cfg.synthesis.claude_project_id == ""
@@ -380,22 +373,6 @@ def test_claude_project_id_round_trip(isolated_data_dir):
         loaded.synthesis.claude_chat_url()
         == "https://claude.ai/project/019e5077-c745-7541-b2c8-08caeb0f3051"
     )
-
-
-def test_claude_project_id_validation_uuid_shape(isolated_data_dir):
-    cfg = Config()
-    cfg.synthesis.claude_project_id = "not-a-uuid"
-    errors = cfg.validate()
-    assert any("claude_project_id" in e for e in errors)
-
-
-def test_claude_project_id_validation_accepts_uuid_v7(isolated_data_dir):
-    """The Claude project ID Aaron provided is UUID v7 (time-based) --
-    different from v4 internally but same 8-4-4-4-12 outer shape.
-    The validator should accept both."""
-    cfg = Config()
-    cfg.synthesis.claude_project_id = "019e5077-c745-7541-b2c8-08caeb0f3051"
-    assert cfg.validate() == []
 
 
 def test_claude_project_id_accepts_empty(isolated_data_dir):
@@ -626,34 +603,6 @@ def test_synthesis_timeout_defaults(isolated_data_dir):
     assert cfg.validate() == []
 
 
-def test_synthesis_timeout_validates_response_lower_bound(isolated_data_dir):
-    cfg = Config()
-    cfg.synthesis.llm_response_timeout_seconds = 30  # below 60 (1 min)
-    errors = cfg.validate()
-    assert any("llm_response_timeout_seconds" in e for e in errors)
-
-
-def test_synthesis_timeout_validates_response_upper_bound(isolated_data_dir):
-    cfg = Config()
-    cfg.synthesis.llm_response_timeout_seconds = 3600  # above 1800 (30 min)
-    errors = cfg.validate()
-    assert any("llm_response_timeout_seconds" in e for e in errors)
-
-
-def test_synthesis_timeout_validates_clipboard_lower_bound(isolated_data_dir):
-    cfg = Config()
-    cfg.synthesis.clipboard_read_seconds = 0
-    errors = cfg.validate()
-    assert any("clipboard_read_seconds" in e for e in errors)
-
-
-def test_synthesis_timeout_validates_clipboard_upper_bound(isolated_data_dir):
-    cfg = Config()
-    cfg.synthesis.clipboard_read_seconds = 60
-    errors = cfg.validate()
-    assert any("clipboard_read_seconds" in e for e in errors)
-
-
 def test_synthesis_timeout_round_trips_through_toml(tmp_path, isolated_data_dir):
     src = Config()
     src.synthesis.llm_response_timeout_seconds = 900  # 15 min
@@ -664,26 +613,3 @@ def test_synthesis_timeout_round_trips_through_toml(tmp_path, isolated_data_dir)
     assert dst.synthesis.clipboard_read_seconds == 10
 
 
-def test_synthesize_request_carries_timeouts():
-    from meeting_notetaker.automation.messages import SynthesizeRequest
-    req = SynthesizeRequest(
-        request_id="r", target="claude", prompt="hi",
-        llm_response_timeout_seconds=900,
-        clipboard_read_seconds=10,
-    )
-    js = req.to_json()
-    assert js["llm_response_timeout_seconds"] == 900
-    assert js["clipboard_read_seconds"] == 10
-
-
-def test_synthesize_request_defaults_to_zero_for_backcompat():
-    """Default 0 lets the extension fall back to its built-in
-    defaults so an older app paired with a newer extension still
-    works."""
-    from meeting_notetaker.automation.messages import SynthesizeRequest
-    req = SynthesizeRequest(
-        request_id="r", target="claude", prompt="hi",
-    )
-    js = req.to_json()
-    assert js["llm_response_timeout_seconds"] == 0
-    assert js["clipboard_read_seconds"] == 0
