@@ -81,6 +81,18 @@ Chrome extensions treat 127.0.0.1 as a host like any other. In the
 Claude extension's Site Access, grant access to
 `http://127.0.0.1:*/*` or to the specific port you pick.
 
+### Importing the Claude skill (one-off setup)
+
+The repository ships a Claude Agent Skill under `claude-skill/` that
+teaches the extension exactly which pages to read, where the rendered
+prompt lives, and how to post synthesis back. Zip `claude-skill/`
+with `SKILL.md` at the root and import it into the Chrome Claude
+extension's Skills section. Full steps and the install prerequisites
+are in `claude-skill/README.md`. After the skill is imported you can
+ask the extension to "synthesize the latest meeting" or "summarize
+all meetings in folder X last week" without re-explaining the page
+structure each time.
+
 ## Claude Desktop or Claude Code (stdio MCP)
 
 The stdio server is the right choice when a Claude app can be
