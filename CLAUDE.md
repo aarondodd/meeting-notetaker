@@ -270,7 +270,21 @@ covering tool dispatch, every handler, the stdio loop, and the
 Settings helper; nine retired-automation tests and the extension-
 composer-priority tests dropped; the 2381 pre-change suite is now
 2294 passed, 1 skipped. Rebased onto main after PR #134 (stale
-single-instance lock fix) merged as fda658d. Version bumped to
+single-instance lock fix) merged as fda658d (2026-10-23 09:03 HST);
+the branch head is now 24e4aa2. A second transport landed in 3a32837
+(2026-10-23 23:26 HST, local, not yet pushed): the Chrome Claude
+extension's Custom Connectors UI accepts only remote URLs and cannot
+consume a stdio config, so `main.py --web-ui` serves a stdlib
+`ThreadingHTTPServer` on 127.0.0.1 (first free port from 8765, 20
+fallbacks) under `meeting_notetaker/web/` (`server.py`, `handlers.py`,
+`views.py`, `static.py`). It renders HTML pages for meetings,
+templates and a per-meeting synthesis form, plus a JSON API under
+`/api/` mirroring every tool, with `mcp/tools.py` as the shared layer.
+Settings > Synthesis via MCP gained a "Start web UI and open in
+browser..." button (daemon-thread server) and scopes the stdio snippet
+to Claude Desktop and Claude Code; `docs/mcp-setup.md` documents both
+transports. 48 new tests; 2356 collect on the branch at 3a32837.
+Version bumped to
 `0.8.0-dev`; the extension manifest cache-bust pattern no longer
 applies because there is no extension. The per-version notes below
 stop at v0.6.4 and were never carried forward through the v0.7.x line; treat
