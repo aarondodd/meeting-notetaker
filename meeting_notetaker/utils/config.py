@@ -247,6 +247,15 @@ class SynthesisConfig:
     # 8765 + 20 fallback range, and the resolved URL is logged + shown
     # in Settings > Synthesis.
     start_web_ui_on_launch: bool = False
+    # v0.8.1: per-destination opt-in for the web UI's export dropdown
+    # on the meeting detail page. Each one must ALSO be configured in
+    # its own Settings pane (Obsidian vault_root, Notion verified, etc.)
+    # before the web UI will offer it; the checkbox alone does not bypass
+    # that gate. Default off so Notion/Confluence don't show for users
+    # who haven't picked a default target page yet.
+    web_ui_export_obsidian: bool = False
+    web_ui_export_notion: bool = False
+    web_ui_export_confluence: bool = False
     # v0.6.3..v0.7.14: in-app automation bridge to Chrome. Retired in
     # v0.8 (replaced by the MCP path). The fields below stay in the
     # dataclass so stale config.toml files load cleanly, and the

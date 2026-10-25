@@ -122,12 +122,6 @@ def _apply_list_filters(request: Request) -> tuple[dict, dict]:
         raw["state"] = state_val
         args["state"] = state_val
 
-    if "folder_id" in request.query:
-        folder_val = _first(request.query.get("folder_id"), "") or ""
-        raw["folder_id"] = folder_val
-        # Treat an explicit empty string as "unfiled only"; omission as "any".
-        args["folder_id"] = folder_val
-
     # Classification filters: series_id / contact_id / topic_id. Each
     # one is an integer id; the string value stays in raw so the HTML
     # form keeps its selection after submit. An empty value or
@@ -157,20 +151,28 @@ def _apply_list_filters(request: Request) -> tuple[dict, dict]:
     return args, raw
 
 
-def _obsidian_configured() -> bool:
-    """Cheap test for whether a vault export is wired up.
+def _enabled_export_destinations() -> list[dict]:
+    """Return destinations the user has enabled AND that are configured.
 
-    Reads Config once per request; the common case is a user who sets
-    this once in Settings, so round-tripping config is fine. On error
-    (missing config.toml etc.) return False so the UI shows the
-    'not configured' hint rather than a 500.
+    The dropdown on the detail page offers only destinations in this
+    list. ``list_export_destinations`` returns every destination with
+    enabled + configured flags; this filter is the AND of both so a
+    checkbox for an unconfigured integration (should not happen,
+    Settings disables the box) stays silent instead of 500-ing.
     """
-    try:
-        from ..utils.config import Config  # noqa: PLC0415
-        config = Config.load()
-    except Exception:
-        return False
-    return bool((config.obsidian.vault_root or "").strip())
+    result = tools.list_export_destinations({})
+    out = []
+    for row in result.get("destinations", []):
+        if row.get("enabled") and row.get("configured"):
+            out.append(row)
+    return out
+
+
+_EXPORT_TOOLS = {
+    "obsidian": tools.export_meeting_to_obsidian,
+    "notion": tools.export_meeting_to_notion,
+    "confluence": tools.export_meeting_to_confluence,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +214,6 @@ def meetings_list(request: Request) -> Response:
     if raw_filters.get("has_notes") == "1":
         meetings = [m for m in meetings if m.get("has_notes")]
 
-    with SessionStore() as store:
-        folders = [
-            {"id": f.id, "name": f.name, "parent_id": f.parent_id}
-            for f in store.list_folders()
-        ]
-
     classification = tools.list_classification({})
     if "error" in classification:
         # A disabled classification store should degrade quietly: no
@@ -226,11 +222,9 @@ def meetings_list(request: Request) -> Response:
 
     body = views.render_meeting_list(
         meetings=meetings,
-        folders=folders,
         filters=raw_filters,
         total_shown=len(meetings),
         classification=classification,
-        obsidian_configured=_obsidian_configured(),
     )
     return _html(200, body)
 
@@ -261,12 +255,12 @@ def meeting_detail(request: Request) -> Response:
     tmpl_set_flag = _first(request.query.get("template_set"))
     if tmpl_set_flag:
         flash_tuple = ("ok", f"Template set to '{tmpl_set_flag}'.")
-    obsidian_ok = _first(request.query.get("obsidian"))
-    if obsidian_ok:
-        flash_tuple = ("ok", f"Saved to Obsidian: {obsidian_ok}")
-    obsidian_err = _first(request.query.get("obsidian_err"))
-    if obsidian_err:
-        flash_tuple = ("err", f"Obsidian export failed: {obsidian_err}")
+    export_ok = _first(request.query.get("export"))
+    if export_ok:
+        flash_tuple = ("ok", f"Exported: {export_ok}")
+    export_err = _first(request.query.get("export_err"))
+    if export_err:
+        flash_tuple = ("err", f"Export failed: {export_err}")
 
     body = views.render_meeting_detail(
         meeting=meta["meeting"],
@@ -277,7 +271,7 @@ def meeting_detail(request: Request) -> Response:
         prompt_template_name=template_name,
         templates=templates,
         flash=flash_tuple,
-        obsidian_configured=_obsidian_configured(),
+        export_destinations=_enabled_export_destinations(),
     )
     return _html(200, body)
 
@@ -298,29 +292,95 @@ def meeting_save(request: Request) -> Response:
     return _redirect(f"/meetings/{urllib.parse.quote(mid)}?saved=1")
 
 
-def meeting_export_obsidian(request: Request) -> Response:
-    """Save a meeting's synthesis into the configured Obsidian vault.
+def _run_export(mid: str, destination: str) -> dict:
+    """Dispatch to the right MCP tool for ``destination``.
 
-    Form-POST path redirects (303) back to the meeting detail with a
-    flash describing the result; JSON path returns the tool's response
-    body with a 200/400 status so curl automation can read it.
+    Returns the tool's response dict (with an ``error`` key on
+    failure). ``destination`` is validated here so a bogus value fails
+    with a clean 400 at the handler layer.
     """
-    mid = request.path_params["id"]
-    result = tools.export_meeting_to_obsidian({"meeting_id": mid})
-    wants_json = _wants_json(request)
-    if wants_json:
-        status = 400 if "error" in result else 200
-        return _json(status, result)
+    handler = _EXPORT_TOOLS.get(destination)
+    if handler is None:
+        return {"error": f"unknown export destination '{destination}'"}
+    return handler({"meeting_id": mid})
+
+
+def _export_redirect(mid: str, result: dict, destination: str) -> Response:
     quoted_mid = urllib.parse.quote(mid)
     if "error" in result:
         return _redirect(
             f"/meetings/{quoted_mid}"
-            f"?obsidian_err={urllib.parse.quote(result['error'])}"
+            f"?export_err={urllib.parse.quote(result['error'])}"
         )
+    label = {
+        "obsidian": "Obsidian",
+        "notion": "Notion",
+        "confluence": "Confluence",
+    }.get(destination, destination)
     msg = result.get("message") or result.get("page_url") or "ok"
     return _redirect(
-        f"/meetings/{quoted_mid}?obsidian={urllib.parse.quote(msg)}"
+        f"/meetings/{quoted_mid}"
+        f"?export={urllib.parse.quote(f'{label} -- {msg}')}"
     )
+
+
+def meeting_export(request: Request) -> Response:
+    """Dispatch /meetings/<id>/export on form ``destination`` field.
+
+    The detail page's dropdown POSTs here. Form path redirects (303)
+    back to the detail with a flash; JSON path returns the tool's
+    response for scripted automation.
+    """
+    mid = request.path_params["id"]
+    destination = _first(request.form.get("destination"), "")
+    if request.json_body is not None:
+        body_dict = request.json_body if isinstance(request.json_body, dict) else {}
+        destination = (body_dict.get("destination") or destination or "").strip()
+    destination = (destination or "").strip()
+    wants_json = _wants_json(request)
+    if not destination:
+        err = "destination is required (one of obsidian, notion, confluence)"
+        return _error_json(400, err) if wants_json else _error_html(400, err)
+    result = _run_export(mid, destination)
+    if wants_json:
+        status = 400 if "error" in result else 200
+        return _json(status, result)
+    return _export_redirect(mid, result, destination)
+
+
+def meeting_export_obsidian(request: Request) -> Response:
+    """Legacy per-destination route; kept so an older skill still works.
+
+    Form path redirects back to the detail with a flash; JSON path
+    returns the tool's response body with a 200/400 status.
+    """
+    mid = request.path_params["id"]
+    result = _run_export(mid, "obsidian")
+    wants_json = _wants_json(request)
+    if wants_json:
+        status = 400 if "error" in result else 200
+        return _json(status, result)
+    return _export_redirect(mid, result, "obsidian")
+
+
+def meeting_export_notion(request: Request) -> Response:
+    mid = request.path_params["id"]
+    result = _run_export(mid, "notion")
+    wants_json = _wants_json(request)
+    if wants_json:
+        status = 400 if "error" in result else 200
+        return _json(status, result)
+    return _export_redirect(mid, result, "notion")
+
+
+def meeting_export_confluence(request: Request) -> Response:
+    mid = request.path_params["id"]
+    result = _run_export(mid, "confluence")
+    wants_json = _wants_json(request)
+    if wants_json:
+        status = 400 if "error" in result else 200
+        return _json(status, result)
+    return _export_redirect(mid, result, "confluence")
 
 
 def meeting_set_template(request: Request) -> Response:
@@ -459,6 +519,28 @@ def api_export_obsidian(request: Request) -> Response:
     return _json(status, result)
 
 
+def api_export_notion(request: Request) -> Response:
+    result = tools.export_meeting_to_notion(
+        {"meeting_id": request.path_params["id"]}
+    )
+    status = 400 if "error" in result else 200
+    return _json(status, result)
+
+
+def api_export_confluence(request: Request) -> Response:
+    result = tools.export_meeting_to_confluence(
+        {"meeting_id": request.path_params["id"]}
+    )
+    status = 400 if "error" in result else 200
+    return _json(status, result)
+
+
+def api_export_destinations(_req: Request) -> Response:
+    result = tools.list_export_destinations({})
+    status = 500 if "error" in result else 200
+    return _json(status, result)
+
+
 # ---------------------------------------------------------------------------
 # Routing table
 # ---------------------------------------------------------------------------
@@ -493,8 +575,23 @@ ROUTES: list[Route] = [
     ),
     Route(
         "POST",
+        _compile(r"/meetings/(?P<id>[A-Za-z0-9_\-]+)/export"),
+        meeting_export,
+    ),
+    Route(
+        "POST",
         _compile(r"/meetings/(?P<id>[A-Za-z0-9_\-]+)/export/obsidian"),
         meeting_export_obsidian,
+    ),
+    Route(
+        "POST",
+        _compile(r"/meetings/(?P<id>[A-Za-z0-9_\-]+)/export/notion"),
+        meeting_export_notion,
+    ),
+    Route(
+        "POST",
+        _compile(r"/meetings/(?P<id>[A-Za-z0-9_\-]+)/export/confluence"),
+        meeting_export_confluence,
     ),
     Route("GET", _compile(r"/templates"), templates_list),
     # JSON API.
@@ -511,9 +608,20 @@ ROUTES: list[Route] = [
         _compile(r"/api/meetings/(?P<id>[A-Za-z0-9_\-]+)/export/obsidian"),
         api_export_obsidian,
     ),
+    Route(
+        "POST",
+        _compile(r"/api/meetings/(?P<id>[A-Za-z0-9_\-]+)/export/notion"),
+        api_export_notion,
+    ),
+    Route(
+        "POST",
+        _compile(r"/api/meetings/(?P<id>[A-Za-z0-9_\-]+)/export/confluence"),
+        api_export_confluence,
+    ),
     Route("GET", _compile(r"/api/templates"), api_templates),
     Route("GET", _compile(r"/api/templates/(?P<name>[A-Za-z0-9_\-]+)"), api_template),
     Route("GET", _compile(r"/api/classification"), api_classification),
+    Route("GET", _compile(r"/api/export_destinations"), api_export_destinations),
 ]
 
 

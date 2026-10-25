@@ -399,10 +399,11 @@ def test_meetings_list_renders_series_contact_topic_filters(seeded_meetings):
     assert "Series <select" in text
     assert "Person <select" in text
     assert "Topic <select" in text
-    # The Export column exists even without a configured vault; the
-    # per-row cell displays the "not configured" hint.
-    assert "<th>Export</th>" in text
-    assert "not configured" in text
+    # Folder filter + per-row Export column were removed in v0.8.1 to
+    # match the Python app's list view and to collapse export into a
+    # single detail-page dropdown.
+    assert 'name="folder_id"' not in text
+    assert "<th>Export</th>" not in text
 
 
 def test_meetings_list_filters_pass_through_to_tools(seeded_meetings, monkeypatch):
@@ -451,42 +452,42 @@ def test_meeting_detail_renders_synthesis_as_markdown(seeded_meetings, monkeypat
     assert "<li>ship it</li>" in text
 
 
-def test_meeting_detail_obsidian_section_shows_not_configured(seeded_meetings):
-    """Without a configured vault, the Export to Obsidian section
-    renders the hint rather than the Save button."""
+def test_meeting_detail_export_section_shows_hint_when_none_enabled(seeded_meetings):
+    """Without any destination enabled in Settings, the Export section
+    renders the hint rather than a dropdown."""
     completed_id, _new_id = seeded_meetings
     status, _h, body = handlers.dispatch(
         _req("GET", f"/meetings/{completed_id}")
     )
     assert status == 200
     text = body.decode("utf-8")
-    assert ">Export to Obsidian<" in text
-    assert "vault is not configured" in text
-    assert 'action="/meetings/' not in text.split(">Export to Obsidian<", 1)[1].split(">Synthesis workflow<", 1)[0]
+    assert 'id="export"' in text
+    assert "No export destinations are enabled" in text
+    assert 'name="destination"' not in text
 
 
 def test_meeting_export_obsidian_without_vault_flashes_err(seeded_meetings):
-    """Form POST with no vault configured redirects to the detail
-    page with an `obsidian_err=...` query param that becomes the flash."""
+    """Legacy /export/obsidian form path still works, redirects with
+    an `export_err=...` flash."""
     completed_id, _new_id = seeded_meetings
     status, hdrs, _body = handlers.dispatch(
         _req("POST", f"/meetings/{completed_id}/export/obsidian", form={})
     )
     assert status == 303
     assert hdrs["Location"].startswith(f"/meetings/{completed_id}")
-    assert "obsidian_err=" in hdrs["Location"]
+    assert "export_err=" in hdrs["Location"]
     # Loading the detail page with that query renders the err flash.
     import urllib.parse  # local import; the module is already imported above
     parsed = urllib.parse.urlparse(hdrs["Location"])
     query = urllib.parse.parse_qs(parsed.query)
     status, _h, body = handlers.dispatch(
         _req("GET", f"/meetings/{completed_id}",
-             query={"obsidian_err": query["obsidian_err"][0]})
+             query={"export_err": query["export_err"][0]})
     )
     assert status == 200
     text = body.decode("utf-8")
     assert 'class="flash err"' in text
-    assert "Obsidian export failed" in text
+    assert "Export failed" in text
 
 
 def test_meeting_export_obsidian_json_returns_400_without_vault(seeded_meetings):
@@ -503,6 +504,48 @@ def test_meeting_export_obsidian_json_returns_400_without_vault(seeded_meetings)
     assert status == 400
     data = json.loads(body)
     assert "Obsidian vault is not configured" in data["error"]
+
+
+def test_meeting_export_dropdown_rejects_missing_destination(seeded_meetings):
+    """A form POST to /export with no destination field returns 400
+    rather than silently exporting to the first enabled destination."""
+    completed_id, _new_id = seeded_meetings
+    status, _h, body = handlers.dispatch(
+        _req("POST", f"/meetings/{completed_id}/export", form={})
+    )
+    assert status == 400
+    assert b"destination is required" in body
+
+
+def test_meeting_export_dropdown_dispatches_to_destination(seeded_meetings):
+    """POST /export with destination=obsidian hits the obsidian handler.
+    With no vault configured, the dispatcher still returns a 303 with
+    export_err just like /export/obsidian."""
+    completed_id, _new_id = seeded_meetings
+    status, hdrs, _body = handlers.dispatch(
+        _req(
+            "POST",
+            f"/meetings/{completed_id}/export",
+            form={"destination": "obsidian"},
+        )
+    )
+    assert status == 303
+    assert "export_err=" in hdrs["Location"]
+
+
+def test_api_export_destinations_returns_three_rows(isolated_data_dir):
+    """The destinations endpoint always carries one row per key, each
+    carrying configured + enabled booleans."""
+    status, _h, body = handlers.dispatch(
+        _req("GET", "/api/export_destinations",
+             headers={"accept": "application/json"})
+    )
+    assert status == 200
+    data = json.loads(body)
+    keys = sorted(r["key"] for r in data["destinations"])
+    assert keys == ["confluence", "notion", "obsidian"]
+    for row in data["destinations"]:
+        assert "configured" in row and "enabled" in row
 
 
 def test_api_classification_route_returns_empty_lists(isolated_data_dir):

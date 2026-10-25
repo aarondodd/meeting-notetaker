@@ -142,4 +142,77 @@ def test_new_tools_are_registered():
     names = {t.name for t in tools.TOOLS}
     assert "list_classification" in names
     assert "export_meeting_to_obsidian" in names
+    assert "export_meeting_to_notion" in names
+    assert "export_meeting_to_confluence" in names
+    assert "list_export_destinations" in names
     assert "series_id" in tools.tool_by_name("list_meetings").input_schema["properties"]
+
+
+# ---- list_export_destinations + Notion/Confluence export (v0.8.1) --------
+
+
+def test_list_export_destinations_returns_three_rows(isolated_data_dir):
+    """Fresh config: obsidian/notion/confluence rows all present, all
+    disabled, all unconfigured."""
+    result = tools.list_export_destinations({})
+    assert "error" not in result, result
+    keys = [r["key"] for r in result["destinations"]]
+    assert keys == ["obsidian", "notion", "confluence"]
+    for row in result["destinations"]:
+        assert row["configured"] is False
+        assert row["enabled"] is False
+        assert "label" in row and "target_title" in row
+
+
+def test_list_export_destinations_marks_obsidian_configured(isolated_data_dir, tmp_path):
+    cfg = Config.load()
+    cfg.obsidian.vault_root = str(tmp_path)
+    cfg.obsidian.vault_name = "my-vault"
+    cfg.synthesis.web_ui_export_obsidian = True
+    cfg.save()
+    result = tools.list_export_destinations({})
+    obs = next(r for r in result["destinations"] if r["key"] == "obsidian")
+    assert obs["configured"] is True
+    assert obs["enabled"] is True
+    assert obs["target_title"] == "my-vault"
+
+
+def test_export_meeting_to_notion_without_config(seeded):
+    a_id, _b_id, _s, _t = seeded
+    result = tools.export_meeting_to_notion({"meeting_id": a_id})
+    assert "error" in result
+    assert "Notion is not configured" in result["error"]
+
+
+def test_export_meeting_to_notion_without_target(seeded):
+    """Verified Notion but no favorite / recent target: clean error."""
+    _a_id, _b_id, _s, _t = seeded
+    cfg = Config.load()
+    cfg.notion.api_token = "secret_fake"
+    cfg.notion.last_verified_at = "2026-10-25T00:00:00"
+    cfg.save()
+    result = tools.export_meeting_to_notion({"meeting_id": _a_id})
+    assert "error" in result
+    assert "No Notion target page saved yet" in result["error"]
+
+
+def test_export_meeting_to_confluence_without_config(seeded):
+    a_id, _b_id, _s, _t = seeded
+    result = tools.export_meeting_to_confluence({"meeting_id": a_id})
+    assert "error" in result
+    assert "Confluence is not configured" in result["error"]
+
+
+def test_export_meeting_to_confluence_target_missing_space(seeded):
+    """Verified Confluence + a recent target but no space_id in extra."""
+    a_id, _b_id, _s, _t = seeded
+    cfg = Config.load()
+    cfg.confluence.base_url = "https://example.atlassian.net/wiki"
+    cfg.confluence.email = "me@example.com"
+    cfg.confluence.api_token = "token"
+    cfg.confluence.last_verified_at = "2026-10-25T00:00:00"
+    cfg.confluence.recents = [{"id": "p1", "title": "Projects"}]
+    cfg.save()
+    result = tools.export_meeting_to_confluence({"meeting_id": a_id})
+    assert "error" in result
+    assert "no space_id" in result["error"]

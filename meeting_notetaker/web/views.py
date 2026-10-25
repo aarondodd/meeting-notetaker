@@ -48,11 +48,27 @@ def render_markdown(body: str) -> str:
     return f'<div class="md">{rendered}</div>'
 
 
-def _page(title: str, body: str, flash: str | None = None) -> str:
+def _page(
+    title: str,
+    body: str,
+    flash: str | None = None,
+    sidebar: str | None = None,
+) -> str:
+    """Render the outer shell.
+
+    ``sidebar`` is only passed by the detail view: when present, the
+    main area becomes a two-column grid (sticky nav on the left,
+    content on the right) that collapses to a single column below the
+    narrow-screen breakpoint.
+    """
     flash_html = ""
     if flash:
         kind, msg = flash
         flash_html = f'<div class="flash {_esc(kind)}">{_esc(msg)}</div>'
+    main_class = ' class="with-sidebar"' if sidebar else ""
+    sidebar_html = f'<aside class="toc">{sidebar}</aside>\n    ' if sidebar else ""
+    content_open = '<div class="content">' if sidebar else ""
+    content_close = "</div>" if sidebar else ""
     return (
         "<!doctype html>\n"
         "<html lang=\"en\">\n"
@@ -70,11 +86,13 @@ def _page(title: str, body: str, flash: str | None = None) -> str:
         "      <a href=\"/templates\">Templates</a>\n"
         "    </div>\n"
         "  </header>\n"
-        "  <main>\n"
+        f"  <main{main_class}>\n"
+        f"    {sidebar_html}{content_open}\n"
         f"    {flash_html}\n"
         f"    {body}\n"
         "    <div class=\"footer\">Local, loopback-only. "
         "Data path: %APPDATA%\\MeetingNotetaker (or $MEETING_NOTETAKER_DATA_DIR).</div>\n"
+        f"    {content_close}\n"
         "  </main>\n"
         "</body>\n"
         "</html>\n"
@@ -125,35 +143,30 @@ def _classification_options(
 def render_meeting_list(
     *,
     meetings: list[dict],
-    folders: list[dict],
     filters: dict,
     total_shown: int,
     classification: dict | None = None,
-    obsidian_configured: bool = False,
+    folders: list[dict] | None = None,  # unused since v0.8.1; kept for test compat
+    obsidian_configured: bool = False,  # unused since v0.8.1; kept for test compat
 ) -> str:
     """Render /meetings. ``filters`` carries the live query string so the
-    form repopulates after submit; ``folders`` is the full folder list,
-    ``classification`` is ``{"series": [...], "contacts": [...], "topics": [...]}``
-    for the series / person / topic dropdowns, and ``obsidian_configured``
-    gates the per-row Save to Obsidian button."""
+    form repopulates after submit; ``classification`` is
+    ``{"series": [...], "contacts": [...], "topics": [...]}`` for the
+    series / person / topic dropdowns.
+
+    The per-row Export column and the Folder filter were removed in
+    v0.8.1 to match the Python app's list view and to collapse export
+    into a single destination dropdown on the detail page.
+    ``folders`` / ``obsidian_configured`` are kept as keyword
+    arguments so existing callers and tests still import cleanly.
+    """
+    del folders, obsidian_configured
     classification = classification or {"series": [], "contacts": [], "topics": []}
     options = "".join(
         f'<option value="{_esc(s)}"'
         f'{" selected" if filters.get("state") == s else ""}>{_esc(s)}</option>'
         for s in ALL_STATES
     )
-    folder_options = (
-        '<option value="">(any)</option>'
-        '<option value=""'
-        f'{" selected" if filters.get("folder_id") == "" and "folder_id" in filters else ""}'
-        '>-- unfiled only --</option>'
-    )
-    for folder in folders:
-        folder_options += (
-            f'<option value="{_esc(folder["id"])}"'
-            f'{" selected" if filters.get("folder_id") == folder["id"] else ""}'
-            f'>{_esc(folder["name"])}</option>'
-        )
     series_options = _classification_options(
         "series", classification.get("series", []), "name",
         filters.get("series_id", ""),
@@ -177,8 +190,6 @@ def render_meeting_list(
         '  <label>State '
         f'<select name="state"><option value=""{unselected_state}>(any)</option>'
         f'{options}</select></label>\n'
-        '  <label>Folder '
-        f'<select name="folder_id">{folder_options}</select></label>\n'
         '  <label>Series '
         f'<select name="series_id">{series_options}</select></label>\n'
         '  <label>Person '
@@ -196,29 +207,12 @@ def render_meeting_list(
         '</form>'
     )
     if not meetings:
-        rows_html = '<tr><td colspan="7" style="color:#6e7781">No meetings match these filters.</td></tr>'
+        rows_html = '<tr><td colspan="6" style="color:#6e7781">No meetings match these filters.</td></tr>'
     else:
         rows: list[str] = []
         for m in meetings:
             mid = _esc(m["id"])
             has_notes = bool(m.get("has_notes"))
-            if obsidian_configured and has_notes:
-                obsidian_cell = (
-                    f'<form method="post" class="inline-form" '
-                    f'action="/meetings/{mid}/export/obsidian">'
-                    '<button type="submit" class="secondary tiny">To Obsidian</button>'
-                    '</form>'
-                )
-            elif obsidian_configured:
-                obsidian_cell = (
-                    '<span class="muted" title="Save a synthesis first; the row-level '
-                    'button writes notes.md to the configured vault.">needs synthesis</span>'
-                )
-            else:
-                obsidian_cell = (
-                    '<span class="muted" title="Set Obsidian vault_root in Settings.">'
-                    'not configured</span>'
-                )
             rows.append(
                 "<tr>\n"
                 f'  <td><a class="row-link" href="/meetings/{mid}">'
@@ -228,7 +222,6 @@ def render_meeting_list(
                 f"  <td>{_yesno_badge(bool(m.get('has_transcript')))}</td>\n"
                 f"  <td>{_yesno_badge(has_notes, 'synthesized', 'none')}</td>\n"
                 f'  <td>{_esc(m.get("duration_seconds") or "")}</td>\n'
-                f'  <td>{obsidian_cell}</td>\n'
                 "</tr>"
             )
         rows_html = "\n".join(rows)
@@ -237,7 +230,6 @@ def render_meeting_list(
         "<thead><tr>"
         "<th>Title</th><th>When</th><th>State</th>"
         "<th>Transcript</th><th>Synthesis</th><th>Duration (s)</th>"
-        "<th>Export</th>"
         "</tr></thead>\n"
         f"<tbody>\n{rows_html}\n</tbody>\n"
         "</table>"
@@ -267,6 +259,82 @@ def _attendees_list(attendees: Iterable[str]) -> str:
     return '<ul class="attendees">\n' + "\n".join(items) + "\n</ul>"
 
 
+_DETAIL_TOC = [
+    ("meta", "Overview"),
+    ("attendees", "Attendees"),
+    ("live-notes", "Live notes"),
+    ("transcript", "Transcript"),
+    ("current-synthesis", "Current synthesis"),
+    ("export", "Export"),
+    ("workflow", "Synthesis workflow"),
+]
+
+
+def _render_export_section(mid: str, destinations: list[dict], has_notes: bool) -> str:
+    """Build the single-dropdown Export section for the detail page.
+
+    ``destinations`` is the list of enabled+configured destinations from
+    the handler (``[{"key", "label", "configured", "enabled",
+    "target_title"}, ...]``). An empty list renders a muted hint.
+    """
+    if not destinations:
+        return (
+            '<section id="export">\n'
+            '  <h2>Export</h2>\n'
+            '  <p style="font-size:13px;color:#6e7781;margin:0">'
+            'No export destinations are enabled for the web UI. Open '
+            'Meeting Notetaker &gt; Settings &gt; Synthesis and tick '
+            'the destinations you want to show here.</p>\n'
+            '</section>\n'
+        )
+    if not has_notes:
+        return (
+            '<section id="export">\n'
+            '  <h2>Export</h2>\n'
+            '  <p style="font-size:13px;color:#6e7781;margin:0">'
+            'Save a synthesis below first; the export writes the '
+            'current notes.md to the chosen destination.</p>\n'
+            '</section>\n'
+        )
+    options = []
+    for dest in destinations:
+        key = _esc(dest["key"])
+        label = _esc(dest["label"])
+        target = dest.get("target_title") or ""
+        suffix = f" -- {_esc(target)}" if target else ""
+        options.append(
+            f'<option value="{key}">{label}{suffix}</option>'
+        )
+    return (
+        '<section id="export">\n'
+        '  <h2>Export</h2>\n'
+        '  <p style="font-size:13px;color:#57606a;margin:0 0 10px">'
+        'Writes the current synthesis to the chosen destination. '
+        'Settings control which destinations appear here and which '
+        'target page they land in.</p>\n'
+        f'  <form class="inline" method="post" action="/meetings/{_esc(mid)}/export">\n'
+        '    <label for="export-destination">Destination:</label>\n'
+        '    <select id="export-destination" name="destination">\n'
+        f'      {"".join(options)}\n'
+        '    </select>\n'
+        '    <button type="submit">Export</button>\n'
+        '  </form>\n'
+        '</section>\n'
+    )
+
+
+def _render_toc(mid: str) -> str:
+    items = "".join(
+        f'<li><a href="#{anchor}">{_esc(label)}</a></li>'
+        for anchor, label in _DETAIL_TOC
+    )
+    return (
+        '<div class="toc-title">On this page</div>\n'
+        f'<ul class="toc-list">{items}</ul>\n'
+        f'<div class="toc-back"><a href="/meetings">All meetings</a></div>'
+    )
+
+
 def render_meeting_detail(
     *,
     meeting: dict,
@@ -277,8 +345,25 @@ def render_meeting_detail(
     prompt_template_name: str,
     templates: list[dict],
     flash: tuple[str, str] | None = None,
-    obsidian_configured: bool = False,
+    export_destinations: list[dict] | None = None,
+    obsidian_configured: bool = False,  # unused since v0.8.1; kept for test compat
 ) -> str:
+    """Render /meetings/<id>.
+
+    ``export_destinations`` is the list of destinations the user has
+    enabled AND that are configured. Pass ``obsidian_configured=True``
+    (older test-only path) to approximate the pre-v0.8.1 single
+    Obsidian button.
+    """
+    if export_destinations is None and obsidian_configured:
+        export_destinations = [{
+            "key": "obsidian",
+            "label": "Obsidian vault",
+            "configured": True,
+            "enabled": True,
+            "target_title": "",
+        }]
+    export_destinations = export_destinations or []
     mid = meeting["id"]
     title = meeting.get("title") or "(untitled)"
     meta_cells = [
@@ -334,63 +419,31 @@ def render_meeting_detail(
     else:
         live_notes_html = '<pre>(empty)</pre>'
 
-    # Save-to-Obsidian form (detail page). Button is disabled with a
-    # tooltip when the vault is unconfigured, when the meeting has no
-    # synthesis yet, or when the handler has nothing to export.
     has_notes = bool(meeting.get("has_notes")) or bool(existing_notes)
-    if obsidian_configured and has_notes:
-        obsidian_section = (
-            '<section>\n'
-            '  <h2>Export to Obsidian</h2>\n'
-            '  <p style="font-size:13px;color:#57606a;margin:0 0 10px">'
-            'Writes the current synthesis to your configured vault using the '
-            'location template and frontmatter rules from Settings &gt; Obsidian.</p>\n'
-            f'  <form method="post" action="/meetings/{_esc(mid)}/export/obsidian">\n'
-            '    <button type="submit">Save to Obsidian</button>\n'
-            '  </form>\n'
-            '</section>\n'
-        )
-    elif obsidian_configured:
-        obsidian_section = (
-            '<section>\n'
-            '  <h2>Export to Obsidian</h2>\n'
-            '  <p style="font-size:13px;color:#6e7781;margin:0">'
-            'Save a synthesis below first; the export writes the current '
-            'notes.md to the vault.</p>\n'
-            '</section>\n'
-        )
-    else:
-        obsidian_section = (
-            '<section>\n'
-            '  <h2>Export to Obsidian</h2>\n'
-            '  <p style="font-size:13px;color:#6e7781;margin:0">'
-            'Obsidian vault is not configured. Open Meeting Notetaker &gt; '
-            'Settings &gt; Obsidian and set the vault path.</p>\n'
-            '</section>\n'
-        )
+    export_section = _render_export_section(mid, export_destinations, has_notes)
 
     body = (
-        f'<section>\n  <h2>{_esc(title)}</h2>\n'
+        f'<section id="meta">\n  <h2>{_esc(title)}</h2>\n'
         f'  <div class="meta-grid">{meta_html}</div>\n'
         '</section>\n'
-        '<section>\n  <h2>Attendees</h2>\n'
+        '<section id="attendees">\n  <h2>Attendees</h2>\n'
         f'  {_attendees_list(attendees)}\n'
         '</section>\n'
-        '<section>\n  <h2>Live notes</h2>\n'
+        '<section id="live-notes">\n  <h2>Live notes</h2>\n'
         '  <details><summary>Show / hide</summary>\n'
         f'  {live_notes_html}\n'
         '  </details>\n'
         '</section>\n'
-        '<section>\n  <h2>Transcript</h2>\n'
+        '<section id="transcript">\n  <h2>Transcript</h2>\n'
         '  <details><summary>Show / hide</summary>\n'
         f'  <pre>{_esc(transcript) or "(empty)"}</pre>\n'
         '  </details>\n'
         '</section>\n'
-        '<section>\n  <h2>Current synthesis</h2>\n'
+        '<section id="current-synthesis">\n  <h2>Current synthesis</h2>\n'
         f'  {existing_html}\n'
         '</section>\n'
-        f'{obsidian_section}'
-        '<section>\n  <h2>Synthesis workflow</h2>\n'
+        f'{export_section}'
+        '<section id="workflow">\n  <h2>Synthesis workflow</h2>\n'
         f'  <p style="font-size:13px;color:#57606a;margin-top:0">Template to use for the prompt below. Changing this re-renders the prompt on reload.</p>\n'
         f'  {template_picker_html}\n'
         '  <h3 style="font-size:13px;margin-top:14px;color:#57606a;text-transform:uppercase;letter-spacing:0.03em">Rendered prompt</h3>\n'
@@ -406,7 +459,7 @@ def render_meeting_detail(
         '  </form>\n'
         '</section>'
     )
-    return _page(title, body, flash=flash)
+    return _page(title, body, flash=flash, sidebar=_render_toc(mid))
 
 
 # ---------------------------------------------------------------------------

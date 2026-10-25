@@ -51,7 +51,10 @@ def test_skill_names_core_routes_and_form_handles():
         "/meetings/<id>",
         "/meetings/<id>/save",
         "/meetings/<id>/template",
+        '/meetings/<id>/export"',
         "/meetings/<id>/export/obsidian",
+        "/meetings/<id>/export/notion",
+        "/meetings/<id>/export/confluence",
         "/templates",
         "/healthz",
         "127.0.0.1",
@@ -59,13 +62,14 @@ def test_skill_names_core_routes_and_form_handles():
         'id="rendered-prompt"',
         'name="notes"',
         "Save synthesis",
-        "Save to Obsidian",
+        'name="destination"',
         "has_transcript",
         "has_notes",
         "series_id",
         "contact_id",
         "topic_id",
         "/api/classification",
+        "/api/export_destinations",
     ]
     missing = [token for token in required if token not in body]
     assert not missing, f"SKILL.md is missing anchors: {missing}"

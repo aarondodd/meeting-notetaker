@@ -35,16 +35,16 @@ def test_list_page_renders_rows_and_echoes_filters():
                 "duration_seconds": 90,
             },
         ],
-        folders=[{"id": "fid1", "name": "Topic X"}],
         filters={"state": "complete", "has_transcript": "1", "limit": "25"},
         total_shown=1,
     )
     assert "Alpha" in html
     assert "complete" in html
-    assert "Topic X" in html
     # Filter echoed in form values.
     assert 'value="25"' in html
     assert 'checked' in html
+    # Folder filter was removed in v0.8.1; no folder select rendered.
+    assert 'name="folder_id"' not in html
 
 
 def test_detail_page_has_save_form_and_prompt_pane():
@@ -225,7 +225,9 @@ def test_detail_renders_synthesis_as_markdown_container():
     assert "raw transcript\nline two" in html
 
 
-def test_list_renders_classification_filters_and_export_column():
+def test_list_renders_classification_filters():
+    """The expanded filter form carries the three classification selects
+    and no Folder / Export column (both dropped in v0.8.1)."""
     classification = {
         "series": [{"id": 1, "name": "Platform"}],
         "contacts": [{"id": 7, "display_name": "Alex"}],
@@ -241,11 +243,9 @@ def test_list_renders_classification_filters_and_export_column():
                 "duration_seconds": 60,
             },
         ],
-        folders=[],
         filters={"series_id": "1"},
         total_shown=1,
         classification=classification,
-        obsidian_configured=True,
     )
     # Classification selects + their options.
     assert 'name="series_id"' in html
@@ -253,29 +253,15 @@ def test_list_renders_classification_filters_and_export_column():
     assert ">Platform<" in html
     assert 'name="contact_id"' in html and ">Alex<" in html
     assert 'name="topic_id"' in html and ">auth<" in html
-    # Export column + per-row Obsidian button.
-    assert "<th>Export</th>" in html
-    assert "To Obsidian" in html
+    # Folder filter + per-row Export column were removed in v0.8.1.
+    assert 'name="folder_id"' not in html
+    assert "<th>Export</th>" not in html
 
 
-def test_list_export_column_shows_not_configured_when_vault_absent():
-    html = views.render_meeting_list(
-        meetings=[
-            {
-                "id": "mid", "title": "sync", "state": "complete",
-                "has_transcript": True, "has_notes": True,
-                "duration_seconds": 60, "started_at": "",
-            },
-        ],
-        folders=[], filters={}, total_shown=1,
-        classification={"series": [], "contacts": [], "topics": []},
-        obsidian_configured=False,
-    )
-    assert "not configured" in html
-    assert "To Obsidian" not in html
-
-
-def test_detail_renders_obsidian_section_when_configured_and_has_notes():
+def test_detail_renders_export_dropdown_with_destinations():
+    """When at least one destination is enabled and configured AND the
+    meeting has synthesis, the Export section renders a dropdown
+    posting to /meetings/<id>/export."""
     meeting = {
         "id": "mid", "title": "sync", "state": "complete",
         "started_at": "", "ended_at": "", "duration_seconds": 0,
@@ -289,14 +275,26 @@ def test_detail_renders_obsidian_section_when_configured_and_has_notes():
         prompt_text="",
         prompt_template_name="",
         templates=[],
-        obsidian_configured=True,
+        export_destinations=[
+            {"key": "obsidian", "label": "Obsidian vault",
+             "configured": True, "enabled": True, "target_title": "notes"},
+            {"key": "notion", "label": "Notion",
+             "configured": True, "enabled": True, "target_title": "Weekly"},
+        ],
     )
-    assert ">Export to Obsidian<" in html
-    assert 'action="/meetings/mid/export/obsidian"' in html
-    assert "Save to Obsidian" in html
+    assert 'id="export"' in html
+    assert 'action="/meetings/mid/export"' in html
+    assert 'name="destination"' in html
+    assert '<option value="obsidian">Obsidian vault -- notes</option>' in html
+    assert '<option value="notion">Notion -- Weekly</option>' in html
+    # Sidebar TOC carries each section's anchor.
+    for anchor in ("#meta", "#attendees", "#transcript", "#export", "#workflow"):
+        assert f'href="{anchor}"' in html
 
 
-def test_detail_obsidian_section_renders_configured_but_no_notes_hint():
+def test_detail_export_section_renders_no_destinations_hint():
+    """With no destinations enabled, the Export section renders a
+    hint pointing at Settings rather than a dropdown."""
     meeting = {
         "id": "mid", "title": "sync", "state": "new",
         "started_at": "", "ended_at": "", "duration_seconds": 0,
@@ -310,8 +308,59 @@ def test_detail_obsidian_section_renders_configured_but_no_notes_hint():
         prompt_text="",
         prompt_template_name="",
         templates=[],
-        obsidian_configured=True,
+        export_destinations=[],
     )
-    assert ">Export to Obsidian<" in html
+    assert 'id="export"' in html
+    assert "No export destinations are enabled" in html
+    assert 'name="destination"' not in html
+
+
+def test_detail_export_section_renders_configured_but_no_notes_hint():
+    """At least one destination enabled but the meeting has no
+    synthesis yet: show the save-first hint, no dropdown."""
+    meeting = {
+        "id": "mid", "title": "sync", "state": "new",
+        "started_at": "", "ended_at": "", "duration_seconds": 0,
+        "has_transcript": False, "has_notes": False, "attendees": [],
+    }
+    html = views.render_meeting_detail(
+        meeting=meeting,
+        transcript="",
+        live_notes="",
+        existing_notes="",
+        prompt_text="",
+        prompt_template_name="",
+        templates=[],
+        export_destinations=[
+            {"key": "obsidian", "label": "Obsidian vault",
+             "configured": True, "enabled": True, "target_title": ""},
+        ],
+    )
+    assert 'id="export"' in html
     assert "Save a synthesis below first" in html
-    assert "Save to Obsidian" not in html
+    assert 'name="destination"' not in html
+
+
+def test_detail_renders_sidebar_toc_with_section_ids():
+    """Each left-nav link resolves to a section's id on the page."""
+    meeting = {
+        "id": "mid", "title": "sync", "state": "complete",
+        "started_at": "", "ended_at": "", "duration_seconds": 0,
+        "has_transcript": True, "has_notes": True, "attendees": [],
+    }
+    html = views.render_meeting_detail(
+        meeting=meeting,
+        transcript="t",
+        live_notes="",
+        existing_notes="body",
+        prompt_text="",
+        prompt_template_name="",
+        templates=[],
+        export_destinations=[],
+    )
+    assert 'class="toc"' in html
+    assert 'class="with-sidebar"' in html
+    for anchor in ("meta", "attendees", "live-notes", "transcript",
+                   "current-synthesis", "export", "workflow"):
+        assert f'id="{anchor}"' in html
+        assert f'href="#{anchor}"' in html

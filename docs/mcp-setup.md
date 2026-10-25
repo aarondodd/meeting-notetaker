@@ -1,7 +1,7 @@
 # Synthesis via MCP
 
 Meeting Notetaker v0.8 retires the bundled Chrome extension in favor
-of an MCP service layer. The ten MCP tools (listed at the end of this
+of an MCP service layer. The MCP tools (listed at the end of this
 document) are the API; two transports expose them. Pick whichever
 your Claude surface supports.
 
@@ -65,11 +65,17 @@ up to 20 if busy), `--no-open` skips the automatic browser launch,
 
 ### What the page offers
 
-- `/meetings`: list view with filters (state, folder, has transcript,
-  has synthesis, limit). Each row links to a detail page.
-- `/meetings/<id>`: metadata, attendees, live notes, transcript,
-  current synthesis, template picker, rendered prompt, textarea, Save
-  button.
+- `/meetings`: list view with filters (state, series, person, topic,
+  has transcript, has synthesis, limit). Each row links to a detail
+  page. There is no per-row export column; export lives on the
+  detail page.
+- `/meetings/<id>`: sticky left-sidebar table of contents linking to
+  each section (overview, attendees, live notes, transcript, current
+  synthesis, export, synthesis workflow). The export section carries
+  a destination dropdown listing every target the user ticked under
+  Settings > Synthesis > Web UI export destinations. The workflow
+  section carries the template picker, the rendered prompt, the Save
+  textarea and the Save button.
 - `/templates`: list of configured prompt templates.
 - `/api/...`: JSON mirrors of every HTML route plus every mutating
   action, for scripts and future automation. See the Automation
@@ -167,7 +173,7 @@ JSON in and JSON out; the response shape matches the MCP tools.
 
 | Method and path | Tool it mirrors |
 | :--- | :--- |
-| GET `/api/meetings?limit=&state=&folder_id=&series_id=&contact_id=&topic_id=&has_transcript=&has_notes=` | `list_meetings` |
+| GET `/api/meetings?limit=&state=&series_id=&contact_id=&topic_id=&has_transcript=&has_notes=` | `list_meetings` |
 | GET `/api/meetings/<id>` | `get_meeting` |
 | GET `/api/meetings/<id>/transcript` | `get_transcript` |
 | GET `/api/meetings/<id>/live_notes` | `get_live_notes` |
@@ -176,9 +182,12 @@ JSON in and JSON out; the response shape matches the MCP tools.
 | POST `/api/meetings/<id>/save` (`{"notes": "..."}`) | `save_notes` |
 | POST `/api/meetings/<id>/template` (`{"template_name": "..."}`) | `set_prompt_template` |
 | POST `/api/meetings/<id>/export/obsidian` | `export_meeting_to_obsidian` |
+| POST `/api/meetings/<id>/export/notion` | `export_meeting_to_notion` |
+| POST `/api/meetings/<id>/export/confluence` | `export_meeting_to_confluence` |
 | GET `/api/templates` | `list_templates` |
 | GET `/api/templates/<name>` | `get_template` |
 | GET `/api/classification` | `list_classification` |
+| GET `/api/export_destinations` | `list_export_destinations` |
 
 Both JSON POST bodies and form-encoded bodies are accepted on the
 mutating routes, so the HTML form on the detail page and a scripted
@@ -186,9 +195,9 @@ mutating routes, so the HTML form on the detail page and a scripted
 
 ## Available tools
 
-The MCP server exposes these ten tools; each one is schema-advertised
-so the Claude surface sees descriptions and types directly. The web
-UI and JSON API are built on top of the same functions.
+The MCP server exposes these tools; each one is schema-advertised so
+the Claude surface sees descriptions and types directly. The web UI
+and JSON API are built on top of the same functions.
 
 - `list_meetings(limit?, state?, folder_id?, series_id?, contact_id?, topic_id?)`:
   recent sessions, now also filterable by classification
@@ -207,6 +216,16 @@ UI and JSON API are built on top of the same functions.
   mapping a user's text onto the id filters above
 - `export_meeting_to_obsidian(meeting_id)`: publish the current
   synthesis into the configured Obsidian vault
+- `export_meeting_to_notion(meeting_id)`: publish the current
+  synthesis to Notion as a new page under the most-recent (or first
+  favorite) parent saved by the Python app's picker
+- `export_meeting_to_confluence(meeting_id)`: same shape as the
+  Notion tool, under the most-recent (or first favorite) Confluence
+  parent plus its space
+- `list_export_destinations()`: enumerate the three destinations
+  with per-destination `configured` + `enabled` booleans and the
+  saved target page title; the web UI uses this to populate the
+  detail-page dropdown
 
 The canonical flow is: `list_meetings` to pick an id,
 `render_synthesis_prompt` to get a ready-to-execute prompt, let your

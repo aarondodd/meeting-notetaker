@@ -41,7 +41,6 @@ The meeting list. Filters passable as query parameters or via the
 form at the top:
 
 - `state`: `new`, `recording`, `complete`, `error`.
-- `folder_id`: scopes to one folder/topic.
 - `series_id`: filter by series (meeting-series grouping).
 - `contact_id`: filter by person who attended.
 - `topic_id`: filter by free-text topic tag.
@@ -50,10 +49,9 @@ form at the top:
 - `limit`: maximum rows returned (default 25).
 
 Each row carries the meeting title, state, created-at, duration, and
-has-transcript / has-synthesis indicators, a link to the detail page
-at `/meetings/<id>`, and an Export column with a "To Obsidian" button
-that writes the current synthesis to the configured vault directly
-from the list.
+has-transcript / has-synthesis indicators, and a link to the detail
+page at `/meetings/<id>`. Export now lives on the detail page as a
+destination dropdown (see below); there is no per-row Export column.
 
 To resolve a user's text ("the Platform series", "meetings with
 Alex", "auth topic") into a filter id, GET `/api/classification` or
@@ -77,10 +75,17 @@ page carries:
 - Save form: `<form action="/meetings/<id>/save" method="POST">`
   containing `<textarea name="notes">` and a submit button labeled
   **Save synthesis**.
-- Export to Obsidian: `<form action="/meetings/<id>/export/obsidian"
-  method="POST">` with a **Save to Obsidian** button, shown only when
-  the user has configured an Obsidian vault_root in Settings AND the
-  meeting already has a saved synthesis.
+- Export dropdown: `<section id="export">` carries
+  `<form action="/meetings/<id>/export" method="POST">` with
+  `<select name="destination">` listing every destination the user
+  enabled under `Settings > Synthesis > Web UI export destinations`
+  (`obsidian`, `notion`, or `confluence`) that is ALSO configured
+  with a target. Pick one and click **Export**. The section renders
+  a muted hint instead of a dropdown when no destinations are
+  enabled or the meeting has no saved synthesis. Legacy direct
+  routes still work: POST to `/meetings/<id>/export/obsidian`,
+  `/meetings/<id>/export/notion`, or `/meetings/<id>/export/confluence`
+  skips the dropdown and targets one destination.
 - Optional flash message after any save, under `<div class="flash
   ok">` (`ok`) or `<div class="flash err">` (`err`).
 
@@ -145,7 +150,7 @@ MCP tools:
 
 | Method and path | Returns / takes |
 | :--- | :--- |
-| GET `/api/meetings?limit=&state=&folder_id=&has_transcript=&has_notes=` | list of meetings |
+| GET `/api/meetings?limit=&state=&series_id=&contact_id=&topic_id=&has_transcript=&has_notes=` | list of meetings |
 | GET `/api/meetings/<id>` | metadata |
 | GET `/api/meetings/<id>/transcript` | raw transcript |
 | GET `/api/meetings/<id>/live_notes` | the user's live-notes buffer |
@@ -154,9 +159,12 @@ MCP tools:
 | POST `/api/meetings/<id>/save` `{"notes": "..."}` | writes notes.md, archives prior |
 | POST `/api/meetings/<id>/template` `{"template_name": "..."}` | switches template |
 | POST `/api/meetings/<id>/export/obsidian` | saves synthesis into the Obsidian vault |
+| POST `/api/meetings/<id>/export/notion` | posts synthesis as a new Notion page |
+| POST `/api/meetings/<id>/export/confluence` | posts synthesis as a new Confluence page |
 | GET `/api/templates` | list |
 | GET `/api/templates/<name>` | raw template body |
 | GET `/api/classification` | `{series:[...], contacts:[...], topics:[...]}` |
+| GET `/api/export_destinations` | `{destinations:[{key, label, configured, enabled, target_title}, ...]}` |
 
 Both JSON POST bodies and form-encoded bodies are accepted on the
 mutating routes, so the HTML form on the detail page and a scripted

@@ -628,3 +628,26 @@ def test_start_web_ui_on_launch_round_trip(tmp_path, isolated_data_dir):
     assert dst.synthesis.start_web_ui_on_launch is True
 
 
+def test_web_ui_export_destinations_default_false(isolated_data_dir):
+    """Fresh installs leave the web UI export dropdown empty until the
+    user opts in; Notion and Confluence need a saved target too, which
+    the Settings pane gates on separately."""
+    cfg = Config()
+    assert cfg.synthesis.web_ui_export_obsidian is False
+    assert cfg.synthesis.web_ui_export_notion is False
+    assert cfg.synthesis.web_ui_export_confluence is False
+
+
+def test_web_ui_export_destinations_round_trip(tmp_path, isolated_data_dir):
+    """Each flag survives save and reload independently."""
+    src = Config()
+    src.synthesis.web_ui_export_obsidian = True
+    src.synthesis.web_ui_export_notion = True
+    src.synthesis.web_ui_export_confluence = False
+    src.save(tmp_path / "config.toml")
+    dst = Config.load(tmp_path / "config.toml")
+    assert dst.synthesis.web_ui_export_obsidian is True
+    assert dst.synthesis.web_ui_export_notion is True
+    assert dst.synthesis.web_ui_export_confluence is False
+
+

@@ -280,6 +280,249 @@ def export_meeting_to_obsidian(args: dict) -> dict:
     }
 
 
+def _pick_integration_target(entries: list[dict], favorites: list[dict]) -> Optional[dict]:
+    """Pick a saved target page from recents, then favorites.
+
+    Returns the raw entry dict (``{id, title, used_at?, extra?}``) or
+    None when nothing has been saved. Used by the Notion + Confluence
+    web-UI export paths, which have no interactive picker to drill into.
+    """
+    for entry in entries:
+        if entry.get("id"):
+            return entry
+    for entry in favorites:
+        if entry.get("id"):
+            return entry
+    return None
+
+
+def export_meeting_to_notion(args: dict) -> dict:
+    """Publish a meeting's current synthesis to Notion.
+
+    Targets the most-recent (or first favorite) parent page saved by
+    the Python app's picker. Fails cleanly when Notion is not verified
+    or no target has been saved yet.
+    """
+    mid = args.get("meeting_id")
+    if not mid:
+        return {"error": "meeting_id is required"}
+    config = Config.load()
+    nc = config.notion
+    if not ((nc.api_token or "").strip() and (nc.last_verified_at or "").strip()):
+        return {
+            "error": (
+                "Notion is not configured. Verify the connection in "
+                "Settings > Integrations first."
+            )
+        }
+    target = _pick_integration_target(nc.recents, nc.favorites)
+    if not target:
+        return {
+            "error": (
+                "No Notion target page saved yet. Export once from the "
+                "Python app (Session view > Save to Notion) to seed a "
+                "recent or favorite parent."
+            )
+        }
+    with SessionStore() as store:
+        session = store.get_session(mid)
+    if not session:
+        return {"error": f"no meeting with id {mid}"}
+    body = TranscriptStore(mid).read_notes()
+    if not body.strip():
+        return {
+            "error": (
+                "No synthesis saved yet; use save_notes before exporting."
+            )
+        }
+    try:
+        from ..integrations.notion_api import NotionClient  # noqa: PLC0415
+        from ..integrations.export import export_to_notion  # noqa: PLC0415
+        from ..utils.paths import sessions_dir  # noqa: PLC0415
+    except Exception as exc:
+        return {"error": f"notion export unavailable: {exc}"}
+    client = NotionClient(nc.api_token)
+    title = session.title or "Untitled meeting"
+    try:
+        result = export_to_notion(
+            client=client,
+            parent_id=target["id"],
+            title=title,
+            markdown_body=body,
+            session_dir=sessions_dir() / session.id,
+            attachments=[],
+            number_headings=bool(config.synthesis.heading_numbering),
+            include_toc=bool(config.synthesis.toc_in_exports),
+            toc_max_depth=int(config.synthesis.toc_max_depth or 3),
+        )
+    except Exception as exc:
+        return {"error": f"notion export failed: {exc}"}
+    return {
+        "meeting_id": mid,
+        "target": result.target,
+        "parent_id": target["id"],
+        "parent_title": target.get("title") or "",
+        "page_id": result.page_id,
+        "page_url": result.page_url,
+        "title": result.title,
+        "message": result.message,
+    }
+
+
+def export_meeting_to_confluence(args: dict) -> dict:
+    """Publish a meeting's current synthesis to Confluence.
+
+    Targets the most-recent (or first favorite) parent page saved by
+    the Python app's picker; the parent's space_id is read from the
+    saved extra. Fails cleanly when Confluence is not verified, no
+    target has been saved, or the saved target has no space_id.
+    """
+    mid = args.get("meeting_id")
+    if not mid:
+        return {"error": "meeting_id is required"}
+    config = Config.load()
+    cc = config.confluence
+    if not (
+        (cc.base_url or "").strip()
+        and (cc.email or "").strip()
+        and (cc.api_token or "").strip()
+        and (cc.last_verified_at or "").strip()
+    ):
+        return {
+            "error": (
+                "Confluence is not configured. Verify the connection in "
+                "Settings > Integrations first."
+            )
+        }
+    target = _pick_integration_target(cc.recents, cc.favorites)
+    if not target:
+        return {
+            "error": (
+                "No Confluence target page saved yet. Export once from "
+                "the Python app (Session view > Save to Confluence) to "
+                "seed a recent or favorite parent."
+            )
+        }
+    extra = target.get("extra") or {}
+    space_id = (extra.get("space_id") or "").strip()
+    if not space_id:
+        return {
+            "error": (
+                "The saved Confluence target has no space_id. Re-pick a "
+                "parent page from the Python app so the space is "
+                "recorded alongside it."
+            )
+        }
+    with SessionStore() as store:
+        session = store.get_session(mid)
+    if not session:
+        return {"error": f"no meeting with id {mid}"}
+    body = TranscriptStore(mid).read_notes()
+    if not body.strip():
+        return {
+            "error": (
+                "No synthesis saved yet; use save_notes before exporting."
+            )
+        }
+    try:
+        from ..integrations.confluence_api import ConfluenceClient  # noqa: PLC0415
+        from ..integrations.export import export_to_confluence  # noqa: PLC0415
+        from ..utils.paths import sessions_dir  # noqa: PLC0415
+    except Exception as exc:
+        return {"error": f"confluence export unavailable: {exc}"}
+    client = ConfluenceClient(cc.base_url, cc.email, cc.api_token)
+    title = session.title or "Untitled meeting"
+    try:
+        result = export_to_confluence(
+            client=client,
+            parent_id=target["id"],
+            space_id=space_id,
+            title=title,
+            markdown_body=body,
+            session_dir=sessions_dir() / session.id,
+            attachments=[],
+            number_headings=bool(config.synthesis.heading_numbering),
+            include_toc=bool(config.synthesis.toc_in_exports),
+            toc_max_depth=int(config.synthesis.toc_max_depth or 3),
+        )
+    except Exception as exc:
+        return {"error": f"confluence export failed: {exc}"}
+    return {
+        "meeting_id": mid,
+        "target": result.target,
+        "parent_id": target["id"],
+        "parent_title": target.get("title") or "",
+        "space_id": space_id,
+        "page_id": result.page_id,
+        "page_url": result.page_url,
+        "title": result.title,
+        "message": result.message,
+    }
+
+
+_EXPORT_DESTINATIONS = ("obsidian", "notion", "confluence")
+
+
+def list_export_destinations(_args: dict) -> dict:
+    """List the export destinations the web UI should offer.
+
+    Each entry reports whether the destination is configured (its own
+    Settings pane is wired up) and whether the user has enabled it for
+    the web UI dropdown (``Settings > Synthesis > Web UI export
+    destinations``). The handler also carries the display label and,
+    for Notion/Confluence, the saved target page title so the dropdown
+    row can show "Notion -- Projects/Meetings" without an API call.
+    """
+    try:
+        config = Config.load()
+    except Exception as exc:
+        return {"error": f"config unavailable: {exc}"}
+    destinations: list[dict] = []
+    obs_configured = bool((config.obsidian.vault_root or "").strip())
+    destinations.append({
+        "key": "obsidian",
+        "label": "Obsidian vault",
+        "configured": obs_configured,
+        "enabled": bool(config.synthesis.web_ui_export_obsidian),
+        "target_title": config.obsidian.vault_name or "",
+    })
+    notion_configured = bool(
+        (config.notion.api_token or "").strip()
+        and (config.notion.last_verified_at or "").strip()
+    )
+    notion_target = _pick_integration_target(
+        config.notion.recents, config.notion.favorites,
+    )
+    destinations.append({
+        "key": "notion",
+        "label": "Notion",
+        "configured": notion_configured and bool(notion_target),
+        "enabled": bool(config.synthesis.web_ui_export_notion),
+        "target_title": (notion_target or {}).get("title", ""),
+    })
+    conf_configured = bool(
+        (config.confluence.base_url or "").strip()
+        and (config.confluence.email or "").strip()
+        and (config.confluence.api_token or "").strip()
+        and (config.confluence.last_verified_at or "").strip()
+    )
+    conf_target = _pick_integration_target(
+        config.confluence.recents, config.confluence.favorites,
+    )
+    conf_target_has_space = bool(
+        conf_target
+        and (conf_target.get("extra") or {}).get("space_id")
+    )
+    destinations.append({
+        "key": "confluence",
+        "label": "Confluence",
+        "configured": conf_configured and conf_target_has_space,
+        "enabled": bool(config.synthesis.web_ui_export_confluence),
+        "target_title": (conf_target or {}).get("title", ""),
+    })
+    return {"destinations": destinations}
+
+
 def get_meeting(args: dict) -> dict:
     """Return a single meeting's metadata."""
     mid = args.get("meeting_id")
@@ -636,6 +879,43 @@ TOOLS: list[Tool] = [
             {"meeting_id": {"type": "string"}}, required=["meeting_id"],
         ),
         handler=export_meeting_to_obsidian,
+    ),
+    Tool(
+        name="export_meeting_to_notion",
+        description=(
+            "Publish a meeting's current synthesis to Notion as a new "
+            "page under the most-recent (or first favorite) parent "
+            "saved by the Python app's picker. Fails cleanly when "
+            "Notion is not verified or no target has been saved yet."
+        ),
+        input_schema=_schema(
+            {"meeting_id": {"type": "string"}}, required=["meeting_id"],
+        ),
+        handler=export_meeting_to_notion,
+    ),
+    Tool(
+        name="export_meeting_to_confluence",
+        description=(
+            "Publish a meeting's current synthesis to Confluence as a "
+            "new page under the most-recent (or first favorite) parent "
+            "saved by the Python app's picker. Fails cleanly when "
+            "Confluence is not verified or no target has been saved yet."
+        ),
+        input_schema=_schema(
+            {"meeting_id": {"type": "string"}}, required=["meeting_id"],
+        ),
+        handler=export_meeting_to_confluence,
+    ),
+    Tool(
+        name="list_export_destinations",
+        description=(
+            "List the export destinations the web UI exposes to the "
+            "Chrome Claude extension. Returns per-destination "
+            "configured + enabled booleans plus the display label and "
+            "the saved target page title where applicable."
+        ),
+        input_schema=_schema({}),
+        handler=list_export_destinations,
     ),
 ]
 

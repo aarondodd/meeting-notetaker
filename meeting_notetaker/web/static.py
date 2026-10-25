@@ -29,6 +29,74 @@ header a {
 }
 header a:hover { text-decoration: underline; }
 main { padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
+main.with-sidebar {
+  max-width: 1240px;
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 24px;
+}
+main.with-sidebar .content { min-width: 0; }
+aside.toc {
+  position: sticky;
+  top: 16px;
+  align-self: start;
+  font-size: 13px;
+  background: #ffffff;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  padding: 12px 14px;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+aside.toc .toc-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #57606a;
+  margin-bottom: 8px;
+}
+aside.toc ul.toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+aside.toc ul.toc-list li { margin: 0 0 4px; }
+aside.toc ul.toc-list a {
+  color: #0969da;
+  text-decoration: none;
+  display: block;
+  padding: 3px 6px;
+  border-radius: 4px;
+}
+aside.toc ul.toc-list a:hover {
+  background: #f6f8fa;
+  text-decoration: none;
+}
+aside.toc .toc-back {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #eaeef2;
+  font-size: 12px;
+}
+aside.toc .toc-back a { color: #57606a; text-decoration: none; }
+aside.toc .toc-back a:hover { text-decoration: underline; }
+@media (max-width: 760px) {
+  main.with-sidebar {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+  aside.toc {
+    position: static;
+    max-height: none;
+  }
+  aside.toc ul.toc-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  aside.toc ul.toc-list li { margin: 0; }
+  aside.toc .toc-back { margin-top: 6px; padding-top: 6px; }
+}
 section {
   background: #ffffff;
   border: 1px solid #d0d7de;

@@ -855,6 +855,89 @@ class SettingsDialog(QDialog):
         snippet_row.addStretch(1)
         auto_layout.addLayout(snippet_row)
 
+        # Web UI export destinations. The detail page's Export dropdown
+        # offers each ticked destination that is ALSO configured in its
+        # own Settings pane. A checkbox for an unconfigured integration
+        # is disabled with a hint pointing at the pane that would wire
+        # it up, so a user can't tick a destination that won't work.
+        export_label = QLabel(
+            "Web UI export destinations:",
+            self,
+        )
+        export_label.setStyleSheet("font-weight: 600; margin-top: 6px;")
+        auto_layout.addWidget(export_label)
+        export_blurb = QLabel(
+            "Show these destinations in the web UI's per-meeting Export "
+            "dropdown. Each must also be configured in its own Settings "
+            "pane; Notion and Confluence need a saved favorite or recent "
+            "page to post into without an interactive picker.",
+            self,
+        )
+        export_blurb.setWordWrap(True)
+        auto_layout.addWidget(export_blurb)
+        obs_cfg = config.obsidian
+        obs_ready = bool((obs_cfg.vault_root or "").strip())
+        self._web_ui_export_obsidian = QCheckBox(
+            "Obsidian vault",
+            self,
+        )
+        self._web_ui_export_obsidian.setChecked(
+            config.synthesis.web_ui_export_obsidian and obs_ready,
+        )
+        self._web_ui_export_obsidian.setEnabled(obs_ready)
+        self._web_ui_export_obsidian.setToolTip(
+            "Writes notes.md into the configured vault using the "
+            "location template from Settings > Obsidian."
+            if obs_ready
+            else "Set a vault_root in Settings > Obsidian first."
+        )
+        auto_layout.addWidget(self._web_ui_export_obsidian)
+        notion_cfg = config.notion
+        notion_ready = bool(
+            (notion_cfg.api_token or "").strip()
+            and (notion_cfg.last_verified_at or "").strip()
+        )
+        self._web_ui_export_notion = QCheckBox(
+            "Notion",
+            self,
+        )
+        self._web_ui_export_notion.setChecked(
+            config.synthesis.web_ui_export_notion and notion_ready,
+        )
+        self._web_ui_export_notion.setEnabled(notion_ready)
+        self._web_ui_export_notion.setToolTip(
+            "Posts as a new page under the most-recent (or first "
+            "favorite) parent you've used from Settings > Integrations. "
+            "Save a favorite or export once from the Python app first "
+            "to seed the target."
+            if notion_ready
+            else "Verify Notion in Settings > Integrations first."
+        )
+        auto_layout.addWidget(self._web_ui_export_notion)
+        conf_cfg = config.confluence
+        conf_ready = bool(
+            (conf_cfg.base_url or "").strip()
+            and (conf_cfg.email or "").strip()
+            and (conf_cfg.api_token or "").strip()
+            and (conf_cfg.last_verified_at or "").strip()
+        )
+        self._web_ui_export_confluence = QCheckBox(
+            "Confluence",
+            self,
+        )
+        self._web_ui_export_confluence.setChecked(
+            config.synthesis.web_ui_export_confluence and conf_ready,
+        )
+        self._web_ui_export_confluence.setEnabled(conf_ready)
+        self._web_ui_export_confluence.setToolTip(
+            "Posts as a new page under the most-recent (or first "
+            "favorite) parent you've used from Settings > Integrations. "
+            "Save a favorite or export once from the Python app first "
+            "to seed the target."
+            if conf_ready
+            else "Verify Confluence in Settings > Integrations first."
+        )
+        auto_layout.addWidget(self._web_ui_export_confluence)
 
         # Prompt Templates sub-group of Synthesis -----------------------
         prompts_group = QGroupBox("Prompt Templates", self)
@@ -1356,6 +1439,15 @@ class SettingsDialog(QDialog):
         self._config.synthesis.mcp_enabled = self._mcp_enabled.isChecked()
         self._config.synthesis.start_web_ui_on_launch = (
             self._start_web_ui_on_launch.isChecked()
+        )
+        self._config.synthesis.web_ui_export_obsidian = (
+            self._web_ui_export_obsidian.isChecked()
+        )
+        self._config.synthesis.web_ui_export_notion = (
+            self._web_ui_export_notion.isChecked()
+        )
+        self._config.synthesis.web_ui_export_confluence = (
+            self._web_ui_export_confluence.isChecked()
         )
         self._config.synthesis.auto_extract_attendee_details = (
             self._extract_attendees.isChecked()
