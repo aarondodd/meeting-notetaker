@@ -6,26 +6,43 @@ Teams / Zoom / Meet calls), transcribes both streams on-device with
 faster-whisper, captures screenshots of any region you draw, plays
 the recording back in-app, and hands the resulting transcript to you
 for synthesis by any LLM you trust. Synthesis routes through a local
-MCP server that your Chrome Claude extension, Claude Desktop, or
-Claude Code consumes; the clipboard-paste fallback stays available
-when you'd rather handle it by hand. No audio leaves the machine; no
-API key required.
+Model Context Protocol (MCP) service layer; a stdio MCP server for
+Claude Desktop and Claude Code, and a loopback web UI any browser
+(including the Chrome Claude extension and your phone over LAN) can
+drive. The manual Generate Prompt + Paste Response Back flow stays
+available when you'd rather handle it by hand. No audio leaves the
+machine; no API key required.
 
 ## What's new in v0.8 (pre-release)
 
-v0.8 replaces the bundled Chrome extension with a local Model Context
-Protocol (MCP) server. See [docs/mcp-setup.md](docs/mcp-setup.md) for
-the one-page setup. The old automation path is retired: no more
-unpacked-extension install, no more native-messaging host, no more
-selector hunts against claude.ai's shifting markup. Everything the
-synthesis flow needs (list meetings, read transcripts, render a
-prompt, save notes) now lives behind MCP tools your Claude surface
-calls directly.
+v0.8 retires the bundled Chrome extension in favor of a local MCP
+service layer with two transports. See
+[docs/mcp-setup.md](docs/mcp-setup.md) for the one-page setup.
 
-To migrate: pick MCP in Settings > Synthesis via MCP, paste the
-config snippet into your Claude client. The clipboard Generate +
-Paste Response Back flow is unchanged and remains the default for
-users not on MCP.
+- **stdio MCP server** (`main.py --mcp-server`): for Claude Desktop
+  and Claude Code, which take a stdio connector config. Ten typed
+  tools expose list / read / render-prompt / save / export directly.
+- **Loopback web UI** (`main.py --web-ui`): for the Chrome Claude
+  extension, which only accepts remote connector URLs and cannot
+  consume a stdio config. Serves a 127.0.0.1 page (port 8765 up to
+  8785) plus a JSON API mirroring every tool. The HTML is
+  responsive, so you can also point your phone's browser at the
+  same URL over LAN and read a transcript, render the prompt, or
+  save synthesis from the couch.
+
+The old automation path is gone: no more unpacked-extension install,
+no more native-messaging host, no more selector hunts against
+claude.ai's shifting markup. Everything the synthesis flow needs
+(list meetings, read transcripts, render a prompt, save notes,
+export to Obsidian/Notion/Confluence) now sits behind MCP tools your
+Claude surface calls directly or drives through the web UI.
+
+To migrate: tick **Enable synthesis via MCP** in Settings >
+Synthesis via MCP, then paste the stdio config snippet into Claude
+Desktop or Claude Code, or click **Start web UI and open in
+browser...** for the Chrome Claude extension / phone browser path.
+The clipboard Generate + Paste Response Back flow is unchanged and
+remains the fallback for anyone not on either transport.
 
 Status at v0.7.14 released, v0.8.0 in pre-release. End-to-end capture, transcription, synthesis,
 screen capture, retained-audio playback + export, and transcript-
@@ -129,10 +146,20 @@ etc.) live in [Technical Details](#technical-details) below.
 - A working microphone and a default speaker / output device.
 - ~500 MB of disk for the default `small.en` Whisper model. The
   model downloads on first run.
-- **For optional synthesis automation:** Google Chrome on the same
-  machine. The automation feature opens a Claude.ai tab in your
-  existing Chrome session and reads the response back via Chrome's
-  clipboard API.
+
+Synthesis automation is optional. If you want it, pick one of:
+
+- Claude Desktop or Claude Code on the same machine, consuming the
+  stdio MCP server directly.
+- The Chrome Claude extension in any Chromium browser, driving the
+  loopback web UI.
+- Any mobile browser on the same LAN, pointed at the web UI with
+  `--host 0.0.0.0` and the laptop's LAN IP; see
+  [Accessing the web UI from a phone](#accessing-the-web-ui-from-a-phone).
+
+Setup matrix in [docs/mcp-setup.md](docs/mcp-setup.md). The web UI
+is a stdlib HTTP server with no extra dependency on the machine's
+side.
 
 > **Microsoft Store Python is unsupported** (dev install only).
 > Microsoft Store Python runs in a UWP AppContainer sandbox that
@@ -255,13 +282,15 @@ see what that column conveys.
    it finishes the tray returns to blue and the transcript view
    shows the refined final transcript.
 5. Switch to the **Synthesis** flow. Either:
-   - **Manual:** click **Generate Synthesis Prompt**, paste into
-     your chatbot, paste the response back.
-   - **Automated (with the bundled extension installed):** click
-     **Send to Claude.ai**.
+   - Click **Generate Synthesis Prompt**, paste into your chatbot of
+     choice, paste the response back.
+   - Or drive it through MCP: ask Claude Desktop / Claude Code to
+     synthesize the latest meeting, or open the local web UI (from
+     Chrome Claude or a phone browser) and work the detail page's
+     Save form.
 
-   See [Synthesis automation](#synthesis-automation) below for the
-   automated path.
+   See [Synthesis: chatbot hand-off](#synthesis-chatbot-hand-off)
+   and [Synthesis via MCP](#synthesis-via-mcp) below.
 
 ## Taking notes in parallel (My Notes)
 
@@ -452,8 +481,8 @@ importing the transcript directly into the session.
    "Unknown Speaker" label or the user's display name is wrong.
    Click **Apply remap to preview** to see the result.
 6. Click **Import**. The body is written to the session's
-   transcript and the **Send to Claude.ai** + **Save to...** buttons
-   become available the same way they do after a recording.
+   transcript and the **Generate Synthesis Prompt** + **Save to...**
+   buttons become available the same way they do after a recording.
 
 Notes are merged in via the existing My Notes flow -- if you took
 running notes during the meeting they remain attached to the
@@ -468,9 +497,11 @@ avoid accidentally wiping a recording's transcript.
 
 ## Synthesis: chatbot hand-off
 
-The default flow is **manual** (clipboard hand-off). You can
-optionally install the bundled Chrome extension to automate the
-flow against Claude.ai.
+Two paths cover the hand-off: a manual clipboard flow that works
+with any chatbot, and a Settings-wired MCP service layer that
+Claude Desktop, Claude Code, and the Chrome Claude extension can
+drive directly. See [Synthesis via MCP](#synthesis-via-mcp) below
+for the second path.
 
 ### Manual flow
 
@@ -531,75 +562,131 @@ the flow without leaving the menu bar. See
 [Saving notes to Notion or Confluence](#saving-notes-to-notion-or-confluence)
 below for the picker dialog walk-through.
 
-### Synthesis automation (optional)
+### Per-session prompt template
 
-Starting in v0.6.3, the **Settings -> Synthesis Automation**
-section can replace the Generate + Paste buttons with a single
-**Send to Claude.ai** button. A bundled Chrome extension drives
-the chat tab for you: opens the conversation, pastes the prompt,
-watches for the response to stream in, clicks Claude's Copy
-button to read it back as proper markdown, then closes the tab.
-
-![Synthesis tab with automation enabled](docs/screenshots/15-main-synthesis-automation.png)
-
-**What stays the same:**
-
-- **No API calls.** The extension uses your existing Claude.ai
-  browser session.
-- **The browser remains the intermediary.** The extension types
-  into the chat composer and reads the rendered response via
-  Claude's own Copy button.
-- **The proxy interstitial still gates traffic.** If your
-  outbound proxy shows a "PROCEED" page on the first AI request,
-  the extension detects it, shows a toast, and waits for you to
-  click PROCEED.
-
-**Hard dependencies:**
-
-- Google Chrome on the same machine. The extension is Manifest
-  V3 and loads as an unpacked extension.
-- Windows (the native-messaging bridge registers itself in HKCU).
-- A signed-in Claude.ai account.
-
-**One-time install (Path 3: guided manual).** Chrome doesn't
-permit silent install of unpacked extensions, so the install flow
-is a three-step wizard launched from **Settings > Synthesis
-Automation > Install / Verify...**:
-
-![Install wizard](docs/screenshots/16-dialog-automation-install.png)
-
-1. **Extract the extension files.** Click *Extract and open
-   folder*; the app drops the unpacked extension into
-   `%LOCALAPPDATA%\MeetingNotetaker\automation\extension` and
-   opens it in Explorer.
-2. **Load in Chrome.** Open `chrome://extensions`, toggle
-   Developer mode on, click **Load unpacked**, select the
-   folder.
-3. **Verify.** Back in the wizard, click *Verify*. The app
-   registers the native-messaging bridge in HKCU and waits up
-   to a minute for the extension to connect.
-
-**Chrome permissions you'll be asked to grant.** On the first
-synthesis, Chrome shows a one-time per-site prompt asking the
-extension to access the clipboard for `claude.ai`. Click
-**Allow**. The extension uses Claude's own Copy button + the
-Clipboard API to read the response back as markdown.
-
-**Status bar.** The **Syn** pill in the status bar carries the
-connection state in its dot color: green = connected, yellow =
-Chrome cold (Send will launch it), red = disconnected. Hover for
-the full description.
-
-**Optional: route into a Claude project.** Paste a project UUID
-into **Settings > Synthesis Automation > Claude project ID** and
-every Send goes into that project instead of the default chat
-list.
-
-**Per-session prompt template.** The synthesis tab has a
-**Prompt** dropdown that picks which template (default,
-one-on-one, standup, or any custom file in
+The synthesis tab has a **Prompt** dropdown that picks which
+template (default, one-on-one, standup, or any custom file in
 `%APPDATA%\MeetingNotetaker\prompts\`) to use for that session.
-Selection persists across app restarts.
+Selection persists across app restarts and feeds both the manual
+hand-off above and the MCP tools below.
+
+## Synthesis via MCP
+
+Starting in v0.8, synthesis automation moves off the bundled
+Chrome extension to a local MCP service layer. Two transports
+expose the same ten tools; pick whichever your Claude surface
+supports. One-page setup in
+[docs/mcp-setup.md](docs/mcp-setup.md).
+
+| Claude surface | Transport |
+| :--- | :--- |
+| Chrome Claude extension (claude.ai in-browser) | Local web UI at `http://127.0.0.1:PORT/` |
+| Claude Desktop | stdio MCP server (`--mcp-server`) |
+| Claude Code | stdio MCP server (`--mcp-server`) |
+| Any mobile browser on LAN | Local web UI with `--host 0.0.0.0` |
+
+Your meetings never leave the machine either way. The web UI
+binds loopback by default. The stdio server reads JSON-RPC on
+stdin and writes to stdout; nothing crosses the network at all.
+
+### Enabling MCP
+
+Open **Settings > Synthesis via MCP** and tick **Enable
+synthesis via MCP**. The pane then offers:
+
+- Start web UI and open in browser (launches the local web UI,
+  default `127.0.0.1:8765` with 20 port fallbacks, and points
+  your default browser at it). The server runs for the rest of
+  the Meeting Notetaker session.
+- Start the web UI automatically when Meeting Notetaker launches
+  (one-time tick-box; every subsequent app launch starts the
+  web UI in the background).
+- Copy config to clipboard (hands you the JSON snippet to paste
+  into Claude Desktop's `claude_desktop_config.json` or
+  `claude mcp add` for Claude Code).
+- Web UI export destinations: three check-boxes (Obsidian,
+  Notion, Confluence) that pick which Save-to destinations
+  surface in the web UI's per-meeting export dropdown. Each is
+  disabled until the matching integration is configured and
+  verified under Settings > Integrations.
+
+### Claude Desktop and Claude Code (stdio)
+
+Paste the Settings-generated snippet into your client:
+
+```json
+{
+  "mcpServers": {
+    "meeting-notetaker": {
+      "command": "C:\\Program Files\\MeetingNotetaker\\meeting-notetaker.exe",
+      "args": ["--mcp-server"]
+    }
+  }
+}
+```
+
+Restart the client. Then ask it to "list my meetings" or
+"synthesize the latest meeting and save it"; it calls the typed
+tools directly with no page-scraping involved.
+
+### Chrome Claude extension (local web UI)
+
+The Chrome Claude extension's Custom Connectors list only accepts
+remote MCP server URLs and refuses private IPs, so a stdio
+localhost server has nowhere to be pasted. The web UI gives the
+extension a page to drive instead.
+
+1. Start the web UI from Settings (or launch Meeting Notetaker
+   with the auto-start tick-box on).
+2. In Chrome, grant the Claude extension Site Access to
+   `http://127.0.0.1:*/*` (or the specific port you pick).
+3. Import the shipped Claude Agent Skill (see
+   [claude-skill/README.md](claude-skill/README.md)) so the
+   extension knows which page is which.
+4. Open the extension sidebar on the local page and ask it to
+   synthesize a meeting; it follows links, reads the rendered
+   prompt, drafts notes, and submits the Save form.
+
+### Accessing the web UI from a phone
+
+The web UI is responsive. The sidebar table-of-contents
+collapses to a horizontal chip row under 760px, so a meeting
+detail page is usable one-handed. If you want to read a
+transcript, kick off a synthesis, or save it from your phone,
+run the web UI bound to the LAN:
+
+```
+meeting-notetaker.exe --web-ui --host 0.0.0.0 --no-open
+```
+
+Then open `http://<laptop-lan-ip>:8765/` in your phone's
+browser. Loopback is the default for a reason: once you bind
+`0.0.0.0`, anything else on your network can reach the page
+too, so prefer trusted home networks and consider pointing
+`--host` at a specific LAN interface IP instead. Mobile Chrome
+and Safari both drive the Save form and the export dropdown
+fine. There is no mobile app to install.
+
+### What the pages offer
+
+- `/meetings` lists meetings with filters (state, series,
+  person, topic, has transcript, has synthesis, limit). Each
+  row links to a detail page.
+- `/meetings/<id>` carries a sticky left-sidebar table of
+  contents, then overview, attendees, live notes, transcript,
+  current synthesis, an Export dropdown (destinations driven
+  by your Settings tick-boxes), and the synthesis workflow
+  (template picker, rendered prompt, Save textarea, Save
+  button).
+- `/templates` is the configured prompt templates.
+- `/api/...` is the JSON mirror of every HTML route and every
+  mutating action, for scripts and automation.
+
+### Status bar
+
+The **Syn** pill in the status bar reports the MCP state: green
+when at least one transport is running, gray when disabled.
+Hover for the full description.
 
 ## Saving notes to Notion or Confluence
 
@@ -819,6 +906,9 @@ of these are also editable directly in `config.toml`.
 | Match threshold | 75% | Cosine-similarity floor for matching a meeting voice against a stored speaker. |
 | Merge threshold | 75% | Cosine-similarity floor for merging two clusters into one during the agglomerative pass. |
 | Manage Speakers... | -- | Opens the speaker-library editor. |
+| Enable synthesis via MCP | off | Reveals the Start web UI button, the stdio config snippet, the auto-start tick-box, and the Web UI export destinations group. |
+| Start the web UI automatically when Meeting Notetaker launches | off | Background-starts the web UI on every app launch. Pair with the Chrome Claude extension or a mobile browser. |
+| Web UI export destinations | all off | Three check-boxes (Obsidian, Notion, Confluence) picking which Save-to destinations surface in the web UI's per-meeting export dropdown. Each stays disabled until the matching integration is configured and verified below. |
 | Notion integration token | (empty) | Internal Integration Token from notion.so/my-integrations. Enables Save to Notion when Verify succeeds. |
 | Confluence base URL | (empty) | Tenant root (Cloud: `https://your-org.atlassian.net/wiki`). |
 | Confluence email + API token | (empty) | Email + token from id.atlassian.com. Enables Save to Confluence when Verify succeeds. |
@@ -864,8 +954,7 @@ search index (`search.db`); `config.toml`, the user's customized
 prompt templates, the per-session content (audio + transcripts +
 notes + screenshots + attachments). What's *not* in a snapshot: the
 downloaded faster-whisper models (~480MB-1.5GB, re-downloaded on
-demand), the Chrome native-host install bundle (re-extracted on
-launch), and the running log files.
+demand) and the running log files.
 
 **Snapshot vs. close.** If a backup is running when you close the
 app, a modal "Backup in progress" dialog blocks the close until the
@@ -913,7 +1002,7 @@ flowchart TD
     sshots -. anchored by<br/>recording time .-> transcript
     notes_live --> prompt
     transcript --> prompt
-    prompt -->|clipboard or<br/>Chrome extension| llm
+    prompt -->|clipboard, stdio MCP,<br/>or local web UI| llm
     llm --> notes
 ```
 
@@ -1182,52 +1271,67 @@ state. Clicking a thumbnail in the Slides tab while audio is
 loaded seeks the player to that screenshot's recording-relative
 timestamp.
 
-## Synthesis automation deep-dive
+## Synthesis service layer deep-dive
 
 ```mermaid
 flowchart TD
-    sv[SessionView<br/>Send to Claude.ai click]
-    main[MainApp<br/>render prompt + open bridge]
-    bridge["Bridge<br/>(TCP loopback, app side)"]
-    nh["Native host<br/>(main.py --native-host)"]
-    ext_bg["Chrome extension<br/>background.js"]
-    ext_cs["Content script<br/>(content/claude.js)"]
-    claude[claude.ai tab]
-    response[Claude response]
-    copy[Copy Button +<br/>Clipboard read]
+    tools[meeting_notetaker/mcp/tools.py<br/>ten typed tools over<br/>SessionStore + TranscriptStore]
 
-    sv --> main
-    main -->|SynthesizeRequest| bridge
-    bridge -->|length-prefixed JSON| nh
-    nh -->|stdio| ext_bg
-    ext_bg -->|open tab,<br/>port connect| ext_cs
-    ext_cs --> claude
-    claude --> response
-    response --> copy
-    copy -->|via ClipboardAPI| ext_cs
-    ext_cs -->|SynthesizeResult| ext_bg
-    ext_bg --> nh
-    nh --> bridge
-    bridge --> main
-    main -->|TranscriptStore.save_notes| sv
+    stdio["main.py --mcp-server<br/>JSON-RPC on stdin/stdout"]
+    webui["main.py --web-ui<br/>stdlib ThreadingHTTPServer"]
+
+    desktop[Claude Desktop]
+    code[Claude Code]
+    chrome["Chrome Claude extension<br/>(Site Access to 127.0.0.1)"]
+    phone["Mobile browser<br/>(--host 0.0.0.0 on LAN)"]
+
+    stdio --> tools
+    webui --> tools
+
+    desktop -->|stdio connector| stdio
+    code -->|stdio connector| stdio
+
+    chrome -->|HTML + /api JSON| webui
+    phone -->|HTML + /api JSON| webui
 ```
 
-The Chrome extension is Manifest V3 with a deterministic key
-(`gmnecenhibfigbpldhacjhgmooopeelo`) hard-coded as
-`installer.EXTENSION_ID`. The bundled extension lives at
-`meeting_notetaker/resources/extension/`; the installer copies
-it to `%LOCALAPPDATA%\MeetingNotetaker\automation\extension`
-and registers the native-host manifest in HKCU.
+`meeting_notetaker/mcp/tools.py` is the single source of truth
+for every exposed operation. Both transports call into it:
 
-The bridge is a single-peer TCP loopback server. Each app launch
-rotates the handshake token in
-`%LOCALAPPDATA%\MeetingNotetaker\automation\bridge.json` so a
-stale handshake from a crashed prior run can't authenticate.
+- The stdio server (`meeting_notetaker/mcp/server.py`) implements
+  the MCP protocol version 2025-06-18 as newline-delimited
+  JSON-RPC over stdin and stdout. Claude Desktop and Claude Code
+  launch it on demand from their connector configs; nothing
+  binds a socket.
+- The web UI (`meeting_notetaker/web/`) wraps the same tools in
+  HTML pages (for Chrome Claude and mobile browsers to drive)
+  and in a parallel JSON API under `/api/` (for scripts). The
+  server is a stdlib `ThreadingHTTPServer`; no Flask, no Django,
+  no extra wheel.
 
-The content script's response detector uses Claude's stop-button
-toggle to know when generation has finished, then clicks Claude's
-own Copy button and reads the clipboard. This is resilient to
-class-name churn in Claude's DOM and survives most UI updates.
+The web UI's export dropdown is populated by `list_export_destinations`,
+whose rows are gated on two conditions: the destination has to be
+configured and verified under Settings > Integrations, and the
+user has to have ticked it in Settings > Synthesis via MCP >
+Web UI export destinations. The dropdown posts to
+`/meetings/<id>/export`; legacy per-destination routes
+(`/export/obsidian`, `/export/notion`, `/export/confluence`)
+stay available for scripts that want to pick a destination
+without reading the dropdown.
+
+Launching the web UI from the command line:
+
+```
+meeting-notetaker.exe --web-ui                   # loopback, auto-open browser
+meeting-notetaker.exe --web-ui --no-open         # no browser launch
+meeting-notetaker.exe --web-ui --host 0.0.0.0    # bind LAN for phone access
+meeting-notetaker.exe --web-ui --port 8800       # pick a starting port
+```
+
+`--mcp-server` has no flags: it reads JSON-RPC on stdin and
+writes to stdout. The single-instance lock is deliberately
+bypassed in that mode so a Claude client can spawn the server
+alongside a running GUI.
 
 ## Audio playback + transcript sync
 
@@ -1288,9 +1392,6 @@ the next play() builds a fresh stream from scratch.
   models\                        # faster-whisper model cache
   prompts\                       # user-editable synthesis prompts
   vocabulary.txt                 # user-editable global hotwords
-  automation\                    # synthesis-automation install state
-    extension\                   # unpacked Chrome extension
-    bridge.json                  # per-launch handshake token
   sessions\
     <session-uuid>\
       raw.transcript.md          # interleaved transcript, source-labeled
