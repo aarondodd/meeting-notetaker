@@ -53,16 +53,6 @@ and verified under Settings > Integrations.
 See `docs/mcp-setup.md` in the repository root for the full setup
 reference (including the Claude Desktop / Claude Code stdio path).
 
-## Driving the web UI from a phone
-
-The web UI is responsive: the sidebar table-of-contents collapses to
-a horizontal chip row under 760px and the Save textarea and Export
-dropdown stay usable on a phone screen. The skill drives the same
-HTML, so once the server binds the LAN (`--host 0.0.0.0`) any mobile
-browser on the same network can import the skill into its own Chrome
-Claude session and work the pages the same way the desktop extension
-does. There is no mobile app to install.
-
 ## When to update the skill
 
 Keep the skill in sync with the HTML surface it drives. Any change to
