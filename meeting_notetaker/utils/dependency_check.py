@@ -119,11 +119,6 @@ _AD_HOC_DETECT: tuple[_Check, ...] = (
 )
 
 
-# Synthesis automation (v0.6.3+). The bridge module is pure stdlib so
-# it never goes MISSING in a healthy bundle -- this entry mostly
-# documents that the package was packaged in. winreg is the registry
-# helper used by installer.register_native_host on Windows; checking
-# it surfaces a frozen-build packaging bug if it were ever dropped.
 # Screen capture (v0.6.5+) + video export. mss does conditional
 # platform imports, Pillow dynamically loads codec plugins on Image.open
 # / Image.save, and PyAV ships bundled FFmpeg shared libs. All three
@@ -137,17 +132,15 @@ _SCREEN_CAPTURE: tuple[_Check, ...] = (
 )
 
 
-_AUTOMATION: tuple[_Check, ...] = (
+# Synthesis via MCP (v0.8+). The MCP server is pure stdlib so it never
+# goes MISSING in a healthy bundle -- this entry documents that the
+# package was packaged in. The server runs under --mcp-server; see
+# docs/mcp-setup.md.
+_MCP: tuple[_Check, ...] = (
     _Check(
-        "meeting_notetaker.automation",
-        "Synthesis automation bridge",
-        "meeting_notetaker.automation.bridge",
-    ),
-    _Check(
-        "winreg",
-        "Windows registry (native-host registration)",
-        "winreg",
-        windows_only=True,
+        "meeting_notetaker.mcp",
+        "MCP synthesis server",
+        "meeting_notetaker.mcp.server",
     ),
 )
 
@@ -162,7 +155,7 @@ _GROUPS: tuple[tuple[str, tuple[_Check, ...]], ...] = (
     ("Outlook calendar (Windows)", _OUTLOOK),
     ("Ad-hoc meeting detection (Windows)", _AD_HOC_DETECT),
     ("Screen capture + video export", _SCREEN_CAPTURE),
-    ("Synthesis automation", _AUTOMATION),
+    ("Synthesis via MCP", _MCP),
 )
 
 

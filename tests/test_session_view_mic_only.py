@@ -119,31 +119,15 @@ def test_edit_dropdown_action_matches_generate_gate(qt_app):
         ), f"Generate dropdown parity broke for has_transcript={ht}, has_notes={hn}"
 
 
-def test_send_dropdown_action_matches_send_gate(qt_app):
-    """The Send button's dropdown action obeys the same can_synthesize
-    rule even though Send itself has additional automation gates --
-    the edit-prompt path runs through the same render + dispatch so
-    it only needs content to exist."""
-    for ht, hn in ((True, False), (False, True), (True, True), (False, False)):
-        view = _state_view(qt_app, has_transcript=ht, has_notes=hn)
-        can_synth = view._generate_btn.isEnabled()  # noqa: SLF001
-        assert view._send_edit_action.isEnabled() == can_synth, (  # noqa: SLF001
-            f"Send dropdown parity broke for has_transcript={ht}, has_notes={hn}"
-        )
-
-
 def test_edit_dropdown_action_labels(qt_app, isolated_data_dir):
-    """#90: each button's dropdown surfaces an action whose label
-    matches the action it modifies. Stable across automation toggle."""
+    """#90: the Generate button's dropdown surfaces an edit-prompt
+    action whose label matches the action it modifies.
+
+    The sibling Send button and its "Edit prompt before sending..."
+    action were retired in v0.8 along with the in-app automation
+    bridge, so only the Generate dropdown remains."""
     from meeting_notetaker.ui.session_view import SessionView
     view = SessionView()
-    assert "Edit prompt before generating" in view._generate_edit_action.text()  # noqa: SLF001
-    assert "Edit prompt before sending" in view._send_edit_action.text()  # noqa: SLF001
-    # Stable through automation toggle.
-    view.set_automation_enabled(True, "claude")
-    assert "Edit prompt before generating" in view._generate_edit_action.text()  # noqa: SLF001
-    assert "Edit prompt before sending" in view._send_edit_action.text()  # noqa: SLF001
-    view.set_automation_enabled(False)
     assert "Edit prompt before generating" in view._generate_edit_action.text()  # noqa: SLF001
 
 

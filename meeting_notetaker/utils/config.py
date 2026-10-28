@@ -233,12 +233,35 @@ _DEFAULT_DETECTION_ALLOWLIST: tuple[str, ...] = (
 
 @dataclass
 class SynthesisConfig:
+    # v0.8+: opt-in flag recording that the user has wired a Claude
+    # surface (Chrome Claude extension, Claude Desktop, Claude Code)
+    # into Meeting Notetaker's MCP server. The server itself runs on
+    # demand (`main.py --mcp-server`); this flag is a bookkeeping
+    # signal the app may use to tweak hints or to suppress legacy
+    # UI once Aaron confirms the user has moved over.
+    mcp_enabled: bool = False
+    # When set, MainApp starts the local web UI on a daemon thread at
+    # launch (bound to 127.0.0.1) so the Chrome Claude extension can
+    # reach it without the user running `main.py --web-ui` as a
+    # separate process. The port is still picked by the web server's
+    # 8765 + 20 fallback range, and the resolved URL is logged + shown
+    # in Settings > Synthesis.
+    start_web_ui_on_launch: bool = False
+    # v0.8.1: per-destination opt-in for the web UI's export dropdown
+    # on the meeting detail page. Each one must ALSO be configured in
+    # its own Settings pane (Obsidian vault_root, Notion verified, etc.)
+    # before the web UI will offer it; the checkbox alone does not bypass
+    # that gate. Default off so Notion/Confluence don't show for users
+    # who haven't picked a default target page yet.
+    web_ui_export_obsidian: bool = False
+    web_ui_export_notion: bool = False
+    web_ui_export_confluence: bool = False
+    # v0.6.3..v0.7.14: in-app automation bridge to Chrome. Retired in
+    # v0.8 (replaced by the MCP path). The fields below stay in the
+    # dataclass so stale config.toml files load cleanly, and the
+    # validator no longer enforces them.
     automation_enabled: bool = False
     llm_target: str = "claude"
-    # Optional Claude.ai project UUID. When set, the Send-to-Claude
-    # flow opens https://claude.ai/project/<id> instead of /new, so
-    # synthesized notes accumulate inside the named project rather
-    # than flooding the user's default chat list. Empty == no project.
     claude_project_id: str = ""
     # v0.7.2 (issue #51 Phase 4): append an attendee-details
     # extraction request to every synthesis prompt. Off by default
@@ -590,23 +613,11 @@ class Config:
                 f"ui.session_list_sort {self.ui.session_list_sort!r} "
                 f"must be one of {VALID_SESSION_LIST_SORTS}"
             )
-        if self.synthesis.llm_target not in VALID_LLM_TARGETS:
-            errors.append(
-                f"synthesis.llm_target {self.synthesis.llm_target!r} "
-                f"must be one of {VALID_LLM_TARGETS}"
-            )
-        if not (60 <= self.synthesis.llm_response_timeout_seconds <= 1800):
-            errors.append(
-                "synthesis.llm_response_timeout_seconds must be between "
-                "60 and 1800 (1 to 30 minutes), got "
-                f"{self.synthesis.llm_response_timeout_seconds}"
-            )
-        if not (1 <= self.synthesis.clipboard_read_seconds <= 30):
-            errors.append(
-                "synthesis.clipboard_read_seconds must be between "
-                "1 and 30 seconds, got "
-                f"{self.synthesis.clipboard_read_seconds}"
-            )
+        # v0.6.3..v0.7.14 enforced synthesis.llm_target /
+        # llm_response_timeout_seconds / clipboard_read_seconds. The
+        # in-app automation bridge they fed was retired in v0.8; the
+        # fields stay as dataclass defaults for config-load compat but
+        # the validator no longer rejects stale values.
         if self.backup.schedule not in VALID_BACKUP_SCHEDULES:
             errors.append(
                 f"backup.schedule {self.backup.schedule!r} must be one "
@@ -657,24 +668,6 @@ class Config:
                 "obsidian.location_template_custom must be set when "
                 "location_template_name is 'custom'"
             )
-        if self.synthesis.claude_project_id:
-            # Optional field; if set, must look like a UUID
-            # (8-4-4-4-12 hex). Loose match -- Claude uses UUID-v7
-            # variants whose internal structure differs from v4 but
-            # the outer shape is the same.
-            import re  # noqa: PLC0415
-
-            if not re.fullmatch(
-                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-                self.synthesis.claude_project_id.strip(),
-            ):
-                errors.append(
-                    "synthesis.claude_project_id must be a UUID-shaped "
-                    "string (e.g. 019e5077-c745-7541-b2c8-08caeb0f3051) "
-                    "or empty to disable. Got: "
-                    f"{self.synthesis.claude_project_id!r}"
-                )
         return errors
 
     def _dump_toml(self) -> str:

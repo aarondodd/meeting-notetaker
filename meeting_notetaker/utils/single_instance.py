@@ -163,12 +163,18 @@ def acquire(path: Path | None = None, *, force: bool = False) -> bool:
     this build cannot parse or a detection that gets it wrong.
     """
     path = path or lock_path()
+    me_pid = os.getpid()
+    me_image = _current_image()
     if force:
         _write_lockfile(path)
+        log.info(
+            "single_instance: acquired (force) pid=%d image=%s path=%s",
+            me_pid, me_image, path,
+        )
         return True
     if path.exists():
         other_pid, other_image = _read_lockfile(path)
-        if other_pid and other_pid != os.getpid():
+        if other_pid and other_pid != me_pid:
             live_image = _image_of_pid(other_pid)
             if live_image is not None:
                 # live_image is "" when the PID is alive but we could
@@ -177,17 +183,58 @@ def acquire(path: Path | None = None, *, force: bool = False) -> bool:
                 # lockfile also recorded no image, we are back to the
                 # old check.
                 if other_image is None or live_image == "" or live_image == other_image:
+                    log.info(
+                        "single_instance: BLOCKED by live instance "
+                        "pid=%d stored_image=%r live_image=%r me_pid=%d me_image=%r path=%s",
+                        other_pid, other_image, live_image, me_pid, me_image, path,
+                    )
                     return False
+                log.info(
+                    "single_instance: stale lock (image mismatch) "
+                    "stored_pid=%d stored_image=%r live_image=%r me_pid=%d me_image=%r",
+                    other_pid, other_image, live_image, me_pid, me_image,
+                )
+            else:
+                log.info(
+                    "single_instance: stale lock (dead pid) "
+                    "stored_pid=%d stored_image=%r me_pid=%d me_image=%r",
+                    other_pid, other_image, me_pid, me_image,
+                )
+        elif other_pid == me_pid:
+            # Our own PID in the lockfile means a prior run with the
+            # same PID did not call release(); overwrite without
+            # drama since we are already here.
+            log.info(
+                "single_instance: overwriting self-stale lock pid=%d image=%s",
+                me_pid, me_image,
+            )
+    else:
+        log.info(
+            "single_instance: no existing lockfile pid=%d image=%s path=%s",
+            me_pid, me_image, path,
+        )
     _write_lockfile(path)
+    log.info(
+        "single_instance: acquired pid=%d image=%s path=%s",
+        me_pid, me_image, path,
+    )
     return True
 
 
 def release(path: Path | None = None) -> None:
     path = path or lock_path()
+    me_pid = os.getpid()
     try:
         if path.exists():
             stored_pid, _ = _read_lockfile(path)
-            if stored_pid == os.getpid():
+            if stored_pid == me_pid:
                 path.unlink()
+                log.info("single_instance: released pid=%d path=%s", me_pid, path)
+            else:
+                log.info(
+                    "single_instance: skip release (lockfile belongs to another pid) "
+                    "stored_pid=%d me_pid=%d",
+                    stored_pid, me_pid,
+                )
     except OSError:
-        pass
+        log.exception("single_instance: release failed")

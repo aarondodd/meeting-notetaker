@@ -243,31 +243,63 @@ recovered sessions show the error badge instead of the stale recording badge.
 Test suite collects 2368 on main (3 new test files, 14 new tests). Aaron
 confirmed the fix on his laptop before release.
 
-Open work (unmerged): the single-instance lock treats any live PID as a running
-Meeting Notetaker, so a crashed or SIGKILL'd previous launch leaves a lockfile
-whose PID gets handed to an unrelated process by the OS and the next launch
-hits "Another Meeting Notetaker instance is already running" with no window to
-foreground. `utils/single_instance.py` now also records the resolved image
-path at acquire time, reads the live image for the stored PID via
-QueryFullProcessImageNameW on Windows and /proc/<pid>/exe on Linux, and only
-blocks when both match; a mismatch, a dead PID, or an unparseable lockfile is
-treated as stale and overwritten. `acquire(force=True)` is the escape hatch,
-exposed as a `--force` command-line flag on the frozen build and offered as a
-Yes/No prompt the first time the user hits the dialog, so there is a path
-forward even if a future detection gets it wrong. A legacy single-line
-lockfile (PID only, from pre-fix builds) still works and falls back to the
-old PID-alive check for backwards compat. 13 pure-Python tests pin the
-behavior across fresh acquire, dead-PID stale, recycled-PID stale (spawning
-`sleep` to produce a live PID whose image is not ours), live-match blocks,
-force overrides a live match, garbage lockfile, empty lockfile, release
-leaves foreign lockfiles alone, and the two `_normalise_image` branches;
-mutation controls confirm the recycled-image and force branches each cover
-their test. Two end-to-end smokes under offscreen Qt: with and without
-`--force` the app recovers from a stale lock and rewrites it with its own
-PID + image. The extension manifest reads
-0.7.15 against this 0.7.14 release: the offset is deliberate dev-loop
-cache-busting so Chrome force-reloads on the next "Load unpacked", mirroring
-the pattern v0.7.12 and v0.7.13 shipped with. The per-version notes below
+Open work (unmerged, v0.8.0-dev): synthesis is being migrated off the bundled
+Chrome extension to a local MCP server (branch `mcp-synthesis-replace-extension`).
+`main.py --mcp-server` boots a stdio MCP server (newline-delimited
+JSON-RPC over stdin/stdout, protocol version 2025-06-18) that any
+Claude surface can consume: Chrome Claude extension, Claude Desktop,
+Claude Code. `meeting_notetaker/mcp/` carries the server (`server.py`
+holds the dispatch loop, `tools.py` the catalog). Ten tools:
+`list_meetings`, `get_meeting`, `get_transcript`, `get_live_notes`,
+`get_notes`, `list_templates`, `get_template`,
+`render_synthesis_prompt`, `save_notes`, `set_prompt_template`. The
+settings tab previously called "Automation" (Chrome extension install
+wizard, Claude project ID, timeouts) is replaced by "Synthesis via
+MCP" with a tick-box, a link to the Chrome Claude extension listing,
+the generated launcher command, and a copy-to-clipboard JSON snippet.
+The old `meeting_notetaker/automation/` module, the bundled Chrome
+extension under `meeting_notetaker/resources/extension/`, the
+`automation_install_dialog.py`, and `utils/chrome_process.py` are
+removed. Config fields that fed the old bridge (`automation_enabled`,
+`llm_target`, `claude_project_id`, `llm_response_timeout_seconds`,
+`clipboard_read_seconds`) stay on `SynthesisConfig` as dataclass
+defaults so stale `config.toml` files load cleanly; the validators
+for those fields are gone. A new `mcp_enabled: bool = False` flag
+records the opt-in. Setup doc at `docs/mcp-setup.md`. 23 new tests
+covering tool dispatch, every handler, the stdio loop, and the
+Settings helper; nine retired-automation tests and the extension-
+composer-priority tests dropped; the 2381 pre-change suite is now
+2294 passed, 1 skipped. Rebased onto main after PR #134 (stale
+single-instance lock fix) merged as fda658d (2026-10-23 09:03 HST);
+the branch head is now 24e4aa2. A second transport landed in 3a32837
+(2026-10-23 23:26 HST, local, not yet pushed): the Chrome Claude
+extension's Custom Connectors UI accepts only remote URLs and cannot
+consume a stdio config, so `main.py --web-ui` serves a stdlib
+`ThreadingHTTPServer` on 127.0.0.1 (first free port from 8765, 20
+fallbacks) under `meeting_notetaker/web/` (`server.py`, `handlers.py`,
+`views.py`, `static.py`). It renders HTML pages for meetings,
+templates and a per-meeting synthesis form, plus a JSON API under
+`/api/` mirroring every tool, with `mcp/tools.py` as the shared layer.
+Settings > Synthesis via MCP gained a "Start web UI and open in
+browser..." button (daemon-thread server) and scopes the stdio snippet
+to Claude Desktop and Claude Code; `docs/mcp-setup.md` documents both
+transports. 48 new tests; 2356 collect on the branch at 3a32837.
+Follow-ups on 2026-10-24 (all pushed; branch head 6a801e0, even with
+origin): 27fe227 moves the web UI into the GUI process so it shares the
+single-instance lock, adding `synthesis.start_web_ui_on_launch` (off by
+default) and an on-screen URL; 9e21484 ships `claude-skill/SKILL.md`
+for the Chrome Claude extension and instruments the lock for a
+two-process report; f6841f8 adds `export_meeting_to_obsidian` plus
+markdown rendering and series/person/topic filters; 8e0dad0 adds
+`export_meeting_to_notion`, `export_meeting_to_confluence` and
+`list_export_destinations`, Settings checkboxes for Web UI export
+destinations, a single export dropdown and a sidebar TOC; 6a801e0
+rewrites the README for the two transports, moves the user guide into
+`docs/user-guide/`, and documents the one-time v0.7.x extension and
+native-host cleanup that stops zombie Python respawns.
+Version bumped to
+`0.8.0-dev`; the extension manifest cache-bust pattern no longer
+applies because there is no extension. The per-version notes below
 stop at v0.6.4 and were never carried forward through the v0.7.x line; treat
 `git log` and the GitHub releases page as authoritative for anything after
 v0.6.4, and read the "v0.6.4 (current)" heading below as "v0.6.4 (last

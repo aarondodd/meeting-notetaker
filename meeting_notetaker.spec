@@ -55,11 +55,10 @@ for pkg in (
 
 datas += collect_data_files("ctranslate2")
 datas += [("meeting_notetaker/resources/prompts", "meeting_notetaker/resources/prompts")]
-# Synthesis automation extension (v0.6.3+). The bundle contains the
-# unpacked Chrome extension folder; the installer extracts it to
-# %LOCALAPPDATA%\MeetingNotetaker\automation\extension when the user
-# enables the feature and clicks Install in Settings.
-datas += [("meeting_notetaker/resources/extension", "meeting_notetaker/resources/extension")]
+# v0.8: the bundled Chrome extension is retired. Synthesis routes
+# through an MCP server (meeting_notetaker.mcp) that the user's own
+# Claude surface (Chrome extension, Claude Desktop, Claude Code)
+# consumes. See docs/mcp-setup.md.
 
 # SpeechBrain's hparam yaml constructs classes via `!new:speechbrain...`
 # tags resolved at runtime. PyInstaller cannot see those, so the relevant
