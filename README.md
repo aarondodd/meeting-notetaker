@@ -12,9 +12,9 @@ Claude extension can drive. The manual Generate Prompt + Paste
 Response Back flow stays available when you'd rather handle it by
 hand. No audio leaves the machine; no API key required.
 
-## What's new in v0.8 (pre-release)
+## What's new in v0.8.0
 
-v0.8 retires the bundled Chrome extension in favor of a local MCP
+v0.8.0 retires the bundled Chrome extension in favor of a local MCP
 service layer with two transports. See
 [docs/mcp-setup.md](docs/mcp-setup.md) for the one-page setup.
 
@@ -64,7 +64,7 @@ Step 1 alone stops the respawns; steps 2 and 3 remove the dead
 pointers so a stray service worker from a reinstalled extension
 can't start up the loop again.
 
-Status at v0.7.14 released, v0.8.0 in pre-release. End-to-end capture, transcription, synthesis,
+Status at v0.8.0 released. End-to-end capture, transcription, synthesis,
 screen capture, retained-audio playback + export, and transcript-
 synchronized playback all working. v0.7.14 keeps the app alive when
 an exception escapes a Qt slot and lets you re-transcribe a crashed

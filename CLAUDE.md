@@ -218,7 +218,26 @@ correctness assertions.
 
 ## Status
 
-Released version is v0.7.14 (tag `v0.7.14`, 2026-10-09), which shipped PR #133
+Released version is v0.8.0 (tag `v0.8.0`, 2026-10-28), which shipped PR #135
+(squash-merge `cad1a18`): synthesis moves off the bundled Chrome extension and
+native-messaging bridge to a local MCP service layer with two transports. A
+stdio MCP server (`main.py --mcp-server`) serves Claude Desktop and Claude Code
+through ten typed tools in `meeting_notetaker/mcp/tools.py`; a loopback web UI
+plus JSON API serves the Chrome Claude extension, which only accepts remote
+connector URLs and cannot consume a stdio config. The web UI runs inside the
+GUI process under the single-instance lock, auto-started on launch when
+`synthesis.start_web_ui_on_launch` is on (default off). Settings > Automation
+becomes Settings > Synthesis via MCP with per-destination Obsidian / Notion /
+Confluence export checkboxes. The old `meeting_notetaker/automation/`,
+`meeting_notetaker/resources/extension/`, `automation_install_dialog.py` and
+`utils/chrome_process.py` are removed; retired config fields stay as dataclass
+defaults for load-compat. User guide moved into `docs/user-guide/`, Help > User
+Guide points at the new index, README trimmed to install plus a one-time
+cleanup block for the v0.7.x extension and native-host leftovers that cause
+Python respawns if left in place. 2403 passed, 1 skipped. Aaron verified the
+web UI end to end on Windows before release.
+
+Previous release v0.7.14 (tag `v0.7.14`, 2026-10-09) shipped PR #133
 (squash-merge `f85052d`): PyQt6 slot exceptions now land in the log instead of
 killing the windowed build (`utils/crash_guard.py` installs `sys.excepthook`,
 `threading.excepthook` and a Qt message handler at startup, so a traceback
@@ -243,63 +262,7 @@ recovered sessions show the error badge instead of the stale recording badge.
 Test suite collects 2368 on main (3 new test files, 14 new tests). Aaron
 confirmed the fix on his laptop before release.
 
-Open work (unmerged, v0.8.0-dev): synthesis is being migrated off the bundled
-Chrome extension to a local MCP server (branch `mcp-synthesis-replace-extension`).
-`main.py --mcp-server` boots a stdio MCP server (newline-delimited
-JSON-RPC over stdin/stdout, protocol version 2025-06-18) that any
-Claude surface can consume: Chrome Claude extension, Claude Desktop,
-Claude Code. `meeting_notetaker/mcp/` carries the server (`server.py`
-holds the dispatch loop, `tools.py` the catalog). Ten tools:
-`list_meetings`, `get_meeting`, `get_transcript`, `get_live_notes`,
-`get_notes`, `list_templates`, `get_template`,
-`render_synthesis_prompt`, `save_notes`, `set_prompt_template`. The
-settings tab previously called "Automation" (Chrome extension install
-wizard, Claude project ID, timeouts) is replaced by "Synthesis via
-MCP" with a tick-box, a link to the Chrome Claude extension listing,
-the generated launcher command, and a copy-to-clipboard JSON snippet.
-The old `meeting_notetaker/automation/` module, the bundled Chrome
-extension under `meeting_notetaker/resources/extension/`, the
-`automation_install_dialog.py`, and `utils/chrome_process.py` are
-removed. Config fields that fed the old bridge (`automation_enabled`,
-`llm_target`, `claude_project_id`, `llm_response_timeout_seconds`,
-`clipboard_read_seconds`) stay on `SynthesisConfig` as dataclass
-defaults so stale `config.toml` files load cleanly; the validators
-for those fields are gone. A new `mcp_enabled: bool = False` flag
-records the opt-in. Setup doc at `docs/mcp-setup.md`. 23 new tests
-covering tool dispatch, every handler, the stdio loop, and the
-Settings helper; nine retired-automation tests and the extension-
-composer-priority tests dropped; the 2381 pre-change suite is now
-2294 passed, 1 skipped. Rebased onto main after PR #134 (stale
-single-instance lock fix) merged as fda658d (2026-10-23 09:03 HST);
-the branch head is now 24e4aa2. A second transport landed in 3a32837
-(2026-10-23 23:26 HST, local, not yet pushed): the Chrome Claude
-extension's Custom Connectors UI accepts only remote URLs and cannot
-consume a stdio config, so `main.py --web-ui` serves a stdlib
-`ThreadingHTTPServer` on 127.0.0.1 (first free port from 8765, 20
-fallbacks) under `meeting_notetaker/web/` (`server.py`, `handlers.py`,
-`views.py`, `static.py`). It renders HTML pages for meetings,
-templates and a per-meeting synthesis form, plus a JSON API under
-`/api/` mirroring every tool, with `mcp/tools.py` as the shared layer.
-Settings > Synthesis via MCP gained a "Start web UI and open in
-browser..." button (daemon-thread server) and scopes the stdio snippet
-to Claude Desktop and Claude Code; `docs/mcp-setup.md` documents both
-transports. 48 new tests; 2356 collect on the branch at 3a32837.
-Follow-ups on 2026-10-24 (all pushed; branch head 6a801e0, even with
-origin): 27fe227 moves the web UI into the GUI process so it shares the
-single-instance lock, adding `synthesis.start_web_ui_on_launch` (off by
-default) and an on-screen URL; 9e21484 ships `claude-skill/SKILL.md`
-for the Chrome Claude extension and instruments the lock for a
-two-process report; f6841f8 adds `export_meeting_to_obsidian` plus
-markdown rendering and series/person/topic filters; 8e0dad0 adds
-`export_meeting_to_notion`, `export_meeting_to_confluence` and
-`list_export_destinations`, Settings checkboxes for Web UI export
-destinations, a single export dropdown and a sidebar TOC; 6a801e0
-rewrites the README for the two transports, moves the user guide into
-`docs/user-guide/`, and documents the one-time v0.7.x extension and
-native-host cleanup that stops zombie Python respawns.
-Version bumped to
-`0.8.0-dev`; the extension manifest cache-bust pattern no longer
-applies because there is no extension. The per-version notes below
+The per-version notes below
 stop at v0.6.4 and were never carried forward through the v0.7.x line; treat
 `git log` and the GitHub releases page as authoritative for anything after
 v0.6.4, and read the "v0.6.4 (current)" heading below as "v0.6.4 (last
