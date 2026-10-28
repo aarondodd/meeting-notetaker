@@ -4910,18 +4910,18 @@ class MainApp(QObject):
         AboutDialog(parent=self.window).exec()
 
     def _on_user_guide(self) -> None:
-        """Open the GitHub README at the User Guide anchor.
+        """Open the User Guide index on GitHub.
 
-        Keeping the how-to in the README (where mermaid renders) and
-        deep-linking from the app avoids maintaining two copies. The
-        repo's main branch is the source of truth; if the user is on
-        an older build the link still points to the latest docs --
-        appropriate for a how-to-use guide.
+        The User Guide lives under docs/user-guide/ on main; the index
+        page links to each page. Pointing at main means a user on an
+        older build still gets the latest how-to, which is the right
+        trade-off for user-facing docs.
         """
         from PyQt6.QtCore import QUrl  # noqa: PLC0415
         from PyQt6.QtGui import QDesktopServices  # noqa: PLC0415
         QDesktopServices.openUrl(QUrl(
-            "https://github.com/aarondodd/meeting-notetaker#user-guide"
+            "https://github.com/aarondodd/meeting-notetaker"
+            "/blob/main/docs/user-guide/README.md"
         ))
 
     def _on_settings(self) -> None:

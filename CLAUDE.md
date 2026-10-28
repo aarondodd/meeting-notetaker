@@ -284,6 +284,19 @@ Settings > Synthesis via MCP gained a "Start web UI and open in
 browser..." button (daemon-thread server) and scopes the stdio snippet
 to Claude Desktop and Claude Code; `docs/mcp-setup.md` documents both
 transports. 48 new tests; 2356 collect on the branch at 3a32837.
+Follow-ups on 2026-10-24 (all pushed; branch head 6a801e0, even with
+origin): 27fe227 moves the web UI into the GUI process so it shares the
+single-instance lock, adding `synthesis.start_web_ui_on_launch` (off by
+default) and an on-screen URL; 9e21484 ships `claude-skill/SKILL.md`
+for the Chrome Claude extension and instruments the lock for a
+two-process report; f6841f8 adds `export_meeting_to_obsidian` plus
+markdown rendering and series/person/topic filters; 8e0dad0 adds
+`export_meeting_to_notion`, `export_meeting_to_confluence` and
+`list_export_destinations`, Settings checkboxes for Web UI export
+destinations, a single export dropdown and a sidebar TOC; 6a801e0
+rewrites the README for the two transports, moves the user guide into
+`docs/user-guide/`, and documents the one-time v0.7.x extension and
+native-host cleanup that stops zombie Python respawns.
 Version bumped to
 `0.8.0-dev`; the extension manifest cache-bust pattern no longer
 applies because there is no extension. The per-version notes below

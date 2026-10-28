@@ -7,11 +7,10 @@ faster-whisper, captures screenshots of any region you draw, plays
 the recording back in-app, and hands the resulting transcript to you
 for synthesis by any LLM you trust. Synthesis routes through a local
 Model Context Protocol (MCP) service layer; a stdio MCP server for
-Claude Desktop and Claude Code, and a loopback web UI any browser
-(including the Chrome Claude extension and your phone over LAN) can
-drive. The manual Generate Prompt + Paste Response Back flow stays
-available when you'd rather handle it by hand. No audio leaves the
-machine; no API key required.
+Claude Desktop and Claude Code, and a loopback web UI the Chrome
+Claude extension can drive. The manual Generate Prompt + Paste
+Response Back flow stays available when you'd rather handle it by
+hand. No audio leaves the machine; no API key required.
 
 ## What's new in v0.8 (pre-release)
 
@@ -25,10 +24,7 @@ service layer with two transports. See
 - **Loopback web UI** (`main.py --web-ui`): for the Chrome Claude
   extension, which only accepts remote connector URLs and cannot
   consume a stdio config. Serves a 127.0.0.1 page (port 8765 up to
-  8785) plus a JSON API mirroring every tool. The HTML is
-  responsive, so you can also point your phone's browser at the
-  same URL over LAN and read a transcript, render the prompt, or
-  save synthesis from the couch.
+  8785) plus a JSON API mirroring every tool.
 
 The old automation path is gone: no more unpacked-extension install,
 no more native-messaging host, no more selector hunts against
@@ -40,9 +36,33 @@ Claude surface calls directly or drives through the web UI.
 To migrate: tick **Enable synthesis via MCP** in Settings >
 Synthesis via MCP, then paste the stdio config snippet into Claude
 Desktop or Claude Code, or click **Start web UI and open in
-browser...** for the Chrome Claude extension / phone browser path.
-The clipboard Generate + Paste Response Back flow is unchanged and
-remains the fallback for anyone not on either transport.
+browser...** for the Chrome Claude extension path. The clipboard
+Generate + Paste Response Back flow is unchanged and remains the
+fallback for anyone not on either transport.
+
+If you installed the v0.7.x bundled Chrome extension via the old
+Settings > Synthesis Automation > Install / Verify button, three
+artifacts outside the git tree persist across the v0.8 upgrade and
+need a one-time hand cleanup. Chrome's extension service worker will
+otherwise wake every few seconds, invoke the registered native host,
+and spawn a Python process from the install's venv for no useful
+reason. The three to clear:
+
+1. The extension itself. Open `chrome://extensions/`, find Meeting
+   Notetaker (ID `gmnecenhibfigbpldhacjhgmooopeelo`), click Remove.
+   Repeat in Edge if you ever loaded it there.
+2. The HKCU registry keys that point Chrome at the native host.
+   `regedit` to
+   `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts\com.meeting_notetaker.bridge`
+   and delete the key. Same path under `Software\Microsoft\Edge\...`
+   for Edge.
+3. The on-disk host files, now orphaned. Delete
+   `%LOCALAPPDATA%\MeetingNotetaker\extension\` and
+   `%LOCALAPPDATA%\MeetingNotetaker\automation\`.
+
+Step 1 alone stops the respawns; steps 2 and 3 remove the dead
+pointers so a stray service worker from a reinstalled extension
+can't start up the loop again.
 
 Status at v0.7.14 released, v0.8.0 in pre-release. End-to-end capture, transcription, synthesis,
 screen capture, retained-audio playback + export, and transcript-
@@ -136,836 +156,28 @@ keys ever leave the machine.
 
 # User Guide
 
-This section walks through everyday use. Technical internals (how
-the recorder aligns the two streams, how the Chrome bridge works,
-etc.) live in [Technical Details](#technical-details) below.
-
-## Requirements
-
-- Windows 10 / 11 (the WASAPI loopback capture is Windows-only).
-- A working microphone and a default speaker / output device.
-- ~500 MB of disk for the default `small.en` Whisper model. The
-  model downloads on first run.
-
-Synthesis automation is optional. If you want it, pick one of:
-
-- Claude Desktop or Claude Code on the same machine, consuming the
-  stdio MCP server directly.
-- The Chrome Claude extension in any Chromium browser, driving the
-  loopback web UI.
-- Any mobile browser on the same LAN, pointed at the web UI with
-  `--host 0.0.0.0` and the laptop's LAN IP; see
-  [Accessing the web UI from a phone](#accessing-the-web-ui-from-a-phone).
-
-Setup matrix in [docs/mcp-setup.md](docs/mcp-setup.md). The web UI
-is a stdlib HTTP server with no extra dependency on the machine's
-side.
-
-> **Microsoft Store Python is unsupported** (dev install only).
-> Microsoft Store Python runs in a UWP AppContainer sandbox that
-> blocks microphone access at the OS level. The app detects this
-> at startup and shows a warning dialog. Use
-> [python.org](https://www.python.org/downloads/) instead.
-
-## Installation
-
-### Windows installer (typical user path, v0.6.6+)
-
-Download `meeting-notetaker-setup-X.Y.Z.exe` from the [latest
-release](https://github.com/aarondodd/meeting-notetaker/releases/latest)
-and run it. The installer:
-
-- Installs per-user by default (no admin required); the UAC dialog
-  lets you elevate for a Program Files install if you prefer
-- Creates a Start Menu shortcut + optional desktop shortcut
-- Registers with Add/Remove Programs for clean uninstall
-- Subsequent versions self-upgrade silently (Help > Upgrade or the
-  weekly background check) by downloading the new installer and
-  re-running it in place
-
-### One-line bootstrap (PowerShell)
-
-Two PowerShell scripts in the repo root cover the headless paths:
-
-```powershell
-# Fresh install -- fetches the latest release asset and launches it.
-iwr -useb https://raw.githubusercontent.com/aarondodd/meeting-notetaker/main/install.ps1 | iex
-
-# Upgrade an existing install -- detects the installed version via
-# the Inno Setup registry entry, compares against the latest
-# release, prompts to confirm, then runs the installer in upgrade
-# mode (Restart Manager closes the running app + relaunches it).
-iwr -useb https://raw.githubusercontent.com/aarondodd/meeting-notetaker/main/upgrade.ps1 | iex
-```
-
-Both scripts print the relevant version + asset details and ask
-**Y/N** before downloading. Pass `-Yes` to skip the prompt for
-unattended installs; `upgrade.ps1` also accepts `-Force` to reinstall
-even when the installed version matches the latest release.
-
-`install.ps1` launches the **full Inno Setup wizard** (EULA, install
-dir, desktop shortcut). `upgrade.ps1` launches the installer with the
-same `/SILENT /SUPPRESSMSGBOXES /NORESTART` flags the in-app updater
-uses, so the existing install is replaced in place without
-re-prompting; Windows Restart Manager closes the running app via the
-installer's `CloseApplications` hook and relaunches it after. If you
-want the full wizard during an upgrade for some reason (e.g. moving
-to a different install dir), use `install.ps1` -- the stable AppId
-still produces an in-place upgrade rather than stacking two
-Add/Remove Programs entries.
-
-### Build locally (Windows)
-
-```powershell
-.\build.ps1                         # produces dist\meeting-notetaker\meeting-notetaker.exe
-.\dist\meeting-notetaker\meeting-notetaker.exe
-```
-
-The executable bundles the Python runtime, PyQt6, faster-whisper,
-and PyAV. The Whisper model itself is downloaded on first run into
-`%APPDATA%\MeetingNotetaker\models\`.
-
-### From source (dev)
-
-```powershell
-# Windows PowerShell
-.\install-deps.ps1                  # creates .venv, installs everything
-.\.venv\Scripts\Activate.ps1
-python main.py
-```
-
-```bash
-# Linux / macOS
-./install-deps.sh
-source .venv/bin/activate
-python main.py
-```
-
-## Recording a meeting
-
-The main window splits a session list (left) and a per-session
-view (right). Recording controls sit above five tabs: **My Notes**
-(your running buffer), **Synthesis** (the LLM-generated note),
-**Slides** (captured screenshots), **Previous Notes** (archived
-prior synthesis runs), and **Transcript** (live + final
-transcription).
-
-![Main window -- Transcript tab](docs/screenshots/01-main-transcript.png)
-
-The session list has two narrow indicator columns to the left of
-each title: a speaker icon if the audio recording is still on
-disk, and a state dot (red while recording, yellow during the
-post-Stop refinement pass, green when refined). Hover any cell to
-see what that column conveys.
-
-### The flow
-
-1. **File -> New Session...** (or `Ctrl+N`). Enter a title.
-   Optionally tick "Keep the audio recording after transcription"
-   to retain the WAV files for this session. When Outlook is
-   reachable, a **Pick from Calendar...** button appears so you
-   can pre-create a session for an upcoming meeting:
-
-   ![New Session dialog](docs/screenshots/06-dialog-new-session.png)
-
-   ![Calendar picker](docs/screenshots/11-dialog-calendar-picker.png)
-
-2. Select the new session in the list. Click **Start**. The tray
-   icon turns red and pulses.
-3. The transcript pane fills with lines labeled `Me:` (your mic)
-   and `Them:` (system audio), interleaved by time. (Live
-   transcription is off by default in v0.6.5 -- toggle it in
-   Settings if you want lines arriving in real time during the
-   meeting.)
-4. **Stop** when the meeting ends. The tray shows a purple
-   "processing" dot while the final transcription pass runs. When
-   it finishes the tray returns to blue and the transcript view
-   shows the refined final transcript.
-5. Switch to the **Synthesis** flow. Either:
-   - Click **Generate Synthesis Prompt**, paste into your chatbot of
-     choice, paste the response back.
-   - Or drive it through MCP: ask Claude Desktop / Claude Code to
-     synthesize the latest meeting, or open the local web UI (from
-     Chrome Claude or a phone browser) and work the detail page's
-     Save form.
-
-   See [Synthesis: chatbot hand-off](#synthesis-chatbot-hand-off)
-   and [Synthesis via MCP](#synthesis-via-mcp) below.
-
-## Taking notes in parallel (My Notes)
-
-The **My Notes** tab is an editable Markdown buffer that lives
-next to the transcript. A small toolbar above the editor handles
-common formatting (Bold / Italic / Headings / Lists / Code /
-Image / HR / Preview toggle).
-
-![My Notes -- edit mode](docs/screenshots/02-main-my-notes-edit.png)
-
-Click **Preview** in the toolbar to render the Markdown in place:
-
-![My Notes -- preview mode](docs/screenshots/03-main-my-notes-preview.png)
-
-Open a new session and the editor is pre-seeded with:
-
-```
-# Attendees
--
-
-# Agenda
-
-# Notes
-
-# Action Items
-```
-
-Everything you type auto-saves continuously (no Save button).
-Names from the `# Attendees` bulleted list are parsed out
-separately and passed into the synthesis prompt as
-`{{attendees}}`, so action-item owners come from the people who
-were actually in the meeting.
-
-**Image paste.** Paste an image from the clipboard (or click
-**Image** in the toolbar to insert a file) and the app copies it
-into the session's `images/` folder and inserts a Markdown
-reference. The Preview pane renders these inline.
-
-**Rich-text paste.** Pastes from Notion, VS Code, GitHub,
-Confluence's rendered view, Office, and similar HTML sources land
-as Markdown source instead of the lossy `text/plain` variant.
-Headings, bold / italic, nested lists, fenced code blocks (with
-language hints), blockquotes, and links round-trip cleanly. Image
-references the receiver can't fetch (Notion's page-attachment
-URLs, `cid:` from email, `file://` from the source machine) render
-as a visible `*❌ (image: foo.png could not be pasted) ❌*`
-placeholder rather than a broken icon.
-
-## Screen capture
-
-The Screen Capture feature snapshots a region of your screen on
-demand or every N seconds. Use it during shared-screen meetings
-to keep visual context with your notes.
-
-### Manual flow
-
-1. While recording, click **Start Screen Capture** in the
-   controls row.
-2. A translucent overlay appears across all monitors. Drag to
-   draw the region you want to capture (typically the
-   shared-screen area in Teams / Zoom).
-3. A thin cyan outline persists around the armed region for the
-   duration of the recording so you can see what will be
-   captured.
-4. In the **My Notes** tab's right sidebar, the Capture and
-   Insert buttons are now enabled.
-5. Click **Capture** to snapshot the region into the session's
-   `screenshots/` folder. Click **Insert** to do the same AND
-   drop a markdown image-ref at the cursor in My Notes.
-
-### Auto-capture
-
-Tick the **Auto-capture** checkbox in the same sidebar. While
-armed, the region is snapshotted every N seconds (default 30,
-set in Settings). Each fresh capture's perceptual dHash is
-compared against the most-recently-kept image; near-duplicates
-are discarded. Only meaningfully-different content sticks
-around. Manual Capture / Insert clicks always keep their image
-(no dedup check) and update the dedup baseline.
-
-### Viewing captured slides
-
-The **Slides** tab lists every captured screenshot as a
-thumbnail grid:
-
-- **Click a thumbnail** -- switch to full-image view with
-  Previous / Next / Back navigation.
-- **Right-click** -- Copy image to clipboard / Open in default
-  viewer / Delete.
-
-While **playback** is active (see below), the Slides tab
-auto-advances to track the recording position; clicking a
-thumbnail seeks the audio to that screenshot's recording-relative
-timestamp.
-
-## Playing back the recording
-
-If you kept the audio (checkbox in New Session, or default in
-Settings), the **Transcript** tab grows a slim Play / Stop +
-scrubber + time-readout bar at the bottom.
-
-- **Click Play** -- the recording plays back. The active
-  transcript line highlights as audio progresses.
-- **Click a transcript line** -- the audio seeks to about 10
-  seconds before that line's timestamp and continues playing
-  from there. The clicked line stays highlighted until playback
-  catches up to it.
-- **Drag the scrubber** -- seek to any moment.
-- **Stop** -- pause where you are. The next Play resumes from
-  the same spot.
-
-If the session also has captured screenshots, hitting Play (or
-clicking any transcript line while paused) swaps the Transcript
-tab to a screenshare-style layout: the matching screenshot shows
-up top, the transcript scrolls below. As playback crosses each
-captured screenshot's recording-relative timestamp, the top image
-updates. The split defaults to 70% screenshot / 30% transcript;
-drag the divider to resize and the new ratio is remembered for
-future sessions. Pausing keeps the layout up; only natural end of
-playback returns to the full-width transcript view.
-
-The Slides tab also gets its own Play bar that drives the same
-player.
-
-## Exporting the recording
-
-Right-click any session with a retained recording in the session
-list:
-
-- **Open recording in media player** -- launches your OS default
-  player on the source file.
-- **Export recording as...** -- opens a save dialog with filter
-  options for MP3 (default, most universal), FLAC, AAC, Opus, or
-  WAV. Both source streams (mic + sys) are mixed into a single
-  file at the chosen format. An indeterminate progress dialog
-  shows while encoding runs in a worker thread.
-- **Export session as video...** -- renders an MP4 slideshow with
-  the mixed audio + screenshots flipping at their captured
-  timestamps. H.264 1080p / 30 fps video, AAC mono audio, black
-  frames before the first screenshot, letterbox bars to preserve
-  aspect ratio. A matching `.srt` sidecar carries the transcript
-  as toggleable subtitles -- every standard player auto-loads the
-  SRT and lets the viewer turn subtitles on or off; delete the
-  SRT if you'd rather share the MP4 alone. A determinate progress
-  dialog tracks per-frame encode progress.
-- **Delete recording...** -- removes the audio files but keeps
-  the transcript + notes.
-
-## Transcribing a failed recording
-
-If the app exits while a session is recording, the next launch marks
-that session as failed (the red cross in the state column) and lists
-it in a Crash Recovery dialog. The audio captured up to that point is
-still on disk. Select the session and choose **File > Transcribe
-Failed Recording...** (also on the session list's right-click menu)
-to run the full transcription and speaker pass over it. With
-multi-endpoint capture on, the per-endpoint system-audio tracks the
-interrupted recording never mixed are combined first. The audio is
-kept afterwards even if the session was not set to keep its
-recording, so a bad transcription pass never costs you the source.
-
-## Importing a transcript (no recording)
-
-Sometimes a meeting happens without a local recording -- you joined
-late, your mic was wrong, Teams recorded the call but the app
-didn't, or the meeting was a hallway call with someone else's
-transcript already on hand. You can still use the synthesis flow by
-importing the transcript directly into the session.
-
-1. Create a new session in the usual way (the **+ New** button in
-   the sessions list), or open an existing empty session.
-2. Click **Import Transcript...** on the empty Transcript tab, or
-   pick **File -> Import Transcript...** from the menu bar.
-3. In the dialog, either click **From file...** (accepts `.txt`,
-   `.md`, and `.docx`) or **Paste from clipboard**. The preview
-   pane shows the normalized body the app would save.
-
-   ![Import Transcript dialog](docs/screenshots/31-dialog-import-transcript.png)
-4. Leave **Strip Teams formatting** checked for transcripts that
-   came out of Teams. The cleanup pass drops boilerplate banners
-   ("Started transcription", "View original meeting"), folds the
-   web-paste three-line speaker/timestamp/body shape back into one
-   labeled line, and collapses runs of blank lines. Uncheck it to
-   import the source verbatim.
-5. If the preview shows `Name:`-prefixed lines the dialog lists each
-   detected speaker, how many lines they contributed, and lets you
-   type a remapped label. Useful when Teams used a generic
-   "Unknown Speaker" label or the user's display name is wrong.
-   Click **Apply remap to preview** to see the result.
-6. Click **Import**. The body is written to the session's
-   transcript and the **Generate Synthesis Prompt** + **Save to...**
-   buttons become available the same way they do after a recording.
-
-Notes are merged in via the existing My Notes flow -- if you took
-running notes during the meeting they remain attached to the
-session and feed the synthesis prompt alongside the imported
-transcript. A flat caption blob with no speaker labels works fine;
-the synthesis prompt template treats `{{transcript}}` as opaque
-text, and Claude leans on your notes when speaker attribution is
-missing.
-
-Importing over an existing transcript prompts for confirmation to
-avoid accidentally wiping a recording's transcript.
-
-## Synthesis: chatbot hand-off
-
-Two paths cover the hand-off: a manual clipboard flow that works
-with any chatbot, and a Settings-wired MCP service layer that
-Claude Desktop, Claude Code, and the Chrome Claude extension can
-drive directly. See [Synthesis via MCP](#synthesis-via-mcp) below
-for the second path.
-
-### Manual flow
-
-1. Click **Generate Synthesis Prompt**. A dialog opens with a
-   template picker, a rendered preview of the merged prompt
-   (your live notes + the transcript), and a Copy to clipboard
-   button:
-
-   ![Generate Synthesis Prompt dialog](docs/screenshots/08-dialog-generate-prompt.png)
-
-2. Paste into your chatbot of choice (Claude.ai, M365 Copilot,
-   etc.). Wait for the reply.
-
-3. Copy the response, come back to Meeting Notetaker, click
-   **Paste Response Back...**, paste, save:
-
-   ![Paste Response Back dialog](docs/screenshots/09-dialog-paste-response.png)
-
-4. The **Synthesis** tab now shows the rendered response. If a
-   prior notes file existed, it's auto-archived to
-   `notes-YYYYMMDD-HHMM.md` and listed under **Previous Notes**.
-
-The Synthesis tab is editable in place (Markdown source + Preview
-toggle, same as My Notes), so you can polish the LLM's output
-before sharing.
-
-![Synthesis tab](docs/screenshots/04-main-synthesis.png)
-
-The **Copy** button puts the active tab's contents on the
-clipboard as both Markdown and rendered HTML (with images inlined
-as base64 data: URIs) for paste into Word / OneNote / Notion /
-plain editors. Coverage varies by destination; see the
-paste-target table in the [Technical Details](#technical-details)
-section.
-
-The **Print** and **Save to...** buttons render the active tab to
-a printer or write it to one of three destinations:
-
-- **Save as PDF...** -- writes a PDF file (images preserved,
-  Markdown links clickable, links rendered as black + underlined).
-- **Save to Notion...** -- creates a new Notion page under a parent
-  you pick. Visible only when Notion is configured + verified under
-  Settings > Integrations.
-- **Save to Confluence...** -- creates a new Confluence page under
-  a parent you pick. Visible only when Confluence is configured +
-  verified.
-- **Save to Obsidian...** -- writes a markdown file (with YAML
-  frontmatter linking attendees + series) into a configured
-  Obsidian vault. Visible only when an Obsidian vault path is
-  configured + verified under Settings > Integrations. No remote
-  service involved -- the note lands on local disk and Obsidian
-  syncs it however the user already has it set up (iCloud,
-  Syncthing, Obsidian Sync, etc.). See
-  [Saving notes to Obsidian](#saving-notes-to-obsidian) below.
-
-The File menu mirrors the same Save to submenu so you can drive
-the flow without leaving the menu bar. See
-[Saving notes to Notion or Confluence](#saving-notes-to-notion-or-confluence)
-below for the picker dialog walk-through.
-
-### Per-session prompt template
-
-The synthesis tab has a **Prompt** dropdown that picks which
-template (default, one-on-one, standup, or any custom file in
-`%APPDATA%\MeetingNotetaker\prompts\`) to use for that session.
-Selection persists across app restarts and feeds both the manual
-hand-off above and the MCP tools below.
-
-## Synthesis via MCP
-
-Starting in v0.8, synthesis automation moves off the bundled
-Chrome extension to a local MCP service layer. Two transports
-expose the same ten tools; pick whichever your Claude surface
-supports. One-page setup in
-[docs/mcp-setup.md](docs/mcp-setup.md).
-
-| Claude surface | Transport |
-| :--- | :--- |
-| Chrome Claude extension (claude.ai in-browser) | Local web UI at `http://127.0.0.1:PORT/` |
-| Claude Desktop | stdio MCP server (`--mcp-server`) |
-| Claude Code | stdio MCP server (`--mcp-server`) |
-| Any mobile browser on LAN | Local web UI with `--host 0.0.0.0` |
-
-Your meetings never leave the machine either way. The web UI
-binds loopback by default. The stdio server reads JSON-RPC on
-stdin and writes to stdout; nothing crosses the network at all.
-
-### Enabling MCP
-
-Open **Settings > Synthesis via MCP** and tick **Enable
-synthesis via MCP**. The pane then offers:
-
-- Start web UI and open in browser (launches the local web UI,
-  default `127.0.0.1:8765` with 20 port fallbacks, and points
-  your default browser at it). The server runs for the rest of
-  the Meeting Notetaker session.
-- Start the web UI automatically when Meeting Notetaker launches
-  (one-time tick-box; every subsequent app launch starts the
-  web UI in the background).
-- Copy config to clipboard (hands you the JSON snippet to paste
-  into Claude Desktop's `claude_desktop_config.json` or
-  `claude mcp add` for Claude Code).
-- Web UI export destinations: three check-boxes (Obsidian,
-  Notion, Confluence) that pick which Save-to destinations
-  surface in the web UI's per-meeting export dropdown. Each is
-  disabled until the matching integration is configured and
-  verified under Settings > Integrations.
-
-### Claude Desktop and Claude Code (stdio)
-
-Paste the Settings-generated snippet into your client:
-
-```json
-{
-  "mcpServers": {
-    "meeting-notetaker": {
-      "command": "C:\\Program Files\\MeetingNotetaker\\meeting-notetaker.exe",
-      "args": ["--mcp-server"]
-    }
-  }
-}
-```
-
-Restart the client. Then ask it to "list my meetings" or
-"synthesize the latest meeting and save it"; it calls the typed
-tools directly with no page-scraping involved.
-
-### Chrome Claude extension (local web UI)
-
-The Chrome Claude extension's Custom Connectors list only accepts
-remote MCP server URLs and refuses private IPs, so a stdio
-localhost server has nowhere to be pasted. The web UI gives the
-extension a page to drive instead.
-
-1. Start the web UI from Settings (or launch Meeting Notetaker
-   with the auto-start tick-box on).
-2. In Chrome, grant the Claude extension Site Access to
-   `http://127.0.0.1:*/*` (or the specific port you pick).
-3. Import the shipped Claude Agent Skill (see
-   [claude-skill/README.md](claude-skill/README.md)) so the
-   extension knows which page is which.
-4. Open the extension sidebar on the local page and ask it to
-   synthesize a meeting; it follows links, reads the rendered
-   prompt, drafts notes, and submits the Save form.
-
-### Accessing the web UI from a phone
-
-The web UI is responsive. The sidebar table-of-contents
-collapses to a horizontal chip row under 760px, so a meeting
-detail page is usable one-handed. If you want to read a
-transcript, kick off a synthesis, or save it from your phone,
-run the web UI bound to the LAN:
-
-```
-meeting-notetaker.exe --web-ui --host 0.0.0.0 --no-open
-```
-
-Then open `http://<laptop-lan-ip>:8765/` in your phone's
-browser. Loopback is the default for a reason: once you bind
-`0.0.0.0`, anything else on your network can reach the page
-too, so prefer trusted home networks and consider pointing
-`--host` at a specific LAN interface IP instead. Mobile Chrome
-and Safari both drive the Save form and the export dropdown
-fine. There is no mobile app to install.
-
-### What the pages offer
-
-- `/meetings` lists meetings with filters (state, series,
-  person, topic, has transcript, has synthesis, limit). Each
-  row links to a detail page.
-- `/meetings/<id>` carries a sticky left-sidebar table of
-  contents, then overview, attendees, live notes, transcript,
-  current synthesis, an Export dropdown (destinations driven
-  by your Settings tick-boxes), and the synthesis workflow
-  (template picker, rendered prompt, Save textarea, Save
-  button).
-- `/templates` is the configured prompt templates.
-- `/api/...` is the JSON mirror of every HTML route and every
-  mutating action, for scripts and automation.
-
-### Status bar
-
-The **Syn** pill in the status bar reports the MCP state: green
-when at least one transport is running, gray when disabled.
-Hover for the full description.
-
-## Saving notes to Notion or Confluence
-
-The **Save to...** button on the Synthesis row (and the matching
-**File > Save to** submenu) sends the active My Notes or Synthesis
-tab to Notion or Confluence as a new page. Both destinations
-require a one-time setup under **Tools > Settings > Integrations**.
-
-![Settings -- Integrations](docs/screenshots/28-dialog-settings-integrations.png)
-
-**Notion:** create an internal integration at
-[notion.so/my-integrations](https://www.notion.so/my-integrations),
-paste the integration token, click **Verify connection**. Share
-each destination page or workspace with the integration from inside
-Notion -- the picker only lists pages the integration has access to.
-
-**Confluence Cloud:** generate an API token at
-[id.atlassian.com](https://id.atlassian.com/) (Security > API
-tokens), enter your tenant base URL
-(`https://your-org.atlassian.net/wiki`), your email, and the token.
-Click **Verify**. Self-hosted Confluence Server users supply their
-own base URL.
-
-Tokens persist in `config.toml` (chmod-equivalent to user-only).
-Changing a credential clears the verified-state stamp so a stale
-"Connected" label can't outlive the change. The Save to menu items
-only surface after Verify succeeds.
-
-**The picker dialog.** When you pick **Save to Notion** or **Save to
-Confluence**, a dialog opens with:
-
-- A **Page title** field defaulted to `YYYY-MM-DD HH:MM - <session
-  title>`. Edit it freely; whatever's in this field becomes the
-  page name.
-- An **Include N attachment(s)** checkbox (only when the session has
-  attached files). When checked, each attachment uploads to the new
-  page -- Notion as file blocks under an "Attachments" heading,
-  Confluence as page attachments with a linked list at the bottom.
-- A **Favorites** group with destinations you've starred, a
-  **Recents** group with the last 5 places you saved, and a
-  **Browse** tree that lazy-loads children on expand. Entries
-  alphabetize; recents stay in recency order.
-- A **Star this selection** button to pin / unpin the current row,
-  and a **Create folder...** button to make a new container page
-  under the currently-selected destination. The Create folder
-  dialog has a one-click "Use series name" affordance that fills
-  the input with the session's series name (when one is set).
-
-![Save to picker](docs/screenshots/30-dialog-integrations-picker.png)
-
-Click **OK** and the export runs on a background thread; on
-success your default browser opens the new page. Re-running the
-export creates a new sibling under the same parent rather than
-overwriting; the status toast spells this out so previous exports
-stay intact.
-
-**Format fidelity.** Notion exports go through a Markdown-to-block
-converter that maps headings, lists (including nested + task
-lists), bold / italic / code, inline links, code fences with
-language hints, quotes, dividers, tables, and inline images.
-Confluence exports use the storage XML format directly -- not the
-REST converter -- so code blocks, nested lists, and adjacent
-blockquotes survive round-tripping unscathed.
-
-**Image handling.** Local images in the notes body upload to the
-target with the page; HTTP-hosted images stay external. Image refs
-the destination can't fetch (Notion's page-attachment URLs,
-`cid:`, `file://`) render as visible
-`*❌ (image: foo.png could not be pasted) ❌*` placeholders rather
-than broken icons.
-
-## Saving notes to Obsidian
-
-**Save to Obsidian** writes the finalized synthesis into a folder
-of an Obsidian vault you control. The vault is just a directory of
-plaintext markdown on disk -- no API, no token, no third-party
-plugin. Whatever sync the user already has on the vault
-(iCloud / OneDrive / Syncthing / Obsidian Sync) propagates the note
-to their other machines without us doing anything.
-
-**One-time setup.** Settings > Integrations > Obsidian: point the
-vault path at your vault directory + click **Verify vault**. The
-status line reports whether Obsidian itself has the vault
-registered (which it needs for the "open in Obsidian" URI to work
--- if the vault is not yet registered, open it once in Obsidian
-and re-verify).
-
-**Per-save dialog.** The picker offers:
-
-  * **Subfolder** -- defaults to the location template the user
-    picked in Settings (`Meetings/{YYYY}/{MM}` by default; "By
-    series", "Flat", or a custom template are also available);
-    editable per-save with a folder browser.
-  * **Filename** -- defaults to the sanitized session title (with
-    characters Obsidian forbids -- `[ ] # ^ | : * ? " < > | / \`
-    -- stripped automatically); editable.
-  * **Include attachments** -- copies the session's tracked
-    attachments into the vault alongside the note, and links them
-    in an `## Attachments` tail.
-  * **Append a backlink to today's daily note** -- adds a single
-    `- [[path/to/note|title]] -- 30 min` line to the user's daily
-    note (reads the user's Daily Notes core-plugin or Periodic
-    Notes config to find the right file). Off by default.
-  * **Open in Obsidian after save** -- launches
-    `obsidian://open?vault=<name>&file=<path>` after writing.
-
-**YAML frontmatter.** Every saved note opens with a frontmatter
-block carrying the session's date, time, duration, attendees,
-series, tags, and `source_session_id`. The session ID is the
-bridge back: re-saving the same session detects the existing note
-by `source_session_id` and offers **Overwrite / Save as new /
-Cancel** so the user doesn't accidentally produce duplicates.
-
-**Wikilinks.** Attendee names and the series land in frontmatter
-as `[[Alice]]` / `[[Weekly Sync]]` so they form graph nodes in
-Obsidian; the body text is untouched (no auto-wikification of
-arbitrary names inside paragraphs). Toggles in Settings let the
-user turn either off.
-
-**Images.** Local images in the body copy into
-`Meetings/_assets/<session-id>/` under the vault, and the
-markdown links in the note rewrite to point at the copied files.
-Hash-based dedup means re-saves don't double-copy an unchanged
-image.
-
-**No table of contents.** Obsidian has a built-in outline view in
-the right sidebar, and the Outline community plugin gives the
-same thing inline. We deliberately don't emit a markdown TOC into
-the body -- it would duplicate what Obsidian shows for free.
-Heading numbering (the `number_headings` Settings toggle) still
-applies to Obsidian saves.
-
-## Speaker identification
-
-After each recording, the app tries to label the *system audio*
-side of the transcript with real names ("Alice:", "Bob:") instead
-of the generic "Them:". It learns who is who over time -- the
-first meeting with a new colleague needs one quick labeling pass;
-subsequent meetings recognize that voice automatically. All
-processing is on-device.
-
-### What you'll see
-
-If any voice in the recording didn't match the speaker library,
-the **Label Unknown Speakers** dialog pops automatically after
-the post-meeting pass. Each card shows the top example transcript
-lines for that cluster plus a name field that autocompletes from
-Outlook attendees and known speakers:
-
-![Label Unknown Speakers dialog](docs/screenshots/12-dialog-label-unknown-speakers.png)
-
-After the fact, **Review Speakers** (button on the session view)
-walks every detected speaker and lets you rename / forget /
-confirm:
-
-![Review Speakers dialog](docs/screenshots/13-dialog-review-speakers.png)
-
-The speaker library lives at
-`%APPDATA%/MeetingNotetaker/speakers.db`. Open via **Settings >
-Manage Speakers...**; Rename / Forget per row, with a Forget All
-escape hatch:
-
-![Manage Speakers dialog](docs/screenshots/14-dialog-manage-speakers.png)
-
-### Tips for accuracy
-
-The library starts empty. It grows as you label voices, and the
-running-average centroid update tightens each stored embedding
-with every confirmation.
-
-- **Label voices the first time you see them.** Use a consistent
-  form (`Alice Smith` every time, not `Alice` sometimes) -- the
-  store keys on the exact string.
-- **Skip what you don't recognize.** A bad label trains the
-  wrong embedding into the store.
-- **Use Review Speakers when something looks wrong.** Rename
-  pushes the centroid update to the *new* name; the old name's
-  record is unchanged (Forget it manually via Manage Speakers if
-  it's corrupted).
-- **Lean on the Outlook attendee list.** Calendar-pre-filled
-  sessions have attendee names ready in the name combo box.
-
-Both the merge threshold (within-meeting clustering) and the
-match threshold (cross-meeting recognition) are tunable in
-Settings; see the [Tuning diarization
-thresholds](#tuning-diarization-thresholds) subsection below.
-
-## Settings reference
-
-Open via **Tools -> Settings...** (`Ctrl+,`) or the tray menu. All
-of these are also editable directly in `config.toml`.
-
-![Settings dialog](docs/screenshots/07-dialog-settings.png)
-
-| Setting | Default | What it does |
-|---|---|---|
-| Your name | (empty -> "Me") | Replaces "Me:" in the transcript display and in the synthesis prompt. When set, the LLM sees your real name and assigns action items by name instead of "TBD". |
-| Model size | `small.en` | Which faster-whisper model to use. See [Choosing a model](#choosing-a-model). |
-| Capture-only mode | **on** | Skip live transcription; run a single Whisper pass when you click Stop. v0.6.5+ default. Lower CPU during the meeting. Per-session override available in the New Session dialog. |
-| Skip post-Stop refinement | off | Make the live transcript final. No second Whisper pass after you click Stop. |
-| High accuracy mode | off | Off = greedy decoding (beam_size=1); on = beam_size=5 (slower, slightly more accurate). |
-| CPU threads per worker | 0 (auto) | CTranslate2 `cpu_threads`. 0 derives from `cpu_count() / num_workers`, minimum 2. |
-| Parallel workers | 2 | CTranslate2 `num_workers`. Lets independent transcribe() calls run truly in parallel. |
-| Retain audio (default) | off | Default state of the "Keep recording" checkbox for new sessions. |
-| Retained format | Opus | Opus / FLAC / WAV. Opus trims a 1-hour meeting from ~1 GB to ~45 MB with no practical speech-quality loss. |
-| Auto-capture interval | 30 s | Cadence for the screen-capture auto-mode (5-300 s range). |
-| Auto-capture dedup threshold | 10 bits | Sensitivity for the dHash-based duplicate filter (0-32, of 64 bits). |
-| Enable VAD | on | Trim silent stretches before Whisper decodes them. |
-| VAD min silence (ms) | 500 | How quiet a stretch has to be (in ms) before VAD treats it as silence. |
-| Mic device | (System default) | Persists by name so the same device is picked after replug. |
-| Loopback device | (System default) | WASAPI loopback. Windows-only. |
-| Custom vocabulary | (empty) | One phrase per line in `vocabulary.txt`. Per-session hotwords also auto-derived from `# Attendees` + agenda. |
-| Watch Outlook calendar | off | Poll Outlook for upcoming meetings. Click a tray notification to open New Session with the meeting subject + attendees + agenda pre-filled. |
-| Notify within (min) | 5 | How far in advance to surface the calendar notification. |
-| Detect ad-hoc meetings | off | Watch the Windows audio mixer for sustained audio from a known meeting app (Teams, Zoom, ...). |
-| Enable speaker identification | on | Run the post-meeting clustering pass. Disable to keep generic "Them:" labels. |
-| Match threshold | 75% | Cosine-similarity floor for matching a meeting voice against a stored speaker. |
-| Merge threshold | 75% | Cosine-similarity floor for merging two clusters into one during the agglomerative pass. |
-| Manage Speakers... | -- | Opens the speaker-library editor. |
-| Enable synthesis via MCP | off | Reveals the Start web UI button, the stdio config snippet, the auto-start tick-box, and the Web UI export destinations group. |
-| Start the web UI automatically when Meeting Notetaker launches | off | Background-starts the web UI on every app launch. Pair with the Chrome Claude extension or a mobile browser. |
-| Web UI export destinations | all off | Three check-boxes (Obsidian, Notion, Confluence) picking which Save-to destinations surface in the web UI's per-meeting export dropdown. Each stays disabled until the matching integration is configured and verified below. |
-| Notion integration token | (empty) | Internal Integration Token from notion.so/my-integrations. Enables Save to Notion when Verify succeeds. |
-| Confluence base URL | (empty) | Tenant root (Cloud: `https://your-org.atlassian.net/wiki`). |
-| Confluence email + API token | (empty) | Email + token from id.atlassian.com. Enables Save to Confluence when Verify succeeds. |
-| Obsidian vault path | (empty) | Absolute path to an Obsidian vault directory. Enables Save to Obsidian when Verify vault succeeds. |
-| Obsidian note location | `By series + date` | Template that picks the subfolder + filename. `By series + date` (default) = `Meetings/{series}/{YYYY}-{MM}-{DD} - {title}` (chronological order inside each series folder); `Year / Month` = `Meetings/{YYYY}/{MM}` (filename = session title); `By series` = `Meetings/{series}` (filename = session title); `Flat` = `Meetings/` (filename = session title); `Custom...` exposes a free-form template with `{YYYY}` / `{MM}` / `{DD}` / `{title}` / `{series}` / `{session_id}` placeholders -- if the template's last segment contains `{title}`, it becomes the filename pattern and everything before is the subdir. |
-| Obsidian YAML frontmatter | on | Write a YAML frontmatter block at the top of each saved note. Carries title / date / attendees / series / tags / `source_session_id`. |
-| Obsidian wikilinks (attendees + series) | on | Render attendee names and the series in frontmatter as `[[wikilinks]]` so they form graph nodes. |
-| Obsidian classification in frontmatter | off | Add the session's classification value to frontmatter. |
-| Obsidian include attachments by default | off | Pre-check the "Include attachments" box in the save dialog. Saves a click for users who want every save to bring the attachments with it. |
-| Obsidian daily-note backlink | off | After saving, append a backlink to today's daily note (reads the user's Daily Notes or Periodic Notes config to find it). |
-| Obsidian open after save | on | Launch `obsidian://open?vault=...&file=...` after the note lands. |
-
-## Backups (v0.7.5+)
-
-Local-machine SPOF mitigation. Pick a destination folder under
-**Settings -> Backups**, choose a schedule, and the app writes
-timestamped zip snapshots of the data dir + all sqlite stores. The
-**Tools -> Backup Now...** menu fires an immediate snapshot; **Tools
--> Restore from Backup...** picks a zip and atomically swaps the
-data dir aside before relaunching.
-
-![Backups settings page](docs/screenshots/26-dialog-settings-backups.png)
-
-| Setting | Default | What it does |
-|---|---|---|
-| Backup folder | (empty -> disabled) | Destination for the snapshot zips. Local disk, external drive, NAS, or OneDrive folder all work. |
-| Schedule | Manual only | One of: Manual only, On app close, When idle (after configured time). |
-| Idle after | 30 min | (When-idle schedule) Minutes of inactivity before a snapshot fires. Resets on any mouse / keyboard activity. |
-| Only after | 19:00 local | (When-idle schedule) Earliest local hour the idle trigger may fire. |
-| Keep newest | 7 snapshots | Retention cap by count (0 disables). |
-| Drop older than | 30 days | Retention cap by age (0 disables). Both gates apply; the intersection survives. |
-
-**OneDrive note.** OneDrive is **safe as a backup target** because the
-snapshot zips are atomic-once-closed -- OneDrive's conflict-resolution
-problem only applies to *open files being modified*. The data dir
-itself **must stay on local disk**: OneDrive sync corrupts the sqlite
-WAL files (the live `*.db-wal` / `*-shm` companions get rewritten
-under the running connection's feet).
-
-**What's in a snapshot.** The three primary sqlite stores
-(`sessions.db`, `classification.db`, `speakers.db`) plus the FTS5
-search index (`search.db`); `config.toml`, the user's customized
-prompt templates, the per-session content (audio + transcripts +
-notes + screenshots + attachments). What's *not* in a snapshot: the
-downloaded faster-whisper models (~480MB-1.5GB, re-downloaded on
-demand) and the running log files.
-
-**Snapshot vs. close.** If a backup is running when you close the
-app, a modal "Backup in progress" dialog blocks the close until the
-snapshot completes (no data loss from a torn zip). When the schedule
-is "On app close", the close-path snapshot shows a progress dialog
-in the same way.
-
-**Restore.** Restoring overwrites the current data directory; the
-existing dir is preserved as `.pre-restore.MeetingNotetaker.<timestamp>/`
-so you can roll back manually if needed. The app quits at the start
-of the restore; relaunch after the swap completes.
+The day-to-day usage walkthrough is split across the pages under
+[docs/user-guide/](docs/user-guide/README.md):
+
+- [Getting started](docs/user-guide/getting-started.md): requirements
+  and the four install paths.
+- [Recording and notes](docs/user-guide/recording.md): running a
+  session, My Notes, screen capture, playback, exporting the
+  recording, transcribing a crashed recording, and importing a
+  transcript.
+- [Synthesis](docs/user-guide/synthesis.md): manual clipboard
+  hand-off, and the MCP service layer (stdio for Claude Desktop /
+  Code; loopback web UI for the Chrome Claude extension).
+- [Publishing notes](docs/user-guide/publishing.md): Save to Notion,
+  Confluence, and Obsidian.
+- [Speaker identification](docs/user-guide/speakers.md): the
+  on-device recognition pipeline and how to tune it.
+- [Settings and backups](docs/user-guide/settings.md): the full
+  Settings reference table plus the backup / restore flow.
+
+The in-app Help > User Guide... menu item opens this page directly.
+Technical internals (recording pipeline, diarization, service layer)
+live in the [Technical Details](#technical-details) section below.
 
 ---
 
@@ -1283,7 +495,6 @@ flowchart TD
     desktop[Claude Desktop]
     code[Claude Code]
     chrome["Chrome Claude extension<br/>(Site Access to 127.0.0.1)"]
-    phone["Mobile browser<br/>(--host 0.0.0.0 on LAN)"]
 
     stdio --> tools
     webui --> tools
@@ -1292,7 +503,6 @@ flowchart TD
     code -->|stdio connector| stdio
 
     chrome -->|HTML + /api JSON| webui
-    phone -->|HTML + /api JSON| webui
 ```
 
 `meeting_notetaker/mcp/tools.py` is the single source of truth
@@ -1304,10 +514,9 @@ for every exposed operation. Both transports call into it:
   launch it on demand from their connector configs; nothing
   binds a socket.
 - The web UI (`meeting_notetaker/web/`) wraps the same tools in
-  HTML pages (for Chrome Claude and mobile browsers to drive)
-  and in a parallel JSON API under `/api/` (for scripts). The
-  server is a stdlib `ThreadingHTTPServer`; no Flask, no Django,
-  no extra wheel.
+  HTML pages (for Chrome Claude to drive) and in a parallel JSON
+  API under `/api/` (for scripts). The server is a stdlib
+  `ThreadingHTTPServer`; no Flask, no Django, no extra wheel.
 
 The web UI's export dropdown is populated by `list_export_destinations`,
 whose rows are gated on two conditions: the destination has to be
@@ -1324,7 +533,6 @@ Launching the web UI from the command line:
 ```
 meeting-notetaker.exe --web-ui                   # loopback, auto-open browser
 meeting-notetaker.exe --web-ui --no-open         # no browser launch
-meeting-notetaker.exe --web-ui --host 0.0.0.0    # bind LAN for phone access
 meeting-notetaker.exe --web-ui --port 8800       # pick a starting port
 ```
 

@@ -60,8 +60,7 @@ You can also run the web UI from the command line:
 ```
 
 Flags: `--port N` picks a preferred port (default 8765; falls back by
-up to 20 if busy), `--no-open` skips the automatic browser launch,
-`--host H` overrides the bind host (default 127.0.0.1).
+up to 20 if busy), `--no-open` skips the automatic browser launch.
 
 ### What the page offers
 

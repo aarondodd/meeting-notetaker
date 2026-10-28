@@ -1,6 +1,6 @@
 ---
 name: meeting-notetaker
-description: Synthesize meeting notes from the user's local Meeting Notetaker app. Use when the user asks you to summarize, synthesize, review, write up, save, or export notes for one of their meetings. Meeting Notetaker is a desktop app that transcribes meetings locally and exposes them through a web UI on `http://127.0.0.1:8765/` (with fallbacks to 8766..8785; the user may also bind a LAN host for phone access). Covers listing meetings with filters by state, series, person, topic, has-transcript or has-synthesis; reading the transcript, live notes, and the rendered synthesis prompt for a single meeting; writing the synthesized notes back via the Save form; publishing a finished note to Obsidian, Notion, or Confluence via the per-meeting Export dropdown; and cross-meeting summaries like "summarize all meetings on topic X last week".
+description: Synthesize meeting notes from the user's local Meeting Notetaker app. Use when the user asks you to summarize, synthesize, review, write up, save, or export notes for one of their meetings. Meeting Notetaker is a desktop app that transcribes meetings locally and exposes them through a web UI on `http://127.0.0.1:8765/` (with fallbacks to 8766..8785). Covers listing meetings with filters by state, series, person, topic, has-transcript or has-synthesis; reading the transcript, live notes, and the rendered synthesis prompt for a single meeting; writing the synthesized notes back via the Save form; publishing a finished note to Obsidian, Notion, or Confluence via the per-meeting Export dropdown; and cross-meeting summaries like "summarize all meetings on topic X last week".
 ---
 
 # Meeting Notetaker synthesis
@@ -23,12 +23,6 @@ live URL:
 2. If 8765 does not answer, try 8766..8785 in order until one responds
    `ok`.
 
-If the user has bound the server to the LAN for phone access (started
-with `--host 0.0.0.0` or a specific LAN IP), the URL is
-`http://<their-lan-ip>:<port>/` instead; the same page structure and
-same routes apply. Ask the user for the base URL and use that
-throughout.
-
 If none respond, the server is not running. Ask the user to:
 
 - Open Meeting Notetaker.
@@ -38,8 +32,8 @@ If none respond, the server is not running. Ask the user to:
   session, or tick **Start the web UI automatically when Meeting
   Notetaker launches** and relaunch the app.
 - In the Chrome Claude extension's own options, grant Site Access to
-  `http://127.0.0.1:*/*` (or the specific port, or the LAN URL).
-  Without this the extension cannot read the pages described below.
+  `http://127.0.0.1:*/*` (or the specific port). Without this the
+  extension cannot read the pages described below.
 
 ## Pages you drive
 
