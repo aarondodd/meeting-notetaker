@@ -22,6 +22,16 @@ Why decode-into-memory instead of streaming-from-disk:
 The mix is a clip-safe average: at each sample, mixed = (mic + sys) / 2.
 Each source is float32 in [-1, 1] coming out of PyAV's AudioResampler;
 the average stays in [-1, 1] which converts to int16 without clipping.
+
+Storage format: int16 at 16 kHz mono. Earlier versions kept the
+mixed buffer as float32 for symmetry with sounddevice's default
+dtype, but a 2.5h meeting at float32 is 573 MiB in one allocation
+and OOMs on a bundled Windows build. int16 brings the peak back
+under 290 MiB and sounddevice happily takes dtype="int16" on the
+output stream, so the callback writes chunks straight through with
+no per-callback dtype conversion. The per-source decode and the
+blockwise mix do the same int16 arithmetic with a short int32
+accumulator so we never allocate a full-duration intermediate.
 """
 from __future__ import annotations
 
@@ -323,7 +333,7 @@ class AudioPlayer(QObject):
                 self._stream = sd.OutputStream(
                     samplerate=_PLAYBACK_RATE,
                     channels=1,
-                    dtype="float32",
+                    dtype="int16",
                     callback=self._audio_callback,
                     finished_callback=lambda g=my_generation: self._on_stream_finished(g),
                 )
@@ -356,8 +366,12 @@ class AudioPlayer(QObject):
         # here -- emit only via the QTimer tick on the main thread.
         # Diagnostic logging the first few calls so playback issues
         # are debuggable from the log alone.
+        #
+        # outdata dtype is int16 (matches the OutputStream dtype we
+        # pass to sounddevice). Writing a Python 0 or 0.0 to an int16
+        # slice works, but we stay in-dtype for clarity.
         if self._buffer is None or self._total_frames == 0:
-            outdata[:] = 0.0
+            outdata[:] = 0
             if self._callbacks_logged < 3:
                 log.info(
                     "AudioPlayer cb: empty buffer (frames=%d, total_frames=%d)",
@@ -378,7 +392,7 @@ class AudioPlayer(QObject):
             self._callbacks_logged += 1
         if chunk.size < frames:
             outdata[: chunk.size, 0] = chunk
-            outdata[chunk.size :, 0] = 0.0
+            outdata[chunk.size :, 0] = 0
             self._cursor_frames = self._total_frames
             log.info(
                 "AudioPlayer cb: buffer drained at frame=%d/%d (chunk=%d, "
@@ -492,12 +506,11 @@ class _DecodeWorker(QThread):
                 if self.isInterruptionRequested():
                     self.decoded.emit(self._generation, None, "load cancelled")
                     return
-                decoded.append(_decode_to_mono_float32(src, self._target_rate))
+                decoded.append(_decode_to_mono_int16(src, self._target_rate))
             if self.isInterruptionRequested():
                 self.decoded.emit(self._generation, None, "load cancelled")
                 return
-            mixed = _mix_to_max_length(decoded).astype(np.float32, copy=False)
-            np.clip(mixed, -1.0, 1.0, out=mixed)
+            mixed = _mix_int16_to_max_length(decoded)
             self.decoded.emit(self._generation, mixed, None)
         except Exception as exc:
             log.exception("AudioPlayer decode worker failed")
@@ -571,3 +584,90 @@ def _mix_to_max_length(buffers: list[np.ndarray]) -> np.ndarray:
         else:
             acc += b
     return acc / len(buffers)
+
+
+# int16 variants used by the player's decode worker. Separate from the
+# float32 helpers above because audio/export.py and audio/highlights_
+# export.py depend on the float32 ones at specific shapes, and because
+# the player's constraint is different: it never reads the buffer
+# other than through the audio callback, which writes int16 straight
+# to sounddevice, so staying in int16 end to end keeps peak memory at
+# half of what float32 costs.
+
+# Tune for the blockwise mixer. 1M samples at int32 is 4 MiB per
+# source, well under L2 on any sane machine and small enough that a
+# very long meeting stays bounded.
+_MIX_BLOCK_SAMPLES = 1_000_000
+
+
+def _decode_to_mono_int16(src: Path, target_rate: int) -> np.ndarray:
+    """PyAV decode + resample into mono int16 samples.
+
+    Mirrors `_decode_to_mono_float32` but converts each resampled
+    frame to int16 before accumulating, so the peak-allocation is
+    int16 (2 bytes/sample) instead of float32 (4 bytes/sample). For
+    a 2.5h recording at 16 kHz mono that is the difference between
+    573 MiB and 287 MiB -- the former is what crashes the batch
+    load in issue #137.
+    """
+    import av  # noqa: PLC0415
+
+    chunks: list[np.ndarray] = []
+    with av.open(str(src)) as container:
+        stream = container.streams.audio[0]
+        resampler = av.AudioResampler(
+            format="fltp", layout="mono", rate=target_rate,
+        )
+        for frame in container.decode(stream):
+            for rs in resampler.resample(frame):
+                f32 = rs.to_ndarray().reshape(-1).astype(
+                    np.float32, copy=False,
+                )
+                np.clip(f32, -1.0, 1.0, out=f32)
+                chunks.append((f32 * 32767.0).astype(np.int16))
+        for rs in resampler.resample(None) or []:
+            f32 = rs.to_ndarray().reshape(-1).astype(
+                np.float32, copy=False,
+            )
+            np.clip(f32, -1.0, 1.0, out=f32)
+            chunks.append((f32 * 32767.0).astype(np.int16))
+    if not chunks:
+        return np.zeros(0, dtype=np.int16)
+    return np.concatenate(chunks)
+
+
+def _mix_int16_to_max_length(buffers: list[np.ndarray]) -> np.ndarray:
+    """Average 1+ mono int16 buffers blockwise, end-aligned.
+
+    Shares its end-alignment contract with `_mix_to_max_length`: a
+    shorter buffer is leading-padded with silence so both stop at the
+    same sample. The difference is the accumulator: instead of a
+    full-duration float32 sum (which is 4x the sample count in bytes)
+    this walks a block of up to _MIX_BLOCK_SAMPLES samples at int32,
+    which holds the sum of any realistic number of int16 sources
+    without overflow. Peak extra memory is one block of int32, which
+    is 4 MiB at the default, not 500+ MiB.
+    """
+    if len(buffers) == 1:
+        return buffers[0]
+    n = len(buffers)
+    max_len = max(b.size for b in buffers)
+    offsets = [max_len - b.size for b in buffers]  # leading-silence offsets
+    out = np.empty(max_len, dtype=np.int16)
+    block = _MIX_BLOCK_SAMPLES
+    for i in range(0, max_len, block):
+        j = min(i + block, max_len)
+        acc = np.zeros(j - i, dtype=np.int32)
+        for b, offset in zip(buffers, offsets):
+            src_start = max(i - offset, 0)
+            src_end = min(j - offset, b.size)
+            if src_start < src_end:
+                dst_start = offset + src_start - i
+                dst_end = offset + src_end - i
+                acc[dst_start:dst_end] += b[src_start:src_end].astype(
+                    np.int32, copy=False,
+                )
+        acc //= n
+        np.clip(acc, -32768, 32767, out=acc)
+        out[i:j] = acc.astype(np.int16, copy=False)
+    return out
